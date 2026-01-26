@@ -1714,6 +1714,253 @@ def _flow_artifacts_mode() -> str:
 		return 'copy'
 
 
+def _inject_files_copy_mode() -> str:
+	"""How inject_files should be delivered into compose services.
+
+	- copy: copy into a volume-mounted destination (default)
+	- mount: bind-mount the source files directly into destination
+	"""
+	try:
+		val = str(os.getenv('CORETG_INJECT_FILES_MODE') or '').strip().lower()
+		if val in ('mount', 'bind', 'bind-mount'):
+			return 'mount'
+		return 'copy'
+	except Exception:
+		return 'copy'
+
+
+def _norm_inject_rel(raw: str) -> str:
+	s = str(raw or '').strip()
+	if not s:
+		return ''
+	s = s.replace('\\', '/')
+	while s.startswith('./'):
+		s = s[2:]
+	while s.startswith('/'):
+		s = s[1:]
+	if s.startswith('flow_artifacts/'):
+		s = s[len('flow_artifacts/'):]
+	if s.startswith('artifacts/'):
+		s = s[len('artifacts/'):]
+	while s.startswith('./'):
+		s = s[2:]
+	s = s.strip('/')
+	if not s:
+		return ''
+	try:
+		parts = [p for p in s.split('/') if p]
+		if any(p == '..' for p in parts):
+			return ''
+	except Exception:
+		return ''
+	return s
+
+
+def _split_inject_spec(raw: str) -> tuple[str, str]:
+	text = str(raw or '').strip()
+	if not text:
+		return '', ''
+	for sep in ('->', '=>'):
+		if sep in text:
+			left, right = text.split(sep, 1)
+			return left.strip(), right.strip()
+	return text, ''
+
+
+def _normalize_inject_dest_dir(raw: str, *, default: str = '/flow_injects') -> str:
+	s = str(raw or '').strip()
+	if not s:
+		return default
+	if not s.startswith('/'):
+		return default
+	parts = [p for p in s.split('/') if p]
+	if any(p == '..' for p in parts):
+		return default
+	return '/' + '/'.join(parts) if parts else default
+
+
+def _expand_injects_from_outputs(out_manifest: str, inject_files: list[str]) -> list[str]:
+	if not out_manifest or not os.path.exists(out_manifest):
+		return list(inject_files or [])
+	try:
+		with open(out_manifest, 'r', encoding='utf-8') as f:
+			doc = json.load(f) or {}
+	except Exception:
+		return list(inject_files or [])
+	outputs = doc.get('outputs') if isinstance(doc, dict) else None
+	if not isinstance(outputs, dict):
+		return list(inject_files or [])
+
+	def _looks_like_path(s: str) -> bool:
+		return '/' in (s or '')
+
+	out: list[str] = []
+	for raw in inject_files or []:
+		src_raw, dest_raw = _split_inject_spec(str(raw))
+		key = str(src_raw or '').strip()
+		if not key:
+			continue
+		if key in outputs:
+			v = outputs.get(key)
+			if isinstance(v, str):
+				vv = v.strip()
+				if vv and _looks_like_path(vv):
+					out.append(f"{vv} -> {dest_raw}" if dest_raw else vv)
+					continue
+			if isinstance(v, list):
+				vals: list[str] = []
+				for item in v:
+					s = str(item or '').strip()
+					if s and _looks_like_path(s):
+						vals.append(s)
+				if vals:
+					if dest_raw:
+						out.extend([f"{vv} -> {dest_raw}" for vv in vals])
+					else:
+						out.extend(vals)
+					continue
+		if dest_raw:
+			out.append(f"{key} -> {dest_raw}")
+		else:
+			out.append(key)
+	return out
+
+
+def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str], source_dir: str, outputs_manifest: str = '', prefer_service: str = '') -> dict:
+	if not isinstance(compose_obj, dict) or not inject_files:
+		return compose_obj
+	if not source_dir or not os.path.isdir(source_dir):
+		return compose_obj
+
+	inject_files = _expand_injects_from_outputs(outputs_manifest, inject_files)
+
+	services = compose_obj.get('services')
+	if not isinstance(services, dict):
+		return compose_obj
+
+	# Build inject mapping: relpath -> dest_dir
+	inject_map: dict[str, str] = {}
+	for raw in inject_files or []:
+		src_raw, dest_raw = _split_inject_spec(str(raw))
+		src_norm = _norm_inject_rel(src_raw)
+		if not src_norm:
+			continue
+		dest_dir = _normalize_inject_dest_dir(dest_raw)
+		inject_map[src_norm] = dest_dir
+
+	if not inject_map:
+		return compose_obj
+
+	def _volume_name_for_dest(dest_dir: str) -> str:
+		slug = dest_dir.strip('/') or 'injects'
+		slug = ''.join([c if c.isalnum() else '-' for c in slug])
+		while '--' in slug:
+			slug = slug.replace('--', '-')
+		slug = slug.strip('-') or 'injects'
+		return f"inject-{slug}"[:50]
+
+	def _select_target_service() -> str:
+		if prefer_service and prefer_service in services:
+			return prefer_service
+			
+		# fall back to first service
+		for k in services.keys():
+			return str(k)
+		return ''
+
+	target_service = _select_target_service()
+	if not target_service or target_service not in services:
+		return compose_obj
+
+	mode = _inject_files_copy_mode()
+	if mode == 'mount':
+		# Bind-mount each source path directly into the target container.
+		for rel, dest_dir in inject_map.items():
+			src_path = os.path.join(source_dir, rel)
+			if not os.path.exists(src_path):
+				continue
+			bind = f"{src_path}:{dest_dir}/{rel}:ro"
+			compose_obj = _inject_service_bind_mount(compose_obj, bind, prefer_service=target_service)
+		return compose_obj
+
+	# Copy mode: use a helper init service to copy into named volumes.
+	copy_service_name = 'inject_copy'
+	if copy_service_name in services:
+		i = 2
+		while f"inject_copy_{i}" in services:
+			i += 1
+		copy_service_name = f"inject_copy_{i}"
+
+	copy_vols: list[Any] = []
+	copy_vols.append(f"{source_dir}:/src:ro")
+
+	dest_to_volume: dict[str, str] = {}
+	dest_mounts: dict[str, str] = {}
+	for dest_dir in set(inject_map.values()):
+		vol_name = dest_to_volume.setdefault(dest_dir, _volume_name_for_dest(dest_dir))
+		slug = vol_name.replace('inject-', '')
+		mount_path = f"/dst/{slug}"
+		dest_mounts[dest_dir] = mount_path
+		copy_vols.append(f"{vol_name}:{mount_path}")
+
+	cmds: list[str] = []
+	for rel, dest_dir in inject_map.items():
+		mount_path = dest_mounts.get(dest_dir)
+		if not mount_path:
+			continue
+		rel_dir = os.path.dirname(rel)
+		rel_dir_escaped = rel_dir.replace('"', '\\"')
+		src_escaped = rel.replace('"', '\\"')
+		dst_escaped = rel.replace('"', '\\"')
+		if rel_dir:
+			cmds.append(f"mkdir -p \"{mount_path}/{rel_dir_escaped}\"")
+		cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" || true")
+
+	if not cmds:
+		return compose_obj
+
+	services[copy_service_name] = {
+		'image': 'alpine:3.19',
+		'volumes': copy_vols,
+		'command': ['sh', '-lc', ' && '.join(cmds)],
+	}
+
+	# Mount volumes into target service
+	for dest_dir, vol_name in dest_to_volume.items():
+		bind = f"{vol_name}:{dest_dir}"
+		compose_obj = _inject_service_bind_mount(compose_obj, bind, prefer_service=target_service)
+
+	# Ensure target waits for copy service
+	try:
+		svc = services.get(target_service)
+		if isinstance(svc, dict):
+			dep = svc.get('depends_on')
+			if isinstance(dep, dict):
+				dep.setdefault(copy_service_name, {'condition': 'service_completed_successfully'})
+				svc['depends_on'] = dep
+			elif isinstance(dep, list):
+				if copy_service_name not in dep:
+					dep.append(copy_service_name)
+				svc['depends_on'] = dep
+			else:
+				svc['depends_on'] = {copy_service_name: {'condition': 'service_completed_successfully'}}
+	except Exception:
+		pass
+
+	# Register volumes
+	try:
+		top_vols = compose_obj.get('volumes')
+		if not isinstance(top_vols, dict):
+			top_vols = {}
+		for vol_name in dest_to_volume.values():
+			top_vols.setdefault(vol_name, {})
+		compose_obj['volumes'] = top_vols
+	except Exception:
+		pass
+
+	return compose_obj
+
+
 def _ensure_list_field_has(value: object, item: str) -> List[str]:
 	"""Normalize a compose field that may be a string/list and ensure item is present."""
 	out: List[str] = []
@@ -2271,6 +2518,27 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
 			except Exception:
 				pass
+				# Inject allowlisted files into the target container (copy by default).
+				try:
+					inject_files = rec.get('InjectFiles') or rec.get('inject_files')
+					source_dir = str(rec.get('InjectSourceDir') or rec.get('ArtifactsDir') or '').strip()
+					outputs_manifest = str(rec.get('OutputsManifest') or '')
+					if not outputs_manifest:
+						# best-effort: look for outputs.json in run dir
+						run_dir = str(rec.get('RunDir') or '').strip()
+						cand = os.path.join(run_dir, 'outputs.json') if run_dir else ''
+						if cand and os.path.exists(cand):
+							outputs_manifest = cand
+					if isinstance(inject_files, list) and inject_files and source_dir:
+						obj = _inject_copy_for_inject_files(
+							obj,
+							inject_files=[str(x) for x in inject_files if x is not None],
+							source_dir=source_dir,
+							outputs_manifest=outputs_manifest,
+							prefer_service=prefer,
+						)
+				except Exception:
+					pass
 			# Optional overlays for traffic/segmentation nodes (kept out of baseline template).
 			try:
 				def _truthy(val: object) -> bool:

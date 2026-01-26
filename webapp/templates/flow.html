@@ -1492,11 +1492,25 @@
 
       artSet.forEach((n)=>{
         if(!n || isFlagFactName(n)) return;
-        if(!outArtifacts.has(n)) outArtifacts.set(n, i);
+        const existing = outArtifacts.get(n);
+        if(Array.isArray(existing)) {
+          if(!existing.includes(i)) existing.push(i);
+        } else if(Number.isFinite(+existing)) {
+          if(existing !== i) outArtifacts.set(n, [existing, i]);
+        } else {
+          outArtifacts.set(n, [i]);
+        }
       });
       fieldSet.forEach((n)=>{
         if(!n || isFlagFactName(n)) return;
-        outFields.set(n, i);
+        const existing = outFields.get(n);
+        if(Array.isArray(existing)) {
+          if(!existing.includes(i)) existing.push(i);
+        } else if(Number.isFinite(+existing)) {
+          if(existing !== i) outFields.set(n, [existing, i]);
+        } else {
+          outFields.set(n, [i]);
+        }
       });
 
       if(Array.isArray(a.outputs)){
@@ -1504,15 +1518,36 @@
           const n = String(raw || '').trim();
           if(!n || isFlagFactName(n)) return;
           if(artSet.has(n)) {
-            if(!outArtifacts.has(n)) outArtifacts.set(n, i);
+            const existing = outArtifacts.get(n);
+            if(Array.isArray(existing)) {
+              if(!existing.includes(i)) existing.push(i);
+            } else if(Number.isFinite(+existing)) {
+              if(existing !== i) outArtifacts.set(n, [existing, i]);
+            } else {
+              outArtifacts.set(n, [i]);
+            }
             return;
           }
           if(fieldSet.has(n)) {
-            outFields.set(n, i);
+            const existing = outFields.get(n);
+            if(Array.isArray(existing)) {
+              if(!existing.includes(i)) existing.push(i);
+            } else if(Number.isFinite(+existing)) {
+              if(existing !== i) outFields.set(n, [existing, i]);
+            } else {
+              outFields.set(n, [i]);
+            }
             return;
           }
           // Untyped outputs default to fields to avoid duplicating artifact sources.
-          outFields.set(n, i);
+          const existing = outFields.get(n);
+          if(Array.isArray(existing)) {
+            if(!existing.includes(i)) existing.push(i);
+          } else if(Number.isFinite(+existing)) {
+            if(existing !== i) outFields.set(n, [existing, i]);
+          } else {
+            outFields.set(n, [i]);
+          }
         });
       }
     }
@@ -1523,13 +1558,37 @@
     const n = String(name || '').trim();
     if(!n) return null;
     let idx = null;
+    let idxList = null;
     try{
+      if(row && Number.isFinite(+row.sourceIndex)){
+        idx = +row.sourceIndex;
+      }
       if(sourceMap){
         const isField = row && String(row.kind || '').toLowerCase() === 'field';
         const map = isField ? sourceMap.fields : sourceMap.artifacts;
-        if(map && map.has(n)) idx = map.get(n);
+        if(map && map.has(n)) {
+          const raw = map.get(n);
+          if(Array.isArray(raw)) {
+            idxList = raw.slice().filter(v => Number.isFinite(+v)).map(v => +v).sort((a, b) => a - b);
+          } else if(Number.isFinite(+raw)) {
+            idx = raw;
+          }
+        }
       }
     } catch(e) {}
+    if(Number.isFinite(+idx) && idx >= 0 && row && Number.isFinite(+row.sourceIndex)){
+      const roman = toRoman(idx + 1);
+      const label = roman ? ('Seq ' + roman) : ('Seq ' + (idx + 1));
+      return { text: label, className: 'badge text-bg-primary' };
+    }
+    if(Array.isArray(idxList) && idxList.length){
+      const labels = idxList.map(i => {
+        const roman = toRoman(i + 1);
+        return roman ? roman : String(i + 1);
+      });
+      const label = 'Seq ' + labels.join(', ');
+      return { text: label, className: 'badge text-bg-primary' };
+    }
     if(Number.isFinite(+idx) && idx >= 0){
       const roman = toRoman(idx + 1);
       const label = roman ? ('Seq ' + roman) : ('Seq ' + (idx + 1));
@@ -3156,6 +3215,21 @@
 
         const goalSourceMap = buildGoalFactSourceMap(currentFlagAssignments);
 
+        function _goalSourceIndices(name, kind){
+          try{
+            const n = String(name || '').trim();
+            if(!n || !goalSourceMap) return [];
+            const map = (String(kind || '').toLowerCase() === 'field') ? goalSourceMap.fields : goalSourceMap.artifacts;
+            if(!map || !map.has(n)) return [];
+            const raw = map.get(n);
+            if(Array.isArray(raw)){
+              return raw.slice().filter(v => Number.isFinite(+v)).map(v => +v).sort((a, b) => a - b);
+            }
+            if(Number.isFinite(+raw)) return [+raw];
+          } catch(e) {}
+          return [];
+        }
+
         const rows = [];
         const reqArtifactSet = new Set(reqArtifacts);
         const provArtChainSet = new Set(providedArtifactsChain);
@@ -3163,15 +3237,31 @@
         reqArtifacts.map(String).filter(Boolean).sort().forEach((name)=>{
           const n = String(name || '').trim();
           if(!n || isFlagFactName(n)) return;
-          rows.push({
-            name: n,
-            kind: 'Artifact',
-            resolved: ro ? ro[n] : undefined,
-            fromChain: provArtChainSet.has(n),
-            fromSeq: provArtSeqSet.has(n),
-            missing: !(provArtChainSet.has(n) || provArtSeqSet.has(n)),
-            required: reqArtifactSet.has(n),
-          });
+          const indices = _goalSourceIndices(n, 'Artifact');
+          if(indices.length){
+            indices.forEach((idx)=>{
+              rows.push({
+                name: n,
+                kind: 'Artifact',
+                resolved: ro ? ro[n] : undefined,
+                fromChain: provArtChainSet.has(n),
+                fromSeq: provArtSeqSet.has(n),
+                missing: !(provArtChainSet.has(n) || provArtSeqSet.has(n)),
+                required: reqArtifactSet.has(n),
+                sourceIndex: idx,
+              });
+            });
+          } else {
+            rows.push({
+              name: n,
+              kind: 'Artifact',
+              resolved: ro ? ro[n] : undefined,
+              fromChain: provArtChainSet.has(n),
+              fromSeq: provArtSeqSet.has(n),
+              missing: !(provArtChainSet.has(n) || provArtSeqSet.has(n)),
+              required: reqArtifactSet.has(n),
+            });
+          }
         });
 
         const fieldNameSet = new Set(defFields.map(String).filter(Boolean));
@@ -3185,15 +3275,32 @@
         Array.from(fieldNameSet).sort().forEach((name)=>{
           const n = String(name || '').trim();
           if(!n || isFlagFactName(n)) return;
-          rows.push({
-            name: n,
-            kind: 'Field',
-            resolved: ro ? ro[n] : undefined,
-            fromChain: provFldChainSet.has(n),
-            fromSeq: provFldSeqSet.has(n),
-            missing: !(provFldChainSet.has(n) || provFldSeqSet.has(n)),
-            required: true,
-          });
+          if(reqArtifactSet.has(n)) return;
+          const indices = _goalSourceIndices(n, 'Field');
+          if(indices.length){
+            indices.forEach((idx)=>{
+              rows.push({
+                name: n,
+                kind: 'Field',
+                resolved: ro ? ro[n] : undefined,
+                fromChain: provFldChainSet.has(n),
+                fromSeq: provFldSeqSet.has(n),
+                missing: !(provFldChainSet.has(n) || provFldSeqSet.has(n)),
+                required: true,
+                sourceIndex: idx,
+              });
+            });
+          } else {
+            rows.push({
+              name: n,
+              kind: 'Field',
+              resolved: ro ? ro[n] : undefined,
+              fromChain: provFldChainSet.has(n),
+              fromSeq: provFldSeqSet.has(n),
+              missing: !(provFldChainSet.has(n) || provFldSeqSet.has(n)),
+              required: true,
+            });
+          }
         });
         goalInputs = rows.map((row)=>{
           const badge = goalFactBadgeFor(row && row.name, row, goalSourceMap);

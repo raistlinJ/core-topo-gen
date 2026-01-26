@@ -1225,6 +1225,11 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                 # Extra fields consumed by prepare_compose_for_assignments to mount artifacts.
                 'ArtifactsDir': artifacts_dir,
                 'ArtifactsMountPath': mount_path,
+                # Inject files (copy into container at runtime).
+                'InjectFiles': flow_flag.get('inject_files') or [],
+                'InjectSourceDir': artifacts_dir,
+                'OutputsManifest': str(flow_flag.get('outputs_manifest') or ''),
+                'RunDir': str(flow_flag.get('run_dir') or ''),
             }
             if hint_text:
                 rec2['HintText'] = hint_text
@@ -1266,6 +1271,10 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
         overlay: Dict[str, str] = {
             'ArtifactsDir': artifacts_dir,
             'ArtifactsMountPath': mount_path,
+            'InjectFiles': flow_flag.get('inject_files') or [],
+            'InjectSourceDir': artifacts_dir,
+            'OutputsManifest': str(flow_flag.get('outputs_manifest') or ''),
+            'RunDir': str(flow_flag.get('run_dir') or ''),
         }
         if hint_text:
             overlay['HintText'] = hint_text
