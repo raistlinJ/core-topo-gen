@@ -443,8 +443,28 @@ def plan_r2s_grouping(
             continue
 
         if len(host_list_sorted) < 2:
-            r2s_host_pairs_used[rid] = 0
-            grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': [], 'group_sizes': []})
+            if len(host_list_sorted) == 1:
+                group = [host_list_sorted[0]]
+                rsw_subnet, lan_subnet = _next_group_subnets(rid, 0, host_count=1)
+                router_switch_subnets.append(rsw_subnet)
+                lan_subnets.append(lan_subnet)
+                router_ip = None
+                try:
+                    shared_net = ipaddress.ip_network(lan_subnet, strict=False)
+                    shared_hosts = list(shared_net.hosts())
+                    if shared_hosts:
+                        router_ip = f"{shared_hosts[0]}/{shared_net.prefixlen}"
+                except Exception:
+                    pass
+                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': None, 'host_if_ips': {}})
+                switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-1"})
+                next_switch_id += 1
+                r2s_counts[rid] = 1
+                r2s_host_pairs_used[rid] = 0
+                grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': [group], 'group_sizes': [1]})
+            else:
+                r2s_host_pairs_used[rid] = 0
+                grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': [], 'group_sizes': []})
             continue
         target_groups = nonuniform_targets.get(rid) if effective_mode == 'nonuniform' else None
         if target_groups is not None:

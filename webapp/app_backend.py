@@ -7698,17 +7698,7 @@ def participant_ui_topology_api():
     flow_meta: dict[str, Any] | None = None
     try:
         if scenario_norm:
-            flow_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
-        else:
-            flow_path = None
-        if flow_path:
-            with open(flow_path, 'r', encoding='utf-8') as f:
-                flow_payload = json.load(f) or {}
-            if isinstance(flow_payload, dict):
-                meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
-                fm = (meta or {}).get('flow') or flow_payload.get('flow')
-                if isinstance(fm, dict):
-                    flow_meta = fm
+            flow_meta = _flow_state_from_latest_xml(scenario_norm)
     except Exception:
         flow_meta = None
 
@@ -7791,12 +7781,6 @@ def api_planner_ensure_plan():
 
     try:
         result = _planner_persist_flow_plan(xml_path=xml_path, scenario=scenario, seed=seed, persist_plan_file=False)
-        try:
-            scen_norm = _normalize_scenario_label(result.get('scenario') or scenario or '')
-            if scen_norm:
-                _planner_set_plan(scen_norm, plan_path=result.get('preview_plan_path'), xml_path=xml_path, seed=result.get('seed'))
-        except Exception:
-            pass
         return jsonify({
             'ok': True,
             'xml_path': result.get('xml_path'),
@@ -7814,17 +7798,10 @@ def api_planner_latest_plan():
     scenario_norm = _normalize_scenario_label(scenario)
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'scenario required'}), 400
-    entry = _planner_get_plan(scenario_norm)
-    if entry:
-        return jsonify({'ok': True, 'preview_plan_path': entry.get('plan_path'), 'xml_path': entry.get('xml_path')})
-    # Fallback to latest planner-origin preview plan if state missing.
-    try:
-        plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
-    except Exception:
-        plan_path = None
-    if plan_path:
-        return jsonify({'ok': True, 'preview_plan_path': plan_path})
-    return jsonify({'ok': False, 'error': 'No planner plan found.'}), 404
+    xml_path = _latest_xml_path_for_scenario(scenario_norm)
+    if xml_path:
+        return jsonify({'ok': True, 'preview_plan_path': xml_path, 'xml_path': xml_path})
+    return jsonify({'ok': False, 'error': 'No XML found for scenario.'}), 404
 
 
 _PARTICIPANT_UI_STATS_PATH = os.path.join(_outputs_dir(), 'participant_ui_stats.json')
@@ -10233,25 +10210,11 @@ def _planner_state_path() -> str:
 
 
 def _load_planner_state() -> dict[str, Any]:
-    try:
-        path = _planner_state_path()
-        if not os.path.exists(path):
-            return {}
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f) or {}
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return {}
 
 
 def _save_planner_state(state: dict[str, Any]) -> None:
-    try:
-        path = _planner_state_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
+    return
 
 
 def _planner_set_plan(scenario_norm: str, *, plan_path: str, xml_path: str | None = None, seed: int | None = None) -> None:
@@ -10363,10 +10326,9 @@ def _purge_plan_artifacts_for_scenarios(names: list[str]) -> int:
 
 
 def _attach_latest_flow_into_plan_payload(payload: dict[str, Any], *, scenario: str) -> None:
-    """Best-effort: merge saved flow metadata into a plan payload.
+    """Best-effort: merge saved flow metadata from XML into a plan payload.
 
-    This is useful when the newest plan is a preview plan (topology updated) but
-    we still want to honor the user's saved Flow chain/order/assignments.
+    Flow state is sourced only from the scenario XML (FlagSequencing/FlowState).
     """
     try:
         if not isinstance(payload, dict):
@@ -10379,21 +10341,7 @@ def _attach_latest_flow_into_plan_payload(payload: dict[str, Any], *, scenario: 
         if not isinstance(full_prev, dict):
             return
 
-        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
-        if not flow_plan_path:
-            return
-        try:
-            with open(flow_plan_path, 'r', encoding='utf-8') as f:
-                flow_payload = json.load(f) or {}
-        except Exception:
-            return
-
-        flow_meta = None
-        if isinstance(flow_payload, dict):
-            meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
-            flow_meta = (meta or {}).get('flow')
-            if not flow_meta:
-                flow_meta = flow_payload.get('flow')
+        flow_meta = _flow_state_from_latest_xml(scenario_norm)
         if not isinstance(flow_meta, dict):
             return
 
@@ -10433,8 +10381,7 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
 def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[str], *, repair: bool = True) -> dict | None:
     """Best-effort: load saved Flag Sequencing (flow) metadata for a full_preview payload.
 
-    Preview plans generated from XML alone do not include flow/chain data; the user's
-    sequencing is stored in the per-scenario plan under outputs/plans/plan_<scenario>.json.
+    Flow state is sourced only from the scenario XML (FlagSequencing/FlowState).
     Returns the flow metadata without mutating the full_preview.
     """
     try:
@@ -10444,23 +10391,10 @@ def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[st
         if not scenario_norm:
             return None
         flow_meta = None
-        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
-        if flow_plan_path:
-            try:
-                with open(flow_plan_path, 'r', encoding='utf-8') as f:
-                    flow_payload = json.load(f) or {}
-                if isinstance(flow_payload, dict):
-                    meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
-                    flow_meta = (meta or {}).get('flow')
-                    if not flow_meta:
-                        flow_meta = flow_payload.get('flow')
-            except Exception:
-                flow_meta = None
-        if not isinstance(flow_meta, dict):
-            try:
-                flow_meta = _flow_state_from_latest_xml(scenario_norm)
-            except Exception:
-                flow_meta = None
+        try:
+            flow_meta = _flow_state_from_latest_xml(scenario_norm)
+        except Exception:
+            flow_meta = None
         if not isinstance(flow_meta, dict):
             return None
 
@@ -10813,13 +10747,8 @@ def api_flow_latest_preview_plan():
     scenario_norm = _normalize_scenario_label(scenario_label)
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
-    plan_path = None
     xml_hint = (request.args.get('xml_path') or '').strip()
-    try:
-        plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
-    except Exception:
-        plan_path = None
-    if not plan_path and xml_hint:
+    if xml_hint:
         try:
             xml_abs = os.path.abspath(xml_hint)
             if os.path.exists(xml_abs) and xml_abs.lower().endswith('.xml'):
@@ -10837,34 +10766,22 @@ def api_flow_latest_preview_plan():
                         })
         except Exception:
             pass
-    if not plan_path:
-        try:
-            xml_path = _latest_xml_path_for_scenario(scenario_norm)
-            if xml_path:
-                payload = _load_plan_preview_from_xml(xml_path, scenario_label or scenario_norm)
-                if payload and isinstance(payload, dict):
-                    meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
-                    return jsonify({
-                        'ok': True,
-                        'scenario': scenario_label or scenario_norm,
-                        'preview_plan_path': xml_path,
-                        'preview_source': 'xml',
-                        'metadata': meta or {},
-                    })
-        except Exception:
-            pass
-        return jsonify({'ok': False, 'error': 'No plan found for this scenario. Generate a Preview/Flow first.'}), 404
     try:
-        payload = _load_preview_payload_from_path(plan_path, scenario_label or scenario_norm)
-        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        xml_path = _latest_xml_path_for_scenario(scenario_norm)
+        if xml_path:
+            payload = _load_plan_preview_from_xml(xml_path, scenario_label or scenario_norm)
+            if payload and isinstance(payload, dict):
+                meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                return jsonify({
+                    'ok': True,
+                    'scenario': scenario_label or scenario_norm,
+                    'preview_plan_path': xml_path,
+                    'preview_source': 'xml',
+                    'metadata': meta or {},
+                })
     except Exception:
-        meta = None
-    return jsonify({
-        'ok': True,
-        'scenario': scenario_label or scenario_norm,
-        'preview_plan_path': plan_path,
-        'metadata': meta or {},
-    })
+        pass
+    return jsonify({'ok': False, 'error': 'No XML found for this scenario. Save XML with a PlanPreview first.'}), 404
 
 
 def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
@@ -12792,8 +12709,6 @@ def api_flow_attackflow_preview():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
-    canonical_plan_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
-
     prefer_preview = str(request.args.get('prefer_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     force_preview = str(request.args.get('force_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     prefer_flow = str(request.args.get('prefer_flow') or '').strip().lower() in ('1', 'true', 'yes', 'y')
@@ -12806,74 +12721,38 @@ def api_flow_attackflow_preview():
     # reuse a previously saved chain/assignments.
     ignore_saved_flow = bool(force_preview)
 
-    selected_by = 'explicit'
+    selected_by = 'xml'
 
     preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
-    explicit_preview_plan = bool(preview_plan_path)
     if preview_plan_path:
         try:
             preview_plan_path = os.path.abspath(preview_plan_path)
-            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
-            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
-                preview_plan_path = None
-            elif not os.path.exists(preview_plan_path):
+            if (not preview_plan_path.lower().endswith('.xml')) or (not os.path.exists(preview_plan_path)):
                 preview_plan_path = None
         except Exception:
             preview_plan_path = None
-    try:
-        if canonical_plan_path and os.path.exists(canonical_plan_path):
-            if not preview_plan_path or os.path.abspath(preview_plan_path) != os.path.abspath(canonical_plan_path):
-                preview_plan_path = canonical_plan_path
-                explicit_preview_plan = False
-                selected_by = 'canonical_plan'
-    except Exception:
-        pass
-    if not preview_plan_path:
-        if xml_hint:
-            try:
-                xml_abs = os.path.abspath(xml_hint)
-                if os.path.exists(xml_abs) and xml_abs.lower().endswith('.xml'):
-                    payload_hint = _load_plan_preview_from_xml(xml_abs, scenario_norm)
-                    if isinstance(payload_hint, dict):
-                        meta_hint = payload_hint.get('metadata') if isinstance(payload_hint.get('metadata'), dict) else {}
-                        scen_hint = str(meta_hint.get('scenario') or '').strip()
-                        if (not scen_hint) or _normalize_scenario_label(scen_hint) == scenario_norm:
-                            preview_plan_path = xml_abs
-                            selected_by = 'xml_hint'
-            except Exception:
-                pass
-    if not preview_plan_path:
+
+    if not preview_plan_path and xml_hint:
         try:
-            entry = _planner_get_plan(scenario_norm)
-            if entry:
-                preview_plan_path = entry.get('plan_path') or preview_plan_path
-                if preview_plan_path:
-                    selected_by = 'planner_plan'
+            xml_abs = os.path.abspath(xml_hint)
+            if os.path.exists(xml_abs) and xml_abs.lower().endswith('.xml'):
+                payload_hint = _load_plan_preview_from_xml(xml_abs, scenario_norm)
+                if isinstance(payload_hint, dict):
+                    meta_hint = payload_hint.get('metadata') if isinstance(payload_hint.get('metadata'), dict) else {}
+                    scen_hint = str(meta_hint.get('scenario') or '').strip()
+                    if (not scen_hint) or _normalize_scenario_label(scen_hint) == scenario_norm:
+                        preview_plan_path = xml_abs
+                        selected_by = 'xml_hint'
         except Exception:
             pass
 
     if not preview_plan_path:
-        preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
+        preview_plan_path = _latest_xml_path_for_scenario(scenario_norm)
         if preview_plan_path:
-            selected_by = 'planner_plan'
+            selected_by = 'latest_xml'
 
     if not preview_plan_path:
-        if prefer_flow:
-            selected_by = 'prefer_flow_plan'
-        if force_preview:
-            # Generate button: use the same topology source as refresh (preview plan)
-            # so stats/topology do not flip, but ignore any saved chain/assignments.
-            selected_by = 'force_preview_best_plan'
-            preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
-        elif prefer_preview:
-            selected_by = 'prefer_preview_preview_plan'
-            preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
-        else:
-            selected_by = 'default_best_plan'
-            preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
-
-    if not preview_plan_path:
-        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+        return jsonify({'ok': False, 'error': 'No XML found for this scenario. Save XML with a PlanPreview first.'}), 404
 
     # Prefer the canonical plan; flow metadata is stored in metadata.flow.
 
@@ -13825,26 +13704,16 @@ def api_flow_sequence_preview_plan():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
-    canonical_plan_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
-
     preview_plan_path = str(j.get('preview_plan') or '').strip() or None
     xml_hint = str(j.get('xml_path') or '').strip()
     if preview_plan_path:
         try:
             preview_plan_path = os.path.abspath(preview_plan_path)
-            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
-            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
-                preview_plan_path = None
-            elif not os.path.exists(preview_plan_path):
+            if (not preview_plan_path.lower().endswith('.xml')) or (not os.path.exists(preview_plan_path)):
                 preview_plan_path = None
         except Exception:
             preview_plan_path = None
-    try:
-        if canonical_plan_path and os.path.exists(canonical_plan_path):
-            if not preview_plan_path or os.path.abspath(preview_plan_path) != os.path.abspath(canonical_plan_path):
-                preview_plan_path = canonical_plan_path
-    except Exception:
-        pass
+
     if not preview_plan_path and xml_hint:
         try:
             xml_abs = os.path.abspath(xml_hint)
@@ -13857,22 +13726,12 @@ def api_flow_sequence_preview_plan():
                         preview_plan_path = xml_abs
         except Exception:
             pass
-    if not preview_plan_path:
-        try:
-            planner_entry = _planner_get_plan(scenario_norm)
-            if planner_entry:
-                preview_plan_path = planner_entry.get('plan_path') or preview_plan_path
-        except Exception:
-            pass
 
     if not preview_plan_path:
-        preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
+        preview_plan_path = _latest_xml_path_for_scenario(scenario_norm)
 
     if not preview_plan_path:
-        preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=True)
-
-    if not preview_plan_path:
-        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario.'}), 404
+        return jsonify({'ok': False, 'error': 'No XML found for this scenario. Save XML with a PlanPreview first.'}), 404
 
     try:
         payload = _load_preview_payload_from_path(preview_plan_path, scenario_norm)
@@ -18004,57 +17863,48 @@ def api_flow_afb_from_chain():
     if not chain_nodes:
         return jsonify({'ok': False, 'error': 'Chain contained no valid nodes.'}), 400
 
-    # Prefer latest saved Flow assignments (from the per-scenario plan) when available.
+    # Prefer latest saved Flow assignments (from XML) when available.
     flow_assignments_from_plan: list[dict[str, Any]] = []
     try:
-        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
-    except Exception:
-        flow_plan_path = None
-    if flow_plan_path:
-        try:
-            with open(flow_plan_path, 'r', encoding='utf-8') as f:
-                flow_payload = json.load(f) or {}
-            meta_flow = flow_payload.get('metadata') if isinstance(flow_payload, dict) else None
-            flow_meta = (meta_flow or {}).get('flow') if isinstance(meta_flow, dict) else None
-            saved_chain = (flow_meta or {}).get('chain') if isinstance(flow_meta, dict) else None
-            saved_assignments = (flow_meta or {}).get('flag_assignments') if isinstance(flow_meta, dict) else None
-            if isinstance(saved_assignments, list) and saved_assignments:
-                desired_len = len(chain_nodes)
-                ordered: list[dict[str, Any]] = []
-                if desired_len and len(saved_assignments) >= desired_len:
-                    for i in range(desired_len):
-                        a = saved_assignments[i]
-                        if not isinstance(a, dict):
+        flow_meta = _flow_state_from_latest_xml(scenario_norm)
+        saved_assignments = (flow_meta or {}).get('flag_assignments') if isinstance(flow_meta, dict) else None
+        if isinstance(saved_assignments, list) and saved_assignments:
+            desired_len = len(chain_nodes)
+            ordered: list[dict[str, Any]] = []
+            if desired_len and len(saved_assignments) >= desired_len:
+                for i in range(desired_len):
+                    a = saved_assignments[i]
+                    if not isinstance(a, dict):
+                        ordered.append({})
+                        continue
+                    a2 = dict(a)
+                    try:
+                        a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                    except Exception:
+                        pass
+                    ordered.append(a2)
+            else:
+                assign_by_node: dict[str, dict[str, Any]] = {}
+                for a in saved_assignments:
+                    if not isinstance(a, dict):
+                        continue
+                    nid = str(a.get('node_id') or '').strip()
+                    if nid:
+                        assign_by_node[nid] = a
+                if assign_by_node:
+                    for n in chain_nodes:
+                        nid = str((n or {}).get('id') or '').strip()
+                        a = assign_by_node.get(nid)
+                        if isinstance(a, dict):
+                            a2 = dict(a)
+                            a2['node_id'] = nid
+                            ordered.append(a2)
+                        else:
                             ordered.append({})
-                            continue
-                        a2 = dict(a)
-                        try:
-                            a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
-                        except Exception:
-                            pass
-                        ordered.append(a2)
-                else:
-                    assign_by_node: dict[str, dict[str, Any]] = {}
-                    for a in saved_assignments:
-                        if not isinstance(a, dict):
-                            continue
-                        nid = str(a.get('node_id') or '').strip()
-                        if nid:
-                            assign_by_node[nid] = a
-                    if assign_by_node:
-                        for n in chain_nodes:
-                            nid = str((n or {}).get('id') or '').strip()
-                            a = assign_by_node.get(nid)
-                            if isinstance(a, dict):
-                                a2 = dict(a)
-                                a2['node_id'] = nid
-                                ordered.append(a2)
-                            else:
-                                ordered.append({})
-                if ordered and all(isinstance(a, dict) and str(a.get('id') or a.get('generator_id') or '').strip() for a in ordered):
-                    flow_assignments_from_plan = ordered
-        except Exception:
-            flow_assignments_from_plan = []
+            if ordered and all(isinstance(a, dict) and str(a.get('id') or a.get('generator_id') or '').strip() for a in ordered):
+                flow_assignments_from_plan = ordered
+    except Exception:
+        flow_assignments_from_plan = []
 
     flag_assignments: list[dict[str, Any]] = []
     preview: dict[str, Any] | None = None
@@ -27847,17 +27697,9 @@ def api_plan_preview_full():
         if not os.path.exists(xml_path):
             return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
         from core_topo_gen.planning.orchestrator import compute_full_plan
-        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+        from core_topo_gen.planning.plan_cache import hash_xml_file
         xml_hash = hash_xml_file(xml_path)
-        plan = try_get_cached_plan(xml_hash, scenario, seed)
-        if plan:
-            app.logger.debug('[plan.preview_full] using cached plan (%s, scenario=%s, seed=%s)', xml_hash[:12], scenario, seed)
-        else:
-            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
-            try:
-                save_plan_to_cache(xml_hash, scenario, seed, plan)
-            except Exception as ce:
-                app.logger.debug('[plan.preview_full] cache save failed: %s', ce)
+        plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
         if seed is None:
             seed = plan.get('seed') or _derive_default_seed(xml_hash)
         full_prev = _build_full_preview_from_plan(plan, seed, r2s_hosts_min_list, r2s_hosts_max_list)
@@ -27896,7 +27738,7 @@ def api_plan_preview_full():
 
 @app.route('/api/plan/persist_flow_plan', methods=['POST'])
 def api_plan_persist_flow_plan():
-    """Compute a full preview and persist it as a canonical plan artifact under outputs/plans.
+    """Compute a full preview and persist it into the XML (PlanPreview + FlowState).
 
     Request JSON: { xml_path: "/abs/path.xml", scenario: "name" (optional), seed: int (optional) }
     Response JSON: { ok, xml_path, scenario, seed, preview_plan_path }
@@ -27916,12 +27758,6 @@ def api_plan_persist_flow_plan():
             return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
 
         result = _planner_persist_flow_plan(xml_path=xml_path, scenario=scenario, seed=seed)
-        try:
-            scen_norm = _normalize_scenario_label(result.get('scenario') or scenario or '')
-            if scen_norm:
-                _planner_set_plan(scen_norm, plan_path=result.get('preview_plan_path') or result.get('xml_path') or '', xml_path=result.get('xml_path'), seed=result.get('seed'))
-        except Exception:
-            pass
 
         return jsonify({
             'ok': True,
@@ -27939,7 +27775,7 @@ def api_plan_persist_flow_plan():
 
 
 def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int | None, persist_plan_file: bool = False) -> dict[str, Any]:
-    """Planner-owned plan creation (no side effects beyond plan artifact)."""
+    """Planner-owned plan creation (XML-only, no cache/files beyond XML)."""
     if not xml_path:
         raise ValueError('xml_path missing')
     xml_path = os.path.abspath(xml_path)
@@ -27947,24 +27783,13 @@ def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int
         raise FileNotFoundError(f'XML not found: {xml_path}')
 
     from core_topo_gen.planning.orchestrator import compute_full_plan
-    from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+    from core_topo_gen.planning.plan_cache import hash_xml_file
 
-    xml_hash = hash_xml_file(xml_path)
-    plan = None
-    try:
-        plan = try_get_cached_plan(xml_hash, scenario, seed)
-    except Exception:
-        plan = None
-    if not plan:
-        plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
-        try:
-            save_plan_to_cache(xml_hash, scenario, seed, plan)
-        except Exception:
-            pass
+    plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
 
     if seed is None:
         try:
-            seed = plan.get('seed') or _derive_default_seed(xml_hash)
+            seed = plan.get('seed') or _derive_default_seed(hash_xml_file(xml_path))
         except Exception:
             seed = None
 
@@ -28229,32 +28054,15 @@ def plan_full_preview_page():
             flash(f'XML not found: {xml_path}')
             return redirect(url_for('index'))
         from core_topo_gen.planning.orchestrator import compute_full_plan
-        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+        from core_topo_gen.planning.plan_cache import hash_xml_file
 
-        plan = None
         xml_hash = None
         try:
             xml_hash = hash_xml_file(xml_path)
-            plan = try_get_cached_plan(xml_hash, scenario, seed)
-            if plan:
-                app.logger.debug('[plan.full_preview_page] using cached plan (%s, scenario=%s, seed=%s)', (xml_hash or '')[:12], scenario, seed)
-        except Exception as cache_err:
-            try:
-                app.logger.debug('[plan.full_preview_page] cache lookup failed: %s', cache_err)
-            except Exception:
-                pass
-            plan = None
-        if not plan:
-            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
-            try:
-                if xml_hash is None:
-                    xml_hash = hash_xml_file(xml_path)
-                save_plan_to_cache(xml_hash, scenario, seed, plan)
-            except Exception as cache_save_err:
-                try:
-                    app.logger.debug('[plan.full_preview_page] cache save failed: %s', cache_save_err)
-                except Exception:
-                    pass
+        except Exception:
+            xml_hash = None
+
+        plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
         if seed is None:
             seed = plan.get('seed') or _derive_default_seed(xml_hash or hash_xml_file(xml_path))
         full_prev = _build_full_preview_from_plan(plan, seed, [], [])
@@ -28328,6 +28136,7 @@ def plan_full_preview_page():
             xml_path=xml_path,
             scenario=scenario_name,
             seed=full_prev.get('seed'),
+            flow_meta=flow_meta or {},
             preview_plan_path=preview_plan_path,
             display_artifacts=display_artifacts,
             segmentation_artifacts=segmentation_artifacts,
@@ -28508,30 +28317,23 @@ def plan_full_preview_from_xml():
 
         flow_meta = None
         try:
-            meta_flow = meta.get('flow') if isinstance(meta, dict) else None
-            if isinstance(meta_flow, dict) and meta_flow:
-                flow_meta = meta_flow
+            scen_norm = _normalize_scenario_label(scenario_name or '')
+            if scen_norm:
+                parsed = _parse_scenarios_xml(xml_path)
+                scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                if isinstance(scen_list, list):
+                    for sc in scen_list:
+                        if not isinstance(sc, dict):
+                            continue
+                        nm = str(sc.get('name') or '').strip()
+                        if _normalize_scenario_label(nm) != scen_norm:
+                            continue
+                        fs = sc.get('flow_state')
+                        if isinstance(fs, dict) and fs:
+                            flow_meta = fs
+                            break
         except Exception:
             flow_meta = None
-        if not isinstance(flow_meta, dict) or not flow_meta:
-            try:
-                scen_norm = _normalize_scenario_label(scenario_name or '')
-                if scen_norm:
-                    parsed = _parse_scenarios_xml(xml_path)
-                    scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
-                    if isinstance(scen_list, list):
-                        for sc in scen_list:
-                            if not isinstance(sc, dict):
-                                continue
-                            nm = str(sc.get('name') or '').strip()
-                            if _normalize_scenario_label(nm) != scen_norm:
-                                continue
-                            fs = sc.get('flow_state')
-                            if isinstance(fs, dict) and fs:
-                                flow_meta = fs
-                                break
-            except Exception:
-                flow_meta = None
         if not isinstance(flow_meta, dict) or not flow_meta:
             flow_meta = None
 
@@ -28764,16 +28566,10 @@ def _summary_from_xml_plan(xml_path: str, scenario: str | None, seed: int | None
         pass
 
     from core_topo_gen.planning.orchestrator import compute_full_plan
-    from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+    from core_topo_gen.planning.plan_cache import hash_xml_file
 
     xml_hash = hash_xml_file(xml_path)
-    plan = try_get_cached_plan(xml_hash, scenario, seed)
-    if not plan:
-        plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
-        try:
-            save_plan_to_cache(xml_hash, scenario, seed, plan)
-        except Exception:
-            pass
+    plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
     effective_seed = seed
     if effective_seed is None:
         try:
@@ -28969,6 +28765,9 @@ def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s
     seg_items_serial = plan.get('breakdowns', {}).get('segmentation', {}).get('raw_items_serialized') or []
     seg_density = plan.get('breakdowns', {}).get('segmentation', {}).get('density')
     r2r_policy_plan, r2s_policy_plan = _derive_routing_policies(routing_items)
+    ip4_prefix = plan.get('ip4_prefix') or plan.get('ip_prefix') or '10.0.0.0/16'
+    ip_mode = plan.get('ip_mode') or None
+    ip_region = plan.get('ip_region') or None
     fp = build_full_preview(
         role_counts=role_counts,
         routers_planned=prelim_router_count,
@@ -28982,7 +28781,9 @@ def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s
         segmentation_items=seg_items_serial,
         traffic_plan=plan.get('traffic_plan'),
         seed=seed,
-        ip4_prefix='10.0.0.0/24',
+        ip4_prefix=ip4_prefix,
+        ip_mode=ip_mode,
+        ip_region=ip_region,
         r2s_hosts_min_list=r2s_hosts_min_list,
         r2s_hosts_max_list=r2s_hosts_max_list,
         base_scenario=plan.get('base_scenario'),
@@ -34176,15 +33977,7 @@ def core_details():
     try:
         scenario_norm_for_flow = _normalize_scenario_label(scenario_norm)
         if scenario_norm_for_flow:
-            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm_for_flow)
-            if flow_plan_path:
-                with open(flow_plan_path, 'r', encoding='utf-8') as f:
-                    flow_payload = json.load(f) or {}
-                if isinstance(flow_payload, dict):
-                    meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
-                    candidate = (meta or {}).get('flow') or flow_payload.get('flow')
-                    if isinstance(candidate, dict):
-                        flow_meta = candidate
+            flow_meta = _flow_state_from_latest_xml(scenario_norm_for_flow)
     except Exception:
         flow_meta = None
     session_info = None
