@@ -1362,30 +1362,32 @@ def build_star_from_roles(core,
         node_type = map_role_to_node_type(role)
         node_name = f"{role.lower()}-{idx+1}"
 
-        # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+        host_slot_idx += 1
+        slot_key = f"slot-{host_slot_idx}"
+        is_docker_node = _is_docker_node_type(node_type)
+        is_explicit_docker = is_docker_node and role.lower() == 'docker'
+        # Apply docker slot plan for any host slot (overrides default template when present).
         try:
-            if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                docker_by_name.setdefault(node_name, _standard_docker_compose_record())
-                _apply_mount_overlays(docker_by_name.get(node_name))
-                created_docker += 1
-        except Exception:
-            pass
-        # If this role would be a DEFAULT host, check slot plan to possibly make it a DOCKER node
-        if node_type == NodeType.DEFAULT:
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
-            try:
-                if docker_slot_plan and slot_key in docker_slot_plan:
+            if docker_slot_plan and slot_key in docker_slot_plan:
+                if not is_docker_node:
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
-                        docker_by_name[node_name] = docker_slot_plan[slot_key]
-                        _apply_mount_overlays(docker_by_name.get(node_name))
+                        is_docker_node = True
                         created_docker += 1
-                        docker_slots_used.add(slot_key)
                     else:
-                        logger.warning("NodeType.DOCKER not available in this CORE build; cannot create docker nodes even though a slot plan exists")
-            except Exception:
-                pass
+                        logger.warning("NodeType.DOCKER not available in this CORE build; cannot apply docker slot plan")
+                if is_docker_node:
+                    docker_by_name[node_name] = docker_slot_plan[slot_key]
+                    _apply_mount_overlays(docker_by_name.get(node_name))
+                    docker_slots_used.add(slot_key)
+        except Exception:
+            pass
+        # Explicit Docker role: ensure we count it and have a compose record.
+        if is_explicit_docker:
+            created_docker += 1
+        if is_docker_node and node_name not in docker_by_name:
+            docker_by_name.setdefault(node_name, _standard_docker_compose_record())
+            _apply_mount_overlays(docker_by_name.get(node_name))
 
         # Prepare per-node compose file BEFORE creating the docker node.
         # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
@@ -1677,28 +1679,29 @@ def build_multi_switch_topology(core,
         node_type = map_role_to_node_type(role)
         name = f"{role.lower()}-{idx+1}"
 
-        # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+        host_slot_idx += 1
+        slot_key = f"slot-{host_slot_idx}"
+        is_docker_node = _is_docker_node_type(node_type)
+        is_explicit_docker = is_docker_node and role.lower() == 'docker'
         try:
-            if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                docker_by_name.setdefault(name, _standard_docker_compose_record())
-                _apply_mount_overlays(docker_by_name.get(name))
-                created_docker += 1
-        except Exception:
-            pass
-        if node_type == NodeType.DEFAULT:
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
-            try:
-                if docker_slot_plan and slot_key in docker_slot_plan:
+            if docker_slot_plan and slot_key in docker_slot_plan:
+                if not is_docker_node:
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
-                        docker_by_name[name] = docker_slot_plan[slot_key]
-                        _apply_mount_overlays(docker_by_name.get(name))
+                        is_docker_node = True
                         created_docker += 1
                     else:
                         logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on multi-switch")
-            except Exception:
-                pass
+                if is_docker_node:
+                    docker_by_name[name] = docker_slot_plan[slot_key]
+                    _apply_mount_overlays(docker_by_name.get(name))
+        except Exception:
+            pass
+        if is_explicit_docker:
+            created_docker += 1
+        if is_docker_node and name not in docker_by_name:
+            docker_by_name.setdefault(name, _standard_docker_compose_record())
+            _apply_mount_overlays(docker_by_name.get(name))
 
         # Prepare per-node compose file BEFORE creating the docker node.
         try:
@@ -2181,48 +2184,48 @@ def _try_build_segmented_topology_from_preview(
             y = int(base_y + radius * math.sin(angle))
         name = str(hdata.get('name') or f"host-{hid}")
 
-        # Increment slot index for every host that could potentially be in the slot plan.
-        # This ensures slot keys remain synchronized with the preview plan (which counts all hosts).
-        was_default_for_slot_plan = (node_type == NodeType.DEFAULT)
-        if was_default_for_slot_plan or (_is_docker_node_type(node_type) and str(role).lower() == 'docker'):
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
-        else:
-            slot_key = None
+        host_slot_idx += 1
+        slot_key = f"slot-{host_slot_idx}"
+        is_docker_node = _is_docker_node_type(node_type)
+        is_explicit_docker = is_docker_node and str(role).lower() == 'docker'
+
+        # Apply docker slot plan for any host slot (overrides default template when present).
+        try:
+            if docker_slot_plan and slot_key in docker_slot_plan:
+                if not is_docker_node:
+                    if hasattr(NodeType, "DOCKER"):
+                        node_type = getattr(NodeType, "DOCKER")
+                        is_docker_node = True
+                        created_docker += 1
+                    else:
+                        logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan during preview realization")
+                if is_docker_node:
+                    base_rec = docker_slot_plan[slot_key]
+                    overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+                    docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
+                    _apply_mount_overlays(docker_by_name.get(name))
+                    docker_slots_used.add(slot_key)
+        except Exception:
+            pass
 
         # Explicit Docker role: attach compose metadata so compose files can be prepared later.
         # If Flow injected a flag compose reference into host metadata, prefer that over the standard template.
-        if _is_docker_node_type(node_type) and str(role).lower() == 'docker':
+        if is_explicit_docker:
             try:
-                flow_rec = _flow_flag_record_from_host_metadata(hdata)
-                if flow_rec:
-                    docker_by_name[name] = flow_rec
-                else:
-                    docker_by_name.setdefault(name, _standard_docker_compose_record())
-                _apply_mount_overlays(docker_by_name.get(name))
                 created_docker += 1
-                # Mark slot as used if this explicit Docker host has a slot key
-                if slot_key and docker_slot_plan and slot_key in docker_slot_plan:
-                    docker_slots_used.add(slot_key)
+                if name not in docker_by_name:
+                    flow_rec = _flow_flag_record_from_host_metadata(hdata)
+                    if flow_rec:
+                        docker_by_name[name] = flow_rec
+                    else:
+                        docker_by_name.setdefault(name, _standard_docker_compose_record())
+                    _apply_mount_overlays(docker_by_name.get(name))
             except Exception:
                 pass
 
-        # If this would be a DEFAULT host, allow the docker slot plan to override it.
-        if was_default_for_slot_plan and slot_key:
-            try:
-                if docker_slot_plan and slot_key in docker_slot_plan:
-                    if hasattr(NodeType, "DOCKER"):
-                        node_type = getattr(NodeType, "DOCKER")
-                        base_rec = docker_slot_plan[slot_key]
-                        overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
-                        docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
-                        _apply_mount_overlays(docker_by_name.get(name))
-                        created_docker += 1
-                        docker_slots_used.add(slot_key)
-                    else:
-                        logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan during preview realization")
-            except Exception:
-                pass
+        if is_docker_node and name not in docker_by_name:
+            docker_by_name.setdefault(name, _standard_docker_compose_record())
+            _apply_mount_overlays(docker_by_name.get(name))
 
         # Prepare per-node compose file BEFORE creating the docker node.
         # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
@@ -3385,29 +3388,30 @@ def build_segmented_topology(core,
             node_type = map_role_to_node_type(role)
             name = f"{role.lower()}-{ridx+1}-1"
 
-            # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+            host_slot_idx += 1
+            slot_key = f"slot-{host_slot_idx}"
+            is_docker_node = _is_docker_node_type(node_type)
+            is_explicit_docker = is_docker_node and role.lower() == 'docker'
             try:
-                if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                    docker_by_name.setdefault(name, _standard_docker_compose_record())
-                    _apply_mount_overlays(docker_by_name.get(name))
-                    created_docker += 1
-            except Exception:
-                pass
-            if node_type == NodeType.DEFAULT:
-                host_slot_idx += 1
-                slot_key = f"slot-{host_slot_idx}"
-                try:
-                    if docker_slot_plan and slot_key in docker_slot_plan:
+                if docker_slot_plan and slot_key in docker_slot_plan:
+                    if not is_docker_node:
                         if hasattr(NodeType, "DOCKER"):
                             node_type = getattr(NodeType, "DOCKER")
-                            docker_by_name[name] = docker_slot_plan[slot_key]
-                            _apply_mount_overlays(docker_by_name.get(name))
+                            is_docker_node = True
                             created_docker += 1
-                            docker_slots_used.add(slot_key)
                         else:
                             logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (single-host)")
-                except Exception:
-                    pass
+                    if is_docker_node:
+                        docker_by_name[name] = docker_slot_plan[slot_key]
+                        _apply_mount_overlays(docker_by_name.get(name))
+                        docker_slots_used.add(slot_key)
+            except Exception:
+                pass
+            if is_explicit_docker:
+                created_docker += 1
+            if is_docker_node and name not in docker_by_name:
+                docker_by_name.setdefault(name, _standard_docker_compose_record())
+                _apply_mount_overlays(docker_by_name.get(name))
 
             # Prepare per-node compose file BEFORE creating the docker node.
             # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
@@ -3503,29 +3507,30 @@ def build_segmented_topology(core,
                 node_type = map_role_to_node_type(role)
                 name = f"{role.lower()}-{ridx+1}-{j+1}"
 
-                # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+                host_slot_idx += 1
+                slot_key = f"slot-{host_slot_idx}"
+                is_docker_node = _is_docker_node_type(node_type)
+                is_explicit_docker = is_docker_node and role.lower() == 'docker'
                 try:
-                    if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                        docker_by_name.setdefault(name, _standard_docker_compose_record())
-                        _apply_mount_overlays(docker_by_name.get(name))
-                        created_docker += 1
-                except Exception:
-                    pass
-                if node_type == NodeType.DEFAULT:
-                    host_slot_idx += 1
-                    slot_key = f"slot-{host_slot_idx}"
-                    try:
-                        if docker_slot_plan and slot_key in docker_slot_plan:
+                    if docker_slot_plan and slot_key in docker_slot_plan:
+                        if not is_docker_node:
                             if hasattr(NodeType, "DOCKER"):
                                 node_type = getattr(NodeType, "DOCKER")
-                                docker_by_name[name] = docker_slot_plan[slot_key]
-                                _apply_mount_overlays(docker_by_name.get(name))
+                                is_docker_node = True
                                 created_docker += 1
-                                docker_slots_used.add(slot_key)
                             else:
                                 logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (multi-host deferred)")
-                    except Exception:
-                        pass
+                        if is_docker_node:
+                            docker_by_name[name] = docker_slot_plan[slot_key]
+                            _apply_mount_overlays(docker_by_name.get(name))
+                            docker_slots_used.add(slot_key)
+                except Exception:
+                    pass
+                if is_explicit_docker:
+                    created_docker += 1
+                if is_docker_node and name not in docker_by_name:
+                    docker_by_name.setdefault(name, _standard_docker_compose_record())
+                    _apply_mount_overlays(docker_by_name.get(name))
 
                 # Prepare per-node compose file BEFORE creating the docker node.
                 # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.

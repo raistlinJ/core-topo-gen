@@ -24360,25 +24360,41 @@ def _sync_local_vulns_to_remote(
 
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
 
-    assignments_path = os.path.join(local_dir, "compose_assignments.json")
-    if not os.path.exists(assignments_path):
+    if not os.path.isdir(local_dir):
         return False
 
+    assignments_path = os.path.join(local_dir, "compose_assignments.json")
     node_names: List[str] = []
-    try:
-        with open(assignments_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
-        if isinstance(assignments, dict):
-            node_names = [str(k) for k in assignments.keys()]
-    except Exception:
-        node_names = []
+    if os.path.exists(assignments_path):
+        try:
+            with open(assignments_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+            if isinstance(assignments, dict):
+                node_names = [str(k) for k in assignments.keys()]
+        except Exception:
+            node_names = []
 
-    local_files: List[str] = [assignments_path]
-    for nm in sorted(set(node_names)):
-        yml = os.path.join(local_dir, f"docker-compose-{nm}.yml")
-        if os.path.exists(yml):
-            local_files.append(yml)
+    local_files: List[str] = []
+    if os.path.exists(assignments_path):
+        local_files.append(assignments_path)
+
+    compose_glob = []
+    try:
+        import glob as _glob
+        compose_glob = _glob.glob(os.path.join(local_dir, 'docker-compose-*.yml'))
+    except Exception:
+        compose_glob = []
+
+    if node_names:
+        for nm in sorted(set(node_names)):
+            yml = os.path.join(local_dir, f"docker-compose-{nm}.yml")
+            if os.path.exists(yml):
+                local_files.append(yml)
+    else:
+        for yml in sorted(set(compose_glob)):
+            if os.path.exists(yml):
+                local_files.append(yml)
 
     # Flow flag artifacts: bind-mounted into docker-compose services (e.g., to /flow_artifacts).
     # These directories live under /tmp/vulns/* on the webapp host and must be present on the
@@ -24403,7 +24419,16 @@ def _sync_local_vulns_to_remote(
     except Exception:
         local_dirs = []
 
-    if not local_files:
+    # Wrapper build contexts are required on the CORE VM when compose files reference /tmp/vulns/docker-wrap-*.
+    wrapper_dirs: List[str] = []
+    try:
+        for entry in os.scandir(local_dir):
+            if entry.is_dir() and entry.name.startswith('docker-wrap-'):
+                wrapper_dirs.append(entry.path)
+    except Exception:
+        wrapper_dirs = []
+
+    if not local_files and not wrapper_dirs:
         return False
 
     client = None
@@ -24422,6 +24447,60 @@ def _sync_local_vulns_to_remote(
                 uploaded += 1
             except Exception:
                 log.exception("[sync] Failed uploading %s -> %s", lp, rp)
+
+        # Upload wrapper build contexts, preserving relative paths.
+        for d in sorted(set(wrapper_dirs)):
+            try:
+                rel = os.path.relpath(d, local_dir)
+            except Exception:
+                rel = None
+            if not rel or rel.startswith('..'):
+                continue
+            remote_d = _remote_path_join(remote_dir_resolved, rel)
+            try:
+                if remote_d not in made_dirs:
+                    _remote_mkdirs(client, remote_d)
+                    made_dirs.add(remote_d)
+            except Exception:
+                pass
+            for root, dirs, files in os.walk(d):
+                for dn in dirs:
+                    lp_dir = os.path.join(root, dn)
+                    try:
+                        rel_dir = os.path.relpath(lp_dir, local_dir)
+                    except Exception:
+                        continue
+                    if not rel_dir or rel_dir.startswith('..'):
+                        continue
+                    rp_dir = _remote_path_join(remote_dir_resolved, rel_dir)
+                    if rp_dir in made_dirs:
+                        continue
+                    try:
+                        _remote_mkdirs(client, rp_dir)
+                        made_dirs.add(rp_dir)
+                    except Exception:
+                        pass
+                for fn in files:
+                    lp_file = os.path.join(root, fn)
+                    try:
+                        rel_file = os.path.relpath(lp_file, local_dir)
+                    except Exception:
+                        continue
+                    if not rel_file or rel_file.startswith('..'):
+                        continue
+                    rp_file = _remote_path_join(remote_dir_resolved, rel_file)
+                    rp_parent = os.path.dirname(rp_file)
+                    try:
+                        if rp_parent and rp_parent not in made_dirs:
+                            _remote_mkdirs(client, rp_parent)
+                            made_dirs.add(rp_parent)
+                    except Exception:
+                        pass
+                    try:
+                        sftp.put(lp_file, rp_file)
+                        uploaded += 1
+                    except Exception:
+                        log.exception("[sync] Failed uploading %s -> %s", lp_file, rp_file)
 
         # Upload any referenced Flow generator run directories, preserving relative paths.
         # Example local:  /tmp/vulns/flag_generators_runs/flow-.../outputs.json
@@ -27411,6 +27490,53 @@ def run_cli():
             proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True, env=cli_env)
         logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
         app.logger.debug("[sync] CLI return code: %s", proc.returncode)
+
+        # If docker nodes are expected, ensure per-node compose artifacts exist locally.
+        try:
+            docker_expected = False
+            if preview_plan_path and scenario_for_plan:
+                plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
+                if isinstance(plan_payload, dict):
+                    full_preview = plan_payload.get('full_preview') if isinstance(plan_payload.get('full_preview'), dict) else None
+                    if isinstance(full_preview, dict):
+                        role_counts = full_preview.get('role_counts') if isinstance(full_preview.get('role_counts'), dict) else None
+                        if isinstance(role_counts, dict):
+                            try:
+                                docker_expected = int(role_counts.get('Docker') or 0) > 0
+                            except Exception:
+                                docker_expected = False
+                        if not docker_expected:
+                            hosts = full_preview.get('hosts') if isinstance(full_preview.get('hosts'), list) else []
+                            for h in hosts or []:
+                                if not isinstance(h, dict):
+                                    continue
+                                role = str(h.get('role') or '').strip().lower()
+                                if role == 'docker':
+                                    docker_expected = True
+                                    break
+            if docker_expected:
+                try:
+                    import glob as _glob
+                    compose_files = _glob.glob('/tmp/vulns/docker-compose-*.yml')
+                except Exception:
+                    compose_files = []
+                if not compose_files:
+                    msg = 'No per-node docker-compose files were generated under /tmp/vulns despite Docker nodes in the plan.'
+                    try:
+                        log_f.write(f"[sync] ERROR: {msg}\n")
+                    except Exception:
+                        pass
+                    try:
+                        log_f.close()
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(log_path)
+                    except Exception:
+                        pass
+                    return jsonify({"error": msg}), 500
+        except Exception:
+            pass
 
         # If the CLI generated vulnerability compose artifacts locally, copy them to the CORE VM
         # so the remote Docker Compose card and DockerComposeService can access them.
