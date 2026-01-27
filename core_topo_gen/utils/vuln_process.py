@@ -1830,9 +1830,31 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 	if not isinstance(compose_obj, dict) or not inject_files:
 		return compose_obj
 	if not source_dir or not os.path.isdir(source_dir):
+		try:
+			logger.warning(
+				"[injects] source_dir missing or not a dir: %s (inject_files=%s)",
+				source_dir,
+				inject_files,
+			)
+		except Exception:
+			pass
 		return compose_obj
 
+	try:
+		logger.info(
+			"[injects] prepare injects source_dir=%s outputs_manifest=%s inject_files=%s",
+			source_dir,
+			outputs_manifest,
+			inject_files,
+		)
+	except Exception:
+		pass
+
 	inject_files = _expand_injects_from_outputs(outputs_manifest, inject_files)
+	try:
+		logger.info("[injects] expanded injects=%s", inject_files)
+	except Exception:
+		pass
 
 	services = compose_obj.get('services')
 	if not isinstance(services, dict):
@@ -1849,6 +1871,10 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		inject_map[src_norm] = dest_dir
 
 	if not inject_map:
+		try:
+			logger.warning("[injects] no valid inject mappings produced from %s", inject_files)
+		except Exception:
+			pass
 		return compose_obj
 
 	def _volume_name_for_dest(dest_dir: str) -> str:
@@ -1870,7 +1896,24 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 
 	target_service = _select_target_service()
 	if not target_service or target_service not in services:
+		try:
+			logger.warning(
+				"[injects] target service not found: %s (services=%s)",
+				target_service,
+				list(services.keys()),
+			)
+		except Exception:
+			pass
 		return compose_obj
+	try:
+		logger.info(
+			"[injects] applying injects to service=%s mode=%s map=%s",
+			target_service,
+			_inject_files_copy_mode(),
+			inject_map,
+		)
+	except Exception:
+		pass
 
 	mode = _inject_files_copy_mode()
 	if mode == 'mount':
@@ -1878,6 +1921,10 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		for rel, dest_dir in inject_map.items():
 			src_path = os.path.join(source_dir, rel)
 			if not os.path.exists(src_path):
+				try:
+					logger.warning("[injects] missing source file for bind: %s", src_path)
+				except Exception:
+					pass
 				continue
 			bind = f"{src_path}:{dest_dir}/{rel}:ro"
 			compose_obj = _inject_service_bind_mount(compose_obj, bind, prefer_service=target_service)
@@ -1917,6 +1964,10 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" || true")
 
 	if not cmds:
+		try:
+			logger.warning("[injects] no copy commands generated; skipping inject service")
+		except Exception:
+			pass
 		return compose_obj
 
 	services[copy_service_name] = {
