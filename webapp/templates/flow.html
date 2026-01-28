@@ -71,6 +71,14 @@
                   <option value="sample_reverse_nfs_ssh">Sample: reverse_nfs_ssh</option>
                 </select>
               </div>
+              <div class="col-sm-6 col-md-3">
+                <label class="form-label">Flag Sequencing</label>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="flowEnabledToggle" checked>
+                  <label class="form-check-label" for="flowEnabledToggle">Enable</label>
+                </div>
+                <div id="flowEnabledHelp" class="small text-muted"></div>
+              </div>
               <div class="col-md-6">
                 <div class="d-flex gap-2 flex-nowrap align-items-end">
                   <div>
@@ -107,7 +115,7 @@
 
         <div id="flowValidityAlert" class="alert alert-danger d-none" role="alert"></div>
 
-        <div class="card mb-3">
+        <div class="card mb-3" id="flowVizCard">
           <div class="card-header d-flex align-items-center justify-content-between">
             <div class="fw-semibold">Visualization</div>
           </div>
@@ -190,7 +198,7 @@
           </div>
         </div>
 
-        <div class="card mb-3">
+        <div class="card mb-3" id="flowChainCard">
           <div class="card-header d-flex align-items-center justify-content-between">
             <div class="fw-semibold">Chain Order</div>
           </div>
@@ -303,12 +311,113 @@
   const loadingLogEl = document.getElementById('flowLoadingLog');
   const generateOptionsDialogEl = document.getElementById('flowGenerateOptionsDialog');
   const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
+  const flowEnabledToggleEl = document.getElementById('flowEnabledToggle');
+  const flowEnabledHelpEl = document.getElementById('flowEnabledHelp');
+  const flowChainCardEl = document.getElementById('flowChainCard');
+  const flowVizCardEl = document.getElementById('flowVizCard');
 
   const participantUrlFlags = {{ (participant_url_flags or {})|tojson }};
   const flowStateByScenario = {{ (flow_state_by_scenario or {})|tojson }};
   const scenarioNamesCache = {{ (scenarios or [])|tojson }};
   const initialScenario = {{ (active_scenario or '')|tojson }};
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
+  let flowEnabled = true;
+  let flowEligible = true;
+
+  async function clearFlowStateInXml(){
+    try{
+      const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
+      let xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+      if(!xmlPath && scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function'){
+        xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
+      }
+      if(!xmlPath || !scenario) return false;
+      const flowStatePayload = {
+        scenario,
+        preset: '',
+        length: 0,
+        chain_ids: [],
+        flag_assignments: [],
+        allow_node_duplicates: false,
+        initial_facts: null,
+        goal_facts: null,
+        flow_enabled: false,
+        flags_enabled: false,
+        updated_at: Date.now(),
+      };
+      await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
+        xml_path: xmlPath,
+        scenario,
+        flow_state: flowStatePayload,
+      });
+      try{
+        const key = normalizeScenarioNorm(scenario);
+        if(key && flowStateByScenario && typeof flowStateByScenario === 'object'){
+          flowStateByScenario[key] = flowStatePayload;
+        }
+      } catch(e) {}
+      return true;
+    } catch(e){
+      return false;
+    }
+  }
+
+  function setFlowEnabled(value, opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
+    flowEnabled = !!value;
+    if(flowEnabledToggleEl){
+      flowEnabledToggleEl.checked = !!flowEnabled;
+    }
+    updateFlowEnabledUi();
+    if(!flowEnabled){
+      try{
+        currentChain = [];
+        currentFlagAssignments = [];
+        selectedChainIndex = -1;
+        renderChainEditor();
+        const diagram = buildMermaid([]);
+        renderMermaid(diagram);
+        if(jsonEl){
+          jsonEl.textContent = JSON.stringify({
+            scenario: activeScenario,
+            length: 0,
+            chain: [],
+            flag_assignments: [],
+            flow_valid: false,
+            flow_errors: [],
+            flags_enabled: false,
+            flow_enabled: false,
+          }, null, 2);
+        }
+      } catch(e) {}
+      clearFlowStateInXml();
+    }
+    if(!options.skipPersist){
+      persistFlowState();
+    }
+  }
+
+  function updateFlowEnabledUi(){
+    const enabled = !!flowEnabled;
+    if(lengthEl) lengthEl.disabled = !enabled || !flowEligible;
+    if(presetEl) presetEl.disabled = !enabled || !flowEligible;
+    if(btnEl) btnEl.disabled = !enabled || !flowEligible;
+    if(flowEnabledToggleEl){
+      flowEnabledToggleEl.disabled = !flowEligible;
+      flowEnabledToggleEl.checked = !!flowEnabled;
+    }
+    if(flowChainCardEl) flowChainCardEl.classList.toggle('d-none', !enabled);
+    if(flowVizCardEl) flowVizCardEl.classList.toggle('d-none', !enabled);
+    if(flowEnabledHelpEl){
+      if(!flowEligible){
+        flowEnabledHelpEl.textContent = 'Disabled: topology has no Docker or vulnerability nodes.';
+      } else if(!enabled){
+        flowEnabledHelpEl.textContent = 'Flag sequencing disabled; Execute will run without flows.';
+      } else {
+        flowEnabledHelpEl.textContent = '';
+      }
+    }
+  }
 
   function getSidebarShowSeed(){
     try { return (localStorage.getItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY) || '') === '1'; } catch(e) { return false; }
@@ -442,7 +551,6 @@
       if(!scenario) return;
       const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
       const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-      if(!chain_ids.length) return;
       if(typeof window.coretgSetSavedFlowStateForScenario !== 'function') return;
       window.coretgSetSavedFlowStateForScenario(scenario, {
         preset,
@@ -452,6 +560,7 @@
         allow_node_duplicates: !!allowNodeDuplicates,
         initial_facts: flowInitialFactsOverride,
         goal_facts: flowGoalFactsOverride,
+        flow_enabled: !!flowEnabled,
       });
     } catch(e) {}
   }
@@ -605,11 +714,17 @@
       if(fromServer && Array.isArray(fromServer.chain_ids) && fromServer.chain_ids.length){
         return fromServer;
       }
+      if(fromServer && fromServer.flow_enabled === false){
+        return fromServer;
+      }
     } catch(e) {}
     try{
       if(typeof window.coretgGetSavedFlowStateForScenario === 'function'){
         const saved = window.coretgGetSavedFlowStateForScenario(scenarioName);
         if(saved && Array.isArray(saved.chain_ids) && saved.chain_ids.length){
+          return saved;
+        }
+        if(saved && saved.flow_enabled === false){
           return saved;
         }
       }
@@ -620,8 +735,22 @@
   async function restoreSavedFlowForScenario(scenarioName){
     const saved = getSavedFlowStateForScenario(scenarioName);
     if(!saved || !Array.isArray(saved.chain_ids) || !saved.chain_ids.length){
+      try{
+        if(saved && saved.flow_enabled !== undefined){
+          setFlowEnabled(!!saved.flow_enabled, { skipPersist: true });
+        } else {
+          setFlowEnabled(true, { skipPersist: true });
+        }
+      } catch(e) {}
       return false;
     }
+    try{
+      if(saved && saved.flow_enabled !== undefined){
+        setFlowEnabled(!!saved.flow_enabled, { skipPersist: true });
+      } else {
+        setFlowEnabled(true, { skipPersist: true });
+      }
+    } catch(e) {}
     const chainLen = saved.chain_ids.length;
     try { if(lengthEl) lengthEl.value = String(chainLen); } catch(e) {}
 
@@ -663,6 +792,7 @@
           flow_valid: !!(data && data.flow_valid),
           flow_errors: Array.isArray(data && data.flow_errors) ? data.flow_errors : [],
           flags_enabled: !!(data && data.flags_enabled),
+          flow_enabled: !!flowEnabled,
         }, null, 2);
       }
       showRestoreBadge('Restored saved flow state');
@@ -687,6 +817,9 @@
         }
         if(flowState.goal_facts && !flowGoalFactsOverride){
           flowGoalFactsOverride = normalizeFactsOverride(flowState.goal_facts);
+        }
+        if(flowState.flow_enabled !== undefined){
+          setFlowEnabled(!!flowState.flow_enabled, { skipPersist: true });
         }
       } catch(e) {}
       const savedAssignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : [];
@@ -1056,6 +1189,16 @@
         }
       } catch(e) {}
       const data = await fetchJson(url);
+      try{
+        const eligible = (data && data.flow_eligible !== undefined) ? !!data.flow_eligible : true;
+        const dockerCount = Number.isFinite(+data.docker_count) ? (+data.docker_count) : 0;
+        const vulnCount = Number.isFinite(+data.vuln_count) ? (+data.vuln_count) : 0;
+        flowEligible = eligible || (dockerCount > 0 || vulnCount > 0);
+        if(!flowEligible){
+          setFlowEnabled(false, { skipPersist: false });
+        }
+        updateFlowEnabledUi();
+      } catch(e) {}
       const path = (data && typeof data.preview_plan_path === 'string') ? data.preview_plan_path.trim() : '';
       if(path){
         lastPreviewPlanPath = path;
@@ -1067,6 +1210,10 @@
         updateMeta();
         return path;
       }
+    } catch(e) {}
+    try{
+      flowEligible = true;
+      updateFlowEnabledUi();
     } catch(e) {}
     return '';
   }
@@ -1093,7 +1240,13 @@
         const diagram = buildMermaid([]);
         await renderMermaid(diagram);
       } catch(e) {}
-      setStatus('No saved flow chain. Click Generate to start.', false);
+      if(!flowEligible){
+        setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+      } else if(!flowEnabled){
+        setStatus('Flag sequencing is disabled.', false);
+      } else {
+        setStatus('No saved flow chain. Click Generate to start.', false);
+      }
     }
   }
 
@@ -1127,6 +1280,21 @@
       loginLinkEl.classList.toggle('d-none', !visible);
     } catch(e) {}
   }
+
+  try{
+    if(flowEnabledToggleEl){
+      flowEnabledToggleEl.addEventListener('change', (ev)=>{
+        const next = !!(flowEnabledToggleEl && flowEnabledToggleEl.checked);
+        if(!flowEligible && next){
+          try{ flowEnabledToggleEl.checked = false; } catch(e) {}
+          setFlowEnabled(false, { skipPersist: false });
+          setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+          return;
+        }
+        setFlowEnabled(next, { skipPersist: false });
+      });
+    }
+  } catch(e) {}
 
   function basenameFromPath(p){
     try{
@@ -6495,6 +6663,15 @@
     let length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
     let lastResolvePayload = null;
 
+    if(!flowEligible){
+      setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+      return;
+    }
+    if(!flowEnabled){
+      setStatus('Flag sequencing is disabled.', true);
+      return;
+    }
+
     // User-click Generate should be deterministic: save current settings, produce a fresh
     // preview plan, then build the flow chain from that exact snapshot.
     const runSavePreviewResolve = !!(usePreview && options && options.savePreviewResolve);
@@ -6956,6 +7133,7 @@
             allow_node_duplicates: !!allowNodeDuplicates,
             initial_facts: flowInitialFactsOverride,
             goal_facts: flowGoalFactsOverride,
+            flow_enabled: !!flowEnabled,
           });
         }
       } catch(e) {}
@@ -6983,6 +7161,7 @@
             allow_node_duplicates: !!allowNodeDuplicates,
             initial_facts: flowInitialFactsOverride,
             goal_facts: flowGoalFactsOverride,
+            flow_enabled: !!flowEnabled,
             updated_at: Date.now(),
           };
           let xmlPath = (lastResolvePayload && lastResolvePayload.xml_path) ? String(lastResolvePayload.xml_path) : (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
@@ -7047,41 +7226,55 @@
       return;
     }
     if(execEl) execEl.disabled = true;
-    setStatus('Preparing preview for execution…', false);
+    setStatus(flowEnabled ? 'Preparing preview for execution…' : 'Saving XML for execution…', false);
     setLoginLinkVisible(false);
-    showLoading('Resolving hint values…');
+    showLoading(flowEnabled ? 'Resolving hint values…' : 'Saving XML…');
     try{
-      if(!Array.isArray(currentChain) || currentChain.length === 0){
-        throw new Error('Generate a chain first.');
-      }
-      const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const planPath = '';
-      const prepData = await postJson(
-        '/api/flag-sequencing/prepare_preview_for_execute',
-        {
-          scenario,
-          length,
-          preset,
-          chain_ids: chain_ids,
-          preview_plan: previewPlanForRequest(),
-          allow_node_duplicates: !!allowNodeDuplicates,
-        },
-        { timeoutMs: 480000 }
-      );
-      setFlowValidityFromPayload(prepData);
-      // Prefer server-returned (possibly enriched) assignments so the UI can show
-      // generator run status/mismatch info before scenario execution.
-      if(prepData && Array.isArray(prepData.flag_assignments)){
-        currentFlagAssignments = prepData.flag_assignments.slice();
-        renderChainEditor();
-      }
-      const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
-      const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
-      if(!xmlPath || !previewPlan){
-        throw new Error('Prepare step did not return xml_path/preview_plan_path');
+      let xmlPath = '';
+      let previewPlan = '';
+      if(flowEnabled){
+        if(!flowEligible){
+          throw new Error('Flag sequencing requires Docker or vulnerability nodes in the topology.');
+        }
+        if(!Array.isArray(currentChain) || currentChain.length === 0){
+          throw new Error('Generate a chain first.');
+        }
+        const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+        const prepData = await postJson(
+          '/api/flag-sequencing/prepare_preview_for_execute',
+          {
+            scenario,
+            length,
+            preset,
+            chain_ids: chain_ids,
+            preview_plan: previewPlanForRequest(),
+            allow_node_duplicates: !!allowNodeDuplicates,
+          },
+          { timeoutMs: 480000 }
+        );
+        setFlowValidityFromPayload(prepData);
+        // Prefer server-returned (possibly enriched) assignments so the UI can show
+        // generator run status/mismatch info before scenario execution.
+        if(prepData && Array.isArray(prepData.flag_assignments)){
+          currentFlagAssignments = prepData.flag_assignments.slice();
+          renderChainEditor();
+        }
+        xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
+        previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
+        if(!xmlPath || !previewPlan){
+          throw new Error('Prepare step did not return xml_path/preview_plan_path');
+        }
+      } else {
+        if(typeof window.coretgSaveXmlViaApi !== 'function'){
+          throw new Error('Save helper unavailable; refresh and try again.');
+        }
+        xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+        if(!xmlPath){
+          throw new Error('Save did not return xml_path');
+        }
       }
       setStatus('Starting async execution…', false);
-      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario });
+      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario, flow_enabled: !!flowEnabled });
       const runId = runData && runData.run_id ? String(runData.run_id) : '';
       if(runId){
         setStatus('Run started: ' + runId + ' (see Core/Reports pages).', false);
@@ -7128,23 +7321,27 @@
       }
 
       // Persist chain + assignments into the plan so Preview can render sequence numerals.
-      try {
-        const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-        const assignments = chain_ids.length ? buildPersistAssignments(chain_ids) : [];
-        const missingGen = assignments.some(a => !a || !a.id || !String(a.id).trim());
-        if(chain_ids.length && !missingGen){
-          await postJson('/api/flag-sequencing/save_flow_substitutions', {
-            scenario,
-            chain_ids: chain_ids,
-            preview_plan: previewPlanForRequest(),
-            flag_assignments: assignments,
-            allow_node_duplicates: !!allowNodeDuplicates,
-            initial_facts: flowInitialFactsOverride,
-            goal_facts: flowGoalFactsOverride,
-          }, { timeoutMs: 60000 });
+      if(flowEnabled){
+        try {
+          const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+          const assignments = chain_ids.length ? buildPersistAssignments(chain_ids) : [];
+          const missingGen = assignments.some(a => !a || !a.id || !String(a.id).trim());
+          if(chain_ids.length && !missingGen){
+            await postJson('/api/flag-sequencing/save_flow_substitutions', {
+              scenario,
+              chain_ids: chain_ids,
+              preview_plan: previewPlanForRequest(),
+              flag_assignments: assignments,
+              allow_node_duplicates: !!allowNodeDuplicates,
+              initial_facts: flowInitialFactsOverride,
+              goal_facts: flowGoalFactsOverride,
+            }, { timeoutMs: 60000 });
+          }
+        } catch(e) {
+          try { console.warn('Failed to persist flow substitutions before preview', e); } catch(_e) {}
         }
-      } catch(e) {
-        try { console.warn('Failed to persist flow substitutions before preview', e); } catch(_e) {}
+      } else {
+        try{ await clearFlowStateInXml(); } catch(e) {}
       }
 
       // Navigate to Preview tab.
@@ -7544,6 +7741,7 @@
     seedToggleBtn.dataset.boundSeedToggle = '1';
   }
   updateScenarioSeedBadges();
+  updateFlowEnabledUi();
   // Auto-generate on load (prefer any saved Flow state).
   try { refreshXmlDockPreview({ force: false }); } catch(e) {}
   try {
@@ -7555,7 +7753,7 @@
   clearPreviewPlanCacheForScenario(activeScenario);
   await refreshLatestPreviewPlanPathForScenario(activeScenario);
   const restored = await restoreSavedFlowForScenario(activeScenario);
-  if(!restored){
+  if(!restored && flowEnabled && flowEligible){
     try {
       await generate(false, { autoLoad: true, resolveOnGenerate: false });
     } catch(e) {

@@ -633,7 +633,8 @@
       const preset = (entry.preset || '').toString();
       const length = Number.isFinite(+entry.length) ? (+entry.length) : null;
       const chain_ids = Array.isArray(entry.chain_ids) ? entry.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
-      if (!chain_ids.length) return null;
+      const flow_enabled = (entry.flow_enabled === true) ? true : (entry.flow_enabled === false ? false : undefined);
+      if (!chain_ids.length && flow_enabled !== false) return null;
       const flag_assignments = Array.isArray(entry.flag_assignments) ? entry.flag_assignments : null;
       const allow_node_duplicates = !!entry.allow_node_duplicates;
       const initial_facts = entry.initial_facts || null;
@@ -647,6 +648,7 @@
         allow_node_duplicates,
         initial_facts,
         goal_facts,
+        flow_enabled,
       };
     } catch (e) {
       return null;
@@ -669,6 +671,7 @@
         allow_node_duplicates: !!s.allow_node_duplicates,
         initial_facts: s.initial_facts || null,
         goal_facts: s.goal_facts || null,
+        flow_enabled: (s.flow_enabled === true) ? true : (s.flow_enabled === false ? false : undefined),
         updated_at: Date.now(),
       };
       localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));

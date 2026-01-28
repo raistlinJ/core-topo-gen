@@ -136,6 +136,7 @@
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Description</th>
+                      <th style="width: 140px;">Validated</th>
                       <th>From Source</th>
                       <th style="width: 160px;">Actions</th>
                     </tr>
@@ -215,6 +216,8 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
         <button type="button" class="btn btn-primary" id="vulnTestRunBtn">Run</button>
+        <button type="button" class="btn btn-outline-success" id="vulnTestStopOkBtn" style="display:none;">Stop (Success)</button>
+        <button type="button" class="btn btn-outline-danger" id="vulnTestStopFailBtn" style="display:none;">Stop (Fail)</button>
       </div>
     </div>
   </div>
@@ -481,6 +484,13 @@
         <td class="small">
           ${it.readme_url ? `<a href="${escapeHtml(it.readme_url)}" target="_blank" rel="noopener">README</a>` : '<span class="text-muted">—</span>'}
         </td>
+        <td class="small">
+          ${it.validated_ok === true
+            ? `<span class="badge text-bg-success">Validated</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+            : (it.validated_ok === false
+              ? `<span class="badge text-bg-danger">Failed</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+              : '<span class="text-muted">—</span>')}
+        </td>
         <td class="small">${escapeHtml(it.from_source || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
@@ -519,7 +529,7 @@
 
     if (!rows.length) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="5" class="text-muted">No vulnerabilities found.</td>`;
+      tr.innerHTML = `<td colspan="6" class="text-muted">No vulnerabilities found.</td>`;
       body.appendChild(tr);
     }
   }
@@ -585,13 +595,15 @@
     if (!it) return;
     const btn = _qs('vulnTestRunBtn');
     if (btn) btn.disabled = true;
+    const stopOkBtn = _qs('vulnTestStopOkBtn');
+    const stopFailBtn = _qs('vulnTestStopFailBtn');
     _setText('vulnTestLog', '');
     try {
       const res = _qs('vulnTestResult');
       if (res) res.innerHTML = '';
       const st = _qs('vulnTestStatus');
       if (st) st.style.display = '';
-      _setText('vulnTestStatusText', 'Running docker compose config…');
+      _setText('vulnTestStatusText', 'Starting docker compose…');
     } catch (e) {}
 
     _appendLog('vulnTestLog', `[ui] Testing #${it.id} (${it.name})…`);
@@ -608,20 +620,32 @@
       } catch (e) {}
 
       const inputs = _collectVulnTestInputs(it);
-      const data = await _postJson('/vuln_catalog_items/test', { item_id: it.id, inputs });
-      if (data && data.log) {
-        String(data.log).split('\n').forEach(line => _appendLog('vulnTestLog', line));
+      const data = await _postJson('/vuln_catalog_items/test/start', { item_id: it.id, inputs });
+      if (!data || data.ok !== true || !data.run_id) {
+        throw new Error((data && data.error) ? data.error : 'Failed to start test');
       }
-      const ok = !!(data && data.ok);
+      const runId = String(data.run_id);
+      _vulnCatalogState.activeTestRunId = runId;
+      if (stopOkBtn) stopOkBtn.style.display = '';
+      if (stopFailBtn) stopFailBtn.style.display = '';
+      _setText('vulnTestStatusText', 'Running docker compose… (streaming logs)');
+
       try {
-        const res = _qs('vulnTestResult');
-        if (res) {
-          res.innerHTML = ok
-            ? '<span class="badge text-bg-success">OK</span>'
-            : '<span class="badge text-bg-danger">FAILED</span>';
+        if (_vulnCatalogState.activeTestStream) {
+          _vulnCatalogState.activeTestStream.close();
         }
       } catch (e) {}
-      _appendLog('vulnTestLog', ok ? '[ui] Result: OK' : '[ui] Result: FAILED');
+
+      const es = new EventSource('/stream/' + encodeURIComponent(runId));
+      _vulnCatalogState.activeTestStream = es;
+      es.onmessage = (ev) => {
+        if (ev && typeof ev.data === 'string') {
+          _appendLog('vulnTestLog', ev.data);
+        }
+      };
+      es.addEventListener('end', () => {
+        try { es.close(); } catch (e) {}
+      });
     } catch (e) {
       _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
       try {
@@ -635,6 +659,46 @@
         _setText('vulnTestStatusText', 'Working…');
       } catch (e) {}
       if (btn) btn.disabled = false;
+    }
+  }
+
+  async function stopVulnTest(ok) {
+    const runId = _vulnCatalogState.activeTestRunId;
+    if (!runId) return;
+    const btn = _qs('vulnTestRunBtn');
+    if (btn) btn.disabled = true;
+    const stopOkBtn = _qs('vulnTestStopOkBtn');
+    const stopFailBtn = _qs('vulnTestStopFailBtn');
+    if (stopOkBtn) stopOkBtn.disabled = true;
+    if (stopFailBtn) stopFailBtn.disabled = true;
+    _appendLog('vulnTestLog', `[ui] Stopping test (${ok ? 'success' : 'fail'})…`);
+    try {
+      await _postJson('/vuln_catalog_items/test/stop', { run_id: runId, ok: !!ok });
+      try {
+        const res = _qs('vulnTestResult');
+        if (res) {
+          res.innerHTML = ok
+            ? '<span class="badge text-bg-success">OK</span>'
+            : '<span class="badge text-bg-danger">FAILED</span>';
+        }
+      } catch (e) {}
+      _appendLog('vulnTestLog', ok ? '[ui] Result: OK' : '[ui] Result: FAILED');
+      try { await loadVulnCatalogItems(); } catch (e) {}
+    } catch (e) {
+      _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+    } finally {
+      try {
+        if (_vulnCatalogState.activeTestStream) _vulnCatalogState.activeTestStream.close();
+      } catch (e) {}
+      _vulnCatalogState.activeTestStream = null;
+      _vulnCatalogState.activeTestRunId = null;
+      if (stopOkBtn) { stopOkBtn.style.display = 'none'; stopOkBtn.disabled = false; }
+      if (stopFailBtn) { stopFailBtn.style.display = 'none'; stopFailBtn.disabled = false; }
+      if (btn) btn.disabled = false;
+      try {
+        const st = _qs('vulnTestStatus');
+        if (st) st.style.display = 'none';
+      } catch (e) {}
     }
   }
 
@@ -733,6 +797,10 @@
     });
     const runBtn = _qs('vulnTestRunBtn');
     if (runBtn) runBtn.addEventListener('click', runVulnTest);
+    const stopOkBtn = _qs('vulnTestStopOkBtn');
+    if (stopOkBtn) stopOkBtn.addEventListener('click', () => stopVulnTest(true));
+    const stopFailBtn = _qs('vulnTestStopFailBtn');
+    if (stopFailBtn) stopFailBtn.addEventListener('click', () => stopVulnTest(false));
   });
 </script>
 {% endblock %}

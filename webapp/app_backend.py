@@ -7747,10 +7747,11 @@ def api_flow_save_flow_state_to_xml():
     xml_path = str(j.get('xml_path') or '').strip()
     scenario_label = str(j.get('scenario') or '').strip()
     flow_state = j.get('flow_state') if isinstance(j.get('flow_state'), dict) else None
+    clear_state = _coerce_bool(j.get('clear'))
 
     if not xml_path:
         return jsonify({'ok': False, 'error': 'xml_path required'}), 400
-    if not flow_state:
+    if (not flow_state) and (not clear_state):
         return jsonify({'ok': False, 'error': 'flow_state required'}), 400
 
     try:
@@ -7758,7 +7759,10 @@ def api_flow_save_flow_state_to_xml():
     except Exception:
         return jsonify({'ok': False, 'error': 'invalid xml_path'}), 400
 
-    ok, msg = _update_flow_state_in_xml(xml_path, scenario_label, flow_state)
+    if clear_state:
+        ok, msg = _clear_flow_state_in_xml(xml_path, scenario_label)
+    else:
+        ok, msg = _update_flow_state_in_xml(xml_path, scenario_label, flow_state)
     if not ok:
         return jsonify({'ok': False, 'error': msg}), 422
     return jsonify({'ok': True, 'xml_path': xml_path})
@@ -10748,6 +10752,38 @@ def api_flow_latest_preview_plan():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
     xml_hint = (request.args.get('xml_path') or '').strip()
+    def _flow_eligibility_from_payload(payload: dict) -> tuple[int, int, bool]:
+        docker_count = 0
+        vuln_count = 0
+        try:
+            preview = payload.get('full_preview') if isinstance(payload, dict) else None
+            if isinstance(preview, dict):
+                role_counts = preview.get('role_counts') if isinstance(preview.get('role_counts'), dict) else None
+                if isinstance(role_counts, dict):
+                    try:
+                        docker_count = int(role_counts.get('Docker') or 0)
+                    except Exception:
+                        docker_count = 0
+                hosts = preview.get('hosts') if isinstance(preview.get('hosts'), list) else []
+                if isinstance(hosts, list):
+                    for h in hosts:
+                        if not isinstance(h, dict):
+                            continue
+                        role = str(h.get('role') or '').strip().lower()
+                        if role == 'docker':
+                            docker_count += 1
+                        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                        if vulns:
+                            vuln_count += 1
+                vuln_by_node = preview.get('vulnerabilities_by_node') if isinstance(preview.get('vulnerabilities_by_node'), dict) else None
+                if isinstance(vuln_by_node, dict):
+                    vuln_count = max(vuln_count, len([k for k, v in vuln_by_node.items() if v]))
+        except Exception:
+            docker_count = docker_count
+            vuln_count = vuln_count
+        flow_eligible = bool((docker_count or 0) > 0 or (vuln_count or 0) > 0)
+        return docker_count, vuln_count, flow_eligible
+
     if xml_hint:
         try:
             xml_abs = os.path.abspath(xml_hint)
@@ -10755,6 +10791,7 @@ def api_flow_latest_preview_plan():
                 payload = _load_plan_preview_from_xml(xml_abs, scenario_label or scenario_norm)
                 if payload and isinstance(payload, dict):
                     meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                    docker_count, vuln_count, flow_eligible = _flow_eligibility_from_payload(payload)
                     scen_chk = str(meta.get('scenario') or '').strip()
                     if not scen_chk or _normalize_scenario_label(scen_chk) == scenario_norm:
                         return jsonify({
@@ -10763,6 +10800,9 @@ def api_flow_latest_preview_plan():
                             'preview_plan_path': xml_abs,
                             'preview_source': 'xml',
                             'metadata': meta or {},
+                            'docker_count': docker_count,
+                            'vuln_count': vuln_count,
+                            'flow_eligible': flow_eligible,
                         })
         except Exception:
             pass
@@ -10772,12 +10812,16 @@ def api_flow_latest_preview_plan():
             payload = _load_plan_preview_from_xml(xml_path, scenario_label or scenario_norm)
             if payload and isinstance(payload, dict):
                 meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                docker_count, vuln_count, flow_eligible = _flow_eligibility_from_payload(payload)
                 return jsonify({
                     'ok': True,
                     'scenario': scenario_label or scenario_norm,
                     'preview_plan_path': xml_path,
                     'preview_source': 'xml',
                     'metadata': meta or {},
+                    'docker_count': docker_count,
+                    'vuln_count': vuln_count,
+                    'flow_eligible': flow_eligible,
                 })
     except Exception:
         pass
@@ -25283,6 +25327,51 @@ def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_st
         return False, f'failed to update xml: {e}'
 
 
+def _clear_flow_state_in_xml(xml_path: str, scenario_label: str | None) -> tuple[bool, str]:
+    """Remove FlagSequencing/FlowState from a scenarios XML file (best-effort)."""
+    if not xml_path or not os.path.exists(xml_path):
+        return False, 'xml_path not found'
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        return False, f'failed to parse xml: {e}'
+
+    scenario_norm = _normalize_scenario_label(scenario_label or '')
+    se_target = None
+    try:
+        if root.tag == 'ScenarioEditor':
+            se_target = root
+        elif root.tag == 'Scenarios':
+            for scen_el in root.findall('Scenario'):
+                nm = str(scen_el.get('name') or '').strip()
+                if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
+                    continue
+                se_target = scen_el.find('ScenarioEditor')
+                if se_target is not None:
+                    break
+    except Exception:
+        se_target = None
+
+    if se_target is None:
+        return False, 'ScenarioEditor not found'
+
+    try:
+        fs_el = se_target.find('FlagSequencing')
+        if fs_el is None:
+            return True, 'ok'
+        removed = False
+        for child in list(fs_el):
+            if child.tag == 'FlowState':
+                fs_el.remove(child)
+                removed = True
+        if removed:
+            tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+        return True, 'ok'
+    except Exception as e:
+        return False, f'failed to update xml: {e}'
+
+
 def _update_plan_preview_in_xml(
     xml_path: str,
     scenario_label: str | None,
@@ -28434,6 +28523,43 @@ def plan_full_preview_from_xml():
         if not isinstance(meta, dict):
             meta = {}
 
+        # If the XML has been modified since the PlanPreview was created, recompute
+        # so the preview reflects current scenario contents (e.g., removed vulns/docker).
+        try:
+            plan_ts = None
+            updated_at = str(meta.get('updated_at') or meta.get('created_at') or '').strip()
+            if updated_at:
+                try:
+                    if updated_at.endswith('Z'):
+                        updated_at = updated_at[:-1] + '+00:00'
+                    plan_ts = datetime.datetime.fromisoformat(updated_at).timestamp()
+                except Exception:
+                    plan_ts = None
+            if plan_ts is not None:
+                xml_mtime = os.path.getmtime(xml_path)
+                if xml_mtime > plan_ts:
+                    try:
+                        app.logger.info('[plan.full_preview_from_xml] PlanPreview stale; recomputing for %s', xml_path)
+                    except Exception:
+                        pass
+                    try:
+                        recomputed = _planner_persist_flow_plan(
+                            xml_path=xml_path,
+                            scenario=scenario,
+                            seed=meta.get('seed'),
+                            persist_plan_file=False,
+                        )
+                        if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
+                            full_prev = recomputed.get('full_preview')
+                        payload = _load_plan_preview_from_xml(xml_path, scenario) or payload
+                        meta = payload.get('metadata') if isinstance(payload, dict) else meta
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         scenario_name = str(meta.get('scenario') or '') or scenario or None
         seed_val = meta.get('seed')
         try:
@@ -29850,6 +29976,7 @@ def run_cli_async():
     overwrite_existing_images = False
     upload_only_injected_artifacts = False
     scenarios_inline = None
+    flow_enabled = True
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -29895,9 +30022,16 @@ def run_cli_async():
             request.form.get('upload_only_injected_artifacts')
             or request.form.get('upload_only_injected')
         )
+        if 'flow_enabled' in request.form:
+            flow_enabled = _coerce_bool(request.form.get('flow_enabled'))
+    try:
+        j = request.get_json(silent=True) or {}
+        if 'flow_enabled' in j:
+            flow_enabled = _coerce_bool(j.get('flow_enabled'))
+    except Exception:
+        j = {}
     if not xml_path:
         try:
-            j = request.get_json(silent=True) or {}
             xml_path = j.get('xml_path')
             scenarios_inline = j.get('scenarios')
             if 'seed' in j:
@@ -30040,10 +30174,13 @@ def run_cli_async():
         except Exception:
             preview_plan_path = None
 
+    if not flow_enabled:
+        preview_plan_path = None
+
     # If no preview plan path was provided (or it was rejected), but the user has
     # saved a Flag Sequencing (flow) plan for this scenario, use it automatically.
     # Without a plan, the CLI will execute with 0 flows (no flags/generators).
-    if not preview_plan_path:
+    if not preview_plan_path and flow_enabled:
         try:
             scenario_norm = None
             if scenario_name_hint:
@@ -30072,7 +30209,26 @@ def run_cli_async():
                 scenario_for_plan = names_for_cli[0]
         except Exception:
             scenario_for_plan = None
-    if preview_plan_path and scenario_for_plan:
+    # If XML flow state explicitly disables flag sequencing, honor it.
+    try:
+        if flow_enabled and xml_path and scenario_for_plan:
+            parsed = _parse_scenarios_xml(xml_path)
+            scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+            if isinstance(scen_list, list):
+                for sc in scen_list:
+                    if not isinstance(sc, dict):
+                        continue
+                    nm = str(sc.get('name') or '').strip()
+                    if _normalize_scenario_label(nm) != _normalize_scenario_label(scenario_for_plan):
+                        continue
+                    fs = sc.get('flow_state') if isinstance(sc.get('flow_state'), dict) else None
+                    if isinstance(fs, dict) and fs.get('flow_enabled') is False:
+                        flow_enabled = False
+                        preview_plan_path = None
+                    break
+    except Exception:
+        pass
+    if preview_plan_path and scenario_for_plan and flow_enabled:
         try:
             plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
             if not (isinstance(plan_payload, dict) and plan_payload):
@@ -30115,7 +30271,7 @@ def run_cli_async():
             pass
     # Enforce that Flow-generated values already exist before Execute runs.
     try:
-        if preview_plan_path and scenario_for_plan:
+        if flow_enabled and preview_plan_path and scenario_for_plan:
             plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
             meta = plan_payload.get('metadata') if isinstance(plan_payload, dict) else None
             flow_meta = meta.get('flow') if isinstance(meta, dict) else None
@@ -30196,6 +30352,42 @@ def run_cli_async():
                 return jsonify({
                     'error': 'Execute requires pre-generated Flow values. Run Generate (with resolve) first.',
                     'details': missing_values,
+                }), 422
+    except Exception:
+        pass
+
+    # Enforce flow eligibility when enabled.
+    try:
+        if flow_enabled and preview_plan_path and scenario_for_plan:
+            plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
+            preview = plan_payload.get('full_preview') if isinstance(plan_payload, dict) else None
+            docker_count = 0
+            vuln_count = 0
+            if isinstance(preview, dict):
+                role_counts = preview.get('role_counts') if isinstance(preview.get('role_counts'), dict) else None
+                if isinstance(role_counts, dict):
+                    try:
+                        docker_count = int(role_counts.get('Docker') or 0)
+                    except Exception:
+                        docker_count = 0
+                hosts = preview.get('hosts') if isinstance(preview.get('hosts'), list) else []
+                if isinstance(hosts, list):
+                    for h in hosts:
+                        if not isinstance(h, dict):
+                            continue
+                        role = str(h.get('role') or '').strip().lower()
+                        if role == 'docker':
+                            docker_count += 1
+                        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                        if vulns:
+                            vuln_count += 1
+                vuln_by_node = preview.get('vulnerabilities_by_node') if isinstance(preview.get('vulnerabilities_by_node'), dict) else None
+                if isinstance(vuln_by_node, dict):
+                    vuln_count = max(vuln_count, len([k for k, v in vuln_by_node.items() if v]))
+            if (docker_count <= 0) and (vuln_count <= 0):
+                return jsonify({
+                    'error': 'Flag sequencing requires Docker or vulnerability nodes in the topology.',
+                    'detail': f'Docker nodes: {docker_count}, vulnerability nodes: {vuln_count}',
                 }), 422
     except Exception:
         pass
@@ -37199,6 +37391,8 @@ def vuln_catalog_items_data():
             'from_source': from_source,
             'disabled': bool(it.get('disabled', False)),
             'readme_url': readme_url,
+            'validated_ok': bool(it.get('validated_ok')) if it.get('validated_ok') is not None else None,
+            'validated_at': str(it.get('validated_at') or '').strip() or None,
         })
     return jsonify({
         'ok': True,
@@ -37286,8 +37480,8 @@ def vuln_catalog_items_delete():
     return jsonify({'ok': True})
 
 
-@app.route('/vuln_catalog_items/test', methods=['POST'])
-def vuln_catalog_items_test():
+@app.route('/vuln_catalog_items/test/start', methods=['POST'])
+def vuln_catalog_items_test_start():
     _require_builder_or_admin()
     payload = request.get_json(silent=True) or {}
     item_id_raw = payload.get('item_id')
@@ -37317,31 +37511,174 @@ def vuln_catalog_items_test():
     if not os.path.isfile(compose_path):
         return jsonify({'ok': False, 'error': 'docker-compose.yml not found'}), 404
 
-    log_lines: list[str] = []
-    log_lines.append(f"compose: {os.path.relpath(compose_path, _get_repo_root())}")
+    run_id = str(uuid.uuid4())[:12]
+    project_name = f"coretg-vuln-test-{item_id}-{int(time.time())}"
+    env = os.environ.copy()
+    env['COMPOSE_PROJECT_NAME'] = project_name
+    compose_dir = os.path.dirname(compose_path)
+    run_dir = os.path.join(_outputs_dir(), 'vuln-tests', f'test-{run_id}')
+    os.makedirs(run_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, 'run.log')
 
     try:
-        proc = subprocess.run(
-            ['docker', 'compose', '-f', compose_path, 'config'],
-            cwd=os.path.dirname(compose_path),
+        log_f = open(log_path, 'a', encoding='utf-8', buffering=1)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Failed to open log file'}), 500
+
+    try:
+        log_f.write(f"compose: {os.path.relpath(compose_path, _get_repo_root())}\n")
+        log_f.write(f"[test] docker compose up (project={project_name})\n")
+        proc = subprocess.Popen(
+            ['docker', 'compose', '-f', compose_path, 'up', '--remove-orphans'],
+            cwd=compose_dir,
+            env=env,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError:
+        log_f.write('docker not found on host\n')
+        log_f.flush()
+        log_f.close()
+        return jsonify({'ok': False, 'error': 'docker not found on host'}), 400
+    except Exception as exc:
+        log_f.write(str(exc) + "\n")
+        log_f.flush()
+        log_f.close()
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+    RUNS[run_id] = {
+        'kind': 'vuln_test',
+        'proc': proc,
+        'log_path': log_path,
+        'run_dir': run_dir,
+        'done': False,
+        'returncode': None,
+        'compose_path': compose_path,
+        'compose_dir': compose_dir,
+        'project_name': project_name,
+        'catalog_id': cid,
+        'item_id': item_id,
+    }
+    return jsonify({'ok': True, 'run_id': run_id})
+
+
+@app.route('/vuln_catalog_items/test/stop', methods=['POST'])
+def vuln_catalog_items_test_stop():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    run_id = str(payload.get('run_id') or '').strip()
+    user_ok = bool(payload.get('ok'))
+    if not run_id:
+        return jsonify({'ok': False, 'error': 'run_id required'}), 400
+    meta = RUNS.get(run_id)
+    if not meta or meta.get('kind') != 'vuln_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+
+    compose_path = meta.get('compose_path')
+    compose_dir = meta.get('compose_dir')
+    project_name = meta.get('project_name')
+    log_path = meta.get('log_path')
+    env = os.environ.copy()
+    if project_name:
+        env['COMPOSE_PROJECT_NAME'] = str(project_name)
+
+    try:
+        if log_path:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write("[stop] User requested stop\n")
+    except Exception:
+        pass
+
+    try:
+        proc = meta.get('proc')
+        if proc and hasattr(proc, 'poll') and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Cleanup containers/volumes/images
+    try:
+        if log_path:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write('[cleanup] docker compose down -v --remove-orphans --rmi all\n')
+        subprocess.run(
+            ['docker', 'compose', '-f', compose_path, 'down', '-v', '--remove-orphans', '--rmi', 'all'],
+            cwd=compose_dir,
+            env=env,
             capture_output=True,
             text=True,
-            timeout=25,
+            timeout=60,
             check=False,
         )
-        out = (proc.stdout or '') + (('\n' + proc.stderr) if proc.stderr else '')
-        out = out.strip()
-        if len(out) > 12000:
-            out = out[:12000] + "\n…(truncated)…"
-        if out:
-            log_lines.append(out)
-        return jsonify({'ok': proc.returncode == 0, 'log': '\n'.join(log_lines)})
-    except FileNotFoundError:
-        log_lines.append('docker not found on host')
-        return jsonify({'ok': False, 'log': '\n'.join(log_lines)})
-    except Exception as exc:
-        log_lines.append(str(exc))
-        return jsonify({'ok': False, 'log': '\n'.join(log_lines)})
+    except Exception:
+        pass
+    try:
+        if project_name:
+            # Force-remove any images still labeled for this compose project.
+            img_ids = subprocess.run(
+                ['docker', 'images', '-q', '--filter', f"label=com.docker.compose.project={project_name}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            ids = [x for x in (img_ids.stdout or '').splitlines() if x.strip()]
+            if ids:
+                subprocess.run(['docker', 'rmi', '-f', *ids], capture_output=True, text=True, timeout=30, check=False)
+    except Exception:
+        pass
+    try:
+        if project_name:
+            ps_ids = subprocess.run(
+                ['docker', 'ps', '-aq', '--filter', f"label=com.docker.compose.project={project_name}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            ids = [x for x in (ps_ids.stdout or '').splitlines() if x.strip()]
+            if ids:
+                subprocess.run(['docker', 'rm', '-f', *ids], capture_output=True, text=True, timeout=20, check=False)
+    except Exception:
+        pass
+
+    # Persist validation status on the item.
+    try:
+        state = _load_vuln_catalogs_state()
+        cid = str(meta.get('catalog_id') or '').strip()
+        item_id = int(meta.get('item_id') or 0)
+        catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+        for c in catalogs:
+            if str(c.get('id') or '').strip() != cid:
+                continue
+            items = _normalize_vuln_catalog_items(c)
+            updated = False
+            for it in items:
+                if int(it.get('id') or 0) == item_id:
+                    it['validated_ok'] = bool(user_ok)
+                    it['validated_at'] = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+                    updated = True
+                    break
+            if updated:
+                c['compose_items'] = items
+                c['csv_paths'] = _write_vuln_catalog_csv_from_items(catalog_id=cid, items=items)
+                state['catalogs'] = catalogs
+                _write_vuln_catalogs_state(state)
+            break
+    except Exception:
+        pass
+
+    meta['done'] = True
+    meta['returncode'] = meta.get('returncode') or 0
+    return jsonify({'ok': True})
 
 
 def _zip_entry_is_symlink(info) -> bool:

@@ -899,6 +899,7 @@
     }
 
     const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+    const flowEnabled = (flow && flow.flow_enabled !== undefined) ? !!flow.flow_enabled : true;
     const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
     let chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
     const scenario = (flow && flow.scenario) ? String(flow.scenario)
@@ -906,6 +907,19 @@
       : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
 
     body.innerHTML = '';
+    if(flowEnabled === false){
+      try {
+        if(flowAlertEl){
+          flowAlertEl.classList.add('d-none');
+          flowAlertEl.textContent = '';
+        }
+      } catch(e) {}
+      const empty = document.createElement('div');
+      empty.className = 'small text-muted fst-italic';
+      empty.textContent = '(flag sequencing disabled for this scenario)';
+      body.appendChild(empty);
+      return;
+    }
     if(!chain.length){
       try {
         const chain_ids = (flow && Array.isArray(flow.chain_ids)) ? flow.chain_ids : [];
@@ -3794,6 +3808,11 @@ function buildScenarioUrl(basePath){
           if(planPath && String(planPath).trim().toLowerCase().endsWith('.xml')){
             form.append('preview_plan', planPath);
           }
+          try {
+            const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+            const flowEnabled = (flow && flow.flow_enabled !== undefined) ? !!flow.flow_enabled : true;
+            form.append('flow_enabled', flowEnabled ? '1' : '0');
+          } catch(e) {}
           return form;
         }
 
