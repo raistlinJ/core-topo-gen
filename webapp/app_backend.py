@@ -39826,6 +39826,8 @@ def vuln_catalog():
                     'id': str(it.get('id') or '').strip(),
                     'from_source': from_source,
                     'files_api_url': files_api_url,
+                    'validated_ok': bool(it.get('validated_ok')) if it.get('validated_ok') is not None else None,
+                    'validated_at': str(it.get('validated_at') or '').strip() or None,
                 })
         else:
             items = []

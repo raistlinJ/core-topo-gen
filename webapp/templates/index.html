@@ -18097,13 +18097,40 @@ function ensureVulnModal(){
                     <div class="text-muted small mb-2" id="vulnFilterMeta"></div>
                     <div class="table-responsive" id="vulnTableWrap" style="max-height:50vh; overflow:auto; display:none;">
                         <table class="table table-sm">
-                            <thead class="fw-bold"><tr><th style="width:4rem;">#</th><th>Name</th><th style="width:10rem;">Status</th><th style="width:10rem;">Actions</th><th style="width:6rem;">Files</th></tr></thead>
+                            <thead class="fw-bold"><tr><th style="width:4rem;">#</th><th>Name</th><th style="width:10rem;">Validated</th><th style="width:10rem;">Actions</th><th style="width:6rem;">Files</th></tr></thead>
                             <tbody id="vulnList"></tbody>
                         </table>
                     </div>
                 </div>
                 <div class="modal-footer">
                     <button class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>`;
+        document.body.appendChild(modal);
+}
+
+function ensureVulnPickerTestModal(){
+        if(document.getElementById('vulnPickerTestModal')) return;
+        const modal = document.createElement('div');
+        modal.className = 'modal fade';
+        modal.id = 'vulnPickerTestModal';
+        modal.setAttribute('tabindex', '-1');
+        modal.innerHTML = `
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="vulnPickerTestTitle">Test Vulnerability</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="small text-muted mb-2" id="vulnPickerTestStatus">Starting…</div>
+                    <pre class="small bg-light p-2" id="vulnPickerTestLog" style="max-height:260px; overflow:auto;"></pre>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-outline-success" id="vulnPickerTestStopOkBtn" style="display:none;">Stop (Success)</button>
+                    <button type="button" class="btn btn-outline-danger" id="vulnPickerTestStopFailBtn" style="display:none;">Stop (Fail)</button>
                 </div>
             </div>
         </div>`;
@@ -18234,6 +18261,26 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
     // Status cache keyed by Path (stable) or Name fallback
     const statusByKey = new Map();
     const itemKey = (it) => String((it && (it.Path || it.Name)) || '');
+    let pickerTestRunId = null;
+    let pickerTestStream = null;
+    const postJson = async (url, payload) => {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(payload || {}),
+        });
+        let data = null;
+        try { data = await res.json(); } catch (e) { data = null; }
+        if (!res.ok) {
+            const msg = (data && data.error) ? String(data.error) : (`HTTP ${res.status}`);
+            throw new Error(msg);
+        }
+        if (data && data.ok === false) {
+            throw new Error(String(data.error || 'Request failed'));
+        }
+        return data;
+    };
 
     const setProgress = (pct, label) => {
         try {
@@ -18362,6 +18409,21 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
             return '<span class="badge text-bg-success">Ready</span>';
         } catch (e) {
             return '<span class="badge text-bg-secondary">Unknown</span>';
+        }
+    };
+
+    const validationBadgeHtml = (it) => {
+        try {
+            if (!it || typeof it !== 'object') return '<span class="text-muted">—</span>';
+            if (it.validated_ok === true) {
+                return `<span class="badge text-bg-success">Validated</span>`;
+            }
+            if (it.validated_ok === false) {
+                return `<span class="badge text-bg-danger">Failed</span>`;
+            }
+            return '<span class="text-muted">Not validated</span>';
+        } catch (e) {
+            return '<span class="text-muted">—</span>';
         }
     };
 
@@ -18513,7 +18575,7 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
                     </select>
                 `;
             })();
-            tr.innerHTML = `<td class="text-muted">${idx + 1}</td><td>${nameHtml}</td><td>${statusBadgeHtml(st)}</td><td></td><td>${filesHtml}</td>`;
+            tr.innerHTML = `<td class="text-muted">${idx + 1}</td><td>${nameHtml}</td><td>${validationBadgeHtml(it)}</td><td></td><td>${filesHtml}</td>`;
             const pickable = isPickable(st);
             tr.style.cursor = pickable ? 'pointer' : 'not-allowed';
             if (!pickable) tr.classList.add('text-muted');
@@ -18567,52 +18629,92 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
                 }
             } catch (e) {}
 
-            // Action button (Download/Pull) when not ready
+            // Action button: Test vulnerability
             try {
                 const actionTd = tr.children[3];
                 if (actionTd) {
-                    const needs = canDownloadPull(st);
-                    if (needs) {
-                        const btn = document.createElement('button');
-                        btn.type = 'button';
-                        btn.className = 'btn btn-sm btn-outline-primary';
-                        btn.textContent = 'Download/Pull';
-                        if (st && st.docker_available === false) {
-                            btn.disabled = true;
-                            btn.title = 'Docker not available';
-                        }
-                        if (!allowDownloadPullActions) {
-                            btn.disabled = true;
-                            btn.className = 'btn btn-sm btn-outline-secondary';
-                            btn.textContent = 'Admin required';
-                            btn.title = 'Download/Pull requires admin access.';
-                        }
-                        btn.onclick = async (ev) => {
-                            try { ev.preventDefault(); ev.stopPropagation(); } catch (e) {}
-                            if (!allowDownloadPullActions) {
-                                try { alert('Download/Pull requires admin access.'); } catch (e) {}
-                                return;
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'btn btn-sm btn-outline-primary';
+                    btn.textContent = 'Test';
+                    btn.onclick = async (ev) => {
+                        try { ev.preventDefault(); ev.stopPropagation(); } catch (e) {}
+                        try {
+                            ensureVulnPickerTestModal();
+                            const modalEl = document.getElementById('vulnPickerTestModal');
+                            const titleEl = document.getElementById('vulnPickerTestTitle');
+                            const logEl = document.getElementById('vulnPickerTestLog');
+                            const statusEl = document.getElementById('vulnPickerTestStatus');
+                            const stopOkBtn = document.getElementById('vulnPickerTestStopOkBtn');
+                            const stopFailBtn = document.getElementById('vulnPickerTestStopFailBtn');
+                            const runBtn = btn;
+                            if (titleEl) titleEl.textContent = `Test Vulnerability: ${it.Name || ''}`;
+                            if (logEl) logEl.textContent = '';
+                            if (statusEl) statusEl.textContent = 'Starting…';
+                            if (stopOkBtn) stopOkBtn.style.display = 'none';
+                            if (stopFailBtn) stopFailBtn.style.display = 'none';
+                            if (runBtn) runBtn.disabled = true;
+                            const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl)) : null;
+                            try { modalObj?.show(); } catch (e) {}
+
+                            const data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id });
+                            if (!data || data.ok !== true || !data.run_id) {
+                                throw new Error((data && data.error) ? data.error : 'Failed to start test');
                             }
+                            pickerTestRunId = String(data.run_id);
+                            if (statusEl) statusEl.textContent = 'Running docker compose… (streaming logs)';
+                            if (stopOkBtn) stopOkBtn.style.display = '';
+                            if (stopFailBtn) stopFailBtn.style.display = '';
+                            if (stopOkBtn) stopOkBtn.disabled = false;
+                            if (stopFailBtn) stopFailBtn.disabled = false;
+
+                            if (pickerTestStream) {
+                                try { pickerTestStream.close(); } catch (e) {}
+                            }
+                            pickerTestStream = new EventSource('/stream/' + encodeURIComponent(pickerTestRunId));
+                            pickerTestStream.onmessage = (ev) => {
+                                if (logEl && ev && typeof ev.data === 'string') {
+                                    logEl.textContent += ev.data + '\n';
+                                    logEl.scrollTop = logEl.scrollHeight;
+                                }
+                            };
+                            pickerTestStream.addEventListener('end', () => {
+                                try { pickerTestStream.close(); } catch (e) {}
+                            });
+
+                            const stopHandler = async (ok) => {
+                                if (!pickerTestRunId) return;
+                                try { if (statusEl) statusEl.textContent = 'Stopping…'; } catch (e) {}
+                                if (stopOkBtn) stopOkBtn.disabled = true;
+                                if (stopFailBtn) stopFailBtn.disabled = true;
+                                await postJson('/vuln_catalog_items/test/stop', { run_id: pickerTestRunId, ok: !!ok });
+                                try { pickerTestStream?.close(); } catch (e) {}
+                                pickerTestStream = null;
+                                pickerTestRunId = null;
+                                if (statusEl) statusEl.textContent = ok ? 'Stopped (Success)' : 'Stopped (Fail)';
+                                if (stopOkBtn) stopOkBtn.style.display = 'none';
+                                if (stopFailBtn) stopFailBtn.style.display = 'none';
+                                try { await setupVulnCatalog(); } catch (e) {}
+                                try {
+                                    eligible = (window.VULN_CATALOG?.items || []).filter(it2 => (it2.Type||'').toLowerCase() === 'docker-compose');
+                                    current = eligible;
+                                    applyFilter();
+                                } catch (e) {}
+                            };
+
+                            if (stopOkBtn) stopOkBtn.onclick = () => stopHandler(true);
+                            if (stopFailBtn) stopFailBtn.onclick = () => stopHandler(false);
+                        } catch (e) {
+                            console.warn('Test failed', e);
                             try {
-                                const confirmMsg = `Download compose and pull images for “${it.Name}”?`;
-                                if (!confirm(confirmMsg)) return;
-                                btn.disabled = true;
-                                try { btn.textContent = 'Working…'; } catch (e) {}
-                                await downloadPullOne(it);
-                                // Re-render now that status cache is updated.
-                                applyFilter();
-                            } catch (e) {
-                                console.warn('Download/Pull failed', e);
-                                alert('Download/Pull failed. Check server logs.');
-                            } finally {
-                                try { btn.disabled = false; } catch (e) {}
-                                try { btn.textContent = 'Download/Pull'; } catch (e) {}
-                            }
-                        };
-                        actionTd.appendChild(btn);
-                    } else {
-                        actionTd.innerHTML = '<span class="text-muted small">—</span>';
-                    }
+                                const logEl = document.getElementById('vulnPickerTestLog');
+                                if (logEl) logEl.textContent += `[ui] ERROR: ${e}\n`;
+                            } catch (e2) {}
+                        } finally {
+                            try { btn.disabled = false; } catch (e) {}
+                        }
+                    };
+                    actionTd.appendChild(btn);
                 }
             } catch (e) {}
 
