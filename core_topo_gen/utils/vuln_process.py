@@ -1087,7 +1087,75 @@ def _force_service_workdir_root(service: Dict[str, object]) -> None:
 	"""Force a compose service to run with working_dir: / (best-effort)."""
 	if not isinstance(service, dict):
 		return
+	try:
+		current = service.get('working_dir')
+		if isinstance(current, str) and current.strip():
+			return
+	except Exception:
+		pass
 	service['working_dir'] = '/'
+
+
+def _copy_build_contexts(obj: dict, src_dir: str, base_dir: str) -> dict:
+	"""Copy build contexts into base_dir and rewrite to absolute paths.
+
+	Helps compose files that use relative build contexts (e.g., build: .)
+	so the generated compose can be run from a different directory.
+	"""
+	try:
+		if not isinstance(obj, dict):
+			return obj
+		services = obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return obj
+		seen: Set[str] = set()
+		for _svc_name, svc in services.items():
+			if not isinstance(svc, dict):
+				continue
+			build = svc.get('build')
+			ctx = None
+			if isinstance(build, dict):
+				ctx = build.get('context')
+			elif isinstance(build, str):
+				ctx = build
+			if not isinstance(ctx, str) or not ctx.strip():
+				continue
+			ctx = ctx.strip()
+			src_ctx = ctx if os.path.isabs(ctx) else os.path.join(src_dir, ctx)
+			# Only copy when source exists and is a directory.
+			if not os.path.isdir(src_ctx):
+				continue
+			rel = None
+			try:
+				if os.path.abspath(src_ctx).startswith(os.path.abspath(src_dir) + os.sep):
+					rel = os.path.relpath(src_ctx, src_dir)
+			except Exception:
+				rel = None
+			if not rel:
+				rel = os.path.basename(src_ctx.rstrip(os.sep)) or 'build-context'
+			dest_ctx = os.path.join(base_dir, rel)
+			if dest_ctx not in seen:
+				try:
+					shutil.copytree(src_ctx, dest_ctx, dirs_exist_ok=True)
+				except Exception:
+					pass
+				seen.add(dest_ctx)
+			# Rewrite build context to absolute dest path
+			try:
+				if isinstance(build, dict):
+					build['context'] = dest_ctx
+					# Ensure Dockerfile path is relative to context if provided
+					if isinstance(build.get('dockerfile'), str):
+						build['dockerfile'] = str(build.get('dockerfile'))
+					# Force host network to avoid missing bridge on CORE VM
+					build.setdefault('network', 'host')
+				else:
+					svc['build'] = {'context': dest_ctx, 'network': 'host'}
+			except Exception:
+				pass
+		return obj
+	except Exception:
+		return obj
 
 
 def _prune_compose_published_ports(compose_obj: dict) -> dict:
@@ -2040,25 +2108,37 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 	"""
 	os.makedirs(out_dir, exist_ok=True)
 	dockerfile_path = os.path.join(out_dir, 'Dockerfile')
-	content = f"""FROM {base_image}
-
-RUN set -eux; \\
-		if command -v apt-get >/dev/null 2>&1; then \\
-			apt-get update || true; \
-			apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true; \
-			rm -rf /var/lib/apt/lists/*; \\
-		elif command -v apk >/dev/null 2>&1; then \\
-			apk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3 || true; \
-		elif command -v dnf >/dev/null 2>&1; then \\
-			dnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \
-			dnf clean all || true; \
-		elif command -v yum >/dev/null 2>&1; then \\
-			yum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \
-			yum clean all || true; \
-    else \\
-			echo "No supported package manager found to install baseline tools (continuing)" >&2; \
-    fi
-"""
+	lines = [
+		f"FROM {base_image}",
+		"",
+		"RUN set -eux; \\",
+		"\tif command -v apt-get >/dev/null 2>&1; then \\",
+		"\t\tif ! apt-get update; then \\",
+		"\t\t\trm -f /etc/apt/sources.list; \\",
+		"\t\t\trm -f /etc/apt/sources.list.d/*.list || true; \\",
+		"\t\t\tprintf '%s\\n' \\",
+		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian-security jessie/updates main\" \\",
+		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian jessie main\" \\",
+		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian stretch main\" \\",
+		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian stretch-updates main\" \\",
+		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main\" > /etc/apt/sources.list; \\",
+		"\t\t\tapt-get -o Acquire::Check-Valid-Until=false update || true; \\",
+		"\t\tfi; \\",
+		"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true; \\",
+		"\t\trm -rf /var/lib/apt/lists/*; \\",
+		"\telif command -v apk >/dev/null 2>&1; then \\",
+		"\t\tapk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3 || true; \\",
+		"\telif command -v dnf >/dev/null 2>&1; then \\",
+		"\t\tdnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \\",
+		"\t\tdnf clean all || true; \\",
+		"\telif command -v yum >/dev/null 2>&1; then \\",
+		"\t\tyum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \\",
+		"\t\tyum clean all || true; \\",
+		"\telse \\",
+		"\t\techo \"No supported package manager found to install baseline tools (continuing)\" >&2; \\",
+		"\tfi",
+	]
+	content = "\n".join(lines) + "\n"
 	with open(dockerfile_path, 'w', encoding='utf-8') as f:
 		f.write(content)
 	return dockerfile_path
@@ -2441,6 +2521,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 								src_dir=src_dir,
 								base_dir=base_dir,
 							)
+							base_compose_obj = _copy_build_contexts(
+								base_compose_obj,
+								src_dir=src_dir,
+								base_dir=base_dir,
+							)
 					except Exception:
 						pass
 					logger.debug(
@@ -2471,6 +2556,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							try:
 								src_dir = os.path.dirname(os.path.abspath(fallback_path))
 								base_compose_obj = _copy_support_paths_and_absolutize_binds(
+									base_compose_obj,
+									src_dir=src_dir,
+									base_dir=base_dir,
+								)
+								base_compose_obj = _copy_build_contexts(
 									base_compose_obj,
 									src_dir=src_dir,
 									base_dir=base_dir,
@@ -2644,6 +2734,14 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
 					svc = services.get(svc_key)
 					base_image = str(svc.get('image') or '').strip()
+					try:
+						# Some base images (e.g., ActiveMQ) rely on relative startup paths.
+						# Preserve their expected WORKDIR to avoid '/bin/activemq: not found'.
+						if base_image and 'activemq' in base_image.lower():
+							if not isinstance(svc.get('working_dir'), str) or not str(svc.get('working_dir')).strip():
+								svc['working_dir'] = '/opt/activemq'
+					except Exception:
+						pass
 					# If this compose already references our wrapper tag, don't wrap again.
 					# Double-wrapping can make Docker try to pull the wrapper tag as a base image.
 					if base_image.startswith('coretg/') and base_image.endswith(':iproute2'):
@@ -2657,6 +2755,8 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						# Force host networking for the build to avoid relying on the bridge network.
 						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile', 'network': 'host'}
 						svc['image'] = f"coretg/{scenario_tag_safe}-{_safe_name(node_name)}:iproute2"
+						# Avoid pull warnings for local wrapper image.
+						svc['pull_policy'] = 'never'
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
 						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
 						# CORE services often manipulate files using relative paths; force root workdir.

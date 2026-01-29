@@ -919,6 +919,16 @@ class _RemoteProcessHandle:
         self.channel = None
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str) -> str:
+    try:
+        return _ANSI_ESCAPE_RE.sub('', text)
+    except Exception:
+        return text
+
+
 def _relay_remote_channel_to_log(channel: Any, log_handle: Any) -> None:
     """Stream bytes from an SSH channel into the local log file."""
 
@@ -944,7 +954,7 @@ def _relay_remote_channel_to_log(channel: Any, log_handle: Any) -> None:
                 text = chunk.decode('utf-8', 'replace')
             except Exception:
                 text = chunk.decode('latin-1', 'replace')
-            log_handle.write(text)
+            log_handle.write(_strip_ansi(text))
     finally:
         try:
             log_handle.flush()
@@ -37484,6 +37494,7 @@ def vuln_catalog_items_delete():
 def vuln_catalog_items_test_start():
     _require_builder_or_admin()
     payload = request.get_json(silent=True) or {}
+    force_replace = bool(payload.get('force_replace') or payload.get('replace'))
     item_id_raw = payload.get('item_id')
     try:
         item_id = int(item_id_raw)
@@ -37511,14 +37522,183 @@ def vuln_catalog_items_test_start():
     if not os.path.isfile(compose_path):
         return jsonify({'ok': False, 'error': 'docker-compose.yml not found'}), 404
 
+    try:
+        for meta in RUNS.values():
+            if isinstance(meta, dict) and meta.get('kind') == 'vuln_test' and not meta.get('done'):
+                return jsonify({'ok': False, 'error': 'Another vulnerability test is already running'}), 409
+    except Exception:
+        pass
+
     run_id = str(uuid.uuid4())[:12]
     project_name = f"coretg-vuln-test-{item_id}-{int(time.time())}"
-    env = os.environ.copy()
-    env['COMPOSE_PROJECT_NAME'] = project_name
-    compose_dir = os.path.dirname(compose_path)
     run_dir = os.path.join(_outputs_dir(), 'vuln-tests', f'test-{run_id}')
     os.makedirs(run_dir, exist_ok=True)
     log_path = os.path.join(run_dir, 'run.log')
+
+    # Resolve CORE VM credentials from payload.
+    try:
+        core_cfg = _merge_core_configs(payload.get('core'), include_password=True)
+        # Default gRPC host/port to SSH host when missing.
+        if not core_cfg.get('host'):
+            core_cfg['host'] = core_cfg.get('ssh_host') or '127.0.0.1'
+        if not core_cfg.get('port'):
+            core_cfg['port'] = CORE_PORT
+        core_cfg = _require_core_ssh_credentials(core_cfg)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'CORE VM SSH config required: {exc}'}), 400
+
+    # Ensure no active CORE sessions before running tests.
+    try:
+        errors: list[str] = []
+        host = str(core_cfg.get('host') or '127.0.0.1')
+        port = int(core_cfg.get('port') or CORE_PORT)
+        sessions = _list_active_core_sessions(host, port, core_cfg, errors=errors, meta={})
+        if errors:
+            return jsonify({'ok': False, 'error': f'Unable to verify CORE sessions: {errors[0]}' }), 409
+        if sessions:
+            return jsonify({'ok': False, 'error': 'CORE VM has active session(s). Stop running scenario before testing.'}), 409
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Unable to verify CORE sessions: {exc}' }), 409
+
+    remote_run_dir = f"/tmp/tests/test-{run_id}"
+    prepared_compose_path = compose_path
+    try:
+        from core_topo_gen.utils.vuln_process import prepare_compose_for_assignments
+        node_name = f"vuln-test-{item_id}"
+        rec = {
+            'Name': str(target.get('name') or target.get('Name') or target.get('Title') or f'vuln-{item_id}'),
+            'Path': compose_path,
+            'Type': 'docker-compose',
+            'ScenarioTag': f"vuln-test-{item_id}",
+        }
+        created = prepare_compose_for_assignments({node_name: rec}, out_base=run_dir)
+        if created:
+            prepared_compose_path = created[0]
+    except Exception:
+        prepared_compose_path = compose_path
+
+    # Rewrite local paths in prepared compose to remote paths for CORE VM execution.
+    def _rewrite_compose_paths_for_remote(compose_path: str, local_base: str, remote_base: str) -> None:
+        """Rewrite absolute local paths in docker-compose to remote paths."""
+        try:
+            import yaml
+            with open(compose_path, 'r', encoding='utf-8') as f:
+                compose_obj = yaml.safe_load(f)
+            if not isinstance(compose_obj, dict):
+                return
+            services = compose_obj.get('services')
+            if not isinstance(services, dict):
+                return
+            # Rewrite build context paths
+            for svc_name, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                build = svc.get('build')
+                if isinstance(build, dict):
+                    ctx = build.get('context')
+                    if isinstance(ctx, str) and ctx.startswith(local_base):
+                        rel = os.path.relpath(ctx, local_base)
+                        build['context'] = _remote_path_join(remote_base, rel)
+                # Rewrite volume bind mount paths
+                volumes = svc.get('volumes')
+                if isinstance(volumes, list):
+                    new_volumes = []
+                    for vol in volumes:
+                        if isinstance(vol, str) and ':' in vol:
+                            parts = vol.split(':', 2)
+                            src = parts[0]
+                            if src.startswith(local_base):
+                                rel = os.path.relpath(src, local_base)
+                                parts[0] = _remote_path_join(remote_base, rel)
+                                new_volumes.append(':'.join(parts))
+                            else:
+                                new_volumes.append(vol)
+                        else:
+                            new_volumes.append(vol)
+                    svc['volumes'] = new_volumes
+            # Write updated compose
+            with open(compose_path, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(compose_obj, f, sort_keys=False)
+        except Exception:
+            pass  # Best-effort path rewriting
+
+    if prepared_compose_path != compose_path:
+        _rewrite_compose_paths_for_remote(prepared_compose_path, run_dir, remote_run_dir)
+
+    def _compose_images_and_containers(path: str) -> tuple[list[str], list[str]]:
+        images: list[str] = []
+        containers: list[str] = []
+        try:
+            import yaml
+            with open(path, 'r', encoding='utf-8') as f:
+                obj = yaml.safe_load(f) or {}
+            services = obj.get('services') if isinstance(obj, dict) else None
+            if not isinstance(services, dict):
+                return images, containers
+            for _svc_name, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                img = svc.get('image')
+                if isinstance(img, str) and img.strip():
+                    images.append(img.strip())
+                cname = svc.get('container_name')
+                if isinstance(cname, str) and cname.strip():
+                    containers.append(cname.strip())
+        except Exception:
+            pass
+        # Deduplicate while preserving order
+        images = list(dict.fromkeys(images))
+        containers = list(dict.fromkeys(containers))
+        return images, containers
+
+    def _exec_ssh_sudo_capture(client: Any, command: str, password: str | None) -> tuple[int, str, str]:
+        channel = client.get_transport().open_session() if client.get_transport() else None
+        if channel is None:
+            return 1, '', 'SSH channel unavailable'
+        try:
+            channel.get_pty()
+        except Exception:
+            pass
+        channel.exec_command(command)
+        try:
+            if password:
+                channel.send(str(password) + "\n")
+        except Exception:
+            pass
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        while True:
+            try:
+                if channel.recv_ready():
+                    stdout_chunks.append(channel.recv(REMOTE_LOG_CHUNK_SIZE))
+                if channel.recv_stderr_ready():
+                    stderr_chunks.append(channel.recv_stderr(REMOTE_LOG_CHUNK_SIZE))
+                if channel.exit_status_ready():
+                    if not channel.recv_ready() and not channel.recv_stderr_ready():
+                        break
+            except Exception:
+                break
+            time.sleep(0.15)
+        rc = 0
+        try:
+            rc = int(channel.recv_exit_status())
+        except Exception:
+            rc = 0
+        try:
+            out = b''.join(stdout_chunks).decode('utf-8', 'replace')
+        except Exception:
+            out = b''.join(stdout_chunks).decode('latin-1', 'replace')
+        try:
+            err = b''.join(stderr_chunks).decode('utf-8', 'replace')
+        except Exception:
+            err = b''.join(stderr_chunks).decode('latin-1', 'replace')
+        return rc, out.strip(), err.strip()
+
+    # Upload prepared compose assets to CORE VM and execute there.
+    remote_run_dir = f"/tmp/tests/test-{run_id}"
+    remote_compose_path = None
+    ssh_client = None
+    sftp = None
 
     try:
         log_f = open(log_path, 'a', encoding='utf-8', buffering=1)
@@ -37527,39 +37707,244 @@ def vuln_catalog_items_test_start():
 
     try:
         log_f.write(f"compose: {os.path.relpath(compose_path, _get_repo_root())}\n")
-        log_f.write(f"[test] docker compose up (project={project_name})\n")
-        proc = subprocess.Popen(
-            ['docker', 'compose', '-f', compose_path, 'up', '--remove-orphans'],
-            cwd=compose_dir,
-            env=env,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            text=True,
+        if prepared_compose_path != compose_path:
+            log_f.write(f"compose_prepared: {os.path.relpath(prepared_compose_path, _get_repo_root())}\n")
+        log_f.write(f"[remote] uploading to CORE VM…\n")
+        try:
+            env_path = os.path.join(run_dir, '.env')
+            if not os.path.exists(env_path):
+                with open(env_path, 'w', encoding='utf-8') as _envf:
+                    _envf.write('')
+        except Exception:
+            pass
+        ssh_client = _open_ssh_client(core_cfg)
+        sftp = ssh_client.open_sftp()
+        _remote_mkdirs(ssh_client, remote_run_dir)
+
+        # Check for existing images/containers on remote and optionally replace.
+        try:
+            images, containers = _compose_images_and_containers(prepared_compose_path)
+            existing_images: list[str] = []
+            existing_containers: list[str] = []
+            pw = ''
+            try:
+                pw = str(core_cfg.get('ssh_password') or '')
+            except Exception:
+                pw = ''
+            for img in images:
+                inner = f"sudo -S -p '' -k docker images -q {shlex.quote(img)}"
+                cmd = f"bash -lc {shlex.quote(inner)}"
+                rc, out, _err = _exec_ssh_sudo_capture(ssh_client, cmd, pw)
+                if rc == 0 and out:
+                    existing_images.append(img)
+            for cname in containers:
+                filter_arg = f"name=^{cname}$"
+                inner = f"sudo -S -p '' -k docker ps -a --filter {shlex.quote(filter_arg)} --format {{.Names}}"
+                cmd = f"bash -lc {shlex.quote(inner)}"
+                rc, out, _err = _exec_ssh_sudo_capture(ssh_client, cmd, pw)
+                if rc == 0 and out:
+                    existing_containers.append(cname)
+            if (existing_images or existing_containers) and not force_replace:
+                try:
+                    log_f.write('[remote] existing images/containers detected; awaiting user confirmation\n')
+                    log_f.flush()
+                except Exception:
+                    pass
+                try:
+                    if sftp:
+                        sftp.close()
+                except Exception:
+                    pass
+                try:
+                    if ssh_client:
+                        ssh_client.close()
+                except Exception:
+                    pass
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+                return jsonify({
+                    'ok': True,
+                    'replace_required': True,
+                    'existing_images': existing_images,
+                    'existing_containers': existing_containers,
+                })
+            if force_replace and (existing_images or existing_containers):
+                try:
+                    log_f.write('[remote] replacing existing images/containers\n')
+                except Exception:
+                    pass
+                for cname in existing_containers:
+                    inner = f"sudo -S -p '' -k docker rm -f {shlex.quote(cname)}"
+                    cmd = f"bash -lc {shlex.quote(inner)}"
+                    _exec_ssh_sudo_capture(ssh_client, cmd, pw)
+                for img in existing_images:
+                    inner = f"sudo -S -p '' -k docker rmi -f {shlex.quote(img)}"
+                    cmd = f"bash -lc {shlex.quote(inner)}"
+                    _exec_ssh_sudo_capture(ssh_client, cmd, pw)
+        except Exception:
+            pass
+
+        # Upload prepared dir recursively.
+        total_files = 0
+        try:
+            for _root, _dirs, _files in os.walk(run_dir):
+                total_files += sum(1 for _fn in _files if _fn and os.path.isfile(os.path.join(_root, _fn)))
+        except Exception:
+            total_files = 0
+        try:
+            if total_files:
+                log_f.write(f"[upload] 0/{total_files} (0%)\n")
+        except Exception:
+            pass
+        uploaded = 0
+        for root, dirs, files in os.walk(run_dir):
+            rel = os.path.relpath(root, run_dir)
+            rel = '' if rel == '.' else rel
+            remote_root = remote_run_dir if not rel else _remote_path_join(remote_run_dir, rel)
+            _remote_mkdirs(ssh_client, remote_root)
+            for dn in dirs:
+                _remote_mkdirs(ssh_client, _remote_path_join(remote_root, dn))
+            for fn in files:
+                lp = os.path.join(root, fn)
+                rp = _remote_path_join(remote_root, fn)
+                if os.path.isfile(lp):
+                    sftp.put(lp, rp)
+                    try:
+                        uploaded += 1
+                        if total_files:
+                            if uploaded == total_files or uploaded % 10 == 0:
+                                pct = int((uploaded / max(1, total_files)) * 100)
+                                log_f.write(f"[upload] {uploaded}/{total_files} ({pct}%)\n")
+                    except Exception:
+                        pass
+        try:
+            if total_files:
+                log_f.write(f"[upload] done ({uploaded}/{total_files})\n")
+        except Exception:
+            pass
+
+        rel_compose = os.path.relpath(prepared_compose_path, run_dir)
+        remote_compose_path = _remote_path_join(remote_run_dir, rel_compose)
+        log_f.write(f"[remote] compose: {remote_compose_path}\n")
+        log_f.write(f"[remote] docker compose up (project={project_name})\n")
+
+        pw = ''
+        try:
+            pw = str(core_cfg.get('ssh_password') or '')
+        except Exception:
+            pw = ''
+        inner_cmd = (
+            f"cd {shlex.quote(remote_run_dir)} && "
+            f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} sudo -S -p '' -k "
+            f"docker compose -f {shlex.quote(remote_compose_path)} up --remove-orphans"
         )
-    except FileNotFoundError:
-        log_f.write('docker not found on host\n')
-        log_f.flush()
-        log_f.close()
-        return jsonify({'ok': False, 'error': 'docker not found on host'}), 400
+        cmd = f"bash -lc {shlex.quote(inner_cmd)}"
+        channel = ssh_client.get_transport().open_session() if ssh_client.get_transport() else None
+        if channel is None:
+            raise RuntimeError('SSH channel unavailable')
+        try:
+            channel.get_pty()
+        except Exception:
+            pass
+        channel.exec_command(cmd)
+        try:
+            if pw:
+                channel.send(pw + "\n")
+        except Exception:
+            pass
+
+        relay_thread = threading.Thread(
+            target=_relay_remote_channel_to_log,
+            args=(channel, log_f),
+            daemon=True,
+        )
+        relay_thread.start()
     except Exception as exc:
-        log_f.write(str(exc) + "\n")
-        log_f.flush()
-        log_f.close()
+        try:
+            log_f.write(str(exc) + "\n")
+            log_f.flush()
+            log_f.close()
+        except Exception:
+            pass
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if ssh_client:
+                ssh_client.close()
+        except Exception:
+            pass
         return jsonify({'ok': False, 'error': str(exc)}), 500
 
     RUNS[run_id] = {
         'kind': 'vuln_test',
-        'proc': proc,
+        'proc': None,
         'log_path': log_path,
         'run_dir': run_dir,
         'done': False,
         'returncode': None,
-        'compose_path': compose_path,
-        'compose_dir': compose_dir,
+        'cleanup_started': False,
+        'cleanup_done': False,
+        'compose_path': prepared_compose_path,
+        'compose_path_raw': compose_path,
+        'compose_dir': os.path.dirname(prepared_compose_path),
         'project_name': project_name,
         'catalog_id': cid,
         'item_id': item_id,
+        'remote_run_dir': remote_run_dir,
+        'remote_compose_path': remote_compose_path,
+        'core_cfg': core_cfg,
+        'ssh_client': ssh_client,
+        'ssh_channel': channel,
+        'ssh_log_handle': log_f,
+        'ssh_log_thread': relay_thread,
     }
+
+    def _monitor_remote_vuln_test(_run_id: str) -> None:
+        try:
+            meta = RUNS.get(_run_id)
+            if not isinstance(meta, dict):
+                return
+            ch = meta.get('ssh_channel')
+            if ch is None:
+                return
+            while True:
+                try:
+                    if ch.exit_status_ready():
+                        rc = None
+                        try:
+                            rc = int(ch.recv_exit_status())
+                        except Exception:
+                            rc = 0
+                        meta['returncode'] = rc
+                        meta['done'] = True
+                        break
+                except Exception:
+                    break
+                time.sleep(0.5)
+        finally:
+            try:
+                log_handle = RUNS.get(_run_id, {}).get('ssh_log_handle')
+                if log_handle:
+                    log_handle.flush()
+                    log_handle.close()
+            except Exception:
+                pass
+            try:
+                client = RUNS.get(_run_id, {}).get('ssh_client')
+                if client:
+                    client.close()
+            except Exception:
+                pass
+
+    try:
+        threading.Thread(target=_monitor_remote_vuln_test, args=(run_id,), daemon=True).start()
+    except Exception:
+        pass
     return jsonify({'ok': True, 'run_id': run_id})
 
 
@@ -37568,20 +37953,25 @@ def vuln_catalog_items_test_stop():
     _require_builder_or_admin()
     payload = request.get_json(silent=True) or {}
     run_id = str(payload.get('run_id') or '').strip()
-    user_ok = bool(payload.get('ok'))
+    ok_value = payload.get('ok')
+    user_ok = True if ok_value is True else (False if ok_value is False else None)
     if not run_id:
         return jsonify({'ok': False, 'error': 'run_id required'}), 400
     meta = RUNS.get(run_id)
     if not meta or meta.get('kind') != 'vuln_test':
         return jsonify({'ok': False, 'error': 'not found'}), 404
 
-    compose_path = meta.get('compose_path')
-    compose_dir = meta.get('compose_dir')
+    return _stop_vuln_test_meta(meta, user_ok)
+
+
+def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
+    compose_path = meta.get('remote_compose_path')
+    remote_run_dir = meta.get('remote_run_dir')
     project_name = meta.get('project_name')
     log_path = meta.get('log_path')
-    env = os.environ.copy()
-    if project_name:
-        env['COMPOSE_PROJECT_NAME'] = str(project_name)
+    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+    if not core_cfg:
+        return jsonify({'ok': False, 'error': 'Missing CORE VM credentials'}), 400
 
     try:
         if log_path:
@@ -37591,64 +37981,79 @@ def vuln_catalog_items_test_stop():
         pass
 
     try:
-        proc = meta.get('proc')
-        if proc and hasattr(proc, 'poll') and proc.poll() is None:
+        channel = meta.get('ssh_channel')
+        if channel is not None and hasattr(channel, 'close'):
             try:
-                proc.terminate()
-                proc.wait(timeout=5)
+                channel.close()
             except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                pass
     except Exception:
         pass
 
-    # Cleanup containers/volumes/images
     try:
-        if log_path:
-            with open(log_path, 'a', encoding='utf-8') as log_f:
-                log_f.write('[cleanup] docker compose down -v --remove-orphans --rmi all\n')
-        subprocess.run(
-            ['docker', 'compose', '-f', compose_path, 'down', '-v', '--remove-orphans', '--rmi', 'all'],
-            cwd=compose_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
+        if isinstance(meta, dict):
+            meta['cleanup_started'] = True
+            meta['cleanup_done'] = False
     except Exception:
         pass
-    try:
-        if project_name:
-            # Force-remove any images still labeled for this compose project.
-            img_ids = subprocess.run(
-                ['docker', 'images', '-q', '--filter', f"label=com.docker.compose.project={project_name}"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
+
+    def _cleanup_remote() -> None:
+        _client = None
+        try:
+            _client = _open_ssh_client(core_cfg)
+            if log_path:
+                with open(log_path, 'a', encoding='utf-8') as log_f:
+                    log_f.write('[cleanup] docker compose down -v --remove-orphans --rmi all\n')
+            pw = ''
+            try:
+                pw = str(core_cfg.get('ssh_password') or '')
+            except Exception:
+                pw = ''
+            down_cmd = (
+                f"cd {shlex.quote(remote_run_dir or '/tmp')} && "
+                f"COMPOSE_PROJECT_NAME={shlex.quote(project_name or '')} sudo -S -p '' -k "
+                f"docker compose -f {shlex.quote(compose_path or '')} down -v --remove-orphans --rmi all"
             )
-            ids = [x for x in (img_ids.stdout or '').splitlines() if x.strip()]
-            if ids:
-                subprocess.run(['docker', 'rmi', '-f', *ids], capture_output=True, text=True, timeout=30, check=False)
-    except Exception:
-        pass
+            cmd = f"bash -lc {shlex.quote(down_cmd)}"
+            channel = _client.get_transport().open_session() if _client.get_transport() else None
+            if channel is not None:
+                try:
+                    channel.get_pty()
+                except Exception:
+                    pass
+                channel.exec_command(cmd)
+                try:
+                    if pw:
+                        channel.send(pw + "\n")
+                except Exception:
+                    pass
+                try:
+                    with open(log_path, 'a', encoding='utf-8') as log_f:
+                        _relay_remote_channel_to_log(channel, log_f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if _client and remote_run_dir:
+                _remote_remove_path(_client, remote_run_dir)
+        except Exception:
+            pass
+        try:
+            if _client:
+                _client.close()
+        except Exception:
+            pass
+        try:
+            if isinstance(meta, dict):
+                meta['cleanup_done'] = True
+        except Exception:
+            pass
+
     try:
-        if project_name:
-            ps_ids = subprocess.run(
-                ['docker', 'ps', '-aq', '--filter', f"label=com.docker.compose.project={project_name}"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            ids = [x for x in (ps_ids.stdout or '').splitlines() if x.strip()]
-            if ids:
-                subprocess.run(['docker', 'rm', '-f', *ids], capture_output=True, text=True, timeout=20, check=False)
+        threading.Thread(target=_cleanup_remote, daemon=True).start()
     except Exception:
-        pass
+        _cleanup_remote()
 
     # Persist validation status on the item.
     try:
@@ -37663,7 +38068,12 @@ def vuln_catalog_items_test_stop():
             updated = False
             for it in items:
                 if int(it.get('id') or 0) == item_id:
-                    it['validated_ok'] = bool(user_ok)
+                    if user_ok is None:
+                        it['validated_incomplete'] = True
+                        it['validated_ok'] = None
+                    else:
+                        it['validated_incomplete'] = False
+                        it['validated_ok'] = bool(user_ok)
                     it['validated_at'] = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
                     updated = True
                     break
@@ -37676,9 +38086,50 @@ def vuln_catalog_items_test_stop():
     except Exception:
         pass
 
-    meta['done'] = True
-    meta['returncode'] = meta.get('returncode') or 0
+    try:
+        if isinstance(meta, dict):
+            meta['done'] = True
+            meta['returncode'] = meta.get('returncode') or 0
+    except Exception:
+        pass
     return jsonify({'ok': True})
+
+
+@app.route('/vuln_catalog_items/test/stop_active', methods=['POST'])
+def vuln_catalog_items_test_stop_active():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    ok_value = payload.get('ok')
+    user_ok = True if ok_value is True else (False if ok_value is False else None)
+    active_meta = None
+    try:
+        for m in RUNS.values():
+            if isinstance(m, dict) and m.get('kind') == 'vuln_test' and not m.get('done'):
+                active_meta = m
+                break
+    except Exception:
+        active_meta = None
+    if not active_meta:
+        return jsonify({'ok': False, 'error': 'no active test'}), 404
+    return _stop_vuln_test_meta(active_meta, user_ok)
+
+
+@app.route('/vuln_catalog_items/test/status', methods=['POST'])
+def vuln_catalog_items_test_status():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    run_id = str(payload.get('run_id') or '').strip()
+    if not run_id:
+        return jsonify({'ok': False, 'error': 'run_id required'}), 400
+    meta = RUNS.get(run_id)
+    if not isinstance(meta, dict) or meta.get('kind') != 'vuln_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    return jsonify({
+        'ok': True,
+        'done': bool(meta.get('done')),
+        'cleanup_started': bool(meta.get('cleanup_started')),
+        'cleanup_done': bool(meta.get('cleanup_done')),
+    })
 
 
 def _zip_entry_is_symlink(info) -> bool:

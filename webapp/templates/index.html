@@ -18078,15 +18078,6 @@ function ensureVulnModal(){
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
-                    <div id="vulnLoadingWrap" class="mb-3" style="display:none;">
-                        <div class="d-flex align-items-center gap-2 mb-2 text-muted small">
-                            <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
-                            <span id="vulnLoadMeta">Loading eligible items…</span>
-                        </div>
-                        <div class="progress" style="height: 14px;">
-                            <div class="progress-bar" id="vulnLoadProgressBar" role="progressbar" style="width:0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
-                        </div>
-                    </div>
                     <div class="d-flex align-items-start gap-2 mb-2">
                         <div class="flex-grow-1">
                             <input class="form-control" placeholder="Filter (string or /regex/)" id="vulnFilter">
@@ -18095,7 +18086,7 @@ function ensureVulnModal(){
                         <button class="btn btn-outline-secondary" type="button" id="vulnFilterClear" title="Clear filter">Clear</button>
                     </div>
                     <div class="text-muted small mb-2" id="vulnFilterMeta"></div>
-                    <div class="table-responsive" id="vulnTableWrap" style="max-height:50vh; overflow:auto; display:none;">
+                    <div class="table-responsive" id="vulnTableWrap" style="max-height:50vh; overflow:auto;">
                         <table class="table table-sm">
                             <thead class="fw-bold"><tr><th style="width:4rem;">#</th><th>Name</th><th style="width:10rem;">Validated</th><th style="width:10rem;">Actions</th><th style="width:6rem;">Files</th></tr></thead>
                             <tbody id="vulnList"></tbody>
@@ -18117,18 +18108,18 @@ function ensureVulnPickerTestModal(){
         modal.id = 'vulnPickerTestModal';
         modal.setAttribute('tabindex', '-1');
         modal.innerHTML = `
-        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable" style="max-width: 900px;">
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title" id="vulnPickerTestTitle">Test Vulnerability</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
                     <div class="small text-muted mb-2" id="vulnPickerTestStatus">Starting…</div>
-                    <pre class="small bg-light p-2" id="vulnPickerTestLog" style="max-height:260px; overflow:auto;"></pre>
+                    <pre class="small bg-light p-2" id="vulnPickerTestLog" style="max-height:520px; overflow:auto; white-space: pre-wrap;"></pre>
                 </div>
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-outline-secondary" id="vulnPickerTestCloseBtn" data-bs-dismiss="modal">Cancel</button>
+                    <span class="text-muted small d-none" id="vulnPickerTestStoppingLabel"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Stopping, please wait...</span>
                     <button type="button" class="btn btn-outline-success" id="vulnPickerTestStopOkBtn" style="display:none;">Stop (Success)</button>
                     <button type="button" class="btn btn-outline-danger" id="vulnPickerTestStopFailBtn" style="display:none;">Stop (Fail)</button>
                 </div>
@@ -18252,9 +18243,6 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
     const filterError = modalEl.querySelector('#vulnFilterError');
     const tbody = modalEl.querySelector('#vulnList');
     const tblWrap = modalEl.querySelector('#vulnTableWrap');
-    const loadWrap = modalEl.querySelector('#vulnLoadingWrap');
-    const loadBar = modalEl.querySelector('#vulnLoadProgressBar');
-    const loadMeta = modalEl.querySelector('#vulnLoadMeta');
     // Base: docker-compose only
     const all = (window.VULN_CATALOG?.items || []);
     const base = all.filter(it => (it.Type||'').toLowerCase() === 'docker-compose');
@@ -18282,56 +18270,48 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
         return data;
     };
 
-    const setProgress = (pct, label) => {
+    const isNearBottom = (el, thresholdPx = 24) => {
         try {
-            const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-            if (loadBar) {
-                loadBar.style.width = clamped.toFixed(0) + '%';
-                loadBar.setAttribute('aria-valuenow', String(clamped));
-                loadBar.textContent = clamped.toFixed(0) + '%';
-            }
-            if (loadMeta && label) loadMeta.textContent = label;
-        } catch (e) {}
+            return (el.scrollTop + el.clientHeight) >= (el.scrollHeight - thresholdPx);
+        } catch (e) {
+            return true;
+        }
     };
 
-    const fetchStatuses = async (items, phaseLabel = 'Checking images…') => {
-        const list = Array.isArray(items) ? items : [];
-        if (!list.length) return;
-        const chunkSize = 25;
-        const total = list.length;
-        let done = 0;
-        for (let i = 0; i < total; i += chunkSize) {
-            const chunk = list.slice(i, i + chunkSize);
-            setProgress(total ? (done / total) * 100 : 0, `${phaseLabel} (${Math.min(done + chunk.length, total)}/${total})`);
-            let payload = null;
-            try {
-                const res = await fetch('/vuln_compose/status_images', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    credentials: 'same-origin',
-                    body: JSON.stringify({
-                        items: chunk.map(it => ({
-                            Name: it.Name,
-                            Path: it.Path,
-                            compose: it.compose || 'docker-compose.yml',
-                        }))
-                    }),
-                });
-                payload = res.ok ? await res.json().catch(() => null) : null;
-            } catch (e) {
-                payload = null;
-            }
-            const got = payload && Array.isArray(payload.items) ? payload.items : [];
-            got.forEach(st => {
-                try {
-                    const key = String((st && (st.Path || st.Name)) || '');
-                    if (key) statusByKey.set(key, st);
-                } catch (e) {}
-            });
-            done += chunk.length;
+    const _pickerLogBuffers = new Map();
+    const _pickerLogScheduled = new Set();
+    const _PICKER_MAX_LOG_CHARS = 200000;
+
+    const _flushPickerLog = (el) => {
+        if (!el) return;
+        const id = el.id || '__picker__';
+        const buf = _pickerLogBuffers.get(id) || [];
+        if (!buf.length) return;
+        const stick = isNearBottom(el, 24);
+        const cur = el.textContent || '';
+        const next = cur ? (cur + '\n' + buf.join('\n')) : buf.join('\n');
+        el.textContent = next.length > _PICKER_MAX_LOG_CHARS ? next.slice(-_PICKER_MAX_LOG_CHARS) : next;
+        _pickerLogBuffers.set(id, []);
+        if (stick) {
+            try { el.scrollTop = el.scrollHeight; } catch (e) {}
         }
-        setProgress(100, 'Done');
     };
+
+    const appendPickerLog = (el, line) => {
+        if (!el) return;
+        const id = el.id || '__picker__';
+        const buf = _pickerLogBuffers.get(id) || [];
+        buf.push(String(line || ''));
+        _pickerLogBuffers.set(id, buf);
+        if (!_pickerLogScheduled.has(id)) {
+            _pickerLogScheduled.add(id);
+            requestAnimationFrame(() => {
+                _pickerLogScheduled.delete(id);
+                _flushPickerLog(el);
+            });
+        }
+    };
+
 
     // Show modal and kick off status check
     let eligible = base;
@@ -18369,44 +18349,12 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
         if (modalObj) modalObj.show();
     } catch(e){}
     try {
-        if (tblWrap) tblWrap.style.display = 'none';
-        if (loadWrap) loadWrap.style.display = '';
-        setProgress(0, 'Checking downloaded/pulled status…');
-    } catch (e) {}
-    try {
-        await fetchStatuses(eligible, 'Checking images…');
-    } catch (e) {}
-    try {
-        if (loadWrap) loadWrap.style.display = 'none';
         if (tblWrap) tblWrap.style.display = '';
     } catch (e) {}
 
     const statusBadgeHtml = (st) => {
         try {
-            if (!st) return '<span class="badge text-bg-secondary">Unknown</span>';
-            if (st.docker_available === false) return '<span class="badge text-bg-secondary" title="Docker not available">No docker</span>';
-            if (!st.exists) return '<span class="badge text-bg-warning" title="Compose not downloaded">Not downloaded</span>';
-            if (!st.pulled) {
-                const missingList = Array.isArray(st.missing_images)
-                    ? st.missing_images.map(x => String(x || '').trim()).filter(Boolean)
-                    : [];
-                const missing = missingList.length;
-                const escAttr = (value) => (value ?? '').toString()
-                    .replace(/&/g,'&amp;')
-                    .replace(/</g,'&lt;')
-                    .replace(/>/g,'&gt;')
-                    .replace(/"/g,'&quot;')
-                    .replace(/'/g,'&#39;')
-                    .replace(/\n/g, '&#10;');
-                const maxShow = 8;
-                const shown = missingList.slice(0, maxShow);
-                const more = missingList.length > maxShow ? `\n…and ${missingList.length - maxShow} more` : '';
-                const title = missingList.length
-                    ? `Missing images:\n${shown.join('\n')}${more}`
-                    : 'Missing images';
-                return `<span class="badge text-bg-warning" title="${escAttr(title)}">Missing ${missing}</span>`;
-            }
-            return '<span class="badge text-bg-success">Ready</span>';
+            return '<span class="badge text-bg-info">Remote</span>';
         } catch (e) {
             return '<span class="badge text-bg-secondary">Unknown</span>';
         }
@@ -18415,6 +18363,9 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
     const validationBadgeHtml = (it) => {
         try {
             if (!it || typeof it !== 'object') return '<span class="text-muted">—</span>';
+            if (it.validated_incomplete === true) {
+                return `<span class="badge text-bg-secondary">Incomplete</span>`;
+            }
             if (it.validated_ok === true) {
                 return `<span class="badge text-bg-success">Validated</span>`;
             }
@@ -18429,11 +18380,10 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
 
     const isPickable = (st) => {
         try {
-            if (!st) return false;
-            if (st.docker_available === false) return false;
-            return !!(st.exists && st.pulled);
+            if (skipLocalImageStatus) return true;
+            return true;
         } catch (e) {
-            return false;
+            return true;
         }
     };
 
@@ -18647,17 +18597,66 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
                             const statusEl = document.getElementById('vulnPickerTestStatus');
                             const stopOkBtn = document.getElementById('vulnPickerTestStopOkBtn');
                             const stopFailBtn = document.getElementById('vulnPickerTestStopFailBtn');
+                            const closeBtn = document.getElementById('vulnPickerTestCloseBtn');
+                            const stoppingLabel = document.getElementById('vulnPickerTestStoppingLabel');
                             const runBtn = btn;
+                            if (pickerTestRunId) {
+                                try { if (logEl) appendPickerLog(logEl, '[ui] A test is already running. Stop it before starting another.'); } catch (e) {}
+                                return;
+                            }
                             if (titleEl) titleEl.textContent = `Test Vulnerability: ${it.Name || ''}`;
                             if (logEl) logEl.textContent = '';
                             if (statusEl) statusEl.textContent = 'Starting…';
                             if (stopOkBtn) stopOkBtn.style.display = 'none';
                             if (stopFailBtn) stopFailBtn.style.display = 'none';
                             if (runBtn) runBtn.disabled = true;
-                            const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl)) : null;
+                            const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl, { backdrop: 'static', keyboard: false })) : null;
                             try { modalObj?.show(); } catch (e) {}
 
-                            const data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id });
+                            const coreCfg = (() => {
+                                try {
+                                    const sc = state?.scenarios?.[activeIdx];
+                                    const core = sc?.hitl?.core;
+                                    return core && typeof core === 'object' ? core : null;
+                                } catch (e) {
+                                    return null;
+                                }
+                            })();
+                            if (!coreCfg) {
+                                throw new Error('CORE VM not configured (see VM / Access).');
+                            }
+                            let data = null;
+                            try {
+                                data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg });
+                            } catch (e) {
+                                const msg = String(e || '');
+                                if (msg.includes('Another vulnerability test is already running')) {
+                                    const shouldStop = window.confirm('Another vulnerability test is already running. Stop it and start a new test?');
+                                    if (!shouldStop) throw e;
+                                    await postJson('/vuln_catalog_items/test/stop_active', { ok: null });
+                                    await new Promise(r => setTimeout(r, 600));
+                                    data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg });
+                                } else {
+                                    throw e;
+                                }
+                            }
+                            if (data && data.replace_required) {
+                                const imgs = Array.isArray(data.existing_images) ? data.existing_images : [];
+                                const containers = Array.isArray(data.existing_containers) ? data.existing_containers : [];
+                                const msg = [
+                                    'A matching image/container already exists on the CORE VM.',
+                                    imgs.length ? `Images: ${imgs.join(', ')}` : null,
+                                    containers.length ? `Containers: ${containers.join(', ')}` : null,
+                                    'Replace them and continue?'
+                                ].filter(Boolean).join('\n');
+                                const shouldReplace = window.confirm(msg);
+                                if (!shouldReplace) {
+                                    try { if (logEl) appendPickerLog(logEl, '[ui] Replace cancelled by user.'); } catch (e) {}
+                                    if (closeBtn) closeBtn.style.display = '';
+                                    return;
+                                }
+                                data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg, force_replace: true });
+                            }
                             if (!data || data.ok !== true || !data.run_id) {
                                 throw new Error((data && data.error) ? data.error : 'Failed to start test');
                             }
@@ -18667,6 +18666,7 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
                             if (stopFailBtn) stopFailBtn.style.display = '';
                             if (stopOkBtn) stopOkBtn.disabled = false;
                             if (stopFailBtn) stopFailBtn.disabled = false;
+                            if (closeBtn) closeBtn.style.display = 'none';
 
                             if (pickerTestStream) {
                                 try { pickerTestStream.close(); } catch (e) {}
@@ -18674,41 +18674,109 @@ async function openVulnPicker(sidx, secName, iidx, options = {}){
                             pickerTestStream = new EventSource('/stream/' + encodeURIComponent(pickerTestRunId));
                             pickerTestStream.onmessage = (ev) => {
                                 if (logEl && ev && typeof ev.data === 'string') {
-                                    logEl.textContent += ev.data + '\n';
-                                    logEl.scrollTop = logEl.scrollHeight;
+                                    const line = ev.data;
+                                    appendPickerLog(logEl, line);
+                                    try {
+                                        if (line.startsWith('[remote] uploading')) {
+                                            if (statusEl) statusEl.textContent = 'Uploading files…';
+                                        } else if (line.startsWith('[upload] ')) {
+                                            const m = line.match(/\((\d+)%\)/);
+                                            if (m && m[1] && statusEl) {
+                                                statusEl.textContent = `Uploading files… (${m[1]}%)`;
+                                            }
+                                        } else if (line.startsWith('[remote] compose:')) {
+                                            if (statusEl) statusEl.textContent = 'Starting docker compose…';
+                                        } else if (line.startsWith('[remote] docker compose up')) {
+                                            if (statusEl) statusEl.textContent = 'Running docker compose…';
+                                        }
+                                    } catch (e) {}
                                 }
                             };
                             pickerTestStream.addEventListener('end', () => {
                                 try { pickerTestStream.close(); } catch (e) {}
                             });
 
+                            let stopInFlight = false;
                             const stopHandler = async (ok) => {
-                                if (!pickerTestRunId) return;
-                                try { if (statusEl) statusEl.textContent = 'Stopping…'; } catch (e) {}
-                                if (stopOkBtn) stopOkBtn.disabled = true;
-                                if (stopFailBtn) stopFailBtn.disabled = true;
-                                await postJson('/vuln_catalog_items/test/stop', { run_id: pickerTestRunId, ok: !!ok });
-                                try { pickerTestStream?.close(); } catch (e) {}
-                                pickerTestStream = null;
-                                pickerTestRunId = null;
-                                if (statusEl) statusEl.textContent = ok ? 'Stopped (Success)' : 'Stopped (Fail)';
-                                if (stopOkBtn) stopOkBtn.style.display = 'none';
-                                if (stopFailBtn) stopFailBtn.style.display = 'none';
-                                try { await setupVulnCatalog(); } catch (e) {}
+                                if (stopInFlight) return;
+                                if (!pickerTestRunId) {
+                                    try { if (logEl) appendPickerLog(logEl, '[ui] No active test to stop.'); } catch (e) {}
+                                    return;
+                                }
+                                stopInFlight = true;
                                 try {
-                                    eligible = (window.VULN_CATALOG?.items || []).filter(it2 => (it2.Type||'').toLowerCase() === 'docker-compose');
-                                    current = eligible;
-                                    applyFilter();
-                                } catch (e) {}
+                                    try { if (statusEl) statusEl.textContent = 'Stopping…'; } catch (e) {}
+                                    if (stopOkBtn) stopOkBtn.disabled = true;
+                                    if (stopFailBtn) stopFailBtn.disabled = true;
+                                    if (stoppingLabel) stoppingLabel.classList.remove('d-none');
+                                    if (closeBtn) closeBtn.style.display = 'none';
+                                    try {
+                                        setTimeout(() => {
+                                            try {
+                                                if (stoppingLabel && !stoppingLabel.classList.contains('d-none')) {
+                                                    try { appendPickerLog(logEl, '[ui] Stop timed out after 10s; cleanup may not have completed.'); } catch (e) {}
+                                                    if (closeBtn) { closeBtn.textContent = 'Close'; closeBtn.style.display = ''; }
+                                                    const modalObj = (window.bootstrap && modalEl) ? bootstrap.Modal.getInstance(modalEl) : null;
+                                                    try { modalObj?.hide(); } catch (e) {}
+                                                }
+                                            } catch (e) {}
+                                        }, 30000);
+                                    } catch (e) {}
+                                    const isIncomplete = (ok === null || ok === undefined);
+                                    try { if (logEl) appendPickerLog(logEl, '[stop] User requested stop'); } catch (e) {}
+                                    await postJson('/vuln_catalog_items/test/stop', { run_id: pickerTestRunId, ok: (isIncomplete ? null : !!ok) });
+                                    try { pickerTestStream?.close(); } catch (e) {}
+                                    pickerTestStream = null;
+                                    const finishedRunId = pickerTestRunId;
+                                    pickerTestRunId = null;
+                                    if (statusEl) statusEl.textContent = isIncomplete ? 'Stopped (Incomplete)' : (ok ? 'Stopped (Success)' : 'Stopped (Fail)');
+                                    if (stopOkBtn) stopOkBtn.style.display = 'none';
+                                    if (stopFailBtn) stopFailBtn.style.display = 'none';
+                                    if (closeBtn) { closeBtn.style.display = 'none'; closeBtn.textContent = 'Cancel'; }
+                                    if (stoppingLabel) stoppingLabel.classList.remove('d-none');
+                                    try {
+                                        const poll = async () => {
+                                            const st = await postJson('/vuln_catalog_items/test/status', { run_id: finishedRunId });
+                                            if (st && st.cleanup_done) {
+                                                if (closeBtn) closeBtn.textContent = 'Close';
+                                                if (stoppingLabel) stoppingLabel.classList.add('d-none');
+                                                if (closeBtn) closeBtn.style.display = '';
+                                                return;
+                                            }
+                                            setTimeout(poll, 1000);
+                                        };
+                                        setTimeout(poll, 500);
+                                    } catch (e) {}
+                                    try { await setupVulnCatalog(); } catch (e) {}
+                                    try {
+                                        eligible = (window.VULN_CATALOG?.items || []).filter(it2 => (it2.Type||'').toLowerCase() === 'docker-compose');
+                                        current = eligible;
+                                        applyFilter();
+                                    } catch (e) {}
+                                } finally {
+                                    stopInFlight = false;
+                                }
                             };
 
                             if (stopOkBtn) stopOkBtn.onclick = () => stopHandler(true);
                             if (stopFailBtn) stopFailBtn.onclick = () => stopHandler(false);
+
+                            try {
+                                if (modalEl) {
+                                    modalEl.addEventListener('hidden.bs.modal', () => {
+                                        if (pickerTestRunId) stopHandler(null);
+                                    }, { once: true });
+                                }
+                            } catch (e) {}
                         } catch (e) {
                             console.warn('Test failed', e);
                             try {
                                 const logEl = document.getElementById('vulnPickerTestLog');
                                 if (logEl) logEl.textContent += `[ui] ERROR: ${e}\n`;
+                            } catch (e2) {}
+                            try {
+                                const closeBtn = document.getElementById('vulnPickerTestCloseBtn');
+                                if (closeBtn) closeBtn.style.display = '';
                             } catch (e2) {}
                         } finally {
                             try { btn.disabled = false; } catch (e) {}
