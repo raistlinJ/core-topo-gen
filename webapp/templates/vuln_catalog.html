@@ -250,7 +250,7 @@
         </div>
         <div class="form-check">
           <input class="form-check-input" type="checkbox" id="vulnTestCredsSave" checked>
-          <label class="form-check-label" for="vulnTestCredsSave">Save creds</label>
+          <label class="form-check-label" for="vulnTestCredsSave">Save Credentials</label>
         </div>
       </div>
       <div class="modal-footer">
@@ -648,7 +648,10 @@
       if (st) st.style.display = 'none';
       _setText('vulnTestStatusText', 'Working…');
       const btn = _qs('vulnTestRunBtn');
-      if (btn) btn.disabled = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.style.display = '';
+      }
     } catch (e) {}
     const modal = new bootstrap.Modal(_qs('vulnTestModal'), { backdrop: 'static', keyboard: false });
     modal.show();
@@ -661,8 +664,12 @@
       _appendLog('vulnTestLog', '[ui] A test is already running. Stop it before starting another.');
       return;
     }
+    let started = false;
     const btn = _qs('vulnTestRunBtn');
-    if (btn) btn.disabled = true;
+    if (btn) {
+      btn.disabled = true;
+      btn.style.display = 'none';
+    }
     const stopOkBtn = _qs('vulnTestStopOkBtn');
     const stopFailBtn = _qs('vulnTestStopFailBtn');
     const closeBtn = _qs('vulnTestCloseBtn');
@@ -730,6 +737,8 @@
       }
       const runId = String(data.run_id);
       _vulnCatalogState.activeTestRunId = runId;
+      started = true;
+      if (btn) btn.style.display = 'none';
       if (stopOkBtn) stopOkBtn.style.display = '';
       if (stopFailBtn) stopFailBtn.style.display = '';
       if (closeBtn) closeBtn.style.display = 'none';
@@ -787,7 +796,12 @@
         if (st) st.style.display = 'none';
         _setText('vulnTestStatusText', 'Working…');
       } catch (e) {}
-      if (btn) btn.disabled = false;
+      if (btn) {
+        if (!started && !_vulnCatalogState.activeTestRunId) {
+          btn.disabled = false;
+          btn.style.display = '';
+        }
+      }
     }
   }
 
@@ -861,6 +875,7 @@
     }
     const isIncomplete = (ok === null || ok === undefined);
     _vulnStopInFlight = true;
+    let cleanupPending = false;
     const btn = _qs('vulnTestRunBtn');
     if (btn) btn.disabled = true;
     const stopOkBtn = _qs('vulnTestStopOkBtn');
@@ -879,6 +894,7 @@
         try {
           if (stoppingLabel && !stoppingLabel.classList.contains('d-none')) {
             _appendLog('vulnTestLog', '[ui] Stop timed out after 10s; cleanup may not have completed.');
+            cleanupPending = false;
             if (closeBtn) { closeBtn.textContent = 'Close'; closeBtn.style.display = ''; }
             const modalEl = _qs('vulnTestModal');
             const modalObj = (window.bootstrap && modalEl) ? bootstrap.Modal.getInstance(modalEl) : null;
@@ -889,6 +905,7 @@
     } catch (e) {}
     try {
       await _postJson('/vuln_catalog_items/test/stop', { run_id: runId, ok: (isIncomplete ? null : !!ok) });
+      cleanupPending = true;
       try {
         const res = _qs('vulnTestResult');
         if (res) {
@@ -906,6 +923,7 @@
         const poll = async () => {
           const st = await _postJson('/vuln_catalog_items/test/status', { run_id: runId });
           if (st && st.cleanup_done) {
+            cleanupPending = false;
             if (closeBtn) closeBtn.textContent = 'Close';
             if (stoppingLabel) stoppingLabel.classList.add('d-none');
             if (closeBtn) closeBtn.style.display = '';
@@ -917,7 +935,12 @@
       } catch (e) {}
       try { await loadVulnCatalogItems(); } catch (e) {}
     } catch (e) {
-      _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+      const msg = String(e || '');
+      if (msg.toLowerCase().includes('not found')) {
+        _appendLog('vulnTestLog', '[ui] Stop already completed.');
+      } else {
+        _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+      }
     } finally {
       try {
         if (_vulnCatalogState.activeTestStream) _vulnCatalogState.activeTestStream.close();
@@ -926,9 +949,11 @@
       _vulnCatalogState.activeTestRunId = null;
       if (stopOkBtn) { stopOkBtn.style.display = 'none'; stopOkBtn.disabled = false; }
       if (stopFailBtn) { stopFailBtn.style.display = 'none'; stopFailBtn.disabled = false; }
-      if (closeBtn) closeBtn.style.display = '';
-      if (stoppingLabel) stoppingLabel.classList.add('d-none');
-      if (btn) btn.disabled = false;
+      if (!cleanupPending) {
+        if (closeBtn) closeBtn.style.display = '';
+        if (stoppingLabel) stoppingLabel.classList.add('d-none');
+        if (btn) { btn.disabled = false; btn.style.display = ''; }
+      }
       try {
         const st = _qs('vulnTestStatus');
         if (st) st.style.display = 'none';
