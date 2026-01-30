@@ -2659,27 +2659,27 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
 			except Exception:
 				pass
-				# Inject allowlisted files into the target container (copy by default).
-				try:
-					inject_files = rec.get('InjectFiles') or rec.get('inject_files')
-					source_dir = str(rec.get('InjectSourceDir') or rec.get('ArtifactsDir') or '').strip()
-					outputs_manifest = str(rec.get('OutputsManifest') or '')
-					if not outputs_manifest:
-						# best-effort: look for outputs.json in run dir
-						run_dir = str(rec.get('RunDir') or '').strip()
-						cand = os.path.join(run_dir, 'outputs.json') if run_dir else ''
-						if cand and os.path.exists(cand):
-							outputs_manifest = cand
-					if isinstance(inject_files, list) and inject_files and source_dir:
-						obj = _inject_copy_for_inject_files(
-							obj,
-							inject_files=[str(x) for x in inject_files if x is not None],
-							source_dir=source_dir,
-							outputs_manifest=outputs_manifest,
-							prefer_service=prefer,
-						)
-				except Exception:
-					pass
+			# Inject allowlisted files into the target container (copy by default).
+			try:
+				inject_files = rec.get('InjectFiles') or rec.get('inject_files')
+				source_dir = str(rec.get('InjectSourceDir') or rec.get('ArtifactsDir') or '').strip()
+				outputs_manifest = str(rec.get('OutputsManifest') or '')
+				if not outputs_manifest:
+					# best-effort: look for outputs.json in run dir
+					run_dir = str(rec.get('RunDir') or '').strip()
+					cand = os.path.join(run_dir, 'outputs.json') if run_dir else ''
+					if cand and os.path.exists(cand):
+						outputs_manifest = cand
+				if isinstance(inject_files, list) and inject_files and source_dir:
+					obj = _inject_copy_for_inject_files(
+						obj,
+						inject_files=[str(x) for x in inject_files if x is not None],
+						source_dir=source_dir,
+						outputs_manifest=outputs_manifest,
+						prefer_service=prefer,
+					)
+			except Exception:
+				pass
 			# Optional overlays for traffic/segmentation nodes (kept out of baseline template).
 			try:
 				def _truthy(val: object) -> bool:

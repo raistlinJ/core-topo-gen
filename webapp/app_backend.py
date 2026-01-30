@@ -25224,7 +25224,17 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
         except Exception:
             return None
 
-    for node in root.findall('.//node'):
+    candidates = []
+    try:
+        candidates.extend(root.findall('.//node'))
+    except Exception:
+        pass
+    try:
+        candidates.extend(root.findall('.//device'))
+    except Exception:
+        pass
+
+    for node in candidates:
         nid = _norm_id(node.get('id') or node.findtext('id'))
         if nid is None:
             continue
@@ -29804,6 +29814,228 @@ def _append_async_run_log_line(meta: Dict[str, Any] | None, line: str) -> None:
         pass
 
 
+def _session_docker_nodes_from_xml(session_xml_path: str) -> List[str]:
+    names: List[str] = []
+    if not session_xml_path or not os.path.exists(session_xml_path):
+        return names
+    try:
+        import xml.etree.ElementTree as _ET
+        root = _ET.parse(session_xml_path).getroot()
+    except Exception:
+        return names
+    candidates = []
+    try:
+        candidates.extend(root.findall('.//node'))
+    except Exception:
+        pass
+    try:
+        candidates.extend(root.findall('.//device'))
+    except Exception:
+        pass
+    for node in candidates:
+        try:
+            ntype = (node.get('type') or node.get('model') or '').strip().lower()
+        except Exception:
+            ntype = ''
+        if ntype not in ('docker', 'docker-compose', 'docker_node', 'docker-node') and 'docker' not in ntype:
+            continue
+        nm = (node.get('name') or node.findtext('name') or '').strip()
+        if nm:
+            names.append(nm)
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    out: List[str] = []
+    for n in names:
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+def _remote_docker_injects_status_script(
+    *,
+    containers: List[str],
+    sudo_password: str | None = None,
+    inject_dirs: List[str] | None = None,
+    max_find: int = 200,
+) -> str:
+    containers_literal = json.dumps([str(x) for x in (containers or [])])
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    max_find_literal = json.dumps(int(max_find))
+    inject_dirs_literal = json.dumps([str(d) for d in (inject_dirs or ['/flow_injects', '/flow_artifacts'])])
+    return (
+        r"""
+import json, subprocess
+
+CONTAINERS = __CONTAINERS_LITERAL__
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+MAX_FIND = __MAX_FIND_LITERAL__
+INJECT_DIRS = __INJECT_DIRS_LITERAL__
+
+
+def _run(cmd, timeout=30):
+    try:
+        p = subprocess.run(['sudo', '-n'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', ''] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 127, stdout=str(e))
+
+
+def main():
+    items = []
+    for c in CONTAINERS:
+        c = str(c or '').strip()
+        if not c:
+            continue
+        exists = False
+        running = False
+        try:
+            p = _run(['docker', 'inspect', '--format', '{{.State.Running}}', c], timeout=20)
+            if p.returncode == 0:
+                exists = True
+                running = (str(p.stdout or '').strip().lower() == 'true')
+        except Exception:
+            exists = False
+            running = False
+        inject_count = 0
+        inject_samples = []
+        inject_dirs_found = []
+        if exists:
+            for d in INJECT_DIRS:
+                if not d:
+                    continue
+                shell = (
+                    'set -e; '
+                    f"if [ -d {d} ]; then "
+                    f"find {d} -maxdepth 4 -type f -print 2>/dev/null | head -n {MAX_FIND}; "
+                    f"fi; "
+                )
+                p2 = _run(['docker', 'exec', c, 'sh', '-lc', shell], timeout=25)
+                out = (p2.stdout or '').strip()
+                if out:
+                    lines = [ln for ln in out.splitlines() if ln.strip()]
+                    if lines:
+                        inject_dirs_found.append(d)
+                        inject_samples = (inject_samples + lines)[:5]
+                        inject_count += len(lines)
+        items.append({
+            'container': c,
+            'exists': exists,
+            'running': running,
+            'inject_count': inject_count,
+            'inject_samples': inject_samples,
+            'inject_dirs_found': inject_dirs_found,
+        })
+    print(json.dumps({'ok': True, 'items': items}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__CONTAINERS_LITERAL__', containers_literal) \
+     .replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal) \
+     .replace('__MAX_FIND_LITERAL__', max_find_literal) \
+     .replace('__INJECT_DIRS_LITERAL__', inject_dirs_literal)
+
+
+def _validate_session_nodes_and_injects(
+    *,
+    scenario_xml_path: str | None,
+    session_xml_path: str | None,
+    core_cfg: Dict[str, Any] | None,
+    scenario_label: str | None = None,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        'ok': True,
+        'missing_nodes': [],
+        'extra_nodes': [],
+        'missing_node_ids': [],
+        'extra_node_ids': [],
+        'docker_nodes': [],
+        'docker_missing': [],
+        'docker_not_running': [],
+        'injects_missing': [],
+    }
+    if not scenario_xml_path or not session_xml_path:
+        summary['ok'] = False
+        summary['error'] = 'missing scenario or session xml'
+        return summary
+
+    try:
+        expected = _expected_from_plan_preview(scenario_xml_path, scenario_label)
+        actual = _parse_session_xml_for_compare(session_xml_path)
+        expected_ids = set(expected.keys())
+        actual_ids = set(actual.keys())
+        missing_ids = sorted(expected_ids - actual_ids)
+        extra_ids = sorted(actual_ids - expected_ids)
+        summary['missing_node_ids'] = missing_ids
+        summary['extra_node_ids'] = extra_ids
+        missing_names = []
+        for nid in missing_ids:
+            exp = expected.get(nid) or {}
+            nm = (exp.get('name') or '').strip()
+            missing_names.append(nm or f"node-{nid}")
+        extra_names = []
+        for nid in extra_ids:
+            act = actual.get(nid) or {}
+            nm = (act.get('name') or '').strip()
+            extra_names.append(nm or f"node-{nid}")
+        summary['missing_nodes'] = missing_names
+        summary['extra_nodes'] = extra_names
+    except Exception:
+        pass
+
+    docker_nodes = _session_docker_nodes_from_xml(session_xml_path)
+    summary['docker_nodes'] = docker_nodes
+    if docker_nodes and isinstance(core_cfg, dict):
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_injects_status_script(
+                    containers=docker_nodes,
+                    sudo_password=core_cfg.get('ssh_password'),
+                    inject_dirs=['/flow_injects', '/flow_artifacts'],
+                ),
+                logger=app.logger,
+                label='docker.exec.injects_status',
+                timeout=120.0,
+            )
+            items = payload.get('items') if isinstance(payload, dict) else None
+            if isinstance(items, list):
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    name = str(it.get('container') or '').strip()
+                    if not name:
+                        continue
+                    if not it.get('exists'):
+                        summary['docker_missing'].append(name)
+                        continue
+                    if not it.get('running'):
+                        summary['docker_not_running'].append(name)
+                    if int(it.get('inject_count') or 0) <= 0:
+                        summary['injects_missing'].append(name)
+        except Exception as exc:
+            summary['ok'] = False
+            summary['error'] = f'failed docker injects validation: {exc}'
+
+    if summary['missing_nodes'] or summary['docker_missing'] or summary['docker_not_running'] or summary['injects_missing']:
+        summary['ok'] = False
+    return summary
+
+
 def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, stage: str, log_prefix: str = '[remote] ') -> None:
     if not meta:
         return
@@ -32217,6 +32449,11 @@ def run_cli_async():
                 if post_saved:
                     meta['post_xml_path'] = post_saved
                     app.logger.debug("[async-finalizer] Post-run session XML saved to %s", post_saved)
+                else:
+                    try:
+                        _append_async_run_log_line(meta, "[validate] WARNING: post-run session XML missing; skipping validation")
+                    except Exception:
+                        pass
                 try:
                     _append_session_scenario_discrepancies(
                         report_md,
@@ -32224,6 +32461,29 @@ def run_cli_async():
                         post_saved,
                         scenario_label=scenario_label,
                     )
+                except Exception:
+                    pass
+                try:
+                    _append_async_run_log_line(meta, "[validate] Starting session validation")
+                    validation = _validate_session_nodes_and_injects(
+                        scenario_xml_path=xml_path_local,
+                        session_xml_path=post_saved,
+                        core_cfg=meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None,
+                        scenario_label=scenario_label,
+                    )
+                    meta['validation_summary'] = validation
+                    _append_async_run_log_line(meta, "[validate] VALIDATION_SUMMARY_JSON: " + json.dumps(validation))
+                    if validation.get('ok'):
+                        _append_async_run_log_line(meta, "[validate] Nodes created; containers running; injects present.")
+                    else:
+                        _append_async_run_log_line(
+                            meta,
+                            "[validate] WARNING: issues detected: "
+                            f"missing_nodes={len(validation.get('missing_nodes') or [])}, "
+                            f"docker_missing={len(validation.get('docker_missing') or [])}, "
+                            f"docker_not_running={len(validation.get('docker_not_running') or [])}, "
+                            f"injects_missing={len(validation.get('injects_missing') or [])}"
+                        )
                 except Exception:
                     pass
                 # Build single-scenario XML, then a Full Scenario bundle including scripts
@@ -32391,6 +32651,11 @@ def run_status(run_id: str):
                     if post_saved:
                         meta['post_xml_path'] = post_saved
                         app.logger.debug("[async] Post-run session XML saved to %s", post_saved)
+                    else:
+                        try:
+                            _append_async_run_log_line(meta, "[validate] WARNING: post-run session XML missing; skipping validation")
+                        except Exception:
+                            pass
                     try:
                         _append_session_scenario_discrepancies(
                             report_md,
@@ -32398,6 +32663,29 @@ def run_status(run_id: str):
                             post_saved,
                             scenario_label=scenario_label,
                         )
+                    except Exception:
+                        pass
+                    try:
+                        _append_async_run_log_line(meta, "[validate] Starting session validation")
+                        validation = _validate_session_nodes_and_injects(
+                            scenario_xml_path=xml_path_local,
+                            session_xml_path=post_saved,
+                            core_cfg=meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None,
+                            scenario_label=scenario_label,
+                        )
+                        meta['validation_summary'] = validation
+                        _append_async_run_log_line(meta, "[validate] VALIDATION_SUMMARY_JSON: " + json.dumps(validation))
+                        if validation.get('ok'):
+                            _append_async_run_log_line(meta, "[validate] Nodes created; containers running; injects present.")
+                        else:
+                            _append_async_run_log_line(
+                                meta,
+                                "[validate] WARNING: issues detected: "
+                                f"missing_nodes={len(validation.get('missing_nodes') or [])}, "
+                                f"docker_missing={len(validation.get('docker_missing') or [])}, "
+                                f"docker_not_running={len(validation.get('docker_not_running') or [])}, "
+                                f"injects_missing={len(validation.get('injects_missing') or [])}"
+                            )
                     except Exception:
                         pass
                     # Build single-scenario XML, then a Full Scenario bundle including scripts
@@ -32484,10 +32772,37 @@ def run_status(run_id: str):
         summary_json = None
     if summary_json:
         meta['summary_path'] = summary_json
+    if meta.get('done') and not meta.get('validation_summary'):
+        try:
+            scenario_label = meta.get('scenario_name')
+            if not scenario_label:
+                try:
+                    sns = meta.get('scenario_names') or []
+                    if isinstance(sns, list) and sns:
+                        scenario_label = sns[0]
+                except Exception:
+                    scenario_label = None
+            post_xml = meta.get('post_xml_path')
+            if post_xml and os.path.exists(post_xml):
+                validation = _validate_session_nodes_and_injects(
+                    scenario_xml_path=xml_path,
+                    session_xml_path=post_xml,
+                    core_cfg=meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None,
+                    scenario_label=scenario_label,
+                )
+                meta['validation_summary'] = validation
+            else:
+                meta['validation_summary'] = {
+                    'ok': False,
+                    'error': 'post-run session XML missing; validation skipped',
+                }
+        except Exception:
+            pass
     return jsonify({
         'done': bool(meta.get('done')),
         'returncode': meta.get('returncode'),
         'docker_conflicts': docker_conflicts,
+        'validation_summary': meta.get('validation_summary'),
         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
         'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
         'xml_path': (meta.get('post_xml_path') if meta.get('post_xml_path') and os.path.exists(meta.get('post_xml_path')) else None),

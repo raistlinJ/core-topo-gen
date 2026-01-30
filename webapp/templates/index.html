@@ -740,6 +740,27 @@
         </div>
     </div>
 </div>
+<!-- Execute Summary Modal -->
+<div class="modal fade" id="executeSummaryModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Execute Summary</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="d-flex align-items-center justify-content-between gap-2 mb-2">
+                    <div class="small text-muted" id="executeSummaryStatus">Summary pending.</div>
+                </div>
+                <ul class="list-group" id="executeSummaryList"></ul>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-execute-summary-copy="1">Copy summary</button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
 <!-- Full Preview Modal -->
 <div class="modal fade" id="fullPreviewModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-fullscreen-lg-down modal-xl modal-dialog-scrollable">
@@ -5168,17 +5189,8 @@ function setupPreviewModalExecute(modalEl, modalInstance){
                 },
                 onComplete: (data) => {
                     if(data?.returncode === 0){
-                        completeExecuteProgressPanel(true, 'Scenario started', 'Redirecting to reports…');
-                        try {
-                            setTimeout(()=>{
-                                if(executeConfirmModalEl && window.bootstrap){
-                                    bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
-                                }
-                            }, 200);
-                        } catch(e){}
-                        try {
-                            scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 500 });
-                        } catch(e){}
+                        queueExecuteSummaryRedirect("{{ url_for('reports_page') }}", 500);
+                        completeExecuteProgressPanel(true, 'Scenario started', 'Review summary before reports.');
                     } else {
                         completeExecuteProgressPanel(false, 'Finished with errors', 'Check logs for details.');
                     }
@@ -5413,6 +5425,11 @@ async function computeFullPlanPreview(){
 
         const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const data = await res.json();
+        try {
+            if (data?.validation_summary && !executeProgressState.validationSummary) {
+                executeProgressState.validationSummary = data.validation_summary;
+            }
+        } catch (e) {}
         try {
             if(window.logLine){ window.logLine('INFO', 'Preview: response received; parsing plan summary'); }
         } catch(e){}
@@ -6846,15 +6863,8 @@ document.addEventListener('DOMContentLoaded', ()=>{
                     },
                     onComplete: (data) => {
                         if(data?.returncode === 0){
-                            completeExecuteProgressPanel(true, 'Scenario started', 'Redirecting to reports…');
-                            try {
-                                setTimeout(()=>{
-                                    if(executeConfirmModalEl && window.bootstrap){
-                                        bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
-                                    }
-                                }, 200);
-                            } catch(e){}
-                            scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 600 });
+                            queueExecuteSummaryRedirect("{{ url_for('reports_page') }}", 600);
+                            completeExecuteProgressPanel(true, 'Scenario started', 'Review summary before reports.');
                         } else {
                             completeExecuteProgressPanel(false, 'Finished with errors', 'Check logs for details.');
                             restoreModal();
@@ -16153,6 +16163,11 @@ let executeConfirmMessageEl = null;
 let executeConfirmAlertEl = null;
 let executeConfirmRunBtn = null;
 let executeConfirmCancelBtn = null;
+let executeSummaryModalEl = null;
+let executeSummaryStatusEl = null;
+let executeSummaryListEl = null;
+let executeSummaryCopyBtns = [];
+let executeSummaryRedirect = { url: null, delay: 600 };
 let executeCoreStatusEl = null;
 let executeCoreTestBtn = null;
 let executeRemoteTestRow = null;
@@ -16295,6 +16310,8 @@ const executeProgressState = {
     cancelRequested: false,
     done: false,
     cancelHandlers: [],
+    validationSummary: null,
+    summaryShown: false,
 };
 let setCoreConnectionHint = null;
 
@@ -16334,6 +16351,75 @@ function ensureExecuteConfirmElements() {
     }
     if (!executeConfirmCancelBtn) {
         executeConfirmCancelBtn = document.getElementById('executeConfirmCancelBtn');
+    }
+    if (!executeSummaryModalEl) {
+        executeSummaryModalEl = document.getElementById('executeSummaryModal');
+    }
+    if (!executeSummaryStatusEl) {
+        executeSummaryStatusEl = document.getElementById('executeSummaryStatus');
+    }
+    if (!executeSummaryListEl) {
+        executeSummaryListEl = document.getElementById('executeSummaryList');
+    }
+    try {
+        executeSummaryCopyBtns = Array.from(document.querySelectorAll('[data-execute-summary-copy]'));
+    } catch (e) {
+        executeSummaryCopyBtns = [];
+    }
+    if (executeSummaryModalEl && !executeSummaryModalEl.dataset.execSummaryBound) {
+        executeSummaryModalEl.addEventListener('shown.bs.modal', () => {
+            try { dockLog('[summary] Summary dialog opened', 'INFO'); } catch (e) {}
+        });
+        executeSummaryModalEl.addEventListener('hidden.bs.modal', () => {
+            try {
+                try { dockLog('[summary] Summary dialog closed', 'INFO'); } catch (e) {}
+                const url = executeSummaryRedirect?.url;
+                const delay = executeSummaryRedirect?.delay || 600;
+                if (url) {
+                    executeSummaryRedirect.url = null;
+                    scheduleScenarioRedirect(url, { delay });
+                }
+            } catch (e) {}
+        });
+        executeSummaryModalEl.dataset.execSummaryBound = '1';
+    }
+    if (Array.isArray(executeSummaryCopyBtns)) {
+        executeSummaryCopyBtns.forEach((btn) => {
+            if (!btn || btn.dataset.execSummaryBound) return;
+            btn.addEventListener('click', async (ev) => {
+                const target = ev?.currentTarget || btn;
+                const text = buildExecuteSummaryText();
+                if (!text) return;
+                let copied = false;
+                try {
+                    if (navigator?.clipboard?.writeText) {
+                        await navigator.clipboard.writeText(text);
+                        copied = true;
+                    }
+                } catch (e) {}
+                if (!copied) {
+                    try {
+                        const ta = document.createElement('textarea');
+                        ta.value = text;
+                        ta.setAttribute('readonly', 'true');
+                        ta.style.position = 'fixed';
+                        ta.style.top = '-1000px';
+                        document.body.appendChild(ta);
+                        ta.select();
+                        copied = document.execCommand('copy');
+                        document.body.removeChild(ta);
+                    } catch (e) {}
+                }
+                if (copied && target) {
+                    const prev = target.textContent;
+                    target.textContent = 'Copied!';
+                    setTimeout(() => {
+                        target.textContent = prev || 'Copy summary';
+                    }, 1200);
+                }
+            });
+            btn.dataset.execSummaryBound = '1';
+        });
     }
     if (!executePhaseHeaderEl) {
         executePhaseHeaderEl = document.getElementById('executePhaseHeader');
@@ -16510,6 +16596,160 @@ function ensureExecuteConfirmElements() {
         });
         executeConfirmModalEl.dataset.execShowBound = '1';
     }
+}
+
+function ensureExecuteSummaryElements() {
+    if (!executeSummaryModalEl) executeSummaryModalEl = document.getElementById('executeSummaryModal');
+    if (!executeSummaryStatusEl) executeSummaryStatusEl = document.getElementById('executeSummaryStatus');
+    if (!executeSummaryListEl) executeSummaryListEl = document.getElementById('executeSummaryList');
+}
+
+function renderExecuteSummaryItem(label, ok, detail, items = []) {
+    const li = document.createElement('li');
+    li.className = 'list-group-item d-flex align-items-start gap-2';
+    const icon = document.createElement('span');
+    icon.textContent = ok ? '✅' : '❌';
+    icon.className = 'me-1';
+    const body = document.createElement('div');
+    body.className = 'flex-grow-1';
+    const title = document.createElement('div');
+    title.className = 'fw-semibold';
+    title.textContent = label;
+    const meta = document.createElement('div');
+    meta.className = 'small text-muted';
+    meta.textContent = detail || (ok ? 'OK' : 'Needs attention');
+    body.appendChild(title);
+    body.appendChild(meta);
+
+    const listItems = Array.isArray(items) ? items.filter(Boolean) : [];
+    const details = document.createElement('details');
+    details.className = 'mt-2';
+    const summary = document.createElement('summary');
+    summary.className = 'small';
+    summary.textContent = listItems.length ? `Details (${listItems.length})` : 'Details (none)';
+    details.appendChild(summary);
+    const ul = document.createElement('ul');
+    ul.className = 'small text-muted mt-2 mb-0';
+    if (listItems.length) {
+        listItems.forEach((item) => {
+            const liItem = document.createElement('li');
+            liItem.textContent = String(item);
+            ul.appendChild(liItem);
+        });
+    } else {
+        const liItem = document.createElement('li');
+        liItem.textContent = 'None';
+        ul.appendChild(liItem);
+    }
+    details.appendChild(ul);
+
+    body.appendChild(details);
+    li.appendChild(icon);
+    li.appendChild(body);
+    return li;
+}
+
+function renderExecuteSummary(success) {
+    ensureExecuteSummaryElements();
+    if (!executeSummaryListEl || !executeSummaryStatusEl) return;
+    executeSummaryListEl.innerHTML = '';
+    const summary = executeProgressState?.validationSummary;
+    if (!summary || typeof summary !== 'object') {
+        executeSummaryStatusEl.textContent = success ? 'Scenario started, but no validation summary was captured.' : 'Execution failed; validation summary unavailable.';
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem('Validation summary available', false, 'No summary data received'));
+        return;
+    }
+    const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
+    const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
+    const dockerNodes = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
+    const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
+    const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
+    const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+    executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
+    executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+        'Expected nodes created',
+        missingNodes === 0,
+        missingNodes ? `${missingNodes} missing` : 'All expected nodes present',
+        Array.isArray(summary.missing_nodes) ? summary.missing_nodes : []
+    ));
+    executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+        'No unexpected nodes',
+        extraNodes === 0,
+        extraNodes ? `${extraNodes} unexpected` : 'No extras detected',
+        Array.isArray(summary.extra_nodes) ? summary.extra_nodes : []
+    ));
+    if (dockerNodes > 0) {
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Docker containers present',
+            dockerMissing === 0,
+            dockerMissing ? `${dockerMissing} missing` : `${dockerNodes} containers detected`,
+            Array.isArray(summary.docker_missing) ? summary.docker_missing : []
+        ));
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Docker containers running',
+            dockerNotRunning === 0,
+            dockerNotRunning ? `${dockerNotRunning} not running` : 'All containers running',
+            Array.isArray(summary.docker_not_running) ? summary.docker_not_running : []
+        ));
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Injected files present',
+            injectsMissing === 0,
+            injectsMissing ? `${injectsMissing} containers missing injects` : 'Injects detected',
+            Array.isArray(summary.injects_missing) ? summary.injects_missing : []
+        ));
+    } else {
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Docker containers detected',
+            false,
+            'No docker nodes found in session XML',
+            []
+        ));
+    }
+}
+
+function buildExecuteSummaryText() {
+    const summary = executeProgressState?.validationSummary;
+    const lines = [];
+    lines.push('CORE TopoGen Execute Summary');
+    if (!summary || typeof summary !== 'object') {
+        lines.push('Status: Validation summary unavailable.');
+        return lines.join('\n');
+    }
+    lines.push(`Status: ${summary.ok ? 'OK' : 'Issues detected'}`);
+    const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
+    const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
+    const dockerNodes = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
+    const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
+    const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
+    const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+    lines.push(`Expected nodes created: ${missingNodes === 0 ? 'OK' : `Missing ${missingNodes}`}`);
+    lines.push(`Unexpected nodes: ${extraNodes === 0 ? 'None' : `Extra ${extraNodes}`}`);
+    if (dockerNodes > 0) {
+        lines.push(`Docker containers present: ${dockerMissing === 0 ? 'OK' : `Missing ${dockerMissing}`}`);
+        lines.push(`Docker containers running: ${dockerNotRunning === 0 ? 'OK' : `Not running ${dockerNotRunning}`}`);
+        lines.push(`Injected files present: ${injectsMissing === 0 ? 'OK' : `Missing injects on ${injectsMissing}`}`);
+    } else {
+        lines.push('Docker containers detected: None');
+    }
+    return lines.join('\n');
+}
+
+function showExecuteSummaryModal(success) {
+    ensureExecuteSummaryElements();
+    try { dockLog(`[summary] showExecuteSummaryModal(${success ? 'success' : 'failure'})`, 'INFO'); } catch (e) {}
+    renderExecuteSummary(!!success);
+    if (executeSummaryModalEl && window.bootstrap) {
+        try {
+            if (executeConfirmModalEl && window.bootstrap) {
+                bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
+            }
+            bootstrap.Modal.getOrCreateInstance(executeSummaryModalEl).show();
+        } catch (e) {}
+    }
+}
+
+function queueExecuteSummaryRedirect(url, delayMs = 600) {
+    executeSummaryRedirect = { url: url || null, delay: delayMs };
 }
 
 function isExecuteCoreVmConfigured() {
@@ -17151,6 +17391,9 @@ function resetExecuteProgressUI() {
     executeProgressState.cancelRequested = false;
     executeProgressState.cancelHandlers = [];
     executeProgressState.logLines = [];
+    executeProgressState.validationSummary = null;
+    executeProgressState.summaryShown = false;
+    executeSummaryRedirect = { url: null, delay: 600 };
     executeProgressState.runId = null;
     executeProgressState.heartbeatIndex = 0;
     if (executeProgressWrap) executeProgressWrap.classList.add('d-none');
@@ -17192,6 +17435,7 @@ function showExecuteProgressPanel(status, meta) {
     executeProgressState.cancelRequested = false;
     executeProgressState.cancelHandlers = [];
     executeProgressState.logLines = [];
+    executeProgressState.validationSummary = null;
     if (executeProgressWrap) executeProgressWrap.classList.remove('d-none');
     if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
     if (executeProgressBarEl) executeProgressBarEl.classList.add('progress-bar-animated');
@@ -17289,6 +17533,20 @@ function completeExecuteProgressPanel(success, message, meta) {
         executeProgressBarEl.textContent = success ? 'Done' : 'Error';
     }
     setExecuteProgressStatus(message || (success ? 'Scenario started' : 'Failed to start'), meta || '');
+    if (!success) {
+        try { executeSummaryRedirect = { url: null, delay: 600 }; } catch (e) {}
+    }
+    try {
+        const summary = executeProgressState?.validationSummary;
+        if (summary && typeof summary === 'object' && !summary.ok) {
+            const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
+            const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
+            const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
+            const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+            const msg = `Validation warnings: missing nodes=${missingNodes}, containers missing=${dockerMissing}, not running=${dockerNotRunning}, injects missing=${injectsMissing}`;
+            updateExecuteConfirmAlert(msg, 'warning');
+        }
+    } catch (e) {}
     if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = success ? 'Phase: Complete' : 'Phase: Error';
     if (executeConfirmCancelBtn) {
         executeConfirmCancelBtn.textContent = 'Close';
@@ -17303,6 +17561,7 @@ function completeExecuteProgressPanel(success, message, meta) {
     }
     // Re-enable connection & advanced controls only after run completes.
     try { if (typeof setExecuteDialogControlsEnabled === 'function') setExecuteDialogControlsEnabled(true); } catch(e){}
+    try { showExecuteSummaryModal(success); } catch (e) {}
 }
 
 function handleExecuteProgressLog(line) {
@@ -17310,6 +17569,22 @@ function handleExecuteProgressLog(line) {
     stopExecuteProgressHeartbeat();
     appendExecuteProgressLog(line);
     if (!line) return;
+    const validationMatch = /VALIDATION_SUMMARY_JSON:\s*(\{.*\})\s*$/i.exec(line);
+    if (validationMatch) {
+        try {
+            const payload = JSON.parse(validationMatch[1]);
+            executeProgressState.validationSummary = payload;
+            if (payload && typeof payload === 'object' && !payload.ok) {
+                const missingNodes = Array.isArray(payload.missing_nodes) ? payload.missing_nodes.length : 0;
+                const dockerMissing = Array.isArray(payload.docker_missing) ? payload.docker_missing.length : 0;
+                const dockerNotRunning = Array.isArray(payload.docker_not_running) ? payload.docker_not_running.length : 0;
+                const injectsMissing = Array.isArray(payload.injects_missing) ? payload.injects_missing.length : 0;
+                const msg = `Validation warnings: missing nodes=${missingNodes}, containers missing=${dockerMissing}, not running=${dockerNotRunning}, injects missing=${injectsMissing}`;
+                updateExecuteConfirmAlert(msg, 'warning');
+            }
+        } catch (e) {}
+        return;
+    }
     const phaseMatch = /\bPHASE:\s*(.+)\s*$/i.exec(line);
     if (phaseMatch) {
         const phase = (phaseMatch[1] || '').trim();
@@ -19933,6 +20208,13 @@ function dockLog(message, level = 'INFO') {
     try {
         console.log(msg);
     } catch (e) {}
+    try {
+        const m = /VALIDATION_SUMMARY_JSON:\s*(\{.*\})\s*$/i.exec(msg);
+        if (m) {
+            const payload = JSON.parse(m[1]);
+            executeProgressState.validationSummary = payload;
+        }
+    } catch (e) {}
 }
 
 if (typeof window.appendLog !== 'function') {
@@ -19998,8 +20280,14 @@ async function pollRunStatus(runId) {
         if (!data.done) {
             setTimeout(() => pollRunStatus(runId), 1000);
         } else {
-            if (data.returncode === 0) {
-                scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 500 });
+            if (!executeProgressState.summaryShown) {
+                executeProgressState.summaryShown = true;
+                if (data.returncode === 0) {
+                    queueExecuteSummaryRedirect("{{ url_for('reports_page') }}", 500);
+                    showExecuteSummaryModal(true);
+                } else {
+                    showExecuteSummaryModal(false);
+                }
             }
         }
     } catch(e) {
@@ -20871,6 +21159,11 @@ async function runSyncWithModal(arg){
                     const r = await fetch('/run_status/' + run_id);
                     if(!r.ok){ setTimeout(poll, 1200); return; }
                     const data = await r.json();
+                    try {
+                        if (data?.validation_summary && !executeProgressState.validationSummary) {
+                            executeProgressState.validationSummary = data.validation_summary;
+                        }
+                    } catch (e) {}
                     if(data.report_path || data.xml_path){
                         state.result_path = data.report_path || data.xml_path;
                         persistEditorState();
@@ -20889,8 +21182,14 @@ async function runSyncWithModal(arg){
                     }
                     try { opts.onComplete?.(data); } catch(e){}
                     try {
-                        if (data.returncode === 0) {
-                            scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 500 });
+                        if (!executeProgressState.summaryShown) {
+                            executeProgressState.summaryShown = true;
+                            if (data.returncode === 0) {
+                                queueExecuteSummaryRedirect("{{ url_for('reports_page') }}", 500);
+                                showExecuteSummaryModal(true);
+                            } else {
+                                showExecuteSummaryModal(false);
+                            }
                         }
                     } catch(e){}
                     resolve(data);
