@@ -1203,6 +1203,20 @@
         window.refreshXmlDockPreview({ force: true, preferSavedPath: true, reason: 'save-complete' });
       }
     } catch (e) {}
+    try {
+      if (window.previewState && typeof window.previewState === 'object') {
+        window.previewState.xmlSaved = true;
+        window.previewState.dirty = false;
+      }
+      if (typeof window.setXmlPreviewSavedSignature === 'function' && typeof window.buildXmlPreviewSignature === 'function') {
+        window.setXmlPreviewSavedSignature(window.buildXmlPreviewSignature());
+      } else if (typeof window.noteXmlPreviewSavedSignature === 'function') {
+        window.noteXmlPreviewSavedSignature();
+      }
+      if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+        window.coretgAllowUnsavedNavOnce();
+      }
+    } catch (e) {}
     safeHideProgress(false);
     return xmlPath;
     } catch (err) {

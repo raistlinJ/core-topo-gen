@@ -462,7 +462,7 @@ _CORE_FIELD_KEYS = (
     'venv_user_override',
 )
 
-DEFAULT_CORE_VENV_BIN = '/opt/core/venv/bin'
+DEFAULT_CORE_VENV_BIN = '/opt/core/venv/bin/python'
 CORE_DAEMON_START_COMMAND = 'sudo systemctl start core-daemon'
 PYTHON_EXECUTABLE_NAMES = ('core-python', 'python3', 'python')
 REMOTE_BASE_DIR_ENV = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen')
@@ -490,6 +490,7 @@ REPO_PUSH_EXCLUDE_DIRS = {
     'tmp_hitl',
 }
 REPO_PUSH_EXCLUDE_PATTERNS = ('*.pyc', '*.pyo', '*.pyd', '*.log', '*.tmp', '*.swp', '*.swo')
+REPO_PUSH_ALLOWED_OUTPUTS_ENV = os.environ.get('CORETG_REPO_PUSH_ALLOWED_OUTPUTS', '')
 
 _SESSION_HITL_CACHE: Dict[str, Dict[str, Any]] = {}
 
@@ -538,6 +539,7 @@ def _schedule_repo_push_to_remote(progress_id: str, core_cfg: Dict[str, Any], *,
                 logger=log,
                 progress_id=progress_id,
                 finalize_async=True,
+                upload_only_injected_artifacts=False,
             )
         except Exception as exc:
             try:
@@ -1143,7 +1145,29 @@ def _remote_remove_path(client: Any, path: str) -> None:
     _exec_ssh_command(client, f"rm -rf {quoted}")
 
 
-def _should_exclude_repo_member(rel_path: str) -> bool:
+def _resolve_repo_push_allowed_outputs(upload_only_injected_artifacts: bool) -> List[str]:
+    if REPO_PUSH_ALLOWED_OUTPUTS_ENV:
+        out: List[str] = []
+        for raw in REPO_PUSH_ALLOWED_OUTPUTS_ENV.split(','):
+            item = raw.strip().replace('\\', '/')
+            if item:
+                out.append(item)
+        return out
+    if upload_only_injected_artifacts:
+        return [
+            'outputs/installed_vuln_catalogs',
+            'outputs/installed_generators',
+        ]
+    return [
+        'outputs/installed_vuln_catalogs',
+        'outputs/installed_generators',
+        'outputs/scenarios-',
+        'outputs/tmp-exec-',
+        'outputs/plans',
+    ]
+
+
+def _should_exclude_repo_member(rel_path: str, *, allowed_outputs: Optional[List[str]] = None) -> bool:
     if not rel_path:
         return False
     parts = [part for part in Path(rel_path).parts if part not in ('', '.')]
@@ -1156,17 +1180,11 @@ def _should_exclude_repo_member(rel_path: str) -> bool:
         if rel_norm.startswith('outputs'):
             if rel_norm == 'outputs':
                 return False
-            allowed_outputs = (
-                'outputs/installed_vuln_catalogs',
-                'outputs/installed_generators',
-                'outputs/scenarios-',
-                'outputs/tmp-exec-',
-                'outputs/plans',
-            )
+            if not allowed_outputs:
+                allowed_outputs = _resolve_repo_push_allowed_outputs(False)
             if any(
                 rel_norm == p
                 or rel_norm.startswith(p + '/')
-                or (p.endswith('-') and rel_norm.startswith(p))
                 for p in allowed_outputs
             ):
                 return False
@@ -1183,7 +1201,7 @@ def _should_exclude_repo_member(rel_path: str) -> bool:
     return False
 
 
-def _create_local_repo_archive(src_dir: str, dest_basename: str) -> str:
+def _create_local_repo_archive(src_dir: str, dest_basename: str, *, allowed_outputs: Optional[List[str]] = None) -> str:
     base_name = dest_basename.strip('/') or 'core-topo-gen'
     tmp_fd, tmp_path = tempfile.mkstemp(prefix='coretg_repo_', suffix='.tar.gz')
     os.close(tmp_fd)
@@ -1195,7 +1213,7 @@ def _create_local_repo_archive(src_dir: str, dest_basename: str) -> str:
             rel_name = rel_name[len(prefix):]
         elif rel_name == base_name:
             rel_name = ''
-        if rel_name and _should_exclude_repo_member(rel_name):
+        if rel_name and _should_exclude_repo_member(rel_name, allowed_outputs=allowed_outputs):
             return None
         return member
 
@@ -1211,7 +1229,7 @@ def _repo_skip_if_unchanged_enabled() -> bool:
         return True
 
 
-def _compute_repo_fingerprint(repo_root: str) -> str:
+def _compute_repo_fingerprint(repo_root: str, *, allowed_outputs: Optional[List[str]] = None) -> str:
     """Compute a lightweight fingerprint of repo contents (paths + size + mtime)."""
     import hashlib
     h = hashlib.sha256()
@@ -1221,10 +1239,13 @@ def _compute_repo_fingerprint(repo_root: str) -> str:
         if rel_dir == '.':
             rel_dir = ''
         # Filter directories in-place to avoid walking excluded trees
-        dirnames[:] = [d for d in dirnames if not _should_exclude_repo_member(os.path.join(rel_dir, d))]
+        dirnames[:] = [
+            d for d in dirnames
+            if not _should_exclude_repo_member(os.path.join(rel_dir, d), allowed_outputs=allowed_outputs)
+        ]
         for fname in filenames:
             rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
-            if _should_exclude_repo_member(rel_path):
+            if _should_exclude_repo_member(rel_path, allowed_outputs=allowed_outputs):
                 continue
             full_path = os.path.join(dirpath, fname)
             try:
@@ -1265,6 +1286,8 @@ def _push_repo_to_remote(
     logger: Optional[logging.Logger] = None,
     progress_id: Optional[str] = None,
     finalize_async: bool = False,
+    upload_only_injected_artifacts: bool = False,
+    log_handle: Any | None = None,
 ) -> Dict[str, Any]:
     cfg = _require_core_ssh_credentials(core_cfg)
     repo_root = _get_repo_root()
@@ -1278,9 +1301,17 @@ def _push_repo_to_remote(
         remote_repo = _remote_static_repo_dir(sftp)
         remote_parent = posixpath.dirname(remote_repo.rstrip('/')) or '/'
         base_name = os.path.basename(remote_repo.rstrip('/')) or 'core-topo-gen'
+        allowed_outputs = _resolve_repo_push_allowed_outputs(bool(upload_only_injected_artifacts))
+        try:
+            if log_handle:
+                log_handle.write(f"[remote] Repo upload: remote_repo={remote_repo}\n")
+                log_handle.write(f"[remote] Repo upload: allowed_outputs={allowed_outputs}\n")
+                log_handle.flush()
+        except Exception:
+            pass
         if _repo_skip_if_unchanged_enabled():
             try:
-                local_hash = _compute_repo_fingerprint(repo_root)
+                local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
                 remote_hash = _read_remote_repo_hash(sftp, remote_repo)
                 if remote_hash and local_hash == remote_hash:
                     _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository unchanged; upload skipped.')
@@ -1288,9 +1319,21 @@ def _push_repo_to_remote(
                     return {'repo_path': remote_repo, 'progress_id': progress_id, 'skipped': True}
             except Exception:
                 pass
-        archive_path = _create_local_repo_archive(repo_root, base_name)
+        try:
+            if log_handle:
+                log_handle.write("[remote] Repo upload: packaging snapshot…\n")
+                log_handle.flush()
+        except Exception:
+            pass
+        archive_path = _create_local_repo_archive(repo_root, base_name, allowed_outputs=allowed_outputs)
         _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=8.0, detail='Repository archive ready.')
         remote_archive = _remote_path_join(remote_parent, f"{uuid.uuid4().hex}.tar.gz")
+        try:
+            if log_handle:
+                log_handle.write(f"[remote] Repo upload: uploading snapshot to {remote_archive}\n")
+                log_handle.flush()
+        except Exception:
+            pass
         _update_repo_push_progress(progress_id, status='uploading', stage='uploading', percent=12.0, detail='Uploading snapshot to CORE host…')
         sftp.put(archive_path, remote_archive)
         _update_repo_push_progress(progress_id, status='uploading', stage='uploaded', percent=40.0, detail='Upload complete; preparing remote finalize…')
@@ -1311,13 +1354,25 @@ def _push_repo_to_remote(
             f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}; "
             f"rm -f {shlex.quote(remote_archive)}"
         )
+        try:
+            if log_handle:
+                log_handle.write("[remote] Repo upload: extracting snapshot on CORE host…\n")
+                log_handle.flush()
+        except Exception:
+            pass
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=60.0, detail='Extracting snapshot on CORE host…')
         _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
         try:
+            if log_handle:
+                log_handle.write("[remote] Repo upload: snapshot extracted and ready.\n")
+                log_handle.flush()
+        except Exception:
+            pass
+        try:
             if _repo_skip_if_unchanged_enabled():
-                local_hash = _compute_repo_fingerprint(repo_root)
+                local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
                 _write_remote_repo_hash(client, remote_repo, local_hash)
         except Exception:
             pass
@@ -1559,6 +1614,55 @@ def _extract_inject_dirs_from_plan_xml(scenario_xml_path: str, scenario_label: s
         seen.add(d)
         out.append(d)
     return out
+
+
+def _extract_expected_docker_and_vuln_nodes_from_plan_xml(
+    scenario_xml_path: str,
+    scenario_label: str | None,
+) -> tuple[List[str], List[str]]:
+    payload = None
+    try:
+        payload = _load_plan_preview_from_xml(scenario_xml_path, scenario_label)
+    except Exception:
+        payload = None
+    if not payload or not isinstance(payload, dict):
+        return [], []
+    full = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+    root = full if isinstance(full, dict) else payload
+    hosts = root.get('hosts') if isinstance(root, dict) else None
+    if not isinstance(hosts, list):
+        return [], []
+
+    expected_docker: List[str] = []
+    expected_vuln: List[str] = []
+    for h in hosts:
+        if not isinstance(h, dict):
+            continue
+        name = str(h.get('name') or '').strip()
+        if not name:
+            continue
+        role = str(h.get('role') or '').strip().lower()
+        kind = str(h.get('kind') or '').strip().lower()
+        metadata = h.get('metadata') if isinstance(h.get('metadata'), dict) else {}
+        has_flow = isinstance(metadata.get('flow_flag'), dict)
+        is_docker = role == 'docker' or kind == 'docker' or has_flow
+        if is_docker:
+            expected_docker.append(name)
+        vulns = h.get('vulnerabilities')
+        if isinstance(vulns, list) and any(vulns):
+            expected_vuln.append(name)
+
+    def _dedupe(vals: List[str]) -> List[str]:
+        seen: set[str] = set()
+        out: List[str] = []
+        for v in vals:
+            if v in seen:
+                continue
+            seen.add(v)
+            out.append(v)
+        return out
+
+    return _dedupe(expected_docker), _dedupe(expected_vuln)
 
 
 def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_mount_dir: bool = False) -> List[str]:
@@ -13202,32 +13306,42 @@ def api_flow_attackflow_preview():
             saved_ids = [str(x).strip() for x in (flow_state_from_xml.get('chain_ids') or []) if str(x).strip()]
             if saved_ids:
                 id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
-                chain_nodes = [id_map[cid] for cid in saved_ids if cid in id_map]
-                if chain_nodes:
-                    # Use saved assignments from XML (resolved values) if provided.
-                    fas = flow_state_from_xml.get('flag_assignments') if isinstance(flow_state_from_xml, dict) else None
-                    if isinstance(fas, list) and fas:
-                        ordered: list[dict[str, Any]] = []
-                        for i in range(len(chain_nodes)):
-                            a = fas[i] if i < len(fas) else {}
-                            if not isinstance(a, dict):
-                                ordered.append({})
-                                continue
-                            a2 = dict(a)
+                candidate_nodes = [id_map[cid] for cid in saved_ids if cid in id_map]
+                if candidate_nodes:
+                    try:
+                        invalid = any(
+                            (not _flow_node_is_docker_role(n)) and (not _flow_node_is_vuln(n))
+                            for n in candidate_nodes
+                            if isinstance(n, dict)
+                        )
+                    except Exception:
+                        invalid = True
+                    if not invalid:
+                        chain_nodes = candidate_nodes
+                        # Use saved assignments from XML (resolved values) if provided.
+                        fas = flow_state_from_xml.get('flag_assignments') if isinstance(flow_state_from_xml, dict) else None
+                        if isinstance(fas, list) and fas:
+                            ordered: list[dict[str, Any]] = []
+                            for i in range(len(chain_nodes)):
+                                a = fas[i] if i < len(fas) else {}
+                                if not isinstance(a, dict):
+                                    ordered.append({})
+                                    continue
+                                a2 = dict(a)
+                                try:
+                                    a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                                except Exception:
+                                    pass
+                                ordered.append(a2)
+                            flag_assignments = ordered
                             try:
-                                a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                                flag_assignments = _flow_enrich_saved_flag_assignments(
+                                    flag_assignments,
+                                    chain_nodes,
+                                    scenario_label=(scenario_label or scenario_norm),
+                                )
                             except Exception:
                                 pass
-                            ordered.append(a2)
-                        flag_assignments = ordered
-                        try:
-                            flag_assignments = _flow_enrich_saved_flag_assignments(
-                                flag_assignments,
-                                chain_nodes,
-                                scenario_label=(scenario_label or scenario_norm),
-                            )
-                        except Exception:
-                            pass
     except Exception:
         flow_state_from_xml = None
     try:
@@ -16403,38 +16517,7 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         pass
 
-    # Persist flow_state into the latest scenario XML so refresh restores resolved values.
-    try:
-        xml_path = None
-        try:
-            if base_plan_path and str(base_plan_path).lower().endswith('.xml') and os.path.exists(base_plan_path):
-                xml_path = base_plan_path
-        except Exception:
-            xml_path = None
-        if not xml_path:
-            try:
-                meta_xml = str((meta or {}).get('xml_path') or '').strip()
-                if meta_xml and meta_xml.lower().endswith('.xml') and os.path.exists(meta_xml):
-                    xml_path = meta_xml
-            except Exception:
-                xml_path = None
-        if not xml_path:
-            xml_path = _latest_xml_path_for_scenario(scenario_norm)
-        if xml_path:
-            flow_state_payload = {
-                'scenario': scenario_label or scenario_norm,
-                'preset': preset,
-                'length': len(chain_nodes or []),
-                'chain_ids': [str(n.get('id') or '').strip() for n in (chain_nodes or []) if str(n.get('id') or '').strip()],
-                'flag_assignments': flag_assignments,
-                'allow_node_duplicates': bool(allow_node_duplicates),
-                'initial_facts': initial_facts_override,
-                'goal_facts': goal_facts_override,
-                'updated_at': int(time.time()),
-            }
-            _update_flow_state_in_xml(xml_path, scenario_label or scenario_norm, flow_state_payload)
-    except Exception:
-        pass
+    # NOTE: Flow state persistence is now manual (Save XML) to avoid auto-saving.
 
     # Persist a single per-scenario plan artifact so /run_cli_async can safely consume it.
     try:
@@ -25563,6 +25646,40 @@ def _flow_state_from_latest_xml(scenario_norm: str) -> dict[str, Any] | None:
         return None
 
 
+def _flow_state_from_xml_path(xml_path: str, scenario_label: str | None) -> dict[str, Any] | None:
+    try:
+        if not xml_path:
+            return None
+        xml_abs = os.path.abspath(xml_path)
+        if not os.path.exists(xml_abs):
+            return None
+        parsed = _parse_scenarios_xml(xml_abs)
+        scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+        if not isinstance(scen_list, list):
+            return None
+        target_norm = _normalize_scenario_label(scenario_label or '') if scenario_label else ''
+        if target_norm:
+            for sc in scen_list:
+                if not isinstance(sc, dict):
+                    continue
+                nm = str(sc.get('name') or '').strip()
+                if _normalize_scenario_label(nm) != target_norm:
+                    continue
+                fs = sc.get('flow_state')
+                return fs if isinstance(fs, dict) else None
+            return None
+        # No scenario specified: return the first flow_state found.
+        for sc in scen_list:
+            if not isinstance(sc, dict):
+                continue
+            fs = sc.get('flow_state')
+            if isinstance(fs, dict):
+                return fs
+        return None
+    except Exception:
+        return None
+
+
 def _latest_xml_path_for_scenario(scenario_norm: str) -> str | None:
     try:
         scen_norm = _normalize_scenario_label(scenario_norm)
@@ -28452,102 +28569,115 @@ def plan_full_preview_page():
                 if s>0: seed = s
         except Exception:
             seed = None
-        # Always render from the latest canonical plan for the active scenario.
+        # Render from the requested XML when provided; otherwise fall back to latest scenario plan.
+        try:
+            xml_path_abs = os.path.abspath(xml_path) if xml_path else ''
+        except Exception:
+            xml_path_abs = ''
+        if xml_path_abs and os.path.exists(xml_path_abs):
+            plan_path = xml_path_abs
+        else:
+            plan_path = None
         try:
             scen_norm = _normalize_scenario_label(scenario or '')
         except Exception:
             scen_norm = ''
-        if scen_norm:
-            plan_path = None
+        if (not plan_path) and scen_norm:
             try:
                 plan_path = _latest_flow_plan_for_scenario_norm(scen_norm)
             except Exception:
                 plan_path = plan_path
-            if plan_path:
-                try:
-                    payload = _load_preview_payload_from_path(plan_path, scenario)
-                    if isinstance(payload, dict):
-                        full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
-                        meta = payload.get('metadata') if isinstance(payload, dict) else None
-                        if isinstance(full_prev, dict):
-                            if not isinstance(meta, dict):
-                                meta = {}
-                            xml_path0 = str(meta.get('xml_path') or '')
-                            scenario0 = str(meta.get('scenario') or '') or (scenario or None)
-                            seed0 = meta.get('seed')
-                            try:
-                                seed0 = int(seed0) if seed0 is not None else full_prev.get('seed')
-                            except Exception:
-                                seed0 = full_prev.get('seed')
+        if plan_path:
+            try:
+                payload = _load_preview_payload_from_path(plan_path, scenario)
+                if isinstance(payload, dict):
+                    full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    if isinstance(full_prev, dict):
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        xml_path0 = str(meta.get('xml_path') or '')
+                        scenario0 = str(meta.get('scenario') or '') or (scenario or None)
+                        seed0 = meta.get('seed')
+                        try:
+                            seed0 = int(seed0) if seed0 is not None else full_prev.get('seed')
+                        except Exception:
+                            seed0 = full_prev.get('seed')
 
+                    flow_meta = None
+                    try:
+                        xml_for_flow = xml_path0 or (plan_path if plan_path and str(plan_path).lower().endswith('.xml') else '')
+                        if xml_for_flow:
+                            flow_meta = _flow_state_from_xml_path(xml_for_flow, scenario0 or scenario)
+                    except Exception:
                         flow_meta = None
+                    if not isinstance(flow_meta, dict):
                         try:
                             meta_flow = meta.get('flow') if isinstance(meta, dict) else None
                             if isinstance(meta_flow, dict):
                                 flow_meta = meta_flow
                         except Exception:
                             flow_meta = None
-                        if flow_meta is None:
-                            try:
-                                flow_meta = _attach_latest_flow_into_full_preview(full_prev, scenario0, repair=False)
-                            except Exception:
-                                flow_meta = None
 
-                        display_artifacts = full_prev.get('display_artifacts')
-                        if not display_artifacts:
-                            try:
-                                display_artifacts = _attach_display_artifacts(full_prev)
-                            except Exception:
-                                display_artifacts = {
-                                    'segmentation': {
-                                        'rows': [],
-                                        'table_rows': [],
-                                        'tableRows': [],
-                                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
-                                    },
-                                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
-                                }
-                        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
-
-                        # Reconstruct hitl_config for template display from embedded full_preview fields.
-                        hitl_config = {
-                            'enabled': bool(full_prev.get('hitl_enabled')),
-                            'interfaces': full_prev.get('hitl_interfaces') or [],
-                            'scenario_key': full_prev.get('hitl_scenario_key') or (scenario0 or None),
-                        }
+                    display_artifacts = full_prev.get('display_artifacts')
+                    if not display_artifacts:
                         try:
-                            if full_prev.get('hitl_core'):
-                                hitl_config['core'] = full_prev.get('hitl_core')
+                            display_artifacts = _attach_display_artifacts(full_prev)
                         except Exception:
-                            pass
+                            display_artifacts = {
+                                'segmentation': {
+                                    'rows': [],
+                                    'table_rows': [],
+                                    'tableRows': [],
+                                    'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                                },
+                                '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                            }
+                    segmentation_artifacts = (display_artifacts or {}).get('segmentation')
 
-                        import json as _json
-                        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+                    # Reconstruct hitl_config for template display from embedded full_preview fields.
+                    hitl_config = {
+                        'enabled': bool(full_prev.get('hitl_enabled')),
+                        'interfaces': full_prev.get('hitl_interfaces') or [],
+                        'scenario_key': full_prev.get('hitl_scenario_key') or (scenario0 or None),
+                    }
+                    try:
+                        if full_prev.get('hitl_core'):
+                            hitl_config['core'] = full_prev.get('hitl_core')
+                    except Exception:
+                        pass
+
+                    import json as _json
+                    preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+                    xml_basename = None
+                    try:
+                        if xml_path0:
+                            xml_basename = os.path.basename(xml_path0)
+                    except Exception:
                         xml_basename = None
-                        try:
-                            if xml_path0:
-                                xml_basename = os.path.basename(xml_path0)
-                        except Exception:
-                            xml_basename = None
 
-                        app.logger.info('[plan.full_preview_page] using plan=%s scenario=%s', os.path.basename(plan_path), scen_norm)
-                        return render_template(
-                            'full_preview.html',
-                            full_preview=full_prev,
-                            preview_json=preview_json_str,
-                            xml_path=xml_path0,
-                            scenario=scenario0,
-                            seed=seed0,
-                            flow_meta=flow_meta or {},
-                            preview_plan_path=plan_path,
-                            display_artifacts=display_artifacts,
-                            segmentation_artifacts=segmentation_artifacts,
-                            hitl_config=hitl_config,
-                            xml_basename=xml_basename,
-                            hide_chrome=embed,
-                        )
-                except Exception:
-                    pass
+                    try:
+                        plan_label = os.path.basename(plan_path)
+                    except Exception:
+                        plan_label = str(plan_path)
+                    app.logger.info('[plan.full_preview_page] using plan=%s scenario=%s', plan_label, scen_norm or (scenario or ''))
+                    return render_template(
+                        'full_preview.html',
+                        full_preview=full_prev,
+                        preview_json=preview_json_str,
+                        xml_path=xml_path0,
+                        scenario=scenario0,
+                        seed=seed0,
+                        flow_meta=flow_meta or {},
+                        preview_plan_path=plan_path,
+                        display_artifacts=display_artifacts,
+                        segmentation_artifacts=segmentation_artifacts,
+                        hitl_config=hitl_config,
+                        xml_basename=xml_basename,
+                        hide_chrome=embed,
+                    )
+            except Exception:
+                pass
 
             if embed:
                 return Response(
@@ -28568,6 +28698,17 @@ def plan_full_preview_page():
             )
         flash('Select a scenario to load its Preview.')
         return redirect(url_for('scenarios_preview'))
+
+        if not force_recompute:
+            if embed:
+                return Response(
+                    '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">'
+                    'Preview renders saved XML only. Generate a Preview first.'
+                    '</div>',
+                    mimetype='text/html',
+                )
+            flash('Preview renders saved XML only. Generate a Preview first.')
+            return redirect(url_for('scenarios_preview'))
 
         if not xml_path:
             if embed:
@@ -28833,6 +28974,7 @@ def plan_full_preview_from_xml():
     Form fields: xml_path, optional scenario, optional embed=1
     """
     try:
+        start_ts = time.time()
         embed_raw = request.args.get('embed') or request.form.get('embed') or ''
         embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
         xml_path = (request.form.get('xml_path') or '').strip()
@@ -28865,42 +29007,43 @@ def plan_full_preview_from_xml():
         if not isinstance(meta, dict):
             meta = {}
 
-        # If the XML has been modified since the PlanPreview was created, recompute
-        # so the preview reflects current scenario contents (e.g., removed vulns/docker).
-        try:
-            plan_ts = None
-            updated_at = str(meta.get('updated_at') or meta.get('created_at') or '').strip()
-            if updated_at:
-                try:
-                    if updated_at.endswith('Z'):
-                        updated_at = updated_at[:-1] + '+00:00'
-                    plan_ts = datetime.datetime.fromisoformat(updated_at).timestamp()
-                except Exception:
-                    plan_ts = None
-            if plan_ts is not None:
-                xml_mtime = os.path.getmtime(xml_path)
-                if xml_mtime > plan_ts:
+        # Avoid auto-recomputing on refresh; only recompute when explicitly forced.
+        force_refresh = str(request.form.get('force') or '').strip().lower() in ['1', 'true', 'yes', 'y', 'on']
+        if force_refresh:
+            try:
+                plan_ts = None
+                updated_at = str(meta.get('updated_at') or meta.get('created_at') or '').strip()
+                if updated_at:
                     try:
-                        app.logger.info('[plan.full_preview_from_xml] PlanPreview stale; recomputing for %s', xml_path)
+                        if updated_at.endswith('Z'):
+                            updated_at = updated_at[:-1] + '+00:00'
+                        plan_ts = datetime.datetime.fromisoformat(updated_at).timestamp()
                     except Exception:
-                        pass
-                    try:
-                        recomputed = _planner_persist_flow_plan(
-                            xml_path=xml_path,
-                            scenario=scenario,
-                            seed=meta.get('seed'),
-                            persist_plan_file=False,
-                        )
-                        if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
-                            full_prev = recomputed.get('full_preview')
-                        payload = _load_plan_preview_from_xml(xml_path, scenario) or payload
-                        meta = payload.get('metadata') if isinstance(payload, dict) else meta
-                        if not isinstance(meta, dict):
-                            meta = {}
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                        plan_ts = None
+                if plan_ts is not None:
+                    xml_mtime = os.path.getmtime(xml_path)
+                    if xml_mtime > plan_ts:
+                        try:
+                            app.logger.info('[plan.full_preview_from_xml] PlanPreview stale; recomputing for %s', xml_path)
+                        except Exception:
+                            pass
+                        try:
+                            recomputed = _planner_persist_flow_plan(
+                                xml_path=xml_path,
+                                scenario=scenario,
+                                seed=meta.get('seed'),
+                                persist_plan_file=False,
+                            )
+                            if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
+                                full_prev = recomputed.get('full_preview')
+                            payload = _load_plan_preview_from_xml(xml_path, scenario) or payload
+                            meta = payload.get('metadata') if isinstance(payload, dict) else meta
+                            if not isinstance(meta, dict):
+                                meta = {}
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         scenario_name = str(meta.get('scenario') or '') or scenario or None
         seed_val = meta.get('seed')
@@ -28966,6 +29109,11 @@ def plan_full_preview_from_xml():
         except Exception:
             xml_basename = None
 
+        try:
+            elapsed_ms = int((time.time() - start_ts) * 1000)
+            app.logger.info('[plan.full_preview_from_xml] ok in %sms xml=%s scenario=%s', elapsed_ms, xml_path, scenario_name or '')
+        except Exception:
+            pass
         return render_template(
             'full_preview.html',
             full_preview=full_prev,
@@ -28982,7 +29130,11 @@ def plan_full_preview_from_xml():
             hide_chrome=embed,
         )
     except Exception as e:
-        app.logger.exception('[plan.full_preview_from_xml] error: %s', e)
+        try:
+            elapsed_ms = int((time.time() - start_ts) * 1000) if 'start_ts' in locals() else None
+            app.logger.exception('[plan.full_preview_from_xml] error after %sms: %s', elapsed_ms, e)
+        except Exception:
+            app.logger.exception('[plan.full_preview_from_xml] error: %s', e)
         flash(f'Full preview error: {e}')
         return redirect(url_for('index'))
 
@@ -29890,9 +30042,22 @@ def _session_docker_nodes_from_xml(session_xml_path: str) -> List[str]:
     for node in candidates:
         try:
             ntype = (node.get('type') or node.get('model') or '').strip().lower()
+            nclass = (node.get('class') or '').strip().lower()
+            compose = (node.get('compose') or '').strip()
+            compose_name = (node.get('compose_name') or '').strip()
         except Exception:
             ntype = ''
-        if ntype not in ('docker', 'docker-compose', 'docker_node', 'docker-node') and 'docker' not in ntype:
+            nclass = ''
+            compose = ''
+            compose_name = ''
+        is_docker = False
+        if ntype in ('docker', 'docker-compose', 'docker_node', 'docker-node') or 'docker' in ntype:
+            is_docker = True
+        if nclass and 'docker' in nclass:
+            is_docker = True
+        if compose or compose_name:
+            is_docker = True
+        if not is_docker:
             continue
         nm = (node.get('name') or node.findtext('name') or '').strip()
         if nm:
@@ -30019,6 +30184,12 @@ def _validate_session_nodes_and_injects(
         'missing_node_ids': [],
         'extra_node_ids': [],
         'docker_nodes': [],
+        'expected_docker_nodes': [],
+        'missing_docker_nodes': [],
+        'extra_docker_nodes': [],
+        'expected_vuln_nodes': [],
+        'missing_vuln_nodes': [],
+        'actual_vuln_nodes': [],
         'docker_missing': [],
         'docker_not_running': [],
         'injects_missing': [],
@@ -30056,8 +30227,25 @@ def _validate_session_nodes_and_injects(
     expected_inject_dirs = _extract_inject_dirs_from_plan_xml(scenario_xml_path, scenario_label)
     summary['inject_dirs_expected'] = expected_inject_dirs
 
+    expected_docker_nodes, expected_vuln_nodes = _extract_expected_docker_and_vuln_nodes_from_plan_xml(
+        scenario_xml_path,
+        scenario_label,
+    )
+    summary['expected_docker_nodes'] = expected_docker_nodes
+    summary['expected_vuln_nodes'] = expected_vuln_nodes
+
     docker_nodes = _session_docker_nodes_from_xml(session_xml_path)
     summary['docker_nodes'] = docker_nodes
+    if expected_docker_nodes:
+        exp_set = set(expected_docker_nodes)
+        act_set = set(docker_nodes)
+        summary['missing_docker_nodes'] = sorted(exp_set - act_set)
+        summary['extra_docker_nodes'] = sorted(act_set - exp_set)
+    if expected_vuln_nodes:
+        exp_vuln = set(expected_vuln_nodes)
+        act_set = set(docker_nodes)
+        summary['missing_vuln_nodes'] = sorted(exp_vuln - act_set)
+        summary['actual_vuln_nodes'] = sorted(exp_vuln & act_set)
     if docker_nodes and isinstance(core_cfg, dict):
         try:
             payload = _run_remote_python_json(
@@ -30090,7 +30278,15 @@ def _validate_session_nodes_and_injects(
             summary['ok'] = False
             summary['error'] = f'failed docker injects validation: {exc}'
 
-    if summary['missing_nodes'] or summary['docker_missing'] or summary['docker_not_running'] or summary['injects_missing']:
+    if (
+        summary['missing_nodes']
+        or summary['docker_missing']
+        or summary['docker_not_running']
+        or summary['injects_missing']
+        or summary['missing_docker_nodes']
+        or summary['extra_docker_nodes']
+        or summary['missing_vuln_nodes']
+    ):
         summary['ok'] = False
     return summary
 
@@ -31150,7 +31346,12 @@ def run_cli_async():
         except Exception:
             pass
         try:
-            repo_sync = _push_repo_to_remote(core_cfg, logger=app.logger)
+            repo_sync = _push_repo_to_remote(
+                core_cfg,
+                logger=app.logger,
+                upload_only_injected_artifacts=bool(upload_only_injected_artifacts),
+                log_handle=log_f,
+            )
         except Exception as exc:
             try:
                 log_f.write(f"[remote] Repo upload failed: {exc}\n")

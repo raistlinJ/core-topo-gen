@@ -81,22 +81,11 @@
     {% else %}
       {# In embedded mode, keep controls on the left (no spacer). #}
     {% endif %}
-  {% if not hide_chrome %}
-    <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
-  {% else %}
-    <button id="executeRunBtn" class="d-none" type="button" aria-hidden="true" data-preview-plan="{{ preview_plan_path or '' }}"></button>
-  {% endif %}
-    <form method="post" action="{{ url_for('plan_full_preview_page', embed=1) if hide_chrome else url_for('plan_full_preview_page') }}" class="d-flex align-items-center" id="rerollForm">
-      <input type="hidden" name="xml_path" value="{{ xml_path }}" />
-      {% if scenario %}<input type="hidden" name="scenario" value="{{ scenario }}" />{% endif %}
-      {% if hide_chrome %}<input type="hidden" name="embed" value="1" />{% endif %}
-      <input type="hidden" name="force" value="1" />
-      <div class="input-group input-group-sm me-2" style="width:160px;">
-        <span class="input-group-text">Seed</span>
-        <input type="text" class="form-control" name="seed" value="{{ seed }}" placeholder="random" />
-      </div>
-      <button class="btn btn-sm btn-outline-secondary" type="submit" title="Re-run preview with new / provided seed">Re-roll</button>
-    </form>
+    {% if not hide_chrome %}
+      <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
+    {% else %}
+      <button id="executeRunBtn" class="d-none" type="button" aria-hidden="true" data-preview-plan="{{ preview_plan_path or '' }}"></button>
+    {% endif %}
   </div>
   <p class="text-muted">Current Seed: <strong>{{ seed }}</strong> | XML: {{ xml_path }}</p>
   <div class="mb-3">
@@ -109,14 +98,14 @@
     {% set hitl_cfg = hitl_config or {} %}
     <h5>Overview</h5>
     <ul class="list-unstyled small">
-  <li>Routers: {{ (full_preview.routers or [])|length }}</li>
-  <li>Hosts: {{ (full_preview.hosts or [])|length }}</li>
-  <li>Switches: {{ (full_preview.switches or [])|length }}</li>
-  <li>R2R Edges: {{ (full_preview.r2r_edges_preview or [])|length }}</li>
-  <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or [])|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
-  <li>HITL: {{ 'Enabled' if hitl_cfg.get('enabled') else 'Disabled' }}</li>
-  <li>HITL Interfaces: {{ (hitl_cfg.get('interfaces') or [])|length }}</li>
-      </ul>
+      <li>Routers: {{ (full_preview.routers or [])|length }}</li>
+      <li>Hosts: {{ (full_preview.hosts or [])|length }}</li>
+      <li>Switches: {{ (full_preview.switches or [])|length }}</li>
+      <li>R2R Edges: {{ (full_preview.r2r_edges_preview or [])|length }}</li>
+      <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or [])|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
+      <li>HITL: {{ 'Enabled' if hitl_cfg.get('enabled') else 'Disabled' }}</li>
+      <li>HITL Interfaces: {{ (hitl_cfg.get('interfaces') or [])|length }}</li>
+    </ul>
       <div class="d-flex justify-content-between align-items-center mb-1">
         <h6 class="mb-0">R2R Policy</h6>
         <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-r2r" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
@@ -131,23 +120,23 @@
       <div id="fp-side-r2s" class="collapse">
         <pre class="small bg-light p-2">{{ full_preview.r2s_policy_preview | tojson(indent=2) }}</pre>
       </div>
-  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
-    <h6 class="mb-0">Services Preview</h6>
-    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-services" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-  </div>
-  <div id="fp-side-services" class="collapse">
-    <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
-  </div>
-  {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
-  {% if vuln_by_node %}
-  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
-    <h6 class="mb-0">Vulnerabilities by Host</h6>
-    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-vuln-host" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-  </div>
-  <div id="fp-side-vuln-host" class="collapse">
-    <pre class="small bg-light p-2">{{ vuln_by_node | tojson(indent=2) }}</pre>
-  </div>
-  {% endif %}
+      <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+        <h6 class="mb-0">Services Preview</h6>
+        <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-services" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+      </div>
+      <div id="fp-side-services" class="collapse">
+        <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
+      </div>
+      {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
+      {% if vuln_by_node %}
+      <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+        <h6 class="mb-0">Vulnerabilities by Host</h6>
+        <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-vuln-host" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+      </div>
+      <div id="fp-side-vuln-host" class="collapse">
+        <pre class="small bg-light p-2">{{ vuln_by_node | tojson(indent=2) }}</pre>
+      </div>
+      {% endif %}
     </div>
     <div class="col-md-8">
       <div id="fpFlowValidityAlert" class="alert alert-danger d-none mb-2" role="alert"></div>
@@ -157,9 +146,9 @@
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-hosts" type="button">Hosts</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-vulnerabilities" type="button">Vulnerabilities</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-switches" type="button">Switches</button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-interfaces" type="button">Interfaces</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-traffic" type="button">Traffic</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-interfaces" type="button">Interfaces</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-traffic" type="button">Traffic</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-flag-sequence" type="button">Flag-Sequence</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-node-sections" type="button">Node Sections</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-json" type="button">Raw JSON</button></li>
@@ -181,7 +170,7 @@
             </div>
           </div>
         </div>
-  <div class="tab-pane fade" id="fp-routers">
+        <div class="tab-pane fade" id="fp-routers">
           <div id="fp-routers-body">
             <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
             {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
@@ -2280,6 +2269,12 @@ function buildScenarioUrl(basePath){
     wrap.selectAll('*').remove();
     const width = wrap.node().clientWidth; const height = wrap.node().clientHeight;
     const svg = wrap.append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+    const seedBase = (previewData && previewData.seed !== undefined && previewData.seed !== null)
+      ? String(previewData.seed)
+      : ((previewData && previewData.metadata && previewData.metadata.seed !== undefined && previewData.metadata.seed !== null)
+        ? String(previewData.metadata.seed)
+        : '__seed__');
+    const rngForNode = (nodeId, salt) => makeDeterministicRng(`${seedBase}|${String(nodeId || '')}|${String(salt || '')}`);
     const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(previewData.vulnerabilities_by_node);
     const baseBridgeInfo = previewData.base_bridge_preview || null;
     const baseBridgeKeys = new Set();
@@ -2813,8 +2808,9 @@ function buildScenarioUrl(basePath){
           n.x = offsetX + n._layout.x * scale;
           n.y = offsetY + n._layout.y * scale;
         } else {
-          n.x = width / 2 + Math.random() * 40 - 20;
-          n.y = height / 2 + Math.random() * 40 - 20;
+          const rnd = rngForNode(n.id || n.name || '', 'layout-fallback');
+          n.x = width / 2 + rnd() * 40 - 20;
+          n.y = height / 2 + rnd() * 40 - 20;
         }
       });
       applyRowJitter(nodes);
@@ -2827,8 +2823,9 @@ function buildScenarioUrl(basePath){
       });
     } else {
       nodes.forEach(n => {
-        n.x = width / 2 + Math.random() * 80 - 40;
-        n.y = height / 2 + Math.random() * 80 - 40;
+        const rnd = rngForNode(n.id || n.name || '', 'layout-random');
+        n.x = width / 2 + rnd() * 80 - 40;
+        n.y = height / 2 + rnd() * 80 - 40;
         n.layoutX = undefined;
         n.layoutY = undefined;
       });
@@ -3669,7 +3666,19 @@ function buildScenarioUrl(basePath){
   // Delay styling until after DOM is built
   setTimeout(()=>{ applySegmentationRowStyling(); applyTrafficRowStyling(); }, 0);
   }
-  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+  function notifyParentReady(){
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: 'full-preview-ready' }, window.location.origin);
+      }
+    } catch(e) {}
+  }
+  if(document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => { init(); notifyParentReady(); });
+  } else {
+    init();
+    notifyParentReady();
+  }
   // Export JSON
   document.getElementById('exportJsonBtn')?.addEventListener('click', ()=>{
     try {
@@ -4056,72 +4065,5 @@ function buildScenarioUrl(basePath){
 })();
 </script>
 
-<script>
-(function(){
-  try {
-    const form = document.getElementById('rerollForm');
-    if(!form) return;
-    // Guard against duplicate bindings (e.g., embedded HTML re-injected).
-    if (form.dataset.rerollConfirmBound === '1') return;
-    form.dataset.rerollConfirmBound = '1';
-    const seedInput = form.querySelector('input[name="seed"]');
-    const currentSeed = String({{ seed|tojson }} || '').trim();
-    const scenarioName = String({{ (scenario or '')|tojson }} || '').trim();
-
-    function notifyParentSeed(seedStr){
-      try {
-        const p = (window.parent && window.parent !== window) ? window.parent : null;
-        if (!p) return;
-        const n = parseInt(String(seedStr || '').trim(), 10);
-        if (!Number.isFinite(n) || n <= 0) return;
-        try {
-          if (scenarioName && typeof p.coretgSetSeedForScenario === 'function') {
-            p.coretgSetSeedForScenario(scenarioName, n);
-          }
-        } catch (e) {}
-        try {
-          if (typeof p.coretgPreviewRefreshScenarioSeedBadges === 'function') {
-            p.coretgPreviewRefreshScenarioSeedBadges();
-          }
-        } catch (e) {}
-      } catch (e) {}
-    }
-
-    // In embedded mode, sync the displayed server seed back to the parent.
-    // This covers "random" rerolls where the user doesn't type a seed.
-    try {
-      if (scenarioName && currentSeed) {
-        notifyParentSeed(currentSeed);
-      }
-    } catch (e) {}
-
-    form.addEventListener('submit', (ev)=>{
-      // If multiple submit listeners exist for any reason, ensure the confirm
-      // prompt is only shown once per submission.
-      if (form.dataset.rerollConfirmInFlight === '1') return;
-      form.dataset.rerollConfirmInFlight = '1';
-      try {
-        const nextSeed = (seedInput && typeof seedInput.value === 'string') ? seedInput.value.trim() : '';
-        if(nextSeed && currentSeed && nextSeed !== currentSeed){
-          const ok = confirm('Changing the seed will re-roll the preview (IPs, node assignments, and derived values may change).\n\nContinue?');
-          if(!ok){
-            ev.preventDefault();
-            return;
-          }
-        }
-        if (scenarioName && nextSeed) {
-          notifyParentSeed(nextSeed);
-        }
-      } catch(e) {}
-      finally {
-        // Clear on next tick so future submissions still prompt as expected.
-        try { window.setTimeout(() => { try { delete form.dataset.rerollConfirmInFlight; } catch (_) { form.dataset.rerollConfirmInFlight = '0'; } }, 0); } catch (_) {
-          try { delete form.dataset.rerollConfirmInFlight; } catch (_) { form.dataset.rerollConfirmInFlight = '0'; }
-        }
-      }
-    });
-  } catch(e) {}
-})();
-</script>
 {% endblock %} {# end extra_scripts #}
 {% endblock %} {# end content #}

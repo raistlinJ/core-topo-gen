@@ -77,14 +77,14 @@
   </div>
 </div>
 
-<div class="modal" tabindex="-1" id="scenariosPreviewLoadingModal" aria-hidden="true">
+<div class="modal fade" tabindex="-1" id="scenariosPreviewLoadingModal" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">
       <div class="modal-body d-flex align-items-center gap-3">
         <div class="spinner-border" role="status" aria-label="Loading"></div>
         <div>
           <div class="fw-semibold">Loading preview…</div>
-          <div class="small text-muted">Generating plan and rendering preview page.</div>
+          <div class="small text-muted">Rendering preview page.</div>
         </div>
       </div>
     </div>
@@ -162,13 +162,53 @@
     try {
       const el = document.getElementById('scenariosPreviewLoadingModal');
       if(!el || !window.bootstrap || !window.bootstrap.Modal) return null;
+      try { el.setAttribute('aria-hidden', 'false'); } catch (e) {}
+      try { el.removeAttribute('inert'); } catch (e) {}
       const modal = window.bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
       modal.show();
       return modal;
     } catch(e){ return null; }
   }
 
+  function hideLoading(reason){
+    try {
+      const el = document.getElementById('scenariosPreviewLoadingModal');
+      if(!el || !window.bootstrap || !window.bootstrap.Modal) return;
+      try {
+        const active = document.activeElement;
+        if (active && el.contains(active) && typeof active.blur === 'function') {
+          active.blur();
+        }
+      } catch(e) {}
+      const modal = window.bootstrap.Modal.getOrCreateInstance(el);
+      modal.hide();
+      // Force cleanup in case Bootstrap state gets stuck.
+      try {
+        el.classList.remove('show');
+        el.style.display = 'none';
+        el.setAttribute('aria-hidden', 'true');
+        document.body.classList.remove('modal-open');
+        const backdrops = document.querySelectorAll('.modal-backdrop');
+        backdrops.forEach((bd) => bd.parentNode && bd.parentNode.removeChild(bd));
+      } catch(e) {}
+      try { console.debug('[preview] hide loading', reason || 'unknown'); } catch(e) {}
+    } catch(e) {}
+  }
+
+  try {
+    window.addEventListener('message', (ev) => {
+      try {
+        if (ev.origin !== window.location.origin) return;
+        const data = ev && ev.data ? ev.data : null;
+        if (data && data.type === 'full-preview-ready') {
+          hideLoading();
+        }
+      } catch(e) {}
+    });
+  } catch(e) {}
+
   async function loadPreview(){
+    const startTs = Date.now();
     const params = new URLSearchParams(window.location.search || '');
     // Prefer server-validated hidden inputs over query params. If a stale/invalid
     // xml_path is present in the URL, the backend will intentionally clear it and
@@ -208,16 +248,52 @@
       form.action = '{{ url_for('plan_full_preview_from_xml', embed=1) }}';
     } catch(e) {}
 
+    try {
+      console.debug('[preview] submit', { xmlPath, scenario, action: form && form.action });
+    } catch(e) {}
+
     const modal = showLoading();
     if(frame){
       // Clear previous content for immediate feedback.
       try { frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Loading preview…</div>'; } catch(e){}
       frame.addEventListener('load', async ()=>{
         try { modal && modal.hide(); } catch(e){}
+        try { hideLoading('iframe-load'); } catch(e){}
+        try {
+          const doc = frame.contentDocument || frame.contentWindow?.document;
+          const title = doc && doc.title ? doc.title : '(no title)';
+          const bodyText = doc && doc.body ? doc.body.textContent || '' : '';
+          console.debug('[preview] iframe loaded', { title, bodySnippet: bodyText.slice(0, 200), ms: Date.now() - startTs });
+        } catch (e) {
+          console.debug('[preview] iframe loaded (content unavailable)');
+        }
       }, { once: true });
     }
 
-    try { form && form.submit(); } catch(e){ try { modal && modal.hide(); } catch(_e){} }
+    // Poll readyState to avoid waiting on load when content is already interactive.
+    const pollStart = Date.now();
+    const pollTimer = setInterval(() => {
+      if (!frame) return;
+      try {
+        const doc = frame.contentDocument || frame.contentWindow?.document;
+        const rs = doc && doc.readyState ? doc.readyState : '';
+        if (rs === 'interactive' || rs === 'complete') {
+          clearInterval(pollTimer);
+          hideLoading('readyState-' + rs);
+          try { console.debug('[preview] readyState', rs, 'ms', Date.now() - startTs); } catch(e) {}
+        }
+      } catch(e) {}
+      if (Date.now() - pollStart > 8000) {
+        clearInterval(pollTimer);
+      }
+    }, 100);
+
+    // Fallback: auto-hide if the iframe load event never fires.
+    setTimeout(() => {
+      try { hideLoading('timeout'); } catch(e) {}
+    }, 20000);
+
+    try { form && form.submit(); } catch(e){ try { modal && modal.hide(); } catch(_e){} try { hideLoading('submit-error'); } catch(_e){} }
   }
 
   document.addEventListener('DOMContentLoaded', ()=>{

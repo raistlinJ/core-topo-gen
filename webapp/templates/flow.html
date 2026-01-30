@@ -565,6 +565,41 @@
     } catch(e) {}
   }
 
+  async function saveFlowStateToXml(xmlPath){
+    try {
+      const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
+      if(!scenario) return false;
+      const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      const flowStatePayload = {
+        scenario,
+        preset: (presetEl && presetEl.value) ? String(presetEl.value).trim() : '',
+        length: chain_ids.length,
+        chain_ids: chain_ids,
+        flag_assignments: buildPersistAssignments(chain_ids),
+        allow_node_duplicates: !!allowNodeDuplicates,
+        initial_facts: flowInitialFactsOverride,
+        goal_facts: flowGoalFactsOverride,
+        flow_enabled: !!flowEnabled,
+        updated_at: Date.now(),
+      };
+      if(!xmlPath) return false;
+      await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
+        xml_path: xmlPath,
+        scenario,
+        flow_state: flowStatePayload,
+      });
+      try{
+        const key = normalizeScenarioNorm(scenario);
+        if(key && flowStateByScenario && typeof flowStateByScenario === 'object'){
+          flowStateByScenario[key] = flowStatePayload;
+        }
+      } catch(e) {}
+      return true;
+    } catch(e){
+      return false;
+    }
+  }
+
   function alignAssignmentsToChain(chain, assignments){
     try{
       if(!Array.isArray(chain) || !Array.isArray(assignments)) return assignments;
@@ -2459,6 +2494,12 @@
         if(isVulnNode){
           titleSuffix = ' - ' + vulns.join(', ');
         } else {
+          const typeRaw = node && node.type ? String(node.type) : '';
+          const typeNorm = typeRaw.trim().toLowerCase();
+          const isDocker = typeNorm.includes('docker') || typeRaw.trim().toUpperCase() === 'DOCKER' || !!(node && (node.compose || node.compose_name));
+          const isSwitch = typeNorm.includes('switch');
+          const isRouter = typeNorm.includes('router');
+          const isHost = typeNorm.includes('host');
           let osLabel = '';
           try{
             const composeName = node && node.compose_name ? String(node.compose_name) : '';
@@ -2476,7 +2517,17 @@
               osLabel = 'Alpine';
             }
           } catch(e) {}
-          titleSuffix = osLabel ? (' - Docker Node (' + osLabel + ')') : ' - Docker Node';
+          if(isDocker){
+            titleSuffix = osLabel ? (' - Docker Node (' + osLabel + ')') : ' - Docker Node';
+          } else if(isSwitch){
+            titleSuffix = ' - Switch';
+          } else if(isRouter){
+            titleSuffix = ' - Router';
+          } else if(isHost){
+            titleSuffix = ' - Host';
+          } else {
+            titleSuffix = ' - Node';
+          }
         }
       } catch(e) {}
       title.textContent = ipText ? (baseName + ' @ ' + ipText + titleSuffix) : (baseName + titleSuffix);
@@ -7149,42 +7200,7 @@
           flags_enabled: !!(data && data.flags_enabled),
         }, null, 2);
       }
-      try {
-        if(lastResolvePayload){
-          const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-          const flowStatePayload = {
-            scenario,
-            preset,
-            length: chain_ids.length,
-            chain_ids: chain_ids,
-            flag_assignments: buildPersistAssignments(chain_ids),
-            allow_node_duplicates: !!allowNodeDuplicates,
-            initial_facts: flowInitialFactsOverride,
-            goal_facts: flowGoalFactsOverride,
-            flow_enabled: !!flowEnabled,
-            updated_at: Date.now(),
-          };
-          let xmlPath = (lastResolvePayload && lastResolvePayload.xml_path) ? String(lastResolvePayload.xml_path) : (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
-          if(!xmlPath && typeof window.coretgGetLatestXmlPathForScenario === 'function'){
-            try {
-              xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
-            } catch(e) {}
-          }
-          if(xmlPath){
-            await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
-              xml_path: xmlPath,
-              scenario,
-              flow_state: flowStatePayload,
-            });
-          }
-          try{
-            const key = normalizeScenarioNorm(scenario);
-            if(key && flowStateByScenario && typeof flowStateByScenario === 'object'){
-              flowStateByScenario[key] = flowStatePayload;
-            }
-          } catch(e) {}
-        }
-      } catch(e) {}
+      // NOTE: FlowState persistence is manual via Save XML (no auto-save here).
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
 
@@ -7320,27 +7336,7 @@
         throw new Error('Save did not return xml_path');
       }
 
-      // Persist chain + assignments into the plan so Preview can render sequence numerals.
-      if(flowEnabled){
-        try {
-          const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-          const assignments = chain_ids.length ? buildPersistAssignments(chain_ids) : [];
-          const missingGen = assignments.some(a => !a || !a.id || !String(a.id).trim());
-          if(chain_ids.length && !missingGen){
-            await postJson('/api/flag-sequencing/save_flow_substitutions', {
-              scenario,
-              chain_ids: chain_ids,
-              preview_plan: previewPlanForRequest(),
-              flag_assignments: assignments,
-              allow_node_duplicates: !!allowNodeDuplicates,
-              initial_facts: flowInitialFactsOverride,
-              goal_facts: flowGoalFactsOverride,
-            }, { timeoutMs: 60000 });
-          }
-        } catch(e) {
-          try { console.warn('Failed to persist flow substitutions before preview', e); } catch(_e) {}
-        }
-      } else {
+      if(!flowEnabled){
         try{ await clearFlowStateInXml(); } catch(e) {}
       }
 
@@ -7395,6 +7391,7 @@
         if(!hintResolveFailed){
           setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
         }
+        try { await saveFlowStateToXml(xmlPath); } catch(e) {}
         try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
       } else {
         setStatus('Saved XML (missing path).', false);
@@ -7457,6 +7454,7 @@
         }
       } catch(e) {}
       setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
+      try { await saveFlowStateToXml(xmlPath); } catch(e) {}
       try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
       return xmlPath;
     } catch(err){

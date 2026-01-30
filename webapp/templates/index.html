@@ -682,7 +682,7 @@
                     <div class="mt-3 d-grid gap-2">
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvUploadOnlyInjectedArtifacts" checked>
-                            <label class="form-check-label" for="executeAdvUploadOnlyInjectedArtifacts">Upload only injected artifacts (inject_files allowlist)</label>
+                            <label class="form-check-label" for="executeAdvUploadOnlyInjectedArtifacts">Upload only required files (instead of full artifacts)</label>
                             <div class="form-text">Uploads only the plan's <span class="font-monospace">mount_dir</span> (typically <span class="font-monospace">.../injected</span>) instead of the full <span class="font-monospace">artifacts_dir</span>.</div>
                         </div>
                         <div class="form-check">
@@ -4772,6 +4772,12 @@ function noteXmlPreviewSavedSignature(source = null) {
 }
 
 try {
+    window.noteXmlPreviewSavedSignature = noteXmlPreviewSavedSignature;
+    window.buildXmlPreviewSignature = buildXmlPreviewSignature;
+    window.setXmlPreviewSavedSignature = (sig) => { xmlPreviewSavedSignature = sig; };
+} catch (e) {}
+
+try {
     if (previewState.xmlSaved) {
         noteXmlPreviewSavedSignature();
     }
@@ -4779,6 +4785,10 @@ try {
 
 let _unsavedNavPendingHref = null;
 let _unsavedNavAllowOnce = false;
+
+try {
+    window.coretgAllowUnsavedNavOnce = function(){ _unsavedNavAllowOnce = true; };
+} catch (e) {}
 
 function hasUnsavedChanges() {
     try {
@@ -16662,10 +16672,44 @@ function renderExecuteSummary(success) {
     const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
     const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
     const dockerNodes = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
+    const expectedDockerNodes = Array.isArray(summary.expected_docker_nodes) ? summary.expected_docker_nodes.length : 0;
+    const missingDockerNodes = Array.isArray(summary.missing_docker_nodes) ? summary.missing_docker_nodes.length : 0;
+    const extraDockerNodes = Array.isArray(summary.extra_docker_nodes) ? summary.extra_docker_nodes.length : 0;
+    const expectedVulnNodes = Array.isArray(summary.expected_vuln_nodes) ? summary.expected_vuln_nodes.length : 0;
+    const missingVulnNodes = Array.isArray(summary.missing_vuln_nodes) ? summary.missing_vuln_nodes.length : 0;
+    const actualVulnNodes = Array.isArray(summary.actual_vuln_nodes) ? summary.actual_vuln_nodes.length : 0;
     const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
     const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
     const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
     executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
+    if (expectedDockerNodes > 0) {
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Expected docker nodes present',
+            missingDockerNodes === 0,
+            missingDockerNodes ? `${missingDockerNodes} missing` : `${expectedDockerNodes} expected`,
+            Array.isArray(summary.missing_docker_nodes) ? summary.missing_docker_nodes : []
+        ));
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Unexpected docker nodes',
+            extraDockerNodes === 0,
+            extraDockerNodes ? `${extraDockerNodes} unexpected` : 'None',
+            Array.isArray(summary.extra_docker_nodes) ? summary.extra_docker_nodes : []
+        ));
+    }
+    if (expectedVulnNodes > 0) {
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Expected vulnerability nodes present',
+            missingVulnNodes === 0,
+            missingVulnNodes ? `${missingVulnNodes} missing` : `${expectedVulnNodes} expected`,
+            Array.isArray(summary.missing_vuln_nodes) ? summary.missing_vuln_nodes : []
+        ));
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Vulnerability nodes found',
+            actualVulnNodes === expectedVulnNodes,
+            `${actualVulnNodes} found`,
+            Array.isArray(summary.actual_vuln_nodes) ? summary.actual_vuln_nodes : []
+        ));
+    }
     executeSummaryListEl.appendChild(renderExecuteSummaryItem(
         'Expected nodes created',
         missingNodes === 0,
@@ -16719,11 +16763,25 @@ function buildExecuteSummaryText() {
     const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
     const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
     const dockerNodes = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
+    const expectedDockerNodes = Array.isArray(summary.expected_docker_nodes) ? summary.expected_docker_nodes.length : 0;
+    const missingDockerNodes = Array.isArray(summary.missing_docker_nodes) ? summary.missing_docker_nodes.length : 0;
+    const extraDockerNodes = Array.isArray(summary.extra_docker_nodes) ? summary.extra_docker_nodes.length : 0;
+    const expectedVulnNodes = Array.isArray(summary.expected_vuln_nodes) ? summary.expected_vuln_nodes.length : 0;
+    const missingVulnNodes = Array.isArray(summary.missing_vuln_nodes) ? summary.missing_vuln_nodes.length : 0;
+    const actualVulnNodes = Array.isArray(summary.actual_vuln_nodes) ? summary.actual_vuln_nodes.length : 0;
     const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
     const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
     const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
     lines.push(`Expected nodes created: ${missingNodes === 0 ? 'OK' : `Missing ${missingNodes}`}`);
     lines.push(`Unexpected nodes: ${extraNodes === 0 ? 'None' : `Extra ${extraNodes}`}`);
+    if (expectedDockerNodes > 0) {
+        lines.push(`Expected docker nodes: ${missingDockerNodes === 0 ? 'OK' : `Missing ${missingDockerNodes}`}`);
+        lines.push(`Unexpected docker nodes: ${extraDockerNodes === 0 ? 'None' : `Extra ${extraDockerNodes}`}`);
+    }
+    if (expectedVulnNodes > 0) {
+        lines.push(`Expected vulnerability nodes: ${missingVulnNodes === 0 ? 'OK' : `Missing ${missingVulnNodes}`}`);
+        lines.push(`Vulnerability nodes found: ${actualVulnNodes}`);
+    }
     if (dockerNodes > 0) {
         lines.push(`Docker containers present: ${dockerMissing === 0 ? 'OK' : `Missing ${dockerMissing}`}`);
         lines.push(`Docker containers running: ${dockerNotRunning === 0 ? 'OK' : `Not running ${dockerNotRunning}`}`);
@@ -20614,16 +20672,8 @@ async function runSyncWithModal(arg){
                     const percent = lastFinalizeInfo && typeof lastFinalizeInfo.percent === 'number'
                         ? Math.max(0, Math.min(100, lastFinalizeInfo.percent))
                         : null;
-                    const percentSuffix = percent !== null ? ` [server: ${percent.toFixed(0)}%]` : '';
+                    const percentSuffix = percent !== null ? ` [finalize: ${percent.toFixed(0)}%]` : '';
                     let uploadPctSuffix = '';
-                    try {
-                        const upPct = lastUploadStats && typeof lastUploadStats.percent === 'number'
-                            ? Math.max(0, Math.min(100, lastUploadStats.percent))
-                            : null;
-                        if (upPct !== null) {
-                            uploadPctSuffix = ` [upload: ${upPct.toFixed(0)}%]`;
-                        }
-                    } catch (e) {}
                     let staleSuffix = '';
                     try {
                         const updatedAt = lastFinalizeInfo && typeof lastFinalizeInfo.updated_at === 'number' ? lastFinalizeInfo.updated_at : null;
@@ -20690,17 +20740,14 @@ async function runSyncWithModal(arg){
                 return;
             }
             let detail = 'transferring…';
-            if (lastUploadStats) {
-                const loaded = lastUploadStats.loaded || 0;
-                if (lastUploadStats.total) {
-                    detail = `${formatBytes(loaded)} / ${formatBytes(lastUploadStats.total)}`;
-                } else if (loaded) {
-                    detail = `${formatBytes(loaded)} transferred`;
+                if (lastUploadStats) {
+                    const loaded = lastUploadStats.loaded || 0;
+                    if (lastUploadStats.total) {
+                        detail = `${formatBytes(loaded)} / ${formatBytes(lastUploadStats.total)}`;
+                    } else if (loaded) {
+                        detail = `${formatBytes(loaded)} transferred`;
+                    }
                 }
-                if (typeof lastUploadStats.percent === 'number') {
-                    detail += ` (${lastUploadStats.percent.toFixed(1)}%)`;
-                }
-            }
             appendExecuteDialogLog(`Repository upload still running (${elapsedSec}s): ${detail}`);
         }, 4000);
     };
@@ -20711,15 +20758,10 @@ async function runSyncWithModal(arg){
         const loaded = info.loaded || 0;
         const total = info.total || null;
         const percent = typeof info.percent === 'number' ? Math.max(0, Math.min(100, info.percent)) : null;
-        if (percent !== null) {
-            if (lastLoggedUploadPercent === null || Math.abs(percent - lastLoggedUploadPercent) >= 5) {
-                const detail = total ? `${formatBytes(loaded)} / ${formatBytes(total)}` : `${formatBytes(loaded)} transferred`;
-                appendExecuteDialogLog(`Repository upload ${percent.toFixed(1)}% (${detail})`);
-                lastLoggedUploadPercent = percent;
-            }
-        } else if (loaded) {
+        if (loaded) {
             if (lastLoggedUploadBytes === null || (loaded - lastLoggedUploadBytes) >= (5 * 1024 * 1024)) {
-                appendExecuteDialogLog(`Repository upload transferred ${formatBytes(loaded)}…`);
+                const detail = total ? `${formatBytes(loaded)} / ${formatBytes(total)}` : `${formatBytes(loaded)} transferred`;
+                appendExecuteDialogLog(`Repository upload transferred ${detail}…`);
                 lastLoggedUploadBytes = loaded;
             }
         }
@@ -20763,9 +20805,9 @@ async function runSyncWithModal(arg){
         let meta = `${formatBytes(loaded)} transferred`;
         if (total) {
             meta = `${formatBytes(loaded)} / ${formatBytes(total)}`;
-            if (percent !== null) {
-                meta += ` (${percent.toFixed(1)}%)`;
-            }
+        }
+        if (percent !== null) {
+            meta += ` (${percent.toFixed(1)}%)`;
         }
         updateRunStatus('Copying repository…', meta);
         if (percent !== null) {
@@ -20824,8 +20866,18 @@ async function runSyncWithModal(arg){
         }
         if (detail && detail !== lastFinalizeDetail) {
             lastFinalizeDetail = detail;
-            const pctText = percent !== null ? ` (${percent.toFixed(0)}%)` : '';
-            appendExecuteDialogLog(`Remote finalize: ${detail}${pctText}`);
+            let suffix = '';
+            try {
+                if (/Uploading snapshot to CORE host/i.test(String(detail || ''))) {
+                    const upPct = lastUploadStats && typeof lastUploadStats.percent === 'number'
+                        ? Math.max(0, Math.min(100, lastUploadStats.percent))
+                        : null;
+                    if (upPct !== null) {
+                        suffix = ` (${upPct.toFixed(0)}%)`;
+                    }
+                }
+            } catch (e) {}
+            appendExecuteDialogLog(`Remote finalize: ${detail}${suffix}`);
         }
         if (detail) {
             updateRunStatus('Finishing repository sync… (this may take a few minutes)', detail);
@@ -21144,7 +21196,11 @@ async function runSyncWithModal(arg){
                 appendExecuteDialogLog('First remote log line received.');
                 updateRunStatus('Running CLI…', 'Streaming remote logs…');
             }
-            runProgressLogLine(ev.data||'');
+            const line = ev.data || '';
+            runProgressLogLine(line);
+            if (executeProgressState && executeProgressState.active) {
+                handleExecuteProgressLog(line);
+            }
         };
         runProgressEvtSrc.addEventListener('end', ()=>{
             waitingForRemoteLogs = false;
@@ -21402,7 +21458,11 @@ async function runWithSeedBuild(){
                 const meta = document.getElementById('runProgressMeta');
                 if(meta) meta.textContent = 'Streaming remote logs…';
             }
-            runProgressLogLine(ev.data||'');
+            const line = ev.data || '';
+            runProgressLogLine(line);
+            if (executeProgressState && executeProgressState.active) {
+                handleExecuteProgressLog(line);
+            }
         };
         runProgressEvtSrc.addEventListener('end', ()=>{ waitingForSeedLogs = false; try { runProgressEvtSrc.close(); } catch(e){} try { localStorage.removeItem('coretg_active_run_id'); } catch(e) {} });
         // Poll status similar to runSyncWithModal
