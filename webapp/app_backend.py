@@ -1506,6 +1506,61 @@ def _iter_values_by_key(obj: Any, keys: set[str]) -> Iterator[Any]:
             yield from _iter_values_by_key(item, keys)
 
 
+def _normalize_inject_dest_dir_for_validation(raw: str, *, default: str = '/flow_injects') -> str:
+    s = str(raw or '').strip()
+    if not s:
+        return default
+    if not s.startswith('/'):
+        return default
+    parts = [p for p in s.split('/') if p]
+    if any(p == '..' for p in parts):
+        return default
+    return '/' + '/'.join(parts) if parts else default
+
+
+def _extract_inject_dirs_from_plan_xml(scenario_xml_path: str, scenario_label: str | None) -> List[str]:
+    payload = None
+    try:
+        payload = _load_plan_preview_from_xml(scenario_xml_path, scenario_label)
+    except Exception:
+        payload = None
+    if not payload or not isinstance(payload, dict):
+        return []
+    full = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+    root = full if isinstance(full, dict) else payload
+
+    inject_specs: List[str] = []
+    for v in _iter_values_by_key(root, {'inject_files'}):
+        if isinstance(v, list):
+            for item in v:
+                s = str(item or '').strip()
+                if s:
+                    inject_specs.append(s)
+        elif isinstance(v, str) and v.strip():
+            inject_specs.append(v.strip())
+
+    if not inject_specs:
+        return []
+
+    dests: List[str] = []
+    for raw in inject_specs:
+        dest = ''
+        if '->' in raw:
+            _, dest = raw.split('->', 1)
+        elif '=>' in raw:
+            _, dest = raw.split('=>', 1)
+        dests.append(_normalize_inject_dest_dir_for_validation(dest))
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for d in dests:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
 def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_mount_dir: bool = False) -> List[str]:
     """Extract local artifact directories referenced by the plan.
 
@@ -29967,6 +30022,7 @@ def _validate_session_nodes_and_injects(
         'docker_missing': [],
         'docker_not_running': [],
         'injects_missing': [],
+        'inject_dirs_expected': [],
     }
     if not scenario_xml_path or not session_xml_path:
         summary['ok'] = False
@@ -29997,6 +30053,9 @@ def _validate_session_nodes_and_injects(
     except Exception:
         pass
 
+    expected_inject_dirs = _extract_inject_dirs_from_plan_xml(scenario_xml_path, scenario_label)
+    summary['inject_dirs_expected'] = expected_inject_dirs
+
     docker_nodes = _session_docker_nodes_from_xml(session_xml_path)
     summary['docker_nodes'] = docker_nodes
     if docker_nodes and isinstance(core_cfg, dict):
@@ -30006,7 +30065,7 @@ def _validate_session_nodes_and_injects(
                 _remote_docker_injects_status_script(
                     containers=docker_nodes,
                     sudo_password=core_cfg.get('ssh_password'),
-                    inject_dirs=['/flow_injects', '/flow_artifacts'],
+                    inject_dirs=expected_inject_dirs,
                 ),
                 logger=app.logger,
                 label='docker.exec.injects_status',
@@ -30025,7 +30084,7 @@ def _validate_session_nodes_and_injects(
                         continue
                     if not it.get('running'):
                         summary['docker_not_running'].append(name)
-                    if int(it.get('inject_count') or 0) <= 0:
+                    if expected_inject_dirs and int(it.get('inject_count') or 0) <= 0:
                         summary['injects_missing'].append(name)
         except Exception as exc:
             summary['ok'] = False
