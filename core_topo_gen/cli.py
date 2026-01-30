@@ -372,6 +372,7 @@ def main():
             pass
 
     # Single-pass planning/build
+    logging.info("PHASE: Parse scenario inputs")
 
     # Unified planning via orchestrator (still parse node_info early for some legacy metadata requirements)
     density_base, weight_items, count_items, services = parse_node_info(args.xml, args.scenario)
@@ -413,6 +414,7 @@ def main():
             if remaining <= 0:
                 break
     effective_total = sum(role_counts.values())
+    logging.info("PHASE: Role counts computed (hosts=%d)", effective_total)
     routing_density, routing_items = parse_routing_info(args.xml, args.scenario)
     # Derive R2R / R2S policy directly from the first routing item with a mode (no averaging)
     r2r_policy_plan = None
@@ -463,6 +465,7 @@ def main():
             preview_router_count = None
 
     # Orchestrator full plan (centralized)
+    logging.info("PHASE: Planning topology")
     from .planning.orchestrator import compute_full_plan
     orchestrated_plan = compute_full_plan(args.xml, scenario=args.scenario, seed=args.seed, include_breakdowns=True)
     if not args.scenario and isinstance(orchestrated_plan, dict):
@@ -505,6 +508,11 @@ def main():
             logging.getLogger(__name__).warning("Failed to generate automatic full preview: %s", auto_prev_exc)
     if preview_full and isinstance(router_plan_breakdown, dict):
         preview_full.setdefault('router_plan', router_plan_breakdown)
+    logging.info(
+        "PHASE: Planning complete (routers=%s hosts=%s)",
+        prelim_router_count,
+        effective_total,
+    )
     try:
         from .planning.plan_builder import build_initial_pool
         from .planning.constraints import validate_pool_final
@@ -729,6 +737,7 @@ def main():
             out_base="/tmp/vulns",
             require_pulled=False,
             base_host_pool=density_base,
+            seed=args.seed,
         )
         if assignments_slots:
             docker_slot_plan = assignments_slots
@@ -775,6 +784,7 @@ def main():
     # If any routing item carries abs_count>0, we should build a segmented topology even if density==0
     has_routing_counts = any(getattr(ri, 'abs_count', 0) and int(getattr(ri, 'abs_count', 0)) > 0 for ri in (routing_items or []))
     # Always build directly from current scenario plan (phased path removed)
+    logging.info("PHASE: Building topology")
     if (routing_density and routing_density > 0) or has_routing_counts:
         session, routers, hosts, service_assignments, router_protocols, docker_by_name = build_segmented_topology(
             core,
@@ -836,6 +846,11 @@ def main():
         router_protocols = {}
         routers = []
 
+    try:
+        logging.info("PHASE: Topology built (routers=%d hosts=%d)", len(routers or []), len(hosts or []))
+    except Exception:
+        pass
+
     # Log which docker nodes were actually created by the builders
     try:
         if docker_by_name:
@@ -846,6 +861,7 @@ def main():
         pass
 
     try:
+        logging.info("PHASE: HITL attachment")
         hitl_summary = attach_hitl_rj45_nodes(session, routers, hosts, hitl_config)
         generation_meta["hitl_attachment"] = hitl_summary
         if hitl_summary.get("interfaces"):
@@ -860,6 +876,7 @@ def main():
     # Parse segmentation config OR fallback to preview segmentation if available
     seg_summary = None
     try:
+        logging.info("PHASE: Segmentation")
         seg_density = orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('density')
         seg_items = orchestrated_plan.get('segmentation_items_raw')
         if seg_density is None:
@@ -889,6 +906,7 @@ def main():
         logging.warning("Segmentation parse/apply error: %s", e)
 
     # Parse traffic and generate scripts for non-router hosts
+    logging.info("PHASE: Traffic")
     traffic_density, traffic_items = parse_traffic_info(args.xml, args.scenario)
     logging.info(
         "Traffic config: density=%.3f, items=%d",
@@ -1066,6 +1084,7 @@ def main():
         }
         services_cfg = [{"name": s.name, "factor": s.factor, "density": s.density} for s in (services or [])]
         # Vulnerabilities (load catalog locally to avoid dependency on earlier planning block)
+        logging.info("PHASE: Vulnerabilities")
         try:
             vuln_density = orchestrated_plan.get('breakdowns', {}).get('vulnerabilities', {}).get('density_input')
         except Exception:
@@ -1434,6 +1453,7 @@ def main():
             "density": seg_density if 'seg_density' in locals() else None,
             "items": [{"name": i.name, "factor": i.factor} for i in (seg_items or [])] if 'seg_items' in locals() and seg_items else [],
         }
+        logging.info("PHASE: Report")
         if routing_density and routing_density > 0:
             # Inject XML/source classification metadata if available
             try:
@@ -1529,6 +1549,7 @@ def main():
 
     # Start the CORE session only after all services (including Traffic) are applied
     try:
+        logging.info("PHASE: Start CORE session")
         # Preflight: check for conflicting Docker containers/images for any compose-based Docker nodes.
         # This prevents hard-to-debug failures when CORE attempts to start docker-compose nodes.
         try:

@@ -28,7 +28,7 @@ def test_count_assign_overrides_density_specific():
         }
     ]
     assignments = assign_compose_to_nodes(
-        node_names, density, items_cfg, catalog, out_base="/tmp/vulns", require_pulled=False
+        node_names, density, items_cfg, catalog, out_base="/tmp/vulns", require_pulled=False, seed=0
     )
     assert 1 == len(assignments)
     # Ensure assignment maps to a valid node and the right catalog record
@@ -56,7 +56,7 @@ def test_count_assign_overrides_density_multiple():
         }
     ]
     assignments = assign_compose_to_nodes(
-        node_names, density, items_cfg, catalog, out_base="/tmp/vulns", require_pulled=False
+        node_names, density, items_cfg, catalog, out_base="/tmp/vulns", require_pulled=False, seed=0
     )
     assert 2 == len(assignments)
     # All assigned records should be docker-compose type
@@ -77,5 +77,5 @@ def test_vulnerability_additive_density_and_counts():
         {"selected": "Type/Vector", "v_metric": "Count", "v_type": "docker-compose", "v_vector": "web", "v_count": 2},
         {"selected": "Type/Vector", "factor": 1.0, "v_type": "docker-compose", "v_vector": "web"},
     ]
-    assignments = assign_compose_to_nodes(node_names, density, items_cfg, catalog, out_base="/tmp/vulns", require_pulled=False)
+    assignments = assign_compose_to_nodes(node_names, density, items_cfg, catalog, out_base="/tmp/vulns", require_pulled=False, seed=0)
     assert len(assignments) == 5, f"Expected 5 assignments (2 count + 3 density), got {len(assignments)}"

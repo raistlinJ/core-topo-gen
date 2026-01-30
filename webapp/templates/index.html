@@ -432,7 +432,7 @@
                         </div>
                         <div class="col-12 col-md-6">
                             <div class="form-check form-switch">
-                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvAutoKillSessions">
+                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvAutoKillSessions" checked>
                                 <label class="form-check-label" for="coreAdvAutoKillSessions">Auto-kill any running sessions</label>
                             </div>
                         </div>
@@ -711,7 +711,7 @@
                             <label class="form-check-label" for="executeAdvRestartCoreDaemon">Restart core-daemon</label>
                         </div>
                         <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="executeAdvAutoKillSessions">
+                            <input class="form-check-input" type="checkbox" id="executeAdvAutoKillSessions" checked>
                             <label class="form-check-label" for="executeAdvAutoKillSessions">Auto-kill any running sessions</label>
                         </div>
                     </div>
@@ -10166,7 +10166,7 @@ async function validateCoreConnection(sidx, options = {}) {
         advRunCoreCleanup = false,
         advCheckCoreVersion = false,
         advRestartCoreDaemon = false,
-        advAutoKillSessions = false,
+        advAutoKillSessions = true,
         _daemonConflictPrompted = false,
         showSummaryOnSuccess = false,
     } = options;
@@ -13335,6 +13335,9 @@ function renderMain() {
             coreAdvRestartCoreDaemonInput.disabled = builderLocked || inputsDisabled;
         }
         if (coreAdvAutoKillSessionsInput) {
+            if (coreState.adv_auto_kill_sessions === undefined || coreState.adv_auto_kill_sessions === null) {
+                coreState.adv_auto_kill_sessions = true;
+            }
             coreAdvAutoKillSessionsInput.checked = !!(coreState.adv_auto_kill_sessions);
             coreAdvAutoKillSessionsInput.disabled = builderLocked || inputsDisabled;
         }
@@ -17307,6 +17310,13 @@ function handleExecuteProgressLog(line) {
     stopExecuteProgressHeartbeat();
     appendExecuteProgressLog(line);
     if (!line) return;
+    const phaseMatch = /\bPHASE:\s*(.+)\s*$/i.exec(line);
+    if (phaseMatch) {
+        const phase = (phaseMatch[1] || '').trim();
+        setExecuteProgressStatus('Running CLI…', phase || 'In progress');
+        if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = `Phase: ${phase || 'Running'}`;
+        return;
+    }
     const composeReadyLine = /\[vuln\]\s+compose file ready for node=([^\s]+)\s+compose=([^\s]+)/i.exec(line);
     if (composeReadyLine) {
         const nodeName = composeReadyLine[1] || 'node';
@@ -20317,6 +20327,15 @@ async function runSyncWithModal(arg){
                         ? Math.max(0, Math.min(100, lastFinalizeInfo.percent))
                         : null;
                     const percentSuffix = percent !== null ? ` [server: ${percent.toFixed(0)}%]` : '';
+                    let uploadPctSuffix = '';
+                    try {
+                        const upPct = lastUploadStats && typeof lastUploadStats.percent === 'number'
+                            ? Math.max(0, Math.min(100, lastUploadStats.percent))
+                            : null;
+                        if (upPct !== null) {
+                            uploadPctSuffix = ` [upload: ${upPct.toFixed(0)}%]`;
+                        }
+                    } catch (e) {}
                     let staleSuffix = '';
                     try {
                         const updatedAt = lastFinalizeInfo && typeof lastFinalizeInfo.updated_at === 'number' ? lastFinalizeInfo.updated_at : null;
@@ -20325,7 +20344,7 @@ async function runSyncWithModal(arg){
                             staleSuffix = ` [last update: ${ageSec}s ago]`;
                         }
                     } catch (e) {}
-                    appendExecuteDialogLog(`Waiting for CORE host to finalize (${finalizeElapsed}s)${suffix}${percentSuffix}${staleSuffix}.`);
+                    appendExecuteDialogLog(`Waiting for CORE host to finalize (${finalizeElapsed}s)${suffix}${percentSuffix}${uploadPctSuffix}${staleSuffix}.`);
                 }
                 // Keep the status/meta line accurate while waiting.
                 try {

@@ -479,7 +479,7 @@ def build_full_preview(
         router_plan_stats = {'router_count_input': routers_planned}
     router_nodes: List[PreviewNode] = []
     for i in range(routers_planned):
-        router_nodes.append(PreviewNode(node_id=i + 1, name=f"r{i+1}", role="Router", kind="router"))
+        router_nodes.append(PreviewNode(node_id=i + 1, name=f"router-{i+1}", role="Router", kind="router"))
 
     # ---- Hosts ----
     total_hosts = sum(int(c) for c in role_counts.values())
@@ -501,7 +501,7 @@ def build_full_preview(
             else:
                 rid = 0
             host_router_map[host_id] = rid
-            host_nodes.append(PreviewNode(node_id=host_id, name=f"h{idx+1}", role=role, kind="host"))
+            host_nodes.append(PreviewNode(node_id=host_id, name=f"{role.lower()}-{idx+1}", role=role, kind="host"))
     host_map: Dict[int, PreviewNode] = {h.node_id: h for h in host_nodes}
 
     # ---- Runtime-like IP assignment (using allocators similar to topology.py) ----
@@ -1065,18 +1065,18 @@ def build_full_preview(
     service_assignments = _preview_services(services_plan, [h.node_id for h in host_nodes], rnd_seed)
     vuln_assignments: Dict[int, List[str]] = {}
     if vulnerabilities_plan:
-        docker_hosts = [h for h in host_nodes if (getattr(h, 'role', None) or '').strip().lower() == 'docker']
-        # Prefer Docker hosts when present; else any host.
-        target_hosts = docker_hosts if docker_hosts else host_nodes
+        # Match CLI behavior: assign to the full host slot pool in deterministic order.
+        # Use node_id ordering to mirror slot-1..N allocation, then shuffle with the same seed.
+        target_hosts = sorted(host_nodes, key=lambda h: getattr(h, 'node_id', 0))
         ordered = _stable_shuffle([h.node_id for h in target_hosts], rnd_seed + 101)
         flat: List[str] = []
         for name, count in vulnerabilities_plan.items():
             for _ in range(int(count)):
                 flat.append(name)
         for idx, vname in enumerate(flat):
-            if not ordered:
+            if not ordered or idx >= len(ordered):
                 break
-            hid = ordered[idx % len(ordered)]
+            hid = ordered[idx]
             vuln_assignments.setdefault(hid, []).append(vname)
     for h in host_nodes:
         node_vulns = vuln_assignments.get(h.node_id) or []

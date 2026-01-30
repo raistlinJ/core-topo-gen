@@ -469,6 +469,7 @@ REMOTE_BASE_DIR_ENV = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen
 REMOTE_STATIC_REPO_ENV = os.environ.get('CORE_REMOTE_STATIC_REPO', '/tmp/core-topo-gen')
 REMOTE_RUNS_SUBDIR = 'runs'
 REMOTE_LOG_CHUNK_SIZE = 8192
+REPO_PUSH_SKIP_IF_UNCHANGED = os.environ.get('CORETG_REPO_SKIP_IF_UNCHANGED', '1')
 
 REPO_PUSH_EXCLUDE_DIRS = {
     '.git',
@@ -1203,6 +1204,61 @@ def _create_local_repo_archive(src_dir: str, dest_basename: str) -> str:
     return tmp_path
 
 
+def _repo_skip_if_unchanged_enabled() -> bool:
+    try:
+        return str(REPO_PUSH_SKIP_IF_UNCHANGED).strip().lower() not in ('0', 'false', 'no', 'off')
+    except Exception:
+        return True
+
+
+def _compute_repo_fingerprint(repo_root: str) -> str:
+    """Compute a lightweight fingerprint of repo contents (paths + size + mtime)."""
+    import hashlib
+    h = hashlib.sha256()
+    root = os.path.abspath(repo_root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == '.':
+            rel_dir = ''
+        # Filter directories in-place to avoid walking excluded trees
+        dirnames[:] = [d for d in dirnames if not _should_exclude_repo_member(os.path.join(rel_dir, d))]
+        for fname in filenames:
+            rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+            if _should_exclude_repo_member(rel_path):
+                continue
+            full_path = os.path.join(dirpath, fname)
+            try:
+                st = os.stat(full_path)
+            except Exception:
+                continue
+            h.update(rel_path.replace('\\', '/').encode('utf-8', 'ignore'))
+            h.update(b'\x00')
+            h.update(str(int(st.st_size)).encode('utf-8'))
+            h.update(b'\x00')
+            h.update(str(int(st.st_mtime)).encode('utf-8'))
+            h.update(b'\n')
+    return h.hexdigest()
+
+
+def _read_remote_repo_hash(sftp: Any, remote_repo: str) -> Optional[str]:
+    try:
+        remote_hash_path = _remote_path_join(remote_repo, '.coretg_repo_hash')
+        with sftp.open(remote_hash_path, 'r') as rf:
+            raw = rf.read().decode('utf-8', 'ignore').strip()
+            return raw or None
+    except Exception:
+        return None
+
+
+def _write_remote_repo_hash(client: Any, remote_repo: str, hash_value: str) -> None:
+    try:
+        remote_hash_path = _remote_path_join(remote_repo, '.coretg_repo_hash')
+        cmd = f"printf %s {shlex.quote(hash_value)} > {shlex.quote(remote_hash_path)}"
+        _exec_ssh_command(client, cmd)
+    except Exception:
+        pass
+
+
 def _push_repo_to_remote(
     core_cfg: Dict[str, Any],
     *,
@@ -1222,6 +1278,16 @@ def _push_repo_to_remote(
         remote_repo = _remote_static_repo_dir(sftp)
         remote_parent = posixpath.dirname(remote_repo.rstrip('/')) or '/'
         base_name = os.path.basename(remote_repo.rstrip('/')) or 'core-topo-gen'
+        if _repo_skip_if_unchanged_enabled():
+            try:
+                local_hash = _compute_repo_fingerprint(repo_root)
+                remote_hash = _read_remote_repo_hash(sftp, remote_repo)
+                if remote_hash and local_hash == remote_hash:
+                    _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository unchanged; upload skipped.')
+                    log.info('[remote-sync] Repository unchanged; skipping upload to %s', remote_repo)
+                    return {'repo_path': remote_repo, 'progress_id': progress_id, 'skipped': True}
+            except Exception:
+                pass
         archive_path = _create_local_repo_archive(repo_root, base_name)
         _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=8.0, detail='Repository archive ready.')
         remote_archive = _remote_path_join(remote_parent, f"{uuid.uuid4().hex}.tar.gz")
@@ -1249,6 +1315,12 @@ def _push_repo_to_remote(
         _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
+        try:
+            if _repo_skip_if_unchanged_enabled():
+                local_hash = _compute_repo_fingerprint(repo_root)
+                _write_remote_repo_hash(client, remote_repo, local_hash)
+        except Exception:
+            pass
         _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
         return {'repo_path': remote_repo, 'progress_id': progress_id}
     finally:
@@ -25132,6 +25204,191 @@ def _grpc_save_current_session_xml(core_cfg_or_host: Any, maybe_port: Any, out_d
         raise ValueError('out_dir is required for _grpc_save_current_session_xml')
     return _grpc_save_current_session_xml_with_config(core_cfg, target_out_dir, session_id=session_id)
 
+
+def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str, Any]]:
+    """Return node info map from a CORE session XML file: id -> {name, ips, services, type}."""
+    nodes: Dict[int, Dict[str, Any]] = {}
+    if not session_xml_path or not os.path.exists(session_xml_path):
+        return nodes
+    try:
+        import xml.etree.ElementTree as _ET
+        root = _ET.parse(session_xml_path).getroot()
+    except Exception:
+        return nodes
+
+    def _norm_id(raw: Any) -> Optional[int]:
+        try:
+            if raw is None:
+                return None
+            return int(str(raw).strip())
+        except Exception:
+            return None
+
+    for node in root.findall('.//node'):
+        nid = _norm_id(node.get('id') or node.findtext('id'))
+        if nid is None:
+            continue
+        name = (node.get('name') or node.findtext('name') or '').strip()
+        ntype = (node.get('type') or node.get('model') or '').strip().lower()
+        services: List[str] = []
+        try:
+            for svc in node.findall('.//service'):
+                sname = (svc.get('name') or (svc.text or '')).strip()
+                if sname:
+                    services.append(sname)
+        except Exception:
+            pass
+        nodes.setdefault(nid, {'name': name, 'type': ntype, 'services': set(), 'ips': set()})
+        nodes[nid]['services'].update(services)
+
+    for link in root.findall('.//link'):
+        node1 = _norm_id(link.get('node1') or link.get('node1_id') or link.get('src'))
+        node2 = _norm_id(link.get('node2') or link.get('node2_id') or link.get('dst'))
+        for tag, nid in (('iface1', node1), ('iface2', node2)):
+            if nid is None:
+                continue
+            iface = link.find(tag)
+            if iface is None:
+                continue
+            ip4 = (iface.get('ip4') or '').strip()
+            mask = (iface.get('ip4_mask') or '').strip()
+            if not ip4:
+                continue
+            cidr = f"{ip4}/{mask}" if mask else ip4
+            nodes.setdefault(nid, {'name': '', 'type': '', 'services': set(), 'ips': set()})
+            nodes[nid]['ips'].add(cidr)
+    return nodes
+
+
+def _expected_from_plan_preview(scenario_xml_path: str, scenario_label: Optional[str]) -> Dict[int, Dict[str, Any]]:
+    expected: Dict[int, Dict[str, Any]] = {}
+    if not scenario_xml_path or not os.path.exists(scenario_xml_path):
+        return expected
+    payload = _load_plan_preview_from_xml(scenario_xml_path, scenario_label)
+    if not isinstance(payload, dict):
+        return expected
+    full = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else payload
+    if not isinstance(full, dict):
+        return expected
+    services_preview = full.get('services_preview') if isinstance(full.get('services_preview'), dict) else {}
+
+    def _add_node(entry: dict, role: str | None = None) -> None:
+        try:
+            nid = entry.get('node_id') if isinstance(entry, dict) else None
+            if nid is None:
+                nid = entry.get('id') if isinstance(entry, dict) else None
+            nid_int = int(nid)
+        except Exception:
+            return
+        name = str(entry.get('name') or '').strip() if isinstance(entry, dict) else ''
+        ip4 = str(entry.get('ip4') or '').strip() if isinstance(entry, dict) else ''
+        expected.setdefault(nid_int, {'name': name, 'ip4': ip4, 'role': role, 'services': None})
+
+    for r in (full.get('routers') or []):
+        if isinstance(r, dict):
+            _add_node(r, role='router')
+    for h in (full.get('hosts') or []):
+        if isinstance(h, dict):
+            _add_node(h, role=str(h.get('role') or 'host').strip().lower())
+    for sid, svcs in (services_preview or {}).items():
+        try:
+            nid_int = int(str(sid).strip())
+        except Exception:
+            continue
+        if not isinstance(svcs, list):
+            continue
+        entry = expected.setdefault(nid_int, {'name': '', 'ip4': '', 'role': None, 'services': None})
+        entry['services'] = list({str(s).strip() for s in svcs if str(s).strip()})
+    return expected
+
+
+def _append_session_scenario_discrepancies(
+    report_path: Optional[str],
+    scenario_xml_path: Optional[str],
+    session_xml_path: Optional[str],
+    scenario_label: Optional[str] = None,
+) -> None:
+    if not report_path or not os.path.exists(report_path):
+        return
+    if not scenario_xml_path or not session_xml_path:
+        return
+    try:
+        with open(report_path, 'r', encoding='utf-8', errors='ignore') as rf:
+            existing = rf.read()
+        if '## Scenario/Session Discrepancies' in existing:
+            return
+    except Exception:
+        existing = None
+
+    expected = _expected_from_plan_preview(scenario_xml_path, scenario_label)
+    actual = _parse_session_xml_for_compare(session_xml_path)
+
+    lines: List[str] = []
+    lines.append('\n## Scenario/Session Discrepancies')
+    if not expected:
+        lines.append('PlanPreview missing in scenario XML; comparison skipped.')
+        _append_report_lines(report_path, lines)
+        return
+    if not actual:
+        lines.append('Session XML missing or unreadable; comparison skipped.')
+        _append_report_lines(report_path, lines)
+        return
+
+    expected_ids = set(expected.keys())
+    actual_ids = set(actual.keys())
+    missing_nodes = sorted(expected_ids - actual_ids)
+    extra_nodes = sorted(actual_ids - expected_ids)
+
+    mismatch_rows: List[str] = []
+    for nid in sorted(expected_ids & actual_ids):
+        exp = expected.get(nid) or {}
+        act = actual.get(nid) or {}
+        exp_name = (exp.get('name') or '').strip()
+        act_name = (act.get('name') or '').strip()
+        exp_ip = (exp.get('ip4') or '').strip()
+        act_ips = sorted(list(act.get('ips') or []))
+        exp_services = exp.get('services')
+        act_services = sorted(list(act.get('services') or []))
+
+        name_mismatch = exp_name and act_name and exp_name != act_name
+        ip_mismatch = bool(exp_ip) and (exp_ip not in act_ips)
+        svc_missing: List[str] = []
+        svc_extra: List[str] = []
+        if isinstance(exp_services, list):
+            exp_set = set(exp_services)
+            act_set = set(act_services)
+            svc_missing = sorted(list(exp_set - act_set))
+            svc_extra = sorted(list(act_set - exp_set))
+
+        if name_mismatch or ip_mismatch or svc_missing or svc_extra:
+            mismatch_rows.append(
+                f"| {nid} | {exp_name or 'n/a'} | {act_name or 'n/a'} | {exp_ip or 'n/a'} | {', '.join(act_ips) or 'n/a'} | {', '.join(svc_missing) or '—'} | {', '.join(svc_extra) or '—'} |"
+            )
+
+    if not missing_nodes and not extra_nodes and not mismatch_rows:
+        lines.append('No discrepancies detected.')
+        _append_report_lines(report_path, lines)
+        return
+
+    if missing_nodes:
+        lines.append(f"- Missing nodes in session XML: {', '.join(str(n) for n in missing_nodes)}")
+    if extra_nodes:
+        lines.append(f"- Extra nodes in session XML: {', '.join(str(n) for n in extra_nodes)}")
+    if mismatch_rows:
+        lines.append('')
+        lines.append('| Node ID | Expected Name | Actual Name | Expected IP | Actual IPs | Missing Services | Extra Services |')
+        lines.append('| ---: | --- | --- | --- | --- | --- | --- |')
+        lines.extend(mismatch_rows)
+    _append_report_lines(report_path, lines)
+
+
+def _append_report_lines(report_path: str, lines: List[str]) -> None:
+    try:
+        with open(report_path, 'a', encoding='utf-8') as wf:
+            wf.write('\n'.join(lines).rstrip() + '\n')
+    except Exception:
+        pass
+
 def _attach_base_upload(payload: Dict[str, Any]):
     """Ensure payload['base_upload'] is present if first scenario has a base filepath referencing an existing file.
     Performs validation to set valid flag. Does nothing if already present.
@@ -27737,6 +27994,16 @@ def run_cli():
                 app.logger.debug("[sync] Post-run session XML saved to %s", post_saved)
         except Exception:
             post_saved = None
+        # Append session/scenario discrepancies to the report (best-effort).
+        try:
+            _append_session_scenario_discrepancies(
+                report_md,
+                xml_path,
+                post_saved,
+                scenario_label=active_scenario_name or scenario_name_hint,
+            )
+        except Exception:
+            pass
         payload = payload_for_core or {}
         if not payload:
             try:
@@ -31950,6 +32217,15 @@ def run_cli_async():
                 if post_saved:
                     meta['post_xml_path'] = post_saved
                     app.logger.debug("[async-finalizer] Post-run session XML saved to %s", post_saved)
+                try:
+                    _append_session_scenario_discrepancies(
+                        report_md,
+                        xml_path_local,
+                        post_saved,
+                        scenario_label=scenario_label,
+                    )
+                except Exception:
+                    pass
                 # Build single-scenario XML, then a Full Scenario bundle including scripts
                 single_xml = None
                 try:
@@ -32115,6 +32391,15 @@ def run_status(run_id: str):
                     if post_saved:
                         meta['post_xml_path'] = post_saved
                         app.logger.debug("[async] Post-run session XML saved to %s", post_saved)
+                    try:
+                        _append_session_scenario_discrepancies(
+                            report_md,
+                            xml_path_local,
+                            post_saved,
+                            scenario_label=scenario_label,
+                        )
+                    except Exception:
+                        pass
                     # Build single-scenario XML, then a Full Scenario bundle including scripts
                     single_xml = None
                     try:
@@ -37622,6 +37907,58 @@ def vuln_catalog_items_test_start():
         except Exception:
             pass  # Best-effort path rewriting
 
+    def _summarize_compose_for_log(path: str) -> list[str]:
+        lines: list[str] = []
+        try:
+            import yaml
+            with open(path, 'r', encoding='utf-8') as f:
+                obj = yaml.safe_load(f) or {}
+            if not isinstance(obj, dict):
+                return lines
+            services = obj.get('services') if isinstance(obj, dict) else None
+            if not isinstance(services, dict) or not services:
+                return lines
+            lines.append(f"[local] compose services={len(services)}")
+            inject_helpers = [k for k in services.keys() if str(k).startswith('inject_copy')]
+            if inject_helpers:
+                lines.append(f"[local] inject helper(s): {', '.join(inject_helpers)}")
+            for svc_name, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                img = str(svc.get('image') or '').strip()
+                build = svc.get('build')
+                ctx = ''
+                if isinstance(build, dict):
+                    ctx = str(build.get('context') or '').strip()
+                vols = svc.get('volumes') if isinstance(svc, dict) else None
+                vcount = len(vols) if isinstance(vols, list) else 0
+                labels = svc.get('labels') if isinstance(svc, dict) else None
+                has_flow_label = False
+                if isinstance(labels, dict):
+                    for k in labels.keys():
+                        if str(k).startswith('coretg.flow_artifacts.'):
+                            has_flow_label = True
+                            break
+                elif isinstance(labels, list):
+                    for it in labels:
+                        if isinstance(it, str) and it.startswith('coretg.flow_artifacts.'):
+                            has_flow_label = True
+                            break
+                parts: list[str] = []
+                if img:
+                    parts.append(f"image={img}")
+                if ctx:
+                    parts.append(f"build={ctx}")
+                if vcount:
+                    parts.append(f"volumes={vcount}")
+                if has_flow_label:
+                    parts.append("flow_artifacts_label=1")
+                if parts:
+                    lines.append(f"[local] service {svc_name}: " + ", ".join(parts))
+        except Exception:
+            return lines
+        return lines
+
     if prepared_compose_path != compose_path:
         _rewrite_compose_paths_for_remote(prepared_compose_path, run_dir, remote_run_dir)
 
@@ -37709,6 +38046,17 @@ def vuln_catalog_items_test_start():
         log_f.write(f"compose: {os.path.relpath(compose_path, _get_repo_root())}\n")
         if prepared_compose_path != compose_path:
             log_f.write(f"compose_prepared: {os.path.relpath(prepared_compose_path, _get_repo_root())}\n")
+        try:
+            inject_mode = str(os.getenv('CORETG_INJECT_FILES_MODE') or '').strip() or 'copy'
+            flow_mode = str(os.getenv('CORETG_FLOW_ARTIFACTS_MODE') or '').strip() or 'copy'
+            log_f.write(f"[local] inject_files_mode={inject_mode} flow_artifacts_mode={flow_mode}\n")
+        except Exception:
+            pass
+        try:
+            for line in _summarize_compose_for_log(prepared_compose_path):
+                log_f.write(line + "\n")
+        except Exception:
+            pass
         log_f.write(f"[remote] uploading to CORE VM…\n")
         try:
             env_path = os.path.join(run_dir, '.env')

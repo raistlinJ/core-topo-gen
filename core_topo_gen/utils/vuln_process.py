@@ -648,7 +648,7 @@ def _eligible_compose_items(catalog: Iterable[Dict[str, str]], v_type: Optional[
 	return items
 
 
-def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: List[dict], catalog: List[Dict[str, str]], out_base: str = "/tmp/vulns", require_pulled: bool = True, base_host_pool: int | None = None) -> Dict[str, Dict[str, str]]:
+def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: List[dict], catalog: List[Dict[str, str]], out_base: str = "/tmp/vulns", require_pulled: bool = True, base_host_pool: int | None = None, seed: int | None = None) -> Dict[str, Dict[str, str]]:
 	"""Assign docker-compose vulnerabilities to nodes.
 
 	Rules (updated semantics):
@@ -687,7 +687,7 @@ def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: Li
 	except Exception:
 		pass
 
-	rng = random.Random()
+	rng = random.Random(seed) if seed is not None else random.Random()
 	nodes_pool = list(node_names)
 	rng.shuffle(nodes_pool)
 	assigned: Dict[str, Dict[str, str]] = {}

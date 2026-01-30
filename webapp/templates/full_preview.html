@@ -183,8 +183,8 @@
         </div>
   <div class="tab-pane fade" id="fp-routers">
           <div id="fp-routers-body">
-            <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Primary IP</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
-            {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 or '-' }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
+            <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
+            {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
             </tbody></table>
           </div>
         </div>
@@ -2962,6 +2962,17 @@ function buildScenarioUrl(basePath){
     }
     function primaryIp(d){
       try {
+        const roleRaw = (d && (d.role || d.kind || d.type)) ? String(d.role || d.kind || d.type).toLowerCase() : '';
+        if(roleRaw.includes('switch')) return '';
+        const isRouter = roleRaw.includes('router');
+        if(isRouter){
+          const rid = (d && d.id !== undefined && d.id !== null) ? d.id : null;
+          const sw = (previewData && Array.isArray(previewData.switches_detail)) ? previewData.switches_detail : [];
+          const matches = rid !== null ? sw.filter(x => x && x.router_id == rid) : [];
+          const primary = (matches[0] && matches[0].router_ip) ? String(matches[0].router_ip) : ((d && d.ip4) ? String(d.ip4).trim() : '');
+          const extra = matches.length > 1 ? ` + ${matches.length - 1}` : '';
+          return primary ? `${primary}${extra}` : '';
+        }
         const ip = (d && d.ip4) ? String(d.ip4).trim() : '';
         return ip;
       } catch(e){
