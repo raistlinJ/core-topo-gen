@@ -3669,15 +3669,19 @@ function buildScenarioUrl(basePath){
   function notifyParentReady(){
     try {
       if (window.parent && window.parent !== window) {
+        try { console.debug('[full_preview] posting ready'); } catch(e) {}
         window.parent.postMessage({ type: 'full-preview-ready' }, window.location.origin);
       }
     } catch(e) {}
   }
   if(document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => { init(); notifyParentReady(); });
+    document.addEventListener('DOMContentLoaded', () => {
+      notifyParentReady();
+      setTimeout(init, 0);
+    });
   } else {
-    init();
     notifyParentReady();
+    setTimeout(init, 0);
   }
   // Export JSON
   document.getElementById('exportJsonBtn')?.addEventListener('click', ()=>{

@@ -201,7 +201,8 @@
         if (ev.origin !== window.location.origin) return;
         const data = ev && ev.data ? ev.data : null;
         if (data && data.type === 'full-preview-ready') {
-          hideLoading();
+          try { console.debug('[preview] message full-preview-ready'); } catch(e) {}
+          hideLoading('postMessage');
         }
       } catch(e) {}
     });
