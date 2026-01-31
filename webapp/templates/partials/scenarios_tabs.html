@@ -797,6 +797,7 @@
     try {
       if (!payload || typeof payload !== 'object') return null;
       const cloned = JSON.parse(JSON.stringify(payload));
+      const seedMap = {};
       if (cloned && Array.isArray(cloned.scenarios)) {
         cloned.scenarios.forEach((sc) => {
           if (!sc || typeof sc !== 'object') return;
@@ -810,12 +811,20 @@
           try { delete sc.full_preview; } catch (e) {}
           try { delete sc.fullPreview; } catch (e) {}
           try { delete sc.preview; } catch (e) {}
+          try {
+            const nm = sc.name ? String(sc.name).trim() : '';
+            if (nm) {
+              const seedVal = getSeedForScenario(nm);
+              seedMap[nm] = seedVal !== null && seedVal !== undefined ? seedVal : null;
+            }
+          } catch (e) {}
         });
       }
       return JSON.stringify({
         scenarios: cloned.scenarios || [],
         core: cloned.core || null,
         active_index: cloned.active_index ?? null,
+        seeds: seedMap,
       });
     } catch (e) {
       return null;

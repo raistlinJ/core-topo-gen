@@ -36067,13 +36067,16 @@ def stream_logs(run_id: str):
     def generate():
         # 1) Send existing backlog first for immediate context
         last_pos = 0
+        last_emit_ts = time.time()
         try:
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f_init:
                 backlog = f_init.read()
                 last_pos = f_init.tell()
             if backlog:
                 for line in backlog.splitlines():
-                    yield from _emit_line(line)
+                    for payload in _emit_line(line):
+                        yield payload
+                    last_emit_ts = time.time()
         except FileNotFoundError:
             pass
         # 2) Tail incremental additions
@@ -36086,7 +36089,9 @@ def stream_logs(run_id: str):
                         last_pos = f.tell()
                         # Split into lines to keep events reasonable
                         for line in chunk.splitlines():
-                            yield from _emit_line(line)
+                            for payload in _emit_line(line):
+                                yield payload
+                            last_emit_ts = time.time()
             except FileNotFoundError:
                 pass
             # Check process status
@@ -36107,12 +36112,18 @@ def stream_logs(run_id: str):
                         if tail:
                             last_pos = f_final.tell()
                             for line in tail.splitlines():
-                                yield from _emit_line(line)
+                                for payload in _emit_line(line):
+                                    yield payload
+                                last_emit_ts = time.time()
                 except FileNotFoundError:
                     pass
                 # Signal end regardless; client will stop listening
                 yield "event: end\ndata: done\n\n"
                 break
+            # Keepalive ping to avoid idle timeouts
+            if time.time() - last_emit_ts >= 5:
+                yield "event: ping\ndata: {}\n\n"
+                last_emit_ts = time.time()
             time.sleep(0.5)
 
     headers = {

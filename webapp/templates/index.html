@@ -99,6 +99,19 @@
                 <div class="card-body">
                     <div id="connectionSetupRoot" class="{% if scenarios_active_tab == 'connection-setup' %}d-block{% else %}d-none{% endif %}"></div>
                     {% if scenarios_active_tab != 'connection-setup' %}
+                    <div class="card mb-3" id="topologySeedCard">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <strong>Topology Seed</strong>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="topologySeedRerollBtn" title="Re-roll seed">Re-roll</button>
+                        </div>
+                        <div class="card-body">
+                            <div class="input-group input-group-sm" style="max-width: 260px;">
+                                <label class="input-group-text" for="topologySeedInput">Seed</label>
+                                <input type="number" class="form-control" id="topologySeedInput" min="1" step="1" inputmode="numeric" placeholder="seed" />
+                            </div>
+                            <div class="form-text">Seed is per scenario and affects deterministic topology outputs.</div>
+                        </div>
+                    </div>
                     <div class="card mb-3" id="baseCoreScenarioCard">
                         <div class="card-header d-flex justify-content-between align-items-center">
                             <strong>Base CORE Scenario</strong>
@@ -8557,11 +8570,106 @@ function updateDownloadButtonState() {
     }
 }
 
+function getActiveScenarioNameForSeed() {
+    try {
+        const sc = (state && Array.isArray(state.scenarios)) ? state.scenarios[activeIdx] : null;
+        const name = sc && sc.name ? String(sc.name).trim() : '';
+        return name || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function markTopologySeedChanged() {
+    try { if (window.previewState && typeof window.previewState === 'object') window.previewState.dirty = true; } catch (e) {}
+    try { if (typeof updatePlanButtons === 'function') updatePlanButtons(); } catch (e) {}
+}
+
+function bindTopologySeedControls() {
+    const input = document.getElementById('topologySeedInput');
+    const rerollBtn = document.getElementById('topologySeedRerollBtn');
+    if (input && input.dataset.boundSeedInput !== '1') {
+        input.addEventListener('change', () => {
+            const scenarioName = getActiveScenarioNameForSeed();
+            if (!scenarioName) return;
+            const raw = String(input.value || '').trim();
+            const n = parseInt(raw, 10);
+            if (!Number.isFinite(n) || n <= 0) {
+                try {
+                    const existing = (typeof window.coretgGetSeedForScenario === 'function')
+                        ? window.coretgGetSeedForScenario(scenarioName)
+                        : getSeedForScenario(scenarioName);
+                    if (existing) input.value = String(existing);
+                } catch (e) {}
+                return;
+            }
+            try {
+                if (typeof window.coretgSetSeedForScenario === 'function') {
+                    window.coretgSetSeedForScenario(scenarioName, n);
+                } else {
+                    setSeedForScenario(scenarioName, n);
+                }
+            } catch (e) {}
+            try { renderSidebar(); } catch (e) {}
+            markTopologySeedChanged();
+        });
+        input.dataset.boundSeedInput = '1';
+    }
+    if (rerollBtn && rerollBtn.dataset.boundSeedReroll !== '1') {
+        rerollBtn.addEventListener('click', (ev) => {
+            try { ev.preventDefault(); } catch (e) {}
+            const scenarioName = getActiveScenarioNameForSeed();
+            if (!scenarioName) return;
+            const seed = Math.max(1, Math.floor(Math.random() * 2147483647));
+            try {
+                if (typeof window.coretgSetSeedForScenario === 'function') {
+                    window.coretgSetSeedForScenario(scenarioName, seed);
+                } else {
+                    setSeedForScenario(scenarioName, seed);
+                }
+            } catch (e) {}
+            if (input) input.value = String(seed);
+            try { renderSidebar(); } catch (e) {}
+            markTopologySeedChanged();
+        });
+        rerollBtn.dataset.boundSeedReroll = '1';
+    }
+}
+
+function updateTopologySeedControls() {
+    const card = document.getElementById('topologySeedCard');
+    if (!card) return;
+    if (typeof SCENARIOS_ACTIVE_TAB === 'string' && SCENARIOS_ACTIVE_TAB !== 'topology') {
+        card.classList.add('d-none');
+        return;
+    }
+    card.classList.remove('d-none');
+    bindTopologySeedControls();
+    const input = document.getElementById('topologySeedInput');
+    if (!input) return;
+    const scenarioName = getActiveScenarioNameForSeed();
+    if (!scenarioName) {
+        input.value = '';
+        input.setAttribute('disabled', 'disabled');
+        return;
+    }
+    input.removeAttribute('disabled');
+    try {
+        const seed = (typeof window.coretgEnsureSeedForScenario === 'function')
+            ? window.coretgEnsureSeedForScenario(scenarioName)
+            : ensureSeedForScenario(scenarioName);
+        if (seed !== null && seed !== undefined && String(input.value) !== String(seed)) {
+            input.value = String(seed);
+        }
+    } catch (e) {}
+}
+
 function render() {
     updateActiveScenarioQueryParam();
     renderSidebar();
     renderMain();
     updateParticipantProxmoxNavLink();
+    updateTopologySeedControls();
     // Ensure H/S bounds visibility reflects initial r2s_mode values
     updateHsBoundsVisibility();
     // Ensure routing policy preview replaces the default "(pending)" label.

@@ -3734,7 +3734,7 @@ function buildScenarioUrl(basePath){
   }
 
   function setExecuteProgressUI(opts){
-    const { status, meta, barText, animate } = opts || {};
+    const { status, meta, barText, animate, percent } = opts || {};
     const statusEl = document.getElementById('executeProgressStatus');
     if(statusEl !== null && status !== undefined){ statusEl.textContent = status; }
     const metaEl = document.getElementById('executeProgressMeta');
@@ -3742,6 +3742,11 @@ function buildScenarioUrl(basePath){
     const bar = document.getElementById('executeProgressBar');
     if(bar){
       if(barText !== undefined){ bar.textContent = barText; }
+      if(typeof percent === 'number' && Number.isFinite(percent)){
+        const p = Math.max(0, Math.min(100, Math.round(percent)));
+        bar.style.width = p + '%';
+        bar.setAttribute('aria-valuenow', String(p));
+      }
       if(animate === true){ bar.classList.add('progress-bar-animated','progress-bar-striped'); }
       else if(animate === false){ bar.classList.remove('progress-bar-animated','progress-bar-striped'); }
     }
@@ -3770,6 +3775,27 @@ function buildScenarioUrl(basePath){
     const logEl = document.getElementById('executeProgressLog');
     if(!logEl) return;
     const text = (line === undefined || line === null) ? '' : String(line);
+    try {
+      const finalizeMatch = text.match(/\[ui\]\s*Waiting for CORE host to finalize\s*\((\d+)s\)\s*\(([^)]*)\)\s*\[finalize:\s*(\d+)%\]\s*\[last update:\s*(\d+)s ago\]/i);
+      if (finalizeMatch) {
+        const elapsed = parseInt(finalizeMatch[1], 10);
+        const stage = String(finalizeMatch[2] || '').trim();
+        const pct = parseInt(finalizeMatch[3], 10);
+        const last = parseInt(finalizeMatch[4], 10);
+        const meta = [
+          stage ? `Stage: ${stage}` : null,
+          Number.isFinite(elapsed) ? `Elapsed: ${elapsed}s` : null,
+          Number.isFinite(last) ? `Last update: ${last}s ago` : null,
+        ].filter(Boolean).join(' • ');
+        setExecuteProgressUI({
+          status: 'Finalizing on CORE host…',
+          meta,
+          barText: Number.isFinite(pct) ? `Finalize ${pct}%` : 'Finalizing…',
+          percent: Number.isFinite(pct) ? pct : undefined,
+          animate: true,
+        });
+      }
+    } catch(e) {}
     logEl.textContent += text + '\n';
     logEl.parentElement?.scrollTo({ top: logEl.parentElement.scrollHeight, behavior: 'auto' });
   }
@@ -3780,6 +3806,29 @@ function buildScenarioUrl(basePath){
     }
     executeProgressEvtSrc = null;
     executeProgressRunId = null;
+  }
+
+  function attachExecuteProgressStream(runId){
+    executeProgressRunId = runId;
+    executeProgressEvtSrc = new EventSource('/stream/' + runId);
+    executeProgressEvtSrc.onmessage = (ev)=>{
+      if(ev && typeof ev.data === 'string'){
+        appendExecuteProgressLog(ev.data);
+      }
+    };
+    executeProgressEvtSrc.addEventListener('end', ()=>{
+      appendExecuteProgressLog('Execution stream ended');
+      cleanupExecuteProgress();
+    });
+    executeProgressEvtSrc.addEventListener('ping', ()=>{
+      try {
+        setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
+      } catch(e) {}
+    });
+    executeProgressEvtSrc.onerror = ()=>{
+      appendExecuteProgressLog('[ui] Stream disconnected; reconnecting…');
+      setExecuteProgressUI({ status: 'Reconnecting…', meta: 'Waiting for stream', barText: 'Working…', animate: true });
+    };
   }
 
   document.getElementById('executeProgressModal')?.addEventListener('hidden.bs.modal', ()=>{
@@ -3894,17 +3943,7 @@ function buildScenarioUrl(basePath){
         }
         appendExecuteProgressLog('Run ID: '+run_id);
         setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
-        executeProgressRunId = run_id;
-        executeProgressEvtSrc = new EventSource('/stream/' + run_id);
-        executeProgressEvtSrc.onmessage = (ev)=>{
-          if(ev && typeof ev.data === 'string'){
-            appendExecuteProgressLog(ev.data);
-          }
-        };
-        executeProgressEvtSrc.addEventListener('end', ()=>{
-          appendExecuteProgressLog('Execution stream ended');
-          cleanupExecuteProgress();
-        });
+        attachExecuteProgressStream(run_id);
         (async function poll(){
           try {
             const r = await fetch('/run_status/' + run_id);
@@ -4008,17 +4047,7 @@ function buildScenarioUrl(basePath){
                 }
                 appendExecuteProgressLog('Retry Run ID: '+run_id2);
                 setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
-                executeProgressRunId = run_id2;
-                executeProgressEvtSrc = new EventSource('/stream/' + run_id2);
-                executeProgressEvtSrc.onmessage = (ev)=>{
-                  if(ev && typeof ev.data === 'string'){
-                    appendExecuteProgressLog(ev.data);
-                  }
-                };
-                executeProgressEvtSrc.addEventListener('end', ()=>{
-                  appendExecuteProgressLog('Execution stream ended');
-                  cleanupExecuteProgress();
-                });
+                attachExecuteProgressStream(run_id2);
                 // Start a new poll loop for the retry.
                 (async function pollRetry(){
                   try {
