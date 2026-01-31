@@ -64,7 +64,6 @@
                 <th>Flow/Preview Plan</th>
                 <th>Report</th>
                 <th>Summary</th>
-                <th>Reports Summary</th>
                 <th>Session XML</th>
                 <th style="white-space:nowrap;">Run ID</th>
               </tr>
@@ -79,7 +78,6 @@
                 <td>{% if r.preview_plan_path %}<a href="{{ url_for('download_report', path=r.preview_plan_path) }}">plan</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 <td>{% if r.report_path %}<a href="{{ url_for('download_report', path=r.report_path) }}">report</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 <td>{% if r.summary_path %}<a href="{{ url_for('download_report', path=r.summary_path) }}">summary</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
-                <td class="small">{% if r.summary_output %}{{ r.summary_output }}{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 {% set session_path = r.session_xml_path or r.post_xml_path %}
                 <td>{% if session_path %}<a href="{{ url_for('download_report', path=session_path) }}">session</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 <td>{{ r.run_id or '-' }}</td>
@@ -154,7 +152,6 @@ function buildRow(r){
     <td>${r.preview_plan_path?`<a href='/download_report?path=${encodeURIComponent(r.preview_plan_path)}'>plan</a>`:'<span class="text-muted">n/a</span>'}</td>
   <td>${r.report_path?`<a href='/download_report?path=${encodeURIComponent(r.report_path)}'>report</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
   <td>${r.summary_path?`<a href='/download_report?path=${encodeURIComponent(r.summary_path)}'>summary</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
-  <td class="small">${r.summary_output?escapeHtml(r.summary_output):'<span class=\"text-muted\">n/a</span>'}</td>
   <td>${sessionPath?`<a href='/download_report?path=${encodeURIComponent(sessionPath)}'>session</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
     <td>${escapeHtml(r.run_id||'-')}</td>
   </tr>`;

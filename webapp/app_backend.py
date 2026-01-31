@@ -21922,6 +21922,20 @@ def _extract_summary_path_from_text(text: str, *, require_exists: bool = True) -
     return None
 
 
+def _extract_validation_summary_from_text(text: str) -> dict | None:
+    if not text:
+        return None
+    try:
+        import re as _re
+        matches = _re.findall(r"VALIDATION_SUMMARY_JSON:\s*(\{.*?\})\s*$", text, flags=_re.MULTILINE)
+        if not matches:
+            return None
+        raw = matches[-1]
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 def _extract_docker_conflicts_from_text(text: str) -> dict | None:
     """Parse CLI logs for machine-readable Docker conflict info.
 
@@ -33086,6 +33100,7 @@ def run_status(run_id: str):
         report_md = None
 
     docker_conflicts = _extract_docker_conflicts_from_text(txt)
+    log_validation = _extract_validation_summary_from_text(txt)
     summary_json = _extract_summary_path_from_text(txt)
     if not summary_json:
         summary_json = _derive_summary_from_report(report_md)
@@ -33120,6 +33135,21 @@ def run_status(run_id: str):
                         summary_docker_empty = True
             except Exception:
                 summary_docker_empty = False
+            summary_missing_nodes = False
+            try:
+                if isinstance(summary, dict):
+                    if 'expected_nodes' in summary:
+                        expected_nodes = summary.get('expected_nodes')
+                        if isinstance(expected_nodes, list) and not expected_nodes:
+                            summary_missing_nodes = True
+                    if 'actual_nodes' in summary:
+                        actual_nodes = summary.get('actual_nodes')
+                        if isinstance(actual_nodes, list) and not actual_nodes:
+                            summary_missing_nodes = True
+            except Exception:
+                summary_missing_nodes = False
+            if log_validation and (summary is None or summary_has_error or summary_missing_docker or summary_docker_empty or summary_missing_nodes):
+                meta['validation_summary'] = log_validation
             if post_xml and os.path.exists(post_xml) and (summary is None or summary_has_error or summary_missing_docker or summary_docker_empty):
                 validation = _validate_session_nodes_and_injects(
                     scenario_xml_path=xml_path,

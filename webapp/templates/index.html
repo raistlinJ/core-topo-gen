@@ -5458,8 +5458,9 @@ async function computeFullPlanPreview(){
         const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const data = await res.json();
         try {
-            if (data?.validation_summary && !executeProgressState.validationSummary) {
+            if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                 executeProgressState.validationSummary = data.validation_summary;
+                refreshExecuteSummaryIfVisible();
             }
         } catch (e) {}
         try {
@@ -16440,6 +16441,53 @@ const executeProgressState = {
     validationSummary: null,
     summaryShown: false,
 };
+
+function shouldUpdateValidationSummary(current, incoming) {
+    if (!incoming || typeof incoming !== 'object') return false;
+    if (!current || typeof current !== 'object') return true;
+    const currDocker = Array.isArray(current.docker_nodes) ? current.docker_nodes.length : 0;
+    const incDocker = Array.isArray(incoming.docker_nodes) ? incoming.docker_nodes.length : 0;
+    const currExpected = Array.isArray(current.expected_nodes) ? current.expected_nodes.length : 0;
+    const incExpected = Array.isArray(incoming.expected_nodes) ? incoming.expected_nodes.length : 0;
+    const currActual = Array.isArray(current.actual_nodes) ? current.actual_nodes.length : 0;
+    const incActual = Array.isArray(incoming.actual_nodes) ? incoming.actual_nodes.length : 0;
+    const currHasDockerField = Object.prototype.hasOwnProperty.call(current, 'docker_nodes');
+    const incHasDockerField = Object.prototype.hasOwnProperty.call(incoming, 'docker_nodes');
+    const incExpectedDocker = Array.isArray(incoming.expected_docker_nodes) ? incoming.expected_docker_nodes.length : 0;
+    if (!currHasDockerField && incHasDockerField) return true;
+    if (incDocker > 0 && currDocker === 0) return true;
+    if (incExpectedDocker > 0 && incDocker !== currDocker) return true;
+    if (incExpected > 0 && (currExpected === 0 || incExpected !== currExpected)) return true;
+    if (incActual > 0 && (currActual === 0 || incActual !== currActual)) return true;
+    return false;
+}
+
+function refreshExecuteSummaryIfVisible() {
+    try {
+        if (!executeSummaryModalEl) return;
+        if (!executeSummaryModalEl.classList.contains('show')) return;
+        const summary = executeProgressState?.validationSummary;
+        renderExecuteSummary(!!(summary && summary.ok));
+    } catch (e) {}
+}
+
+function getLatestRunIdForSummary() {
+    return executeProgressState?.runId || runProgressRunId || (typeof localStorage !== 'undefined' ? localStorage.getItem('coretg_active_run_id') : null);
+}
+
+async function refreshValidationSummaryFromRunStatus(runId) {
+    const id = runId || getLatestRunIdForSummary();
+    if (!id) return;
+    try {
+        const res = await fetch('/run_status/' + encodeURIComponent(String(id)));
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
+            executeProgressState.validationSummary = data.validation_summary;
+            refreshExecuteSummaryIfVisible();
+        }
+    } catch (e) {}
+}
 let setCoreConnectionHint = null;
 
 // If the browser throws during execution flow, surface it in the Execute progress panel
@@ -16923,6 +16971,7 @@ function showExecuteSummaryModal(success) {
             bootstrap.Modal.getOrCreateInstance(executeSummaryModalEl).show();
         } catch (e) {}
     }
+    try { refreshValidationSummaryFromRunStatus(); } catch (e) {}
 }
 
 function queueExecuteSummaryRedirect(url, delayMs = 600) {
@@ -17732,7 +17781,13 @@ function completeExecuteProgressPanel(success, message, meta) {
     }
     // Re-enable connection & advanced controls only after run completes.
     try { if (typeof setExecuteDialogControlsEnabled === 'function') setExecuteDialogControlsEnabled(true); } catch(e){}
-    try { showExecuteSummaryModal(success); } catch (e) {}
+    try {
+        refreshValidationSummaryFromRunStatus().finally(() => {
+            try { showExecuteSummaryModal(success); } catch (e) {}
+        });
+    } catch (e) {
+        try { showExecuteSummaryModal(success); } catch (err) {}
+    }
 }
 
 function handleExecuteProgressLog(line) {
@@ -20438,6 +20493,12 @@ async function pollRunStatus(runId) {
     const res = await fetch('/run_status/' + runId);
         if (!res.ok) return;
         const data = await res.json();
+        try {
+            if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
+                executeProgressState.validationSummary = data.validation_summary;
+                refreshExecuteSummaryIfVisible();
+            }
+        } catch (e) {}
         // Update download link
         const rp = data.report_path || data.xml_path;
         if (rp) { state.result_path = rp; persistEditorState(); }
@@ -20455,9 +20516,13 @@ async function pollRunStatus(runId) {
                 executeProgressState.summaryShown = true;
                 if (data.returncode === 0) {
                     queueExecuteSummaryRedirect("{{ url_for('reports_page') }}", 500);
-                    showExecuteSummaryModal(true);
+                    refreshValidationSummaryFromRunStatus(runId).finally(() => {
+                        showExecuteSummaryModal(true);
+                    });
                 } else {
-                    showExecuteSummaryModal(false);
+                    refreshValidationSummaryFromRunStatus(runId).finally(() => {
+                        showExecuteSummaryModal(false);
+                    });
                 }
             }
         }
@@ -21329,8 +21394,9 @@ async function runSyncWithModal(arg){
                     if(!r.ok){ setTimeout(poll, 1200); return; }
                     const data = await r.json();
                     try {
-                        if (data?.validation_summary && !executeProgressState.validationSummary) {
+                        if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                             executeProgressState.validationSummary = data.validation_summary;
+                            refreshExecuteSummaryIfVisible();
                         }
                     } catch (e) {}
                     if(data.report_path || data.xml_path){
@@ -21355,9 +21421,13 @@ async function runSyncWithModal(arg){
                             executeProgressState.summaryShown = true;
                             if (data.returncode === 0) {
                                 queueExecuteSummaryRedirect("{{ url_for('reports_page') }}", 500);
-                                showExecuteSummaryModal(true);
+                                refreshValidationSummaryFromRunStatus(run_id).finally(() => {
+                                    showExecuteSummaryModal(true);
+                                });
                             } else {
-                                showExecuteSummaryModal(false);
+                                refreshValidationSummaryFromRunStatus(run_id).finally(() => {
+                                    showExecuteSummaryModal(false);
+                                });
                             }
                         }
                     } catch(e){}

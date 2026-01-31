@@ -158,39 +158,70 @@
     window.coretgPreviewRefreshScenarioSeedBadges = updateScenarioSeedBadges;
   } catch (e) {}
 
+  let previewLoadingHidden = false;
   function showLoading(){
+    previewLoadingHidden = false;
     try {
       const el = document.getElementById('scenariosPreviewLoadingModal');
-      if(!el || !window.bootstrap || !window.bootstrap.Modal) return null;
+      if(!el) return null;
       try { el.setAttribute('aria-hidden', 'false'); } catch (e) {}
       try { el.removeAttribute('inert'); } catch (e) {}
-      const modal = window.bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
-      modal.show();
-      return modal;
+      try { el.style.display = 'block'; } catch (e) {}
+      try { el.classList.add('show'); } catch (e) {}
+      try { document.body.classList.add('modal-open'); } catch (e) {}
+      if (window.bootstrap && window.bootstrap.Modal) {
+        try {
+          const modal = window.bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+          modal.show();
+          return modal;
+        } catch (e) {}
+      }
+      return null;
     } catch(e){ return null; }
   }
 
+  function forceHidePreviewLoading(el){
+    try {
+      el.classList.remove('show');
+      el.style.display = 'none';
+      el.setAttribute('aria-hidden', 'true');
+      el.removeAttribute('aria-modal');
+      document.body.classList.remove('modal-open');
+      document.body.style.removeProperty('paddingRight');
+      document.body.style.removeProperty('overflow');
+      const backdrops = document.querySelectorAll('.modal-backdrop');
+      backdrops.forEach((bd) => bd.parentNode && bd.parentNode.removeChild(bd));
+    } catch(e) {}
+  }
+
   function hideLoading(reason){
+    if (previewLoadingHidden) return;
+    previewLoadingHidden = true;
     try {
       const el = document.getElementById('scenariosPreviewLoadingModal');
-      if(!el || !window.bootstrap || !window.bootstrap.Modal) return;
+      if(!el) return;
       try {
         const active = document.activeElement;
         if (active && el.contains(active) && typeof active.blur === 'function') {
           active.blur();
         }
       } catch(e) {}
-      const modal = window.bootstrap.Modal.getOrCreateInstance(el);
-      modal.hide();
-      // Force cleanup in case Bootstrap state gets stuck.
-      try {
-        el.classList.remove('show');
-        el.style.display = 'none';
-        el.setAttribute('aria-hidden', 'true');
-        document.body.classList.remove('modal-open');
-        const backdrops = document.querySelectorAll('.modal-backdrop');
-        backdrops.forEach((bd) => bd.parentNode && bd.parentNode.removeChild(bd));
-      } catch(e) {}
+      if (window.bootstrap && window.bootstrap.Modal) {
+        try {
+          const modal = window.bootstrap.Modal.getOrCreateInstance(el);
+          modal.hide();
+          try { modal.dispose(); } catch (e) {}
+        } catch (e) {}
+      }
+      forceHidePreviewLoading(el);
+      // If bootstrap transitions re-show the modal, force-hide again on next tick.
+      setTimeout(() => {
+        try {
+          if (el.classList.contains('show') || el.style.display !== 'none') {
+            forceHidePreviewLoading(el);
+          }
+        } catch (e) {}
+      }, 50);
       try { console.debug('[preview] hide loading', reason || 'unknown'); } catch(e) {}
     } catch(e) {}
   }
