@@ -16848,6 +16848,7 @@ function renderExecuteSummary(success) {
     const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
     const expectedNodesList = Array.isArray(summary.expected_nodes) ? summary.expected_nodes : [];
     const actualNodesList = Array.isArray(summary.actual_nodes) ? summary.actual_nodes : [];
+    const actualNodesDetail = Array.isArray(summary.actual_nodes_detail) ? summary.actual_nodes_detail : [];
     executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
     if (expectedDockerNodes > 0) {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -16881,7 +16882,7 @@ function renderExecuteSummary(success) {
         'Expected nodes created',
         missingNodes === 0,
         missingNodes ? `${missingNodes} missing` : 'All expected nodes present',
-        missingNodes ? (Array.isArray(summary.missing_nodes) ? summary.missing_nodes : []) : expectedNodesList
+        missingNodes ? (Array.isArray(summary.missing_nodes) ? summary.missing_nodes : []) : (actualNodesDetail.length ? actualNodesDetail : expectedNodesList)
     ));
     executeSummaryListEl.appendChild(renderExecuteSummaryItem(
         'No unexpected nodes',
@@ -16972,6 +16973,21 @@ function showExecuteSummaryModal(success) {
         } catch (e) {}
     }
     try { refreshValidationSummaryFromRunStatus(); } catch (e) {}
+    try {
+        let pollCount = 0;
+        const pollMax = 10;
+        const pollTimer = setInterval(async () => {
+            pollCount += 1;
+            await refreshValidationSummaryFromRunStatus();
+            const summary = executeProgressState?.validationSummary || {};
+            const dockerCount = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
+            const actualCount = Array.isArray(summary.actual_nodes_detail) ? summary.actual_nodes_detail.length : 0;
+            const expectedCount = Array.isArray(summary.expected_nodes) ? summary.expected_nodes.length : 0;
+            if (dockerCount > 0 || actualCount > 0 || expectedCount > 0 || pollCount >= pollMax) {
+                clearInterval(pollTimer);
+            }
+        }, 1500);
+    } catch (e) {}
 }
 
 function queueExecuteSummaryRedirect(url, delayMs = 600) {

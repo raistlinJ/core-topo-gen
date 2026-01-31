@@ -30247,6 +30247,7 @@ def _validate_session_nodes_and_injects(
         'extra_node_ids': [],
         'expected_nodes': [],
         'actual_nodes': [],
+        'actual_nodes_detail': [],
         'docker_nodes': [],
         'expected_docker_nodes': [],
         'missing_docker_nodes': [],
@@ -30292,12 +30293,20 @@ def _validate_session_nodes_and_injects(
                 nm = (exp.get('name') or '').strip()
                 expected_names.append(nm or f"node-{nid}")
             actual_names = []
+            actual_detail = []
             for nid in sorted(actual_ids):
                 act = actual.get(nid) or {}
                 nm = (act.get('name') or '').strip()
-                actual_names.append(nm or f"node-{nid}")
+                ntype = (act.get('type') or '').strip()
+                label = nm or f"node-{nid}"
+                actual_names.append(label)
+                if ntype:
+                    actual_detail.append(f"{label} ({ntype})")
+                else:
+                    actual_detail.append(f"{label} (unknown)")
             summary['expected_nodes'] = expected_names
             summary['actual_nodes'] = actual_names
+            summary['actual_nodes_detail'] = actual_detail
         except Exception:
             pass
     except Exception:
