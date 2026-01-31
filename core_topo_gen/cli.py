@@ -703,14 +703,25 @@ def main():
         )
 
     core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
+    # Wrap with retry proxy to handle transient GOAWAY/ping_timeout errors
+    try:
+        from .utils.grpc_retry import wrap_core_client as wrap_core_client_retry
+        core = wrap_core_client_retry(core, logging.getLogger("core_topo_gen.grpc"))
+    except Exception:
+        pass
     # Wrap with a logging proxy to trace all gRPC calls
     try:
-        from .utils.grpc_logging import wrap_core_client
-        core = wrap_core_client(core, logging.getLogger("core_topo_gen.grpc"))
+        from .utils.grpc_logging import wrap_core_client as wrap_core_client_logging
+        core = wrap_core_client_logging(core, logging.getLogger("core_topo_gen.grpc"))
     except Exception:
         pass
     logging.info("[grpc] CoreGrpcClient.connect() -> %s:%s", args.host, args.port)
     core.connect()
+    try:
+        from .utils.grpc_helpers import start_grpc_keepalive
+        start_grpc_keepalive(core)
+    except Exception:
+        pass
     # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots (reuse orchestrator raw)
     docker_slot_plan: dict | None = None
     try:

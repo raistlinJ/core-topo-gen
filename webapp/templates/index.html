@@ -5339,6 +5339,11 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch(e){}
     });
 
+    try { updatePlanButtons(); } catch(e){}
+    try { restorePlanPreviewFromScenario(activeIdx); } catch (e) {}
+});
+
+function handleAutoExecuteFromQuery() {
     // Allow other tabs (Preview / Full Preview) to delegate execution here.
     try {
         const url = new URL(window.location.href);
@@ -5376,9 +5381,13 @@ document.addEventListener('DOMContentLoaded', () => {
             window.history.replaceState({}, '', newUrl);
         }
     } catch (e) {}
-    try { updatePlanButtons(); } catch(e){}
-    try { restorePlanPreviewFromScenario(activeIdx); } catch (e) {}
-});
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', handleAutoExecuteFromQuery);
+} else {
+    handleAutoExecuteFromQuery();
+}
 
 async function computeFullPlanPreview(){
     let newXmlPath = (state.result_path || '').trim();
@@ -16789,6 +16798,8 @@ function renderExecuteSummary(success) {
     const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
     const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
     const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+    const expectedNodesList = Array.isArray(summary.expected_nodes) ? summary.expected_nodes : [];
+    const actualNodesList = Array.isArray(summary.actual_nodes) ? summary.actual_nodes : [];
     executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
     if (expectedDockerNodes > 0) {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -16822,13 +16833,13 @@ function renderExecuteSummary(success) {
         'Expected nodes created',
         missingNodes === 0,
         missingNodes ? `${missingNodes} missing` : 'All expected nodes present',
-        Array.isArray(summary.missing_nodes) ? summary.missing_nodes : []
+        missingNodes ? (Array.isArray(summary.missing_nodes) ? summary.missing_nodes : []) : expectedNodesList
     ));
     executeSummaryListEl.appendChild(renderExecuteSummaryItem(
         'No unexpected nodes',
         extraNodes === 0,
         extraNodes ? `${extraNodes} unexpected` : 'No extras detected',
-        Array.isArray(summary.extra_nodes) ? summary.extra_nodes : []
+        extraNodes ? (Array.isArray(summary.extra_nodes) ? summary.extra_nodes : []) : actualNodesList
     ));
     if (dockerNodes > 0) {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -17045,6 +17056,7 @@ function refreshExecuteRemoteToggleState() {
     const coreVmConfigured = isExecuteCoreVmConfigured();
     const pushPref = getExecuteConfirmUpdateRemotePref();
     const showNotConfigured = remoteSelected && !coreVmConfigured && !IS_BUILDER_VIEW;
+    const showAdvanced = remoteSelected && !showNotConfigured;
 
     const isBuilderCoreVmVerified = (() => {
         if (!IS_BUILDER_VIEW) return true;
@@ -17113,17 +17125,12 @@ function refreshExecuteRemoteToggleState() {
             || (remoteSelected && !info.verified && !IS_BUILDER_VIEW)
             || (IS_BUILDER_VIEW && !isBuilderCoreVmVerified);
         executeConfirmRunBtn.disabled = shouldDisable;
-
         // Only auto-adjust the label for the default Execute flow.
         // Some callers (e.g., seeded runs) supply custom labels like "Run with seed".
         if (!executeProgressState.active && executeConfirmState.autoLabel) {
             const label = remoteSelected ? 'Execute' : 'Generate preview';
             executeConfirmRunBtn.textContent = label;
-            if (!executeConfirmRunBtn.dataset.defaultLabel) {
-                executeConfirmRunBtn.dataset.defaultLabel = label;
-            } else {
-                executeConfirmRunBtn.dataset.defaultLabel = label;
-            }
+            executeConfirmRunBtn.dataset.defaultLabel = label;
         }
 
         if (shouldDisable) {
@@ -17141,7 +17148,6 @@ function refreshExecuteRemoteToggleState() {
 
     // Advanced: only relevant for remote execution with a configured CORE VM.
     if (executeAdvancedWrap) {
-        const showAdvanced = remoteSelected && !showNotConfigured && !IS_BUILDER_VIEW && !info.shouldFake;
         executeAdvancedWrap.classList.toggle('d-none', !showAdvanced);
     }
 }
@@ -17153,7 +17159,6 @@ function isActiveScenarioCoreVmVerifiedForProject() {
             : getActiveScenarioContext().idx;
         if (!Number.isInteger(scenarioIdx)) return false;
         const scen = state?.scenarios?.[scenarioIdx];
-        if (!scen || typeof scen !== 'object') return false;
         const hitl = (typeof ensureHitlStateForScenario === 'function')
             ? ensureHitlStateForScenario(scen)
             : (scen.hitl || {});

@@ -4,10 +4,57 @@ import re
 import shutil
 from typing import Any, Optional
 import time
+import threading
 import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def _env_flag(name: str, default_on: bool = True) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default_on
+    return val not in ("0", "false", "False", "")
+
+
+def start_grpc_keepalive(core: Any) -> Optional[threading.Event]:
+    """Start a background keepalive that calls core.get_sessions periodically.
+
+    This keeps the gRPC channel active during long-running steps (docker pulls, cleanup).
+    Controlled by env:
+    - CORETG_GRPC_KEEPALIVE (default on)
+    - CORETG_GRPC_KEEPALIVE_INTERVAL (seconds, default 20)
+    """
+    if not _env_flag("CORETG_GRPC_KEEPALIVE", default_on=True):
+        return None
+    interval = max(5, _env_int("CORETG_GRPC_KEEPALIVE_INTERVAL", 20))
+    if not hasattr(core, "get_sessions"):
+        return None
+    stop_event = threading.Event()
+
+    def _runner() -> None:
+        while not stop_event.is_set():
+            try:
+                core.get_sessions()
+            except Exception:
+                logger.debug("[grpc] keepalive ping failed", exc_info=True)
+            stop_event.wait(interval)
+
+    t = threading.Thread(target=_runner, name="coretg-grpc-keepalive", daemon=True)
+    t.start()
+    logger.info("[grpc] keepalive enabled (interval=%ss)", interval)
+    return stop_event
 
 
 def _call_create_session(core: Any, session_id: Optional[int] = None) -> Any:

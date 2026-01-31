@@ -6953,6 +6953,40 @@ def _load_summary_metadata(summary_path: Optional[str]) -> dict:
         return {}
 
 
+def _summary_text_from_counts(counts: dict) -> str:
+    if not isinstance(counts, dict) or not counts:
+        return ''
+    def _int(key: str) -> int:
+        try:
+            return int(counts.get(key) or 0)
+        except Exception:
+            return 0
+    total_nodes = _int('total_nodes')
+    hosts = _int('hosts')
+    routers = _int('routers')
+    switches = _int('switches')
+    seg_rules = _int('segmentation_rules')
+    flows = _int('traffic_flows')
+    parts = []
+    if total_nodes:
+        parts.append(f"Nodes {total_nodes}")
+    if hosts or routers or switches:
+        sub = []
+        if hosts:
+            sub.append(f"hosts {hosts}")
+        if routers:
+            sub.append(f"routers {routers}")
+        if switches:
+            sub.append(f"switches {switches}")
+        if sub:
+            parts.append(f"({', '.join(sub)})")
+    if seg_rules:
+        parts.append(f"seg {seg_rules}")
+    if flows:
+        parts.append(f"flows {flows}")
+    return ' '.join(parts)
+
+
 def _seed_from_preview_plan(preview_plan_path: Optional[str]) -> Optional[int]:
     if not preview_plan_path:
         return None
@@ -25378,6 +25412,9 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
             continue
         name = (node.get('name') or node.findtext('name') or '').strip()
         ntype = (node.get('type') or node.get('model') or '').strip().lower()
+        # Ignore infrastructure-only nodes (not part of expected topology compare).
+        if ntype in {'rj45', 'switch', 'hub', 'bridge', 'wlan', 'wireless', 'ethernet', 'link'}:
+            continue
         services: List[str] = []
         try:
             for svc in node.findall('.//service'):
@@ -29863,6 +29900,12 @@ def reports_page():
         scenario_norm = _normalize_scenario_label(scenario_names[0])
     if scenario_norm:
         enriched = _filter_history_by_scenario(enriched, scenario_norm)
+    for entry in enriched:
+        try:
+            counts = _load_summary_counts(entry.get('summary_path'))
+            entry['summary_output'] = _summary_text_from_counts(counts)
+        except Exception:
+            entry['summary_output'] = ''
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
     return render_template(
         'reports.html',
@@ -29908,6 +29951,11 @@ def reports_data():
                 e['scenario_names'] = []
         if isinstance(e.get('scenario_names'), list) and len(e['scenario_names']) > 1:
             e['scenario_names'] = [e['scenario_names'][0]]
+        try:
+            counts = _load_summary_counts(e.get('summary_path'))
+            e['summary_output'] = _summary_text_from_counts(counts)
+        except Exception:
+            e['summary_output'] = ''
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     user = _current_user()
@@ -30183,6 +30231,8 @@ def _validate_session_nodes_and_injects(
         'extra_nodes': [],
         'missing_node_ids': [],
         'extra_node_ids': [],
+        'expected_nodes': [],
+        'actual_nodes': [],
         'docker_nodes': [],
         'expected_docker_nodes': [],
         'missing_docker_nodes': [],
@@ -30221,6 +30271,21 @@ def _validate_session_nodes_and_injects(
             extra_names.append(nm or f"node-{nid}")
         summary['missing_nodes'] = missing_names
         summary['extra_nodes'] = extra_names
+        try:
+            expected_names = []
+            for nid in sorted(expected_ids):
+                exp = expected.get(nid) or {}
+                nm = (exp.get('name') or '').strip()
+                expected_names.append(nm or f"node-{nid}")
+            actual_names = []
+            for nid in sorted(actual_ids):
+                act = actual.get(nid) or {}
+                nm = (act.get('name') or '').strip()
+                actual_names.append(nm or f"node-{nid}")
+            summary['expected_nodes'] = expected_names
+            summary['actual_nodes'] = actual_names
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -33032,7 +33097,7 @@ def run_status(run_id: str):
         summary_json = None
     if summary_json:
         meta['summary_path'] = summary_json
-    if meta.get('done') and not meta.get('validation_summary'):
+    if meta.get('done'):
         try:
             scenario_label = meta.get('scenario_name')
             if not scenario_label:
@@ -33043,7 +33108,19 @@ def run_status(run_id: str):
                 except Exception:
                     scenario_label = None
             post_xml = meta.get('post_xml_path')
-            if post_xml and os.path.exists(post_xml):
+            summary = meta.get('validation_summary')
+            summary_has_error = isinstance(summary, dict) and bool(summary.get('error'))
+            summary_missing_docker = isinstance(summary, dict) and 'docker_nodes' not in summary
+            summary_docker_empty = False
+            try:
+                if isinstance(summary, dict):
+                    expected_docker = summary.get('expected_docker_nodes') or []
+                    docker_nodes = summary.get('docker_nodes') or []
+                    if expected_docker and isinstance(docker_nodes, list) and len(docker_nodes) == 0:
+                        summary_docker_empty = True
+            except Exception:
+                summary_docker_empty = False
+            if post_xml and os.path.exists(post_xml) and (summary is None or summary_has_error or summary_missing_docker or summary_docker_empty):
                 validation = _validate_session_nodes_and_injects(
                     scenario_xml_path=xml_path,
                     session_xml_path=post_xml,
@@ -33051,7 +33128,7 @@ def run_status(run_id: str):
                     scenario_label=scenario_label,
                 )
                 meta['validation_summary'] = validation
-            else:
+            elif summary is None:
                 meta['validation_summary'] = {
                     'ok': False,
                     'error': 'post-run session XML missing; validation skipped',
