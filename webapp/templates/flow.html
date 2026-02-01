@@ -687,6 +687,9 @@
       const injOvr = (curA && Array.isArray(curA.inject_files_override))
         ? curA.inject_files_override
         : undefined;
+      const injectFiles = (curA && Array.isArray(curA.inject_files))
+        ? curA.inject_files.map(String).filter(Boolean)
+        : undefined;
       const hintOvr = (curA && Array.isArray(curA.hint_overrides)) ? curA.hint_overrides : undefined;
       const flagOvr = (curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) ? String(curA.flag_override).trim() : undefined;
 
@@ -705,6 +708,7 @@
       if(ovr !== undefined) out.config_overrides = ovr;
       if(outOvr !== undefined) out.output_overrides = outOvr;
       if(injOvr !== undefined) out.inject_files_override = injOvr;
+      if(injectFiles !== undefined) out.inject_files = injectFiles;
       if(hintOvr !== undefined) out.hint_overrides = hintOvr;
       if(flagOvr !== undefined) out.flag_override = flagOvr;
       if(typeVal !== undefined) out.type = typeVal;
@@ -872,6 +876,9 @@
         const hasOutputs = curA.resolved_outputs && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs) && Object.keys(curA.resolved_outputs).length > 0;
         if(savedA.resolved_inputs && (!hasInputs)) curA.resolved_inputs = savedA.resolved_inputs;
         if(savedA.resolved_outputs && (!hasOutputs)) curA.resolved_outputs = savedA.resolved_outputs;
+        if(savedA.inject_files && (!Array.isArray(curA.inject_files) || !curA.inject_files.length)) {
+          curA.inject_files = savedA.inject_files;
+        }
         nextAssignments[i] = curA;
       }
       currentFlagAssignments = nextAssignments;
@@ -913,6 +920,7 @@
         if(savedA.output_fields && (!Array.isArray(curA.output_fields) || !curA.output_fields.length)) curA.output_fields = savedA.output_fields;
         if(savedA.produces && (!Array.isArray(curA.produces) || !curA.produces.length)) curA.produces = savedA.produces;
         if(savedA.requires && (!Array.isArray(curA.requires) || !curA.requires.length)) curA.requires = savedA.requires;
+        if(savedA.inject_files && (!Array.isArray(curA.inject_files) || !curA.inject_files.length)) curA.inject_files = savedA.inject_files;
         if(savedA.hint && (!curA.hint || !String(curA.hint).trim())) curA.hint = savedA.hint;
         if(savedA.hints && (!Array.isArray(curA.hints) || !curA.hints.length)) curA.hints = savedA.hints;
         if(savedA.description_hints && (!Array.isArray(curA.description_hints) || !curA.description_hints.length)) curA.description_hints = savedA.description_hints;

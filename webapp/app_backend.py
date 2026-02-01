@@ -1573,12 +1573,22 @@ def _normalize_inject_dest_dir_for_validation(raw: str, *, default: str = '/flow
     return '/' + '/'.join(parts) if parts else default
 
 
-def _extract_inject_dirs_from_plan_xml(scenario_xml_path: str, scenario_label: str | None) -> List[str]:
-    payload = None
-    try:
-        payload = _load_plan_preview_from_xml(scenario_xml_path, scenario_label)
-    except Exception:
-        payload = None
+def _normalize_inject_dest_path_for_validation(raw: str, src_path: str | None, *, default_dir: str = '/flow_injects') -> str:
+    src_base = os.path.basename(str(src_path or '').strip()) if src_path else ''
+    dest = str(raw or '').strip()
+    if not dest or not dest.startswith('/'):
+        return f"{default_dir.rstrip('/')}/{src_base}" if src_base else default_dir
+    parts = [p for p in dest.split('/') if p]
+    if any(p == '..' for p in parts):
+        return f"{default_dir.rstrip('/')}/{src_base}" if src_base else default_dir
+    normalized = '/' + '/'.join(parts) if parts else default_dir
+    if dest.endswith('/'):
+        if src_base:
+            normalized = normalized.rstrip('/') + '/' + src_base
+    return normalized
+
+
+def _extract_inject_dirs_from_payload(payload: Dict[str, Any]) -> List[str]:
     if not payload or not isinstance(payload, dict):
         return []
     full = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
@@ -1596,6 +1606,207 @@ def _extract_inject_dirs_from_plan_xml(scenario_xml_path: str, scenario_label: s
 
     if not inject_specs:
         return []
+
+    dests: List[str] = []
+    for raw in inject_specs:
+        dest = ''
+        if '->' in raw:
+            _, dest = raw.split('->', 1)
+        elif '=>' in raw:
+            _, dest = raw.split('=>', 1)
+        dests.append(_normalize_inject_dest_dir_for_validation(dest))
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for d in dests:
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _extract_inject_files_from_payload(payload: Dict[str, Any]) -> List[str]:
+    if not payload or not isinstance(payload, dict):
+        return []
+    full = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+    root = full if isinstance(full, dict) else payload
+
+    inject_specs: List[str] = []
+    for v in _iter_values_by_key(root, {'inject_files'}):
+        if isinstance(v, list):
+            for item in v:
+                s = str(item or '').strip()
+                if s:
+                    inject_specs.append(s)
+        elif isinstance(v, str) and v.strip():
+            inject_specs.append(v.strip())
+
+    if not inject_specs:
+        return []
+
+    files: List[str] = []
+    for raw in inject_specs:
+        src = raw
+        dest = ''
+        if '->' in raw:
+            src, dest = raw.split('->', 1)
+        elif '=>' in raw:
+            src, dest = raw.split('=>', 1)
+        src = str(src or '').strip()
+        dest_path = _normalize_inject_dest_path_for_validation(dest, src)
+        if dest_path:
+            files.append(dest_path)
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for f in files:
+        if not f or f in seen:
+            continue
+        seen.add(f)
+        out.append(f)
+    return out
+
+
+def _load_plan_preview_payload_from_path(path: str, scenario_label: str | None) -> Dict[str, Any] | None:
+    if not path:
+        return None
+    try:
+        ap = os.path.abspath(str(path))
+    except Exception:
+        ap = str(path)
+    if not ap or not os.path.exists(ap):
+        return None
+    try:
+        if ap.lower().endswith('.xml'):
+            return _load_plan_preview_from_xml(ap, scenario_label)
+        with open(ap, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _extract_inject_dirs_from_plan_xml(scenario_xml_path: str, scenario_label: str | None) -> List[str]:
+    payload = None
+    try:
+        payload = _load_plan_preview_from_xml(scenario_xml_path, scenario_label)
+    except Exception:
+        payload = None
+    dirs_from_plan = _extract_inject_dirs_from_payload(payload) if isinstance(payload, dict) else []
+
+    # Merge in Flow sequencing inject overrides saved in FlagSequencing/FlowState.
+    inject_specs: List[str] = []
+    flow_has_artifacts = False
+    try:
+        flow_state = _flow_state_from_xml_path(scenario_xml_path, scenario_label)
+        if isinstance(flow_state, dict):
+            for v in _iter_values_by_key(flow_state, {'inject_files_override', 'inject_files'}):
+                if isinstance(v, list):
+                    for item in v:
+                        s = str(item or '').strip()
+                        if s:
+                            inject_specs.append(s)
+                elif isinstance(v, str) and v.strip():
+                    inject_specs.append(v.strip())
+            try:
+                assigns = flow_state.get('flag_assignments') if isinstance(flow_state, dict) else None
+                if isinstance(assigns, list):
+                    for entry in assigns:
+                        if not isinstance(entry, dict):
+                            continue
+                        ro = entry.get('resolved_outputs')
+                        oo = entry.get('output_overrides')
+                        if isinstance(ro, dict) and ro:
+                            flow_has_artifacts = True
+                            break
+                        if isinstance(oo, dict) and oo:
+                            flow_has_artifacts = True
+                            break
+            except Exception:
+                flow_has_artifacts = flow_has_artifacts
+    except Exception:
+        pass
+
+    dirs_from_flow: List[str] = []
+    if inject_specs:
+        dests: List[str] = []
+        for raw in inject_specs:
+            dest = ''
+            if '->' in raw:
+                _, dest = raw.split('->', 1)
+            elif '=>' in raw:
+                _, dest = raw.split('=>', 1)
+            dests.append(_normalize_inject_dest_dir_for_validation(dest))
+        seen: set[str] = set()
+        for d in dests:
+            if not d or d in seen:
+                continue
+            seen.add(d)
+            dirs_from_flow.append(d)
+    if flow_has_artifacts and not dirs_from_flow:
+        dirs_from_flow.append('/flow_artifacts')
+
+    merged: List[str] = []
+    seen_all: set[str] = set()
+    for src in (dirs_from_plan, dirs_from_flow):
+        for d in src:
+            if d in seen_all:
+                continue
+            seen_all.add(d)
+            merged.append(d)
+    return merged
+
+    if not inject_specs:
+        return []
+
+
+def _extract_inject_files_from_plan_xml(scenario_xml_path: str, scenario_label: str | None) -> List[str]:
+    payload = None
+    try:
+        payload = _load_plan_preview_from_xml(scenario_xml_path, scenario_label)
+    except Exception:
+        payload = None
+    files_from_plan = _extract_inject_files_from_payload(payload) if isinstance(payload, dict) else []
+
+    inject_specs: List[str] = []
+    try:
+        flow_state = _flow_state_from_xml_path(scenario_xml_path, scenario_label)
+        if isinstance(flow_state, dict):
+            for v in _iter_values_by_key(flow_state, {'inject_files_override', 'inject_files'}):
+                if isinstance(v, list):
+                    for item in v:
+                        s = str(item or '').strip()
+                        if s:
+                            inject_specs.append(s)
+                elif isinstance(v, str) and v.strip():
+                    inject_specs.append(v.strip())
+    except Exception:
+        pass
+
+    files_from_flow: List[str] = []
+    if inject_specs:
+        for raw in inject_specs:
+            src = raw
+            dest = ''
+            if '->' in raw:
+                src, dest = raw.split('->', 1)
+            elif '=>' in raw:
+                src, dest = raw.split('=>', 1)
+            src = str(src or '').strip()
+            dest_path = _normalize_inject_dest_path_for_validation(dest, src)
+            if dest_path:
+                files_from_flow.append(dest_path)
+
+    merged: List[str] = []
+    seen_all: set[str] = set()
+    for src in (files_from_plan, files_from_flow):
+        for f in src:
+            if f in seen_all:
+                continue
+            seen_all.add(f)
+            merged.append(f)
+    return merged
 
     dests: List[str] = []
     for raw in inject_specs:
@@ -1739,8 +1950,18 @@ def _upload_flow_artifacts_for_plan_to_remote(
     except Exception:
         pass
 
-    allowed_prefixes = ('/tmp/vulns',)
-    upload_dirs = [d for d in artifact_dirs if any(d == p or d.startswith(p + '/') for p in allowed_prefixes)]
+    repo_root = _repo_root_path()
+    outputs_root = os.path.join(repo_root, 'outputs')
+    allowed_prefixes = (
+        '/tmp/vulns',
+        os.path.join(outputs_root, 'tmp-exec-'),
+        os.path.join(outputs_root, 'scenarios-'),
+    )
+    upload_dirs = [
+        d
+        for d in artifact_dirs
+        if any(d == p or d.startswith(p + '/') for p in allowed_prefixes)
+    ]
     skipped = [d for d in artifact_dirs if d not in upload_dirs]
     if skipped:
         try:
@@ -1923,9 +2144,9 @@ def _candidate_remote_python_interpreters(core_cfg: Dict[str, Any]) -> List[str]
     if venv_bin:
         sanitized = venv_bin.rstrip('/\\')
         if sanitized:
-            for exe_name in PYTHON_EXECUTABLE_NAMES:
+            for exe_name in ('python3', 'python'):
                 candidates.append(posixpath.join(sanitized, exe_name))
-    candidates.extend(PYTHON_EXECUTABLE_NAMES)
+    candidates.extend(['python3', 'python'])
     ordered: List[str] = []
     seen: set[str] = set()
     for entry in candidates:
@@ -24634,15 +24855,19 @@ def main():
 
         copied_any = False
         errs = []
+        commands = []
         for t in targets:
             # Copy directory contents into dest.
-            p = _run_docker(['cp', src.rstrip('/') + '/.', f"{t}:{dest}"], timeout=60, capture=True)
+            cp_src = src.rstrip('/') + '/.'
+            cp_dest = f"{t}:{dest}"
+            commands.append(f"docker cp {cp_src} {cp_dest}")
+            p = _run_docker(['cp', cp_src, cp_dest], timeout=60, capture=True)
             if getattr(p, 'returncode', 1) == 0:
                 copied_any = True
             else:
                 out = (getattr(p, 'stdout', '') or '').strip()
                 errs.append(out)
-        items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs})
+        items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs, 'commands': commands})
 
     print(json.dumps({'ok': True, 'items': items, 'timestamp': int(time.time())}))
 
@@ -25411,12 +25636,25 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
             return None
 
     candidates = []
+    rj45_names: set[str] = set()
     try:
         candidates.extend(root.findall('.//node'))
     except Exception:
         pass
     try:
         candidates.extend(root.findall('.//device'))
+    except Exception:
+        pass
+    try:
+        for net in root.findall('.//network'):
+            try:
+                ntype = (net.get('type') or net.get('model') or '').strip().lower()
+                nclass = (net.get('class') or '').strip().lower()
+                name = (net.get('name') or '').strip()
+                if name and (ntype == 'rj45' or 'rj45' in nclass):
+                    rj45_names.add(name)
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -25428,6 +25666,8 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
         ntype = (node.get('type') or node.get('model') or '').strip().lower()
         # Ignore infrastructure-only nodes (not part of expected topology compare).
         if ntype in {'rj45', 'switch', 'hub', 'bridge', 'wlan', 'wireless', 'ethernet', 'link'}:
+            continue
+        if name and name in rj45_names:
             continue
         services: List[str] = []
         try:
@@ -25797,12 +26037,18 @@ def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_st
     try:
         if root.tag == 'ScenarioEditor':
             se_target = root
+        elif root.tag == 'Scenario':
+            se_target = root.find('ScenarioEditor')
+            if se_target is None:
+                se_target = ET.SubElement(root, 'ScenarioEditor')
         elif root.tag == 'Scenarios':
             for scen_el in root.findall('Scenario'):
                 nm = str(scen_el.get('name') or '').strip()
                 if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
                     continue
                 se_target = scen_el.find('ScenarioEditor')
+                if se_target is None:
+                    se_target = ET.SubElement(scen_el, 'ScenarioEditor')
                 if se_target is not None:
                     break
     except Exception:
@@ -25842,6 +26088,8 @@ def _clear_flow_state_in_xml(xml_path: str, scenario_label: str | None) -> tuple
     try:
         if root.tag == 'ScenarioEditor':
             se_target = root
+        elif root.tag == 'Scenario':
+            se_target = root.find('ScenarioEditor')
         elif root.tag == 'Scenarios':
             for scen_el in root.findall('Scenario'):
                 nm = str(scen_el.get('name') or '').strip()
@@ -30200,11 +30448,12 @@ def main():
                     continue
                 shell = (
                     'set -e; '
+                    'mesg n >/dev/null 2>&1 || true; '
                     f"if [ -d {d} ]; then "
                     f"find {d} -maxdepth 4 -type f -print 2>/dev/null | head -n {MAX_FIND}; "
                     f"fi; "
                 )
-                p2 = _run(['docker', 'exec', c, 'sh', '-lc', shell], timeout=25)
+                p2 = _run(['docker', 'exec', c, 'sh', '-c', shell], timeout=25)
                 out = (p2.stdout or '').strip()
                 if out:
                     lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -30232,11 +30481,42 @@ if __name__ == '__main__':
      .replace('__INJECT_DIRS_LITERAL__', inject_dirs_literal)
 
 
+def _remote_vuln_assignments_script(assignments_path: str = '/tmp/vulns/compose_assignments.json') -> str:
+    assignments_literal = json.dumps(str(assignments_path))
+    return (
+        r"""
+import json, os
+
+ASSIGNMENTS_PATH = __ASSIGNMENTS_PATH_LITERAL__
+
+def main():
+    if not ASSIGNMENTS_PATH or not os.path.exists(ASSIGNMENTS_PATH):
+        print(json.dumps({'ok': False, 'error': 'missing compose_assignments', 'nodes': []}))
+        return
+    try:
+        with open(ASSIGNMENTS_PATH, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': f'read_failed: {exc}', 'nodes': []}))
+        return
+    assignments = payload.get('assignments') if isinstance(payload, dict) else None
+    nodes = []
+    if isinstance(assignments, dict):
+        nodes = [str(k) for k in assignments.keys() if str(k).strip()]
+    print(json.dumps({'ok': True, 'nodes': nodes}))
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__ASSIGNMENTS_PATH_LITERAL__', assignments_literal)
+
+
 def _validate_session_nodes_and_injects(
     *,
     scenario_xml_path: str | None,
     session_xml_path: str | None,
     core_cfg: Dict[str, Any] | None,
+    preview_plan_path: str | None = None,
     scenario_label: str | None = None,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
@@ -30257,7 +30537,9 @@ def _validate_session_nodes_and_injects(
         'actual_vuln_nodes': [],
         'docker_missing': [],
         'docker_not_running': [],
+        'docker_running': [],
         'injects_missing': [],
+        'injects_detail': [],
         'inject_dirs_expected': [],
     }
     if not scenario_xml_path or not session_xml_path:
@@ -30313,7 +30595,34 @@ def _validate_session_nodes_and_injects(
         pass
 
     expected_inject_dirs = _extract_inject_dirs_from_plan_xml(scenario_xml_path, scenario_label)
+    expected_inject_files = _extract_inject_files_from_plan_xml(scenario_xml_path, scenario_label)
+    if preview_plan_path:
+        try:
+            payload = _load_plan_preview_payload_from_path(preview_plan_path, scenario_label)
+            extra_dirs = _extract_inject_dirs_from_payload(payload) if isinstance(payload, dict) else []
+            if extra_dirs:
+                seen_dirs = set(expected_inject_dirs)
+                for d in extra_dirs:
+                    if d in seen_dirs:
+                        continue
+                    seen_dirs.add(d)
+                    expected_inject_dirs.append(d)
+        except Exception:
+            pass
+        try:
+            payload = _load_plan_preview_payload_from_path(preview_plan_path, scenario_label)
+            extra_files = _extract_inject_files_from_payload(payload) if isinstance(payload, dict) else []
+            if extra_files:
+                seen_files = set(expected_inject_files)
+                for f in extra_files:
+                    if f in seen_files:
+                        continue
+                    seen_files.add(f)
+                    expected_inject_files.append(f)
+        except Exception:
+            pass
     summary['inject_dirs_expected'] = expected_inject_dirs
+    summary['inject_files_expected'] = expected_inject_files
 
     expected_docker_nodes, expected_vuln_nodes = _extract_expected_docker_and_vuln_nodes_from_plan_xml(
         scenario_xml_path,
@@ -30324,6 +30633,24 @@ def _validate_session_nodes_and_injects(
 
     docker_nodes = _session_docker_nodes_from_xml(session_xml_path)
     summary['docker_nodes'] = docker_nodes
+    actual_vuln_nodes: List[str] = []
+    if docker_nodes and isinstance(core_cfg, dict):
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_vuln_assignments_script(),
+                logger=app.logger,
+                label='docker.compose.assignments',
+                timeout=45.0,
+            )
+            nodes_raw = payload.get('nodes') if isinstance(payload, dict) else None
+            if isinstance(nodes_raw, list):
+                node_set = {str(n).strip() for n in nodes_raw if str(n).strip()}
+                if node_set:
+                    actual_vuln_nodes = [n for n in docker_nodes if n in node_set]
+                    summary['actual_vuln_nodes'] = actual_vuln_nodes
+        except Exception:
+            pass
     if expected_docker_nodes:
         exp_set = set(expected_docker_nodes)
         act_set = set(docker_nodes)
@@ -30331,9 +30658,12 @@ def _validate_session_nodes_and_injects(
         summary['extra_docker_nodes'] = sorted(act_set - exp_set)
     if expected_vuln_nodes:
         exp_vuln = set(expected_vuln_nodes)
-        act_set = set(docker_nodes)
+        if actual_vuln_nodes:
+            act_set = set(actual_vuln_nodes)
+        else:
+            act_set = set(docker_nodes)
+            summary['actual_vuln_nodes'] = sorted(exp_vuln & act_set)
         summary['missing_vuln_nodes'] = sorted(exp_vuln - act_set)
-        summary['actual_vuln_nodes'] = sorted(exp_vuln & act_set)
     if docker_nodes and isinstance(core_cfg, dict):
         try:
             payload = _run_remote_python_json(
@@ -30341,7 +30671,7 @@ def _validate_session_nodes_and_injects(
                 _remote_docker_injects_status_script(
                     containers=docker_nodes,
                     sudo_password=core_cfg.get('ssh_password'),
-                    inject_dirs=expected_inject_dirs,
+                    inject_dirs=expected_inject_dirs if expected_inject_dirs else None,
                 ),
                 logger=app.logger,
                 label='docker.exec.injects_status',
@@ -30357,9 +30687,32 @@ def _validate_session_nodes_and_injects(
                         continue
                     if not it.get('exists'):
                         summary['docker_missing'].append(name)
+                        summary['injects_detail'].append(f"{name}: missing")
                         continue
                     if not it.get('running'):
                         summary['docker_not_running'].append(name)
+                        summary['injects_detail'].append(f"{name}: not running")
+                    else:
+                        summary['docker_running'].append(name)
+                    try:
+                        samples = it.get('inject_samples') if isinstance(it.get('inject_samples'), list) else []
+                        inject_count = int(it.get('inject_count') or 0)
+                        inject_dirs_found = it.get('inject_dirs_found') if isinstance(it.get('inject_dirs_found'), list) else []
+                        if expected_inject_dirs or inject_count > 0 or samples:
+                            if inject_dirs_found:
+                                dirs_text = ', '.join(str(d) for d in inject_dirs_found)
+                            elif expected_inject_dirs:
+                                dirs_text = ', '.join(str(d) for d in expected_inject_dirs)
+                            else:
+                                dirs_text = ''
+                            detail = f"{name}: {inject_count} file(s)"
+                            if dirs_text:
+                                detail += f" in {dirs_text}"
+                            if samples:
+                                detail += f" (e.g., {', '.join(str(s) for s in samples)})"
+                            summary['injects_detail'].append(detail)
+                    except Exception:
+                        pass
                     if expected_inject_dirs and int(it.get('inject_count') or 0) <= 0:
                         summary['injects_missing'].append(name)
         except Exception as exc:
@@ -30426,6 +30779,7 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
                 targets = it.get('targets')
                 err = it.get('error') or ''
                 errs = it.get('errors') or []
+                commands = it.get('commands') or []
                 err_tail = ''
                 try:
                     if err:
@@ -30446,6 +30800,14 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
                 if err_tail:
                     detail += f" error={err_tail}"
                 _append_async_run_log_line(meta, f"{log_prefix}{detail}")
+                try:
+                    if isinstance(commands, list):
+                        for cmd in commands[:8]:
+                            cmd_str = str(cmd or '').strip()
+                            if cmd_str:
+                                _append_async_run_log_line(meta, f"{log_prefix}cmd: {cmd_str}")
+                except Exception:
+                    pass
 
         # Verify: list /flow_artifacts inside target container(s) so logs prove the copy worked.
         try:
@@ -30793,7 +31155,7 @@ def main():
             'echo "--- find /flow_artifacts (files) ---"; '
             f"find /flow_artifacts -maxdepth 3 -type f -print 2>/dev/null | head -n {MAX_FIND} || true; "
         )
-        p = _run(['docker', 'exec', c, 'sh', '-lc', shell], timeout=25)
+        p = _run(['docker', 'exec', c, 'sh', '-c', shell], timeout=25)
         items.append({'container': c, 'ok': p.returncode == 0, 'rc': int(p.returncode), 'output': (p.stdout or '')})
     print(json.dumps({'ok': True, 'items': items}))
 
@@ -32817,6 +33179,7 @@ def run_cli_async():
                         scenario_xml_path=xml_path_local,
                         session_xml_path=post_saved,
                         core_cfg=meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None,
+                        preview_plan_path=meta.get('preview_plan_path'),
                         scenario_label=scenario_label,
                     )
                     meta['validation_summary'] = validation
@@ -32902,6 +33265,59 @@ def run_cli_async():
     except Exception:
         pass
     return jsonify({"run_id": run_id})
+
+
+@app.route('/core/check_remote_repo', methods=['POST'])
+def check_remote_repo():
+    payload = request.get_json(silent=True) or {}
+    core_cfg = payload.get('core')
+    if not isinstance(core_cfg, dict):
+        try:
+            core_json = payload.get('core_json')
+            if core_json:
+                core_cfg = json.loads(core_json)
+        except Exception:
+            core_cfg = None
+    if not isinstance(core_cfg, dict):
+        return jsonify({'error': 'core config missing'}), 400
+    try:
+        core_cfg = _merge_core_configs(core_cfg, include_password=True)
+        core_cfg = _require_core_ssh_credentials(core_cfg)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+    client = None
+    sftp = None
+    try:
+        client = _open_ssh_client(core_cfg)
+        sftp = client.open_sftp()
+        repo_dir = _remote_static_repo_dir(sftp)
+        try:
+            sftp.stat(repo_dir)
+        except Exception as exc:
+            raise RemoteRepoMissingError(repo_dir) from exc
+        package_dir = _remote_path_join(repo_dir, 'core_topo_gen')
+        package_init = _remote_path_join(package_dir, '__init__.py')
+        try:
+            sftp.stat(package_dir)
+            sftp.stat(package_init)
+        except Exception as exc:
+            raise RemoteRepoMissingError(repo_dir) from exc
+        return jsonify({'ok': True, 'repo_path': repo_dir})
+    except RemoteRepoMissingError as exc:
+        return jsonify({'error': str(exc), 'missing_repo': exc.repo_path, 'can_push_repo': True}), 404
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
 
 
 @app.route('/run_status/<run_id>', methods=['GET'])
@@ -33019,6 +33435,7 @@ def run_status(run_id: str):
                             scenario_xml_path=xml_path_local,
                             session_xml_path=post_saved,
                             core_cfg=meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None,
+                            preview_plan_path=meta.get('preview_plan_path'),
                             scenario_label=scenario_label,
                         )
                         meta['validation_summary'] = validation
@@ -33109,14 +33526,7 @@ def run_status(run_id: str):
         report_md = None
 
     docker_conflicts = _extract_docker_conflicts_from_text(txt)
-    log_validation = _extract_validation_summary_from_text(txt)
     summary_json = _extract_summary_path_from_text(txt)
-    if not summary_json:
-        summary_json = _derive_summary_from_report(report_md)
-    if not summary_json:
-        summary_json = meta.get('summary_path')
-    if not summary_json and not report_md:
-        summary_json = _find_latest_summary_path()
     if summary_json and not os.path.exists(summary_json):
         summary_json = None
     if summary_json:
@@ -33157,20 +33567,10 @@ def run_status(run_id: str):
                             summary_missing_nodes = True
             except Exception:
                 summary_missing_nodes = False
-            if log_validation and (summary is None or summary_has_error or summary_missing_docker or summary_docker_empty or summary_missing_nodes):
-                meta['validation_summary'] = log_validation
-            if post_xml and os.path.exists(post_xml) and (summary is None or summary_has_error or summary_missing_docker or summary_docker_empty):
-                validation = _validate_session_nodes_and_injects(
-                    scenario_xml_path=xml_path,
-                    session_xml_path=post_xml,
-                    core_cfg=meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None,
-                    scenario_label=scenario_label,
-                )
-                meta['validation_summary'] = validation
-            elif summary is None:
+            if summary is None or summary_has_error or summary_missing_docker or summary_docker_empty or summary_missing_nodes:
                 meta['validation_summary'] = {
                     'ok': False,
-                    'error': 'post-run session XML missing; validation skipped',
+                    'error': 'validation summary unavailable or incomplete; refusing fallback',
                 }
         except Exception:
             pass

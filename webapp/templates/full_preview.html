@@ -3776,12 +3776,14 @@ function buildScenarioUrl(basePath){
     if(!logEl) return;
     const text = (line === undefined || line === null) ? '' : String(line);
     try {
-      const finalizeMatch = text.match(/\[ui\]\s*Waiting for CORE host to finalize\s*\((\d+)s\)\s*\(([^)]*)\)\s*\[finalize:\s*(\d+)%\]\s*\[last update:\s*(\d+)s ago\]/i);
+      const finalizeMatch = text.match(/\[ui\]\s*Waiting for CORE host to finalize\s*\((\d+)s\)\s*\(([^)]*)\)\s*(?:\[upload:\s*(\d+)%\])?\s*(?:\[finalize:\s*(\d+)%\])?\s*\[last update:\s*(\d+)s ago\]/i);
       if (finalizeMatch) {
         const elapsed = parseInt(finalizeMatch[1], 10);
         const stage = String(finalizeMatch[2] || '').trim();
-        const pct = parseInt(finalizeMatch[3], 10);
-        const last = parseInt(finalizeMatch[4], 10);
+        const uploadPct = parseInt(finalizeMatch[3], 10);
+        const finalizePct = parseInt(finalizeMatch[4], 10);
+        const pct = Number.isFinite(uploadPct) ? uploadPct : finalizePct;
+        const last = parseInt(finalizeMatch[5], 10);
         const meta = [
           stage ? `Stage: ${stage}` : null,
           Number.isFinite(elapsed) ? `Elapsed: ${elapsed}s` : null,
@@ -3790,7 +3792,7 @@ function buildScenarioUrl(basePath){
         setExecuteProgressUI({
           status: 'Finalizing on CORE host…',
           meta,
-          barText: Number.isFinite(pct) ? `Finalize ${pct}%` : 'Finalizing…',
+          barText: Number.isFinite(pct) ? `Upload ${pct}%` : 'Finalizing…',
           percent: Number.isFinite(pct) ? pct : undefined,
           animate: true,
         });

@@ -10,6 +10,22 @@
 {% endif %}
 {% block extra_head %}
 <style>
+    #executeSummaryModal .modal-dialog {
+        max-width: 960px;
+    }
+    #executeSummaryList.execute-summary-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+    }
+    #executeSummaryList.execute-summary-grid > .list-group-item {
+        margin: 0;
+    }
+    @media (max-width: 992px) {
+        #executeSummaryList.execute-summary-grid {
+            grid-template-columns: 1fr;
+        }
+    }
     body { padding-bottom: 42vh; }
     .pulse-change { animation: pulseHighlight .9s ease-in-out; }
     @keyframes pulseHighlight { 0% { box-shadow:0 0 0 0 rgba(13,110,253,.7); transform:scale(1);} 40% { box-shadow:0 0 0 6px rgba(13,110,253,.0); transform:scale(1.03);} 100% { box-shadow:0 0 0 0 rgba(13,110,253,0); transform:scale(1); } }
@@ -251,7 +267,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title">Running CLI…</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                <button type="button" class="btn-close" id="runProgressCloseBtn" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <div class="d-flex justify-content-between align-items-center mb-2 small text-muted">
@@ -765,7 +781,7 @@
                 <div class="d-flex align-items-center justify-content-between gap-2 mb-2">
                     <div class="small text-muted" id="executeSummaryStatus">Summary pending.</div>
                 </div>
-                <ul class="list-group" id="executeSummaryList"></ul>
+                <ul class="list-group execute-summary-grid" id="executeSummaryList"></ul>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-execute-summary-copy="1">Copy summary</button>
@@ -3814,6 +3830,7 @@ function normalizeCoreState(raw, includePassword = true) {
         ssh_port: toPositiveInt(serverDefaults.ssh_port, 22),
         ssh_username: (typeof serverDefaults.ssh_username === 'string') ? serverDefaults.ssh_username : '',
         auto_start_daemon: !!serverDefaults.auto_start_daemon,
+        core_secret_id: (typeof serverDefaults.core_secret_id === 'string') ? serverDefaults.core_secret_id.trim() : null,
     };
     const serverDefaultVenv = (typeof serverDefaults.venv_bin === 'string' && serverDefaults.venv_bin.trim()) ? serverDefaults.venv_bin.trim() : '';
     const defaultVenvBin = serverDefaultVenv || CORE_DEFAULT_VENV_BIN;
@@ -3828,6 +3845,7 @@ function normalizeCoreState(raw, includePassword = true) {
         ssh_username: defaults.ssh_username,
         venv_bin: defaultVenvBin,
         auto_start_daemon: defaults.auto_start_daemon,
+        core_secret_id: defaults.core_secret_id,
     };
     if ('host' in source && String(source.host).trim()) {
         out.host = String(source.host).trim();
@@ -3851,6 +3869,13 @@ function normalizeCoreState(raw, includePassword = true) {
             out.ssh_password = String(source.ssh.password || '');
         } else {
             out.ssh_password = '';
+        }
+    }
+    if ('core_secret_id' in source) {
+        if (typeof source.core_secret_id === 'string') {
+            out.core_secret_id = source.core_secret_id.trim() || null;
+        } else if (source.core_secret_id == null) {
+            out.core_secret_id = null;
         }
     }
     if (!out.ssh_port || !Number.isFinite(out.ssh_port)) {
@@ -3936,6 +3961,22 @@ function getCoreConfig(includePassword = true) {
     return normalized;
 }
 
+function getRunCoreConfig(includePassword = true, scenarioIndex = null) {
+    const base = getCoreConfig(includePassword);
+    const scenarioCore = Number.isInteger(scenarioIndex)
+        ? cloneScenarioCoreByIndex(scenarioIndex, includePassword)
+        : cloneActiveScenarioCore(includePassword);
+    let merged = mergeCoreSnapshots(base, scenarioCore || {});
+    merged = normalizeCoreState(merged, includePassword);
+    if (includePassword) {
+        merged = restoreCorePasswordFromSession(merged);
+    }
+    if (scenarioCore && typeof scenarioCore.core_secret_id === 'string') {
+        merged.core_secret_id = scenarioCore.core_secret_id.trim() || merged.core_secret_id || null;
+    }
+    return merged;
+}
+
 function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = null) {
     if (!coreState || typeof coreState !== 'object') return;
     const host = (coreState.grpc_host || '').toString().trim() || 'localhost';
@@ -3947,6 +3988,7 @@ function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = nul
     const sshPort = Number.isFinite(sshPortRaw) && sshPortRaw > 0 ? Number(sshPortRaw) : 22;
     const sshUser = (coreState.ssh_username || '').toString();
     const venvBin = (coreState.venv_bin || '').toString().trim();
+    const coreSecretId = (coreState.core_secret_id || '').toString().trim();
     const normalized = normalizeCoreState({
         host,
         port,
@@ -3955,6 +3997,7 @@ function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = nul
         ssh_username: sshUser,
         venv_bin: venvBin,
         ssh_password: '',
+        core_secret_id: coreSecretId || null,
     }, true);
     normalized.ssh_password = '';
     state.core = normalized;
@@ -16442,6 +16485,30 @@ const executeProgressState = {
     summaryShown: false,
 };
 
+let executeBeforeUnloadGuardInstalled = false;
+const executeBeforeUnloadGuard = (ev) => {
+    try {
+        if (!executeProgressState || !executeProgressState.active || executeProgressState.done) {
+            return undefined;
+        }
+        ev.preventDefault();
+        ev.returnValue = '';
+        return '';
+    } catch (e) {
+        return undefined;
+    }
+};
+function updateExecuteBeforeUnloadGuard(enabled) {
+    const shouldEnable = !!enabled;
+    if (shouldEnable && !executeBeforeUnloadGuardInstalled) {
+        window.addEventListener('beforeunload', executeBeforeUnloadGuard);
+        executeBeforeUnloadGuardInstalled = true;
+    } else if (!shouldEnable && executeBeforeUnloadGuardInstalled) {
+        window.removeEventListener('beforeunload', executeBeforeUnloadGuard);
+        executeBeforeUnloadGuardInstalled = false;
+    }
+}
+
 function shouldUpdateValidationSummary(current, incoming) {
     if (!incoming || typeof incoming !== 'object') return false;
     if (!current || typeof current !== 'object') return true;
@@ -16846,9 +16913,14 @@ function renderExecuteSummary(success) {
     const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
     const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
     const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+    const expectedInjectDirs = Array.isArray(summary.inject_dirs_expected) ? summary.inject_dirs_expected.length : 0;
+    const expectedInjectFiles = Array.isArray(summary.inject_files_expected) ? summary.inject_files_expected : [];
     const expectedNodesList = Array.isArray(summary.expected_nodes) ? summary.expected_nodes : [];
     const actualNodesList = Array.isArray(summary.actual_nodes) ? summary.actual_nodes : [];
     const actualNodesDetail = Array.isArray(summary.actual_nodes_detail) ? summary.actual_nodes_detail : [];
+    const dockerNodesList = Array.isArray(summary.docker_nodes) ? summary.docker_nodes : [];
+    const dockerRunningList = Array.isArray(summary.docker_running) ? summary.docker_running : [];
+    const injectsDetailList = Array.isArray(summary.injects_detail) ? summary.injects_detail : [];
     executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
     if (expectedDockerNodes > 0) {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -16869,13 +16941,8 @@ function renderExecuteSummary(success) {
             'Expected vulnerability nodes present',
             missingVulnNodes === 0,
             missingVulnNodes ? `${missingVulnNodes} missing` : `${expectedVulnNodes} expected`,
-            Array.isArray(summary.missing_vuln_nodes) ? summary.missing_vuln_nodes : []
-        ));
-        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
-            'Vulnerability nodes found',
-            actualVulnNodes === expectedVulnNodes,
-            `${actualVulnNodes} found`,
-            Array.isArray(summary.actual_vuln_nodes) ? summary.actual_vuln_nodes : []
+            missingVulnNodes ? (Array.isArray(summary.missing_vuln_nodes) ? summary.missing_vuln_nodes : [])
+                : (Array.isArray(summary.expected_vuln_nodes) ? summary.expected_vuln_nodes : [])
         ));
     }
     executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -16895,19 +16962,32 @@ function renderExecuteSummary(success) {
             'Docker containers present',
             dockerMissing === 0,
             dockerMissing ? `${dockerMissing} missing` : `${dockerNodes} containers detected`,
-            Array.isArray(summary.docker_missing) ? summary.docker_missing : []
+            dockerMissing ? (Array.isArray(summary.docker_missing) ? summary.docker_missing : []) : dockerNodesList
         ));
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
             'Docker containers running',
             dockerNotRunning === 0,
             dockerNotRunning ? `${dockerNotRunning} not running` : 'All containers running',
-            Array.isArray(summary.docker_not_running) ? summary.docker_not_running : []
+            dockerNotRunning ? (Array.isArray(summary.docker_not_running) ? summary.docker_not_running : []) : dockerRunningList
         ));
+        const expectedFilesText = expectedInjectFiles.length ? expectedInjectFiles.join(', ') : '';
+        const injectsMissingList = Array.isArray(summary.injects_missing) ? summary.injects_missing : [];
+        const injectsDetailItems = injectsMissing
+            ? injectsMissingList.map((name) => expectedFilesText ? `${name}: expected ${expectedFilesText}` : name)
+            : (injectsDetailList.length
+                ? injectsDetailList
+                : (expectedInjectDirs > 0
+                    ? [expectedFilesText ? `Expected files: ${expectedFilesText}` : 'No injects detected']
+                    : []));
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
             'Injected files present',
-            injectsMissing === 0,
-            injectsMissing ? `${injectsMissing} containers missing injects` : 'Injects detected',
-            Array.isArray(summary.injects_missing) ? summary.injects_missing : []
+            injectsMissing === 0 && (expectedInjectDirs === 0 || injectsDetailList.length > 0),
+            injectsMissing
+                ? `${injectsMissing} containers missing injects`
+                : (expectedInjectDirs > 0 && injectsDetailList.length === 0)
+                    ? 'No injects detected'
+                    : 'Injects detected',
+            injectsDetailItems
         ));
     } else {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -17661,6 +17741,7 @@ function resetExecuteProgressUI() {
         executeConfirmCancelBtn.disabled = false;
         executeConfirmCancelBtn.textContent = executeConfirmCancelBtn.dataset.cancelLabel;
     }
+    updateExecuteBeforeUnloadGuard(false);
 }
 
 function showExecuteProgressPanel(status, meta) {
@@ -17703,6 +17784,7 @@ function showExecuteProgressPanel(status, meta) {
     setExecuteProgressStatus(status || 'Preparing run…', meta || '');
     setExecuteProgressPercent(0, '0%');
     startExecuteProgressHeartbeat();
+    updateExecuteBeforeUnloadGuard(true);
 }
 
 function setExecuteProgressStatus(main, meta) {
@@ -17795,6 +17877,7 @@ function completeExecuteProgressPanel(success, message, meta) {
         executeProgressCancelBtn.classList.add('d-none');
         executeProgressCancelBtn.disabled = true;
     }
+    updateExecuteBeforeUnloadGuard(false);
     // Re-enable connection & advanced controls only after run completes.
     try { if (typeof setExecuteDialogControlsEnabled === 'function') setExecuteDialogControlsEnabled(true); } catch(e){}
     try {
@@ -20569,9 +20652,41 @@ async function pollRunStatus(runId) {
 function ensureRunProgressModal(){
     if(!runProgressModalInst){
         const el = document.getElementById('runProgressModal');
-        if(el){ runProgressModalInst = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false }); }
+        if(el){
+            runProgressModalInst = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false });
+            if (!el.dataset.guardBound) {
+                el.addEventListener('hide.bs.modal', (ev) => {
+                    try {
+                        const locked = el.dataset.locked === '1';
+                        if (locked || (executeProgressState && executeProgressState.active && !executeProgressState.done)) {
+                            ev.preventDefault();
+                            ev.stopPropagation();
+                            try { appendExecuteProgressLog('[ui] Run dialog close blocked while execution is active.'); } catch (e) {}
+                        }
+                    } catch (e) {}
+                });
+                el.dataset.guardBound = '1';
+            }
+        }
     }
     return runProgressModalInst;
+}
+
+function setRunProgressModalClosable(allowed) {
+    const hideBtn = document.getElementById('runProgressHideBtn');
+    const closeBtn = document.getElementById('runProgressCloseBtn');
+    const modalEl = document.getElementById('runProgressModal');
+    const disable = !allowed;
+    if (modalEl) {
+        modalEl.dataset.locked = disable ? '1' : '0';
+    }
+    [hideBtn, closeBtn].forEach(btn => {
+        if (!btn) return;
+        btn.disabled = disable;
+        btn.classList.toggle('disabled', disable);
+        if (disable) btn.setAttribute('aria-disabled', 'true');
+        else btn.removeAttribute('aria-disabled');
+    });
 }
 
 function markRunProgressComplete(){
@@ -20582,6 +20697,7 @@ function markRunProgressComplete(){
             hideBtn.onclick = null;
         }
     } catch(e) {}
+    setRunProgressModalClosable(true);
     // Also re-enable dialog controls when progress modal completes/finishes.
     try { if (typeof window.setExecuteDialogControlsEnabled === 'function') window.setExecuteDialogControlsEnabled(true); } catch(e){}
 }
@@ -20749,6 +20865,7 @@ function openRunProgress(title){
             hideBtn.textContent = 'Hide';
             hideBtn.onclick = null; // remove any prior navigation handler
         }
+        setRunProgressModalClosable(false);
         runProgressModalInst?.show();
     } catch(e){}
     try {
@@ -20773,6 +20890,7 @@ function closeRunProgress(){
     try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
     runProgressEvtSrc = null;
     runProgressRunId = null;
+    setRunProgressModalClosable(true);
     try { runProgressModalInst?.hide(); } catch(e){}
     try {
         const modalEl = document.getElementById('runProgressModal');
@@ -20863,11 +20981,15 @@ async function runSyncWithModal(arg){
                 if (!lastFinalizeLogTs || (now - lastFinalizeLogTs) >= 12000) {
                     lastFinalizeLogTs = now;
                     const suffix = lastFinalizeDetail ? ` (${lastFinalizeDetail})` : '';
-                    const percent = lastFinalizeInfo && typeof lastFinalizeInfo.percent === 'number'
-                        ? Math.max(0, Math.min(100, lastFinalizeInfo.percent))
-                        : null;
-                    const percentSuffix = percent !== null ? ` [finalize: ${percent.toFixed(0)}%]` : '';
                     let uploadPctSuffix = '';
+                    try {
+                        const upPct = lastUploadStats && typeof lastUploadStats.percent === 'number'
+                            ? Math.max(0, Math.min(100, lastUploadStats.percent))
+                            : null;
+                        if (upPct !== null) {
+                            uploadPctSuffix = ` [upload: ${upPct.toFixed(0)}%]`;
+                        }
+                    } catch (e) {}
                     let staleSuffix = '';
                     try {
                         const updatedAt = lastFinalizeInfo && typeof lastFinalizeInfo.updated_at === 'number' ? lastFinalizeInfo.updated_at : null;
@@ -20876,7 +20998,37 @@ async function runSyncWithModal(arg){
                             staleSuffix = ` [last update: ${ageSec}s ago]`;
                         }
                     } catch (e) {}
-                    appendExecuteDialogLog(`Waiting for CORE host to finalize (${finalizeElapsed}s)${suffix}${percentSuffix}${uploadPctSuffix}${staleSuffix}.`);
+                    let extraSuffix = '';
+                    try {
+                        const parts = [];
+                        if (lastFinalizeInfo) {
+                            if (lastFinalizeInfo.status) parts.push(`status=${lastFinalizeInfo.status}`);
+                            if (lastFinalizeInfo.stage) parts.push(`stage=${lastFinalizeInfo.stage}`);
+                            if (typeof lastFinalizeInfo.percent === 'number') {
+                                const fPct = Math.max(0, Math.min(100, lastFinalizeInfo.percent));
+                                parts.push(`finalize=${fPct.toFixed(0)}%`);
+                            }
+                            if (lastFinalizeInfo.detail && lastFinalizeInfo.detail !== lastFinalizeDetail) {
+                                parts.push(`detail=${lastFinalizeInfo.detail}`);
+                            }
+                        }
+                        if (lastUploadStats) {
+                            const loaded = lastUploadStats.loaded || 0;
+                            const total = lastUploadStats.total || null;
+                            if (total) parts.push(`upload=${formatBytes(loaded)} / ${formatBytes(total)}`);
+                            else if (loaded) parts.push(`upload=${formatBytes(loaded)}`);
+                        }
+                        if (lastResponseStats) {
+                            const loaded = lastResponseStats.loaded || 0;
+                            const total = lastResponseStats.total || null;
+                            if (total) parts.push(`response=${formatBytes(loaded)} / ${formatBytes(total)}`);
+                            else if (loaded) parts.push(`response=${formatBytes(loaded)}`);
+                        }
+                        if (parts.length) {
+                            extraSuffix = ` [${parts.join(' | ')}]`;
+                        }
+                    } catch (e) {}
+                    appendExecuteDialogLog(`Waiting for CORE host to finalize (${finalizeElapsed}s)${suffix}${uploadPctSuffix}${staleSuffix}${extraSuffix}.`);
                 }
                 // Keep the status/meta line accurate while waiting.
                 try {
@@ -21124,6 +21276,45 @@ async function runSyncWithModal(arg){
         openRunProgress('Running CLI…');
         maybeShowLocalEmulationHint();
     }
+    if (!updateRemoteRepo) {
+        try {
+            appendExecuteDialogLog('Checking remote repository availability…');
+            updateRunStatus('Preparing remote workspace…', 'Checking remote repository…');
+            const checkRes = await fetch('/core/check_remote_repo', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ core: getRunCoreConfig(true, scenarioIndexForRun) }),
+            });
+            if (checkRes.status === 404 || checkRes.status === 409) {
+                const info = await parseResponseJson(checkRes);
+                const repoPath = info?.missing_repo || 'remote CORE workspace';
+                const reason = info?.error || 'Remote repository missing on CORE host.';
+                const proceed = window.confirm(`${reason}\n\nRemote path: ${repoPath}\n\nUpload the current repository snapshot now?`);
+                if (proceed) {
+                    updateRemoteRepo = true;
+                } else {
+                    appendExecuteDialogLog('Run aborted: remote repository missing and upload disabled.');
+                    updateRunStatus('Repository missing', 'Enable Upload repo or sync the repo on the CORE host.');
+                    if (executeProgressState.active) {
+                        completeExecuteProgressPanel(false, 'Repository missing', 'Enable Upload repo or sync the repo on the CORE host.');
+                    } else if (showProgressModal) {
+                        const bar = document.getElementById('runProgressBar');
+                        if (bar) {
+                            bar.classList.remove('progress-bar-animated');
+                            bar.textContent = 'Error';
+                        }
+                        markRunProgressComplete();
+                    }
+                    return false;
+                }
+            } else if (!checkRes.ok) {
+                const detail = await extractResponseDetail(checkRes);
+                appendExecuteDialogLog(`Remote repository check failed: ${detail || `HTTP ${checkRes.status}`}`);
+            }
+        } catch (e) {
+            appendExecuteDialogLog(`Remote repository check failed: ${e?.message || e}`);
+        }
+    }
     if(updateRemoteRepo){
         appendExecuteDialogLog('Repository sync requested by user.');
         updateRunStatus('Copying repository…', 'Uploading repository snapshot to CORE host…');
@@ -21277,7 +21468,7 @@ async function runSyncWithModal(arg){
                 if (IS_BUILDER_VIEW) {
                     const payload = enrichPayloadWithScenarioContext({
                         scenarios: state.scenarios,
-                        core: getCoreConfig(true),
+                        core: getRunCoreConfig(true, scenarioIndexForRun),
                     }, { scenarioIndex: scenarioIndexForRun });
                     if (updateRemoteRepo) {
                         payload.update_remote_repo = true;
@@ -21598,7 +21789,7 @@ async function runWithSeedBuild(){
         const statusMetaEl = document.getElementById('runProgressMeta');
         if(statusMetaEl) statusMetaEl.textContent = 'Submitting run request to CORE host…';
         const buildRequest = () => {
-            const payload = enrichPayloadWithScenarioContext({ xml_path: rp, seed: seedVal, core: getCoreConfig(true) });
+            const payload = enrichPayloadWithScenarioContext({ xml_path: rp, seed: seedVal, core: getRunCoreConfig(true, scenarioIdx) });
             if (sendUpdateRemoteFlag) {
                 payload.update_remote_repo = true;
             }

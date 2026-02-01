@@ -724,6 +724,42 @@ def main():
         pass
     # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots (reuse orchestrator raw)
     docker_slot_plan: dict | None = None
+    preview_vuln_slots: list[str] = []
+    seed_for_vuln = args.seed
+    try:
+        if seed_for_vuln is None and isinstance(preview_full, dict):
+            seed_raw = preview_full.get('seed')
+            if seed_raw is not None:
+                seed_for_vuln = int(seed_raw)
+    except Exception:
+        seed_for_vuln = args.seed
+    try:
+        if isinstance(preview_full, dict):
+            vbn = preview_full.get('vulnerabilities_by_node') or preview_full.get('vulnerabilities_preview') or {}
+            host_ids: list[int] = []
+            if isinstance(vbn, dict):
+                for key in vbn.keys():
+                    try:
+                        host_ids.append(int(key))
+                    except Exception:
+                        continue
+            if host_ids:
+                hosts_preview = preview_full.get('hosts') or []
+                if isinstance(hosts_preview, list):
+                    ordered_hosts = sorted(hosts_preview, key=lambda h: (h.get('node_id', 0) if isinstance(h, dict) else 0))
+                    slot_map: dict[int, str] = {}
+                    for idx, h in enumerate(ordered_hosts):
+                        try:
+                            hid = int(h.get('node_id'))
+                        except Exception:
+                            continue
+                        slot_map[hid] = f"slot-{idx+1}"
+                    for hid in host_ids:
+                        slot = slot_map.get(hid)
+                        if slot:
+                            preview_vuln_slots.append(slot)
+    except Exception:
+        preview_vuln_slots = []
     try:
         vuln_density = None
         vuln_items = []
@@ -739,6 +775,18 @@ def main():
         catalog = load_vuln_catalog(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         total_hosts = sum(role_counts.values())  # total allocated hosts (base + additive)
         slot_names = [f"slot-{i+1}" for i in range(total_hosts)]
+        if preview_vuln_slots:
+            seen = set()
+            ordered_slots: list[str] = []
+            for slot in preview_vuln_slots:
+                if slot in slot_names and slot not in seen:
+                    ordered_slots.append(slot)
+                    seen.add(slot)
+            for slot in slot_names:
+                if slot not in seen:
+                    ordered_slots.append(slot)
+            slot_names = ordered_slots
+            logging.info("Using preview vulnerability slot ordering (%d slots prioritized)", len(preview_vuln_slots))
         logging.info("Vulnerabilities config: density=%.3f, items=%d (total_hosts=%d)", float(vuln_density or 0.0), len(vuln_items or []), total_hosts)
         assignments_slots = assign_compose_to_nodes(
             slot_names,
@@ -748,7 +796,8 @@ def main():
             out_base="/tmp/vulns",
             require_pulled=False,
             base_host_pool=density_base,
-            seed=args.seed,
+            seed=seed_for_vuln,
+            shuffle_nodes=not bool(preview_vuln_slots),
         )
         if assignments_slots:
             docker_slot_plan = assignments_slots

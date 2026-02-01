@@ -648,7 +648,7 @@ def _eligible_compose_items(catalog: Iterable[Dict[str, str]], v_type: Optional[
 	return items
 
 
-def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: List[dict], catalog: List[Dict[str, str]], out_base: str = "/tmp/vulns", require_pulled: bool = True, base_host_pool: int | None = None, seed: int | None = None) -> Dict[str, Dict[str, str]]:
+def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: List[dict], catalog: List[Dict[str, str]], out_base: str = "/tmp/vulns", require_pulled: bool = True, base_host_pool: int | None = None, seed: int | None = None, shuffle_nodes: bool = True) -> Dict[str, Dict[str, str]]:
 	"""Assign docker-compose vulnerabilities to nodes.
 
 	Rules (updated semantics):
@@ -689,7 +689,8 @@ def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: Li
 
 	rng = random.Random(seed) if seed is not None else random.Random()
 	nodes_pool = list(node_names)
-	rng.shuffle(nodes_pool)
+	if shuffle_nodes:
+		rng.shuffle(nodes_pool)
 	assigned: Dict[str, Dict[str, str]] = {}
 
 	# Normalize and classify items
@@ -1897,16 +1898,14 @@ def _expand_injects_from_outputs(out_manifest: str, inject_files: list[str]) -> 
 def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str], source_dir: str, outputs_manifest: str = '', prefer_service: str = '') -> dict:
 	if not isinstance(compose_obj, dict) or not inject_files:
 		return compose_obj
-	if not source_dir or not os.path.isdir(source_dir):
+	if source_dir:
 		try:
-			logger.warning(
-				"[injects] source_dir missing or not a dir: %s (inject_files=%s)",
-				source_dir,
-				inject_files,
-			)
+			if not os.path.isabs(source_dir):
+				source_dir = os.path.abspath(source_dir)
 		except Exception:
 			pass
-		return compose_obj
+	if not source_dir or not os.path.isdir(source_dir):
+		raise RuntimeError(f"[injects] source_dir missing or not a dir: {source_dir} (inject_files={inject_files})")
 
 	try:
 		logger.info(
@@ -1919,6 +1918,13 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		pass
 
 	inject_files = _expand_injects_from_outputs(outputs_manifest, inject_files)
+	try:
+		logger.info(
+			"[injects] expanded inject_files=%s",
+			inject_files,
+		)
+	except Exception:
+		pass
 	try:
 		logger.info("[injects] expanded injects=%s", inject_files)
 	except Exception:
@@ -1939,11 +1945,7 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		inject_map[src_norm] = dest_dir
 
 	if not inject_map:
-		try:
-			logger.warning("[injects] no valid inject mappings produced from %s", inject_files)
-		except Exception:
-			pass
-		return compose_obj
+		raise RuntimeError(f"[injects] no valid inject mappings produced from {inject_files}")
 
 	def _volume_name_for_dest(dest_dir: str) -> str:
 		slug = dest_dir.strip('/') or 'injects'
@@ -1989,11 +1991,7 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		for rel, dest_dir in inject_map.items():
 			src_path = os.path.join(source_dir, rel)
 			if not os.path.exists(src_path):
-				try:
-					logger.warning("[injects] missing source file for bind: %s", src_path)
-				except Exception:
-					pass
-				continue
+				raise RuntimeError(f"[injects] missing source file for bind: {src_path}")
 			bind = f"{src_path}:{dest_dir}/{rel}:ro"
 			compose_obj = _inject_service_bind_mount(compose_obj, bind, prefer_service=target_service)
 		return compose_obj
@@ -2018,6 +2016,14 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		dest_mounts[dest_dir] = mount_path
 		copy_vols.append(f"{vol_name}:{mount_path}")
 
+	missing_sources: list[str] = []
+	for rel in inject_map.keys():
+		src_path = os.path.join(source_dir, rel)
+		if not os.path.exists(src_path):
+			missing_sources.append(src_path)
+	if missing_sources:
+		raise RuntimeError(f"[injects] missing source files: {missing_sources}")
+
 	cmds: list[str] = []
 	for rel, dest_dir in inject_map.items():
 		mount_path = dest_mounts.get(dest_dir)
@@ -2029,14 +2035,10 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		dst_escaped = rel.replace('"', '\\"')
 		if rel_dir:
 			cmds.append(f"mkdir -p \"{mount_path}/{rel_dir_escaped}\"")
-		cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" || true")
+		cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\"")
 
 	if not cmds:
-		try:
-			logger.warning("[injects] no copy commands generated; skipping inject service")
-		except Exception:
-			pass
-		return compose_obj
+		raise RuntimeError("[injects] no copy commands generated; refusing to skip inject service")
 
 	services[copy_service_name] = {
 		'image': 'alpine:3.19',
