@@ -678,6 +678,151 @@
       const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
       const out = { node_id: String(nid || ''), id: curId };
 
+      const _normalizeInjectFilesForPersist = (injects, resolvedOutputs) => {
+        const rawList = Array.isArray(injects) ? injects.map(x => String(x || '').trim()).filter(Boolean) : [];
+        if(!rawList.length) return rawList;
+        const ro = (resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)) ? resolvedOutputs : null;
+        const lowerMap = new Map();
+        if(ro){
+          Object.keys(ro).forEach((k)=>{
+            if(k) lowerMap.set(String(k).toLowerCase(), k);
+          });
+        }
+        const resolveToken = (token) => {
+          const text = String(token || '').trim();
+          if(!text || !ro) return text;
+          const direct = ro[text];
+          if(typeof direct === 'string' && direct.trim()) return direct.trim();
+          const key = lowerMap.get(text.toLowerCase());
+          if(key){
+            const val = ro[key];
+            if(typeof val === 'string' && val.trim()) return val.trim();
+          }
+          if(!text.includes('/')){
+            const lowered = text.toLowerCase();
+            try{
+              for(const [k, v] of Object.entries(ro)){
+                if(typeof v !== 'string') continue;
+                const vTrim = v.trim();
+                if(!vTrim) continue;
+                const base = vTrim.split('/').filter(Boolean).pop() || '';
+                if(base.toLowerCase() === lowered || vTrim.toLowerCase().endsWith('/' + lowered)){
+                  return vTrim;
+                }
+              }
+            } catch(e) {}
+          }
+          return text;
+        };
+        const outList = [];
+        rawList.forEach((raw)=>{
+          const text = String(raw || '').trim();
+          if(!text) return;
+          const isTokenLike = !text.includes('/') && !text.includes('->') && !text.includes('=>');
+          let src = text;
+          let dest = '';
+          if(text.includes('->')){
+            const parts = text.split('->');
+            src = parts[0];
+            dest = parts.slice(1).join('->');
+          } else if(text.includes('=>')){
+            const parts = text.split('=>');
+            src = parts[0];
+            dest = parts.slice(1).join('=>');
+          }
+          const resolvedSrc = resolveToken(src);
+          const destTrim = String(dest || '').trim();
+          const destDir = destTrim && destTrim.startsWith('/') ? destTrim.replace(/\/+$/g, '') || '/tmp' : '/tmp';
+          let resolvedRel = String(resolvedSrc || '').replace('\\', '/');
+          if (resolvedRel.startsWith('/')) {
+            resolvedRel = resolvedRel.replace(/^\/+/, '');
+          }
+          const destPath = resolvedRel ? `${destDir}/${resolvedRel}` : destDir;
+          if (!isTokenLike && destTrim) {
+            // Preserve explicit destinations exactly as authored.
+            outList.push(destPath);
+            return;
+          }
+          if (!isTokenLike && text.startsWith('/')) {
+            // If the user already provided an absolute path, keep it.
+            outList.push(text);
+            return;
+          }
+          if(destPath) outList.push(destPath);
+        });
+        return outList;
+      };
+
+      const _injectDetailsForPersist = (injects, resolvedOutputs, nodeId) => {
+        const rawList = Array.isArray(injects) ? injects.map(x => String(x || '').trim()).filter(Boolean) : [];
+        if(!rawList.length) return [];
+        const ro = (resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)) ? resolvedOutputs : null;
+        const lowerMap = new Map();
+        if(ro){
+          Object.keys(ro).forEach((k)=>{
+            if(k) lowerMap.set(String(k).toLowerCase(), k);
+          });
+        }
+        const resolveToken = (token) => {
+          const text = String(token || '').trim();
+          if(!text || !ro) return text;
+          const direct = ro[text];
+          if(typeof direct === 'string' && direct.trim()) return direct.trim();
+          const key = lowerMap.get(text.toLowerCase());
+          if(key){
+            const val = ro[key];
+            if(typeof val === 'string' && val.trim()) return val.trim();
+          }
+          if(!text.includes('/')){
+            const lowered = text.toLowerCase();
+            try{
+              for(const [k, v] of Object.entries(ro)){
+                if(typeof v !== 'string') continue;
+                const vTrim = v.trim();
+                if(!vTrim) continue;
+                const base = vTrim.split('/').filter(Boolean).pop() || '';
+                if(base.toLowerCase() === lowered || vTrim.toLowerCase().endsWith('/' + lowered)){
+                  return vTrim;
+                }
+              }
+            } catch(e) {}
+          }
+          return text;
+        };
+        const details = [];
+        rawList.forEach((raw, idx)=>{
+          const text = String(raw || '').trim();
+          if(!text) return;
+          let src = text;
+          let dest = '';
+          if(text.includes('->')){
+            const parts = text.split('->');
+            src = parts[0];
+            dest = parts.slice(1).join('->');
+          } else if(text.includes('=>')){
+            const parts = text.split('=>');
+            src = parts[0];
+            dest = parts.slice(1).join('=>');
+          }
+          const resolvedSrc = resolveToken(src);
+          const destTrim = String(dest || '').trim();
+          const destDir = destTrim && destTrim.startsWith('/') ? destTrim.replace(/\/+$/g, '') || '/tmp' : '/tmp';
+          let resolvedRel = String(resolvedSrc || '').replace('\\', '/');
+          if (resolvedRel.startsWith('/')) {
+            resolvedRel = resolvedRel.replace(/^\/+/, '');
+          }
+          const destPath = resolvedRel ? `${destDir}/${resolvedRel}` : destDir;
+          const itemId = `inject:${nodeId || 'node'}:${idx}:${src}`;
+          details.push({
+            id: itemId,
+            field: src,
+            resolved: resolvedSrc,
+            path: destPath,
+          });
+        });
+        return details;
+      };
+
       const ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
         ? curA.config_overrides
         : undefined;
@@ -687,9 +832,46 @@
       const injOvr = (curA && Array.isArray(curA.inject_files_override))
         ? curA.inject_files_override
         : undefined;
-      const injectFiles = (curA && Array.isArray(curA.inject_files))
+      const injectFilesRaw = (curA && Array.isArray(curA.inject_files))
         ? curA.inject_files.map(String).filter(Boolean)
-        : undefined;
+        : [];
+      const injectFiles = _normalizeInjectFilesForPersist(injectFilesRaw, curA && curA.resolved_outputs);
+      let injectFilesDetail = _injectDetailsForPersist(injectFilesRaw, curA && curA.resolved_outputs, nid);
+      const resolvedInputs = (curA && typeof curA.resolved_inputs === 'object' && curA.resolved_inputs && !Array.isArray(curA.resolved_inputs))
+        ? curA.resolved_inputs
+        : null;
+      const resolvedOutputs = (curA && typeof curA.resolved_outputs === 'object' && curA.resolved_outputs && !Array.isArray(curA.resolved_outputs))
+        ? curA.resolved_outputs
+        : null;
+      const varIdForField = (field) => {
+        const key = String(field || '').trim();
+        return key ? `var:${key}` : `var:unknown`;
+      };
+      const inputDetails = resolvedInputs
+        ? Object.entries(resolvedInputs).map(([key, value], idx) => ({
+            id: varIdForField(key),
+            field: key,
+            resolved: value,
+          }))
+        : [];
+      const outputDetails = resolvedOutputs
+        ? Object.entries(resolvedOutputs).map(([key, value], idx) => ({
+            id: varIdForField(key),
+            field: key,
+            resolved: value,
+          }))
+        : [];
+      const inputIdByField = new Map(inputDetails.map(item => [String(item.field || ''), item.id]));
+      const outputIdByField = new Map(outputDetails.map(item => [String(item.field || ''), item.id]));
+      injectFilesDetail = injectFilesDetail.map((item) => {
+        const field = String(item.field || '');
+        return {
+          ...item,
+          input_id: inputIdByField.get(field) || null,
+          output_id: outputIdByField.get(field) || null,
+          var_id: varIdForField(field),
+        };
+      });
       const hintOvr = (curA && Array.isArray(curA.hint_overrides)) ? curA.hint_overrides : undefined;
       const flagOvr = (curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) ? String(curA.flag_override).trim() : undefined;
 
@@ -709,6 +891,9 @@
       if(outOvr !== undefined) out.output_overrides = outOvr;
       if(injOvr !== undefined) out.inject_files_override = injOvr;
       if(injectFiles !== undefined) out.inject_files = injectFiles;
+      if(injectFilesDetail.length) out.inject_files_detail = injectFilesDetail;
+      if(inputDetails.length) out.resolved_inputs_detail = inputDetails;
+      if(outputDetails.length) out.resolved_outputs_detail = outputDetails;
       if(hintOvr !== undefined) out.hint_overrides = hintOvr;
       if(flagOvr !== undefined) out.flag_override = flagOvr;
       if(typeVal !== undefined) out.type = typeVal;
@@ -3292,7 +3477,11 @@
 
                   const tdPath = document.createElement('td');
                   tdPath.className = 'small text-muted';
-                  const resolvedBase = resolvedVal ? basenameFrom(resolvedVal) : basenameFrom(displaySrc);
+                  let resolvedRel = resolvedVal ? String(resolvedVal || '').replace('\\', '/') : String(displaySrc || '').replace('\\', '/');
+                  if (resolvedRel.startsWith('/')) {
+                    resolvedRel = resolvedRel.replace(/^\/+/, '');
+                  }
+                  const resolvedBase = resolvedRel ? resolvedRel : basenameFrom(resolvedVal ? resolvedVal : displaySrc);
                   const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
                   tdPath.textContent = destPath || '-';
 

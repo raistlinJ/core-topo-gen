@@ -20943,6 +20943,10 @@ async function runSyncWithModal(arg){
     let lastFinalizeDetail = null;
     let finalizeAnnounced = false;
     let lastFinalizeInfo = null;
+    let lastFinalizeUpdateAtLogged = null;
+    let lastFinalizeUploadLogged = null;
+    let lastFinalizeResponseLogged = null;
+    let lastFinalizeStageLogged = null;
     const updateRunStatus = (status, meta) => {
         if (executeProgressState.active) {
             setExecuteProgressStatus(status, meta);
@@ -20978,7 +20982,39 @@ async function runSyncWithModal(arg){
             const elapsedSec = Math.round((now - (uploadStartTime || now)) / 1000);
             if (uploadDelivered) {
                 const finalizeElapsed = uploadFinalizeStart ? Math.round((now - uploadFinalizeStart) / 1000) : elapsedSec;
+                let shouldLogFinalize = false;
+                try {
+                    const updatedAt = lastFinalizeInfo && typeof lastFinalizeInfo.updated_at === 'number' ? lastFinalizeInfo.updated_at : null;
+                    if (updatedAt && updatedAt !== lastFinalizeUpdateAtLogged) {
+                        shouldLogFinalize = true;
+                        lastFinalizeUpdateAtLogged = updatedAt;
+                    }
+                } catch (e) {}
+                try {
+                    const loaded = lastUploadStats ? (lastUploadStats.loaded || 0) : 0;
+                    const total = lastUploadStats ? (lastUploadStats.total || 0) : 0;
+                    const uploadKey = `${loaded}/${total}`;
+                    if (uploadKey !== lastFinalizeUploadLogged) {
+                        shouldLogFinalize = true;
+                        lastFinalizeUploadLogged = uploadKey;
+                    }
+                } catch (e) {}
+                try {
+                    const loaded = lastResponseStats ? (lastResponseStats.loaded || 0) : 0;
+                    const total = lastResponseStats ? (lastResponseStats.total || 0) : 0;
+                    const responseKey = `${loaded}/${total}`;
+                    if (responseKey !== lastFinalizeResponseLogged) {
+                        shouldLogFinalize = true;
+                        lastFinalizeResponseLogged = responseKey;
+                    }
+                } catch (e) {}
                 if (!lastFinalizeLogTs || (now - lastFinalizeLogTs) >= 12000) {
+                    // Allow a periodic heartbeat only if we have no new progress to report.
+                    if (!shouldLogFinalize) {
+                        shouldLogFinalize = true;
+                    }
+                }
+                if (shouldLogFinalize) {
                     lastFinalizeLogTs = now;
                     const suffix = lastFinalizeDetail ? ` (${lastFinalizeDetail})` : '';
                     let uploadPctSuffix = '';
@@ -21004,10 +21040,6 @@ async function runSyncWithModal(arg){
                         if (lastFinalizeInfo) {
                             if (lastFinalizeInfo.status) parts.push(`status=${lastFinalizeInfo.status}`);
                             if (lastFinalizeInfo.stage) parts.push(`stage=${lastFinalizeInfo.stage}`);
-                            if (typeof lastFinalizeInfo.percent === 'number') {
-                                const fPct = Math.max(0, Math.min(100, lastFinalizeInfo.percent));
-                                parts.push(`finalize=${fPct.toFixed(0)}%`);
-                            }
                             if (lastFinalizeInfo.detail && lastFinalizeInfo.detail !== lastFinalizeDetail) {
                                 parts.push(`detail=${lastFinalizeInfo.detail}`);
                             }
@@ -21196,8 +21228,8 @@ async function runSyncWithModal(arg){
             lastFinalizeLogTs = Date.now();
         }
         const status = info.status || 'pending';
-        const detail = info.detail || info.stage || 'Remote finalize in progress…';
-        const percent = typeof info.percent === 'number' ? Math.max(0, Math.min(100, info.percent)) : null;
+        const stage = info.stage || '';
+        const detail = info.detail || stage || 'Remote finalize in progress…';
         if (!finalizeAnnounced) {
             finalizeAnnounced = true;
             let uploadDetail = '';
@@ -21225,11 +21257,12 @@ async function runSyncWithModal(arg){
             } catch (e) {}
             appendExecuteDialogLog(`Remote finalize: ${detail}${suffix}`);
         }
+        if (stage && stage !== lastFinalizeStageLogged) {
+            lastFinalizeStageLogged = stage;
+            appendExecuteDialogLog(`Remote finalize step: ${stage}${detail ? ` — ${detail}` : ''}`);
+        }
         if (detail) {
             updateRunStatus('Finishing repository sync… (this may take a few minutes)', detail);
-        }
-        if (percent !== null) {
-            setUploadProgressValue(percent, `${percent.toFixed(0)}%`);
         }
         if (status === 'error') {
             logError('Remote finalize reported an error; check server logs for details.');

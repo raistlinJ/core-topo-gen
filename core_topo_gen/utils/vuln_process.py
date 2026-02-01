@@ -1836,7 +1836,7 @@ def _split_inject_spec(raw: str) -> tuple[str, str]:
 	return text, ''
 
 
-def _normalize_inject_dest_dir(raw: str, *, default: str = '/flow_injects') -> str:
+def _normalize_inject_dest_dir(raw: str, *, default: str = '/tmp') -> str:
 	s = str(raw or '').strip()
 	if not s:
 		return default
@@ -1918,13 +1918,6 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		pass
 
 	inject_files = _expand_injects_from_outputs(outputs_manifest, inject_files)
-	try:
-		logger.info(
-			"[injects] expanded inject_files=%s",
-			inject_files,
-		)
-	except Exception:
-		pass
 	try:
 		logger.info("[injects] expanded injects=%s", inject_files)
 	except Exception:

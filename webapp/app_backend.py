@@ -1561,7 +1561,7 @@ def _iter_values_by_key(obj: Any, keys: set[str]) -> Iterator[Any]:
             yield from _iter_values_by_key(item, keys)
 
 
-def _normalize_inject_dest_dir_for_validation(raw: str, *, default: str = '/flow_injects') -> str:
+def _normalize_inject_dest_dir_for_validation(raw: str, *, default: str = '/tmp') -> str:
     s = str(raw or '').strip()
     if not s:
         return default
@@ -1573,7 +1573,7 @@ def _normalize_inject_dest_dir_for_validation(raw: str, *, default: str = '/flow
     return '/' + '/'.join(parts) if parts else default
 
 
-def _normalize_inject_dest_path_for_validation(raw: str, src_path: str | None, *, default_dir: str = '/flow_injects') -> str:
+def _normalize_inject_dest_path_for_validation(raw: str, src_path: str | None, *, default_dir: str = '/tmp') -> str:
     src_base = os.path.basename(str(src_path or '').strip()) if src_path else ''
     dest = str(raw or '').strip()
     if not dest or not dest.startswith('/'):
@@ -1807,6 +1807,72 @@ def _extract_inject_files_from_plan_xml(scenario_xml_path: str, scenario_label: 
             seen_all.add(f)
             merged.append(f)
     return merged
+
+
+def _extract_inject_specs_from_flow_state(scenario_xml_path: str, scenario_label: str | None) -> List[str]:
+    specs: List[str] = []
+    try:
+        flow_state = _flow_state_from_xml_path(scenario_xml_path, scenario_label)
+    except Exception:
+        flow_state = None
+    if not isinstance(flow_state, dict):
+        return specs
+    assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
+    chain_ids = []
+    try:
+        chain_ids = [str(x).strip() for x in (flow_state.get('chain_ids') or []) if str(x).strip()]
+    except Exception:
+        chain_ids = []
+    chain_set = set(chain_ids)
+    for entry in assigns or []:
+        if not isinstance(entry, dict):
+            continue
+        nid_raw = str(entry.get('node_id') or '').strip()
+        if chain_set and nid_raw and nid_raw not in chain_set:
+            continue
+        for key in ('inject_files_override', 'inject_files'):
+            vals = entry.get(key)
+            if isinstance(vals, list):
+                for item in vals:
+                    s = str(item or '').strip()
+                    if s:
+                        specs.append(s)
+            elif isinstance(vals, str) and vals.strip():
+                specs.append(vals.strip())
+    return specs
+
+
+def _extract_inject_node_ids_from_flow_state(scenario_xml_path: str, scenario_label: str | None) -> set[int]:
+    node_ids: set[int] = set()
+    try:
+        flow_state = _flow_state_from_xml_path(scenario_xml_path, scenario_label)
+    except Exception:
+        flow_state = None
+    if not isinstance(flow_state, dict):
+        return node_ids
+    chain_ids = []
+    try:
+        chain_ids = [str(x).strip() for x in (flow_state.get('chain_ids') or []) if str(x).strip()]
+    except Exception:
+        chain_ids = []
+    chain_set = set(chain_ids)
+    assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
+    for entry in assigns or []:
+        if not isinstance(entry, dict):
+            continue
+        nid_raw = str(entry.get('node_id') or '').strip()
+        if not nid_raw:
+            continue
+        if chain_set and nid_raw not in chain_set:
+            continue
+        inj = entry.get('inject_files')
+        if not (isinstance(inj, list) and any(str(x or '').strip() for x in inj)):
+            continue
+        try:
+            node_ids.add(int(nid_raw))
+        except Exception:
+            continue
+    return node_ids
 
     dests: List[str] = []
     for raw in inject_specs:
@@ -25637,6 +25703,7 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
 
     candidates = []
     rj45_names: set[str] = set()
+    rj45_ids: set[int] = set()
     try:
         candidates.extend(root.findall('.//node'))
     except Exception:
@@ -25651,6 +25718,13 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
                 ntype = (net.get('type') or net.get('model') or '').strip().lower()
                 nclass = (net.get('class') or '').strip().lower()
                 name = (net.get('name') or '').strip()
+                if ntype == 'rj45' or 'rj45' in nclass:
+                    try:
+                        nid = _norm_id(net.get('id') or net.findtext('id'))
+                        if nid is not None:
+                            rj45_ids.add(nid)
+                    except Exception:
+                        pass
                 if name and (ntype == 'rj45' or 'rj45' in nclass):
                     rj45_names.add(name)
             except Exception:
@@ -25685,6 +25759,8 @@ def _parse_session_xml_for_compare(session_xml_path: str) -> Dict[int, Dict[str,
         node2 = _norm_id(link.get('node2') or link.get('node2_id') or link.get('dst'))
         for tag, nid in (('iface1', node1), ('iface2', node2)):
             if nid is None:
+                continue
+            if nid in rj45_ids:
                 continue
             iface = link.find(tag)
             if iface is None:
@@ -30541,6 +30617,7 @@ def _validate_session_nodes_and_injects(
         'injects_missing': [],
         'injects_detail': [],
         'inject_dirs_expected': [],
+        'inject_nodes_expected': [],
     }
     if not scenario_xml_path or not session_xml_path:
         summary['ok'] = False
@@ -30594,9 +30671,15 @@ def _validate_session_nodes_and_injects(
     except Exception:
         pass
 
-    expected_inject_dirs = _extract_inject_dirs_from_plan_xml(scenario_xml_path, scenario_label)
-    expected_inject_files = _extract_inject_files_from_plan_xml(scenario_xml_path, scenario_label)
-    if preview_plan_path:
+    flow_inject_specs = _extract_inject_specs_from_flow_state(scenario_xml_path, scenario_label)
+    if flow_inject_specs:
+        flow_payload = {'inject_files': flow_inject_specs}
+        expected_inject_dirs = _extract_inject_dirs_from_payload(flow_payload)
+        expected_inject_files = _extract_inject_files_from_payload(flow_payload)
+    else:
+        expected_inject_dirs = _extract_inject_dirs_from_plan_xml(scenario_xml_path, scenario_label)
+        expected_inject_files = _extract_inject_files_from_plan_xml(scenario_xml_path, scenario_label)
+    if preview_plan_path and not flow_inject_specs:
         try:
             payload = _load_plan_preview_payload_from_path(preview_plan_path, scenario_label)
             extra_dirs = _extract_inject_dirs_from_payload(payload) if isinstance(payload, dict) else []
@@ -30633,6 +30716,19 @@ def _validate_session_nodes_and_injects(
 
     docker_nodes = _session_docker_nodes_from_xml(session_xml_path)
     summary['docker_nodes'] = docker_nodes
+    inject_node_ids = _extract_inject_node_ids_from_flow_state(scenario_xml_path, scenario_label)
+    inject_node_names: List[str] = []
+    if inject_node_ids:
+        try:
+            expected = _expected_from_plan_preview(scenario_xml_path, scenario_label)
+            for nid in sorted(inject_node_ids):
+                exp = expected.get(nid) or {}
+                nm = str(exp.get('name') or '').strip()
+                if nm:
+                    inject_node_names.append(nm)
+        except Exception:
+            inject_node_names = []
+    summary['inject_nodes_expected'] = inject_node_names
     actual_vuln_nodes: List[str] = []
     if docker_nodes and isinstance(core_cfg, dict):
         try:
@@ -30665,11 +30761,14 @@ def _validate_session_nodes_and_injects(
             summary['actual_vuln_nodes'] = sorted(exp_vuln & act_set)
         summary['missing_vuln_nodes'] = sorted(exp_vuln - act_set)
     if docker_nodes and isinstance(core_cfg, dict):
+        containers_for_injects = docker_nodes
+        if inject_node_names:
+            containers_for_injects = [n for n in docker_nodes if n in set(inject_node_names)]
         try:
             payload = _run_remote_python_json(
                 core_cfg,
                 _remote_docker_injects_status_script(
-                    containers=docker_nodes,
+                    containers=containers_for_injects,
                     sudo_password=core_cfg.get('ssh_password'),
                     inject_dirs=expected_inject_dirs if expected_inject_dirs else None,
                 ),
