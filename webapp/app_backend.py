@@ -16521,6 +16521,30 @@ def api_flow_prepare_preview_for_execute():
                             'run_dir': str(flow_out_dir or ''),
                         })
 
+                def _inject_files_for_copy_from_detail(detail_list: Any) -> list[str]:
+                    if not isinstance(detail_list, list):
+                        return []
+                    out: list[str] = []
+                    for entry in detail_list:
+                        if not isinstance(entry, dict):
+                            continue
+                        resolved = str(entry.get('resolved') or '').strip()
+                        path = str(entry.get('path') or '').strip()
+                        if not path:
+                            continue
+                        dest_dir = os.path.dirname(path) if path.startswith('/') else ''
+                        if not dest_dir:
+                            continue
+                        if resolved.startswith('/'):
+                            # Skip absolute sources outside artifacts_dir; they won't exist in source_dir.
+                            continue
+                        if resolved.startswith('./'):
+                            resolved = resolved[2:]
+                        if not resolved:
+                            continue
+                        out.append(f"{resolved} -> {dest_dir}")
+                    return out
+
                 meta_h['flow_flag'] = {
                     'type': assignment_type,
                     'generator_catalog': generator_catalog,
@@ -16538,7 +16562,9 @@ def api_flow_prepare_preview_for_execute():
                             else (flow_out_dir or '')
                         )
                     ),
-                    'inject_files': list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else [],
+                    'inject_files': _inject_files_for_copy_from_detail(fa.get('inject_files_detail')) or (
+                        list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else []
+                    ),
                     'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
                     'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
                     'hint_template': str(fa.get('hint_template') or ''),
