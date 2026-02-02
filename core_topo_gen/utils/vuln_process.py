@@ -1931,6 +1931,25 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 	inject_map: dict[str, str] = {}
 	for raw in inject_files or []:
 		src_raw, dest_raw = _split_inject_spec(str(raw))
+		src_raw_s = str(src_raw or '').strip()
+		# If src is an absolute path, treat it as a destination path inside the
+		# container and map the source to the basename in artifacts. If a dest is
+		# provided, honor it but still use the basename to avoid /tmp/tmp/... paths.
+		if src_raw_s.startswith('/'):
+			try:
+				src_raw_s = src_raw_s.rstrip('/')
+			except Exception:
+				pass
+			parent = os.path.dirname(src_raw_s)
+			base = os.path.basename(src_raw_s)
+			if base:
+				if dest_raw:
+					dest_dir = _normalize_inject_dest_dir(dest_raw)
+					inject_map[base] = dest_dir
+					continue
+				# No dest provided: default to /tmp to avoid /tmp/tmp/... paths.
+				inject_map[base] = '/tmp'
+				continue
 		src_norm = _norm_inject_rel(src_raw)
 		if not src_norm:
 			continue
@@ -1939,6 +1958,21 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 
 	if not inject_map:
 		raise RuntimeError(f"[injects] no valid inject mappings produced from {inject_files}")
+
+	# Persist inject mapping metadata for remote copy mode.
+	try:
+		inject_items = [{'src': k, 'dest': v} for k, v in inject_map.items()]
+		obj = _inject_service_labels(
+			compose_obj,
+			{
+				'coretg.inject.source_dir': str(source_dir),
+				'coretg.inject.map': json.dumps(inject_items, ensure_ascii=False),
+			},
+			prefer_service=target_service,
+		)
+		compose_obj = obj
+	except Exception:
+		pass
 
 	def _volume_name_for_dest(dest_dir: str) -> str:
 		slug = dest_dir.strip('/') or 'injects'

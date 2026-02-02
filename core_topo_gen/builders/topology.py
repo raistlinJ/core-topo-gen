@@ -10,6 +10,8 @@ import subprocess
 import time
 import sys
 import select
+import os
+import json
 
 try:  # pragma: no cover - offline mode exercised via CLI tests
     from core.api.grpc import client  # type: ignore
@@ -1254,7 +1256,7 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
             return None
         flow_flag = meta.get('flow_flag')
         if not isinstance(flow_flag, dict):
-            return None
+            return _flow_flag_artifacts_overlay_from_env(hdata)
         ftype = str(flow_flag.get('type') or '').strip().lower()
         if ftype != 'flag-generator':
             return None
@@ -1278,6 +1280,66 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
         }
         if hint_text:
             overlay['HintText'] = hint_text
+        return overlay
+    except Exception:
+        return None
+
+
+_FLOW_ASSIGNMENTS_CACHE: list[dict[str, Any]] | None = None
+
+
+def _flow_assignments_from_env() -> list[dict[str, Any]]:
+    global _FLOW_ASSIGNMENTS_CACHE
+    if _FLOW_ASSIGNMENTS_CACHE is not None:
+        return _FLOW_ASSIGNMENTS_CACHE
+    raw = os.environ.get('CORETG_FLOW_ASSIGNMENTS_JSON') or ''
+    if not raw:
+        _FLOW_ASSIGNMENTS_CACHE = []
+        return _FLOW_ASSIGNMENTS_CACHE
+    try:
+        data = json.loads(raw)
+        _FLOW_ASSIGNMENTS_CACHE = data if isinstance(data, list) else []
+    except Exception:
+        _FLOW_ASSIGNMENTS_CACHE = []
+    return _FLOW_ASSIGNMENTS_CACHE
+
+
+def _flow_flag_artifacts_overlay_from_env(hdata: Any) -> Optional[Dict[str, str]]:
+    try:
+        if not isinstance(hdata, dict):
+            return None
+        node_id = str(hdata.get('node_id') or hdata.get('id') or '').strip()
+        if not node_id:
+            return None
+        assigns = _flow_assignments_from_env()
+        if not assigns:
+            return None
+        match = None
+        for fa in assigns:
+            if not isinstance(fa, dict):
+                continue
+            if str(fa.get('node_id') or '').strip() == node_id:
+                match = fa
+                break
+        if not match:
+            return None
+        artifacts_dir = str(match.get('mount_dir') or match.get('artifacts_dir') or match.get('run_dir') or '').strip()
+        if not artifacts_dir:
+            return None
+        if not os.path.isabs(artifacts_dir):
+            try:
+                artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
+            except Exception:
+                pass
+        mount_path = '/flow_artifacts'
+        overlay: Dict[str, str] = {
+            'ArtifactsDir': artifacts_dir,
+            'ArtifactsMountPath': mount_path,
+            'InjectFiles': match.get('inject_files') or [],
+            'InjectSourceDir': artifacts_dir,
+            'OutputsManifest': str(match.get('outputs_manifest') or ''),
+            'RunDir': str(match.get('run_dir') or ''),
+        }
         return overlay
     except Exception:
         return None
@@ -2218,13 +2280,17 @@ def _try_build_segmented_topology_from_preview(
                     if flow_rec:
                         docker_by_name[name] = flow_rec
                     else:
-                        docker_by_name.setdefault(name, _standard_docker_compose_record())
+                        base_rec = _standard_docker_compose_record()
+                        overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+                        docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
                     _apply_mount_overlays(docker_by_name.get(name))
             except Exception:
                 pass
 
         if is_docker_node and name not in docker_by_name:
-            docker_by_name.setdefault(name, _standard_docker_compose_record())
+            base_rec = _standard_docker_compose_record()
+            overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+            docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
             _apply_mount_overlays(docker_by_name.get(name))
 
         # Prepare per-node compose file BEFORE creating the docker node.

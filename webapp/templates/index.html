@@ -774,7 +774,10 @@
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title">Execute Summary</h5>
+                <div class="d-flex align-items-center gap-2">
+                    <h5 class="modal-title mb-0">Execute Summary</h5>
+                    <span class="spinner-border spinner-border-sm text-muted d-none" id="executeSummarySpinner" role="status" aria-hidden="true"></span>
+                </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
@@ -5503,6 +5506,7 @@ async function computeFullPlanPreview(){
         try {
             if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                 executeProgressState.validationSummary = data.validation_summary;
+                logExecuteValidationSummary(data.validation_summary);
                 refreshExecuteSummaryIfVisible();
             }
         } catch (e) {}
@@ -16338,6 +16342,7 @@ let executeSummaryModalEl = null;
 let executeSummaryStatusEl = null;
 let executeSummaryListEl = null;
 let executeSummaryCopyBtns = [];
+let executeSummarySpinnerEl = null;
 let executeSummaryRedirect = { url: null, delay: 600 };
 let executeCoreStatusEl = null;
 let executeCoreTestBtn = null;
@@ -16483,6 +16488,7 @@ const executeProgressState = {
     cancelHandlers: [],
     validationSummary: null,
     summaryShown: false,
+    validationLogSig: '',
 };
 
 let executeBeforeUnloadGuardInstalled = false;
@@ -16529,6 +16535,44 @@ function shouldUpdateValidationSummary(current, incoming) {
     return false;
 }
 
+function logExecuteValidationSummary(summary) {
+    try {
+        if (!summary || typeof summary !== 'object') return;
+        const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+        const injectsDetail = Array.isArray(summary.injects_detail) ? summary.injects_detail : [];
+        const expectedByNode = (summary.inject_files_expected_by_node && typeof summary.inject_files_expected_by_node === 'object')
+            ? summary.inject_files_expected_by_node
+            : {};
+        const sig = JSON.stringify({
+            ok: !!summary.ok,
+            injectsMissing,
+            injectsDetail,
+        });
+        if (executeProgressState.validationLogSig === sig) return;
+        executeProgressState.validationLogSig = sig;
+        const emit = (line) => {
+            if (executeProgressState && executeProgressState.active) {
+                appendExecuteProgressLog(line, { mirrorToDock: true });
+            } else if (typeof dockLog === 'function') {
+                dockLog(line, 'INFO');
+            }
+        };
+        emit(`[validate] ok=${summary.ok} injects_missing=${injectsMissing}`);
+        if (injectsDetail.length) {
+            injectsDetail.slice(0, 6).forEach((line) => {
+                emit(`[validate.injects] ${line}`);
+            });
+        } else if (injectsMissing) {
+            const names = Array.isArray(summary.injects_missing) ? summary.injects_missing : [];
+            names.slice(0, 6).forEach((name) => {
+                const expected = expectedByNode && expectedByNode[name];
+                const expectedText = Array.isArray(expected) ? expected.join(', ') : '';
+                emit(`[validate.injects] ${name} expected ${expectedText || 'n/a'}`);
+            });
+        }
+    } catch (e) {}
+}
+
 function refreshExecuteSummaryIfVisible() {
     try {
         if (!executeSummaryModalEl) return;
@@ -16551,6 +16595,7 @@ async function refreshValidationSummaryFromRunStatus(runId) {
         const data = await res.json();
         if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
             executeProgressState.validationSummary = data.validation_summary;
+            logExecuteValidationSummary(data.validation_summary);
             refreshExecuteSummaryIfVisible();
         }
     } catch (e) {}
@@ -16599,6 +16644,9 @@ function ensureExecuteConfirmElements() {
     }
     if (!executeSummaryStatusEl) {
         executeSummaryStatusEl = document.getElementById('executeSummaryStatus');
+    }
+    if (!executeSummarySpinnerEl) {
+        executeSummarySpinnerEl = document.getElementById('executeSummarySpinner');
     }
     if (!executeSummaryListEl) {
         executeSummaryListEl = document.getElementById('executeSummaryList');
@@ -16844,6 +16892,7 @@ function ensureExecuteSummaryElements() {
     if (!executeSummaryModalEl) executeSummaryModalEl = document.getElementById('executeSummaryModal');
     if (!executeSummaryStatusEl) executeSummaryStatusEl = document.getElementById('executeSummaryStatus');
     if (!executeSummaryListEl) executeSummaryListEl = document.getElementById('executeSummaryList');
+    if (!executeSummarySpinnerEl) executeSummarySpinnerEl = document.getElementById('executeSummarySpinner');
 }
 
 function renderExecuteSummaryItem(label, ok, detail, items = []) {
@@ -16897,10 +16946,12 @@ function renderExecuteSummary(success) {
     executeSummaryListEl.innerHTML = '';
     const summary = executeProgressState?.validationSummary;
     if (!summary || typeof summary !== 'object') {
-        executeSummaryStatusEl.textContent = success ? 'Scenario started, but no validation summary was captured.' : 'Execution failed; validation summary unavailable.';
+        executeSummaryStatusEl.textContent = 'Summarizing, please wait…';
+        if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.remove('d-none');
         executeSummaryListEl.appendChild(renderExecuteSummaryItem('Validation summary available', false, 'No summary data received'));
         return;
     }
+    if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.add('d-none');
     const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
     const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
     const dockerNodes = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
@@ -16913,14 +16964,48 @@ function renderExecuteSummary(success) {
     const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
     const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
     const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+    const generatorOutputsMissing = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing.length : 0;
+    const generatorInjectsMissing = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing.length : 0;
     const expectedInjectDirs = Array.isArray(summary.inject_dirs_expected) ? summary.inject_dirs_expected.length : 0;
     const expectedInjectFiles = Array.isArray(summary.inject_files_expected) ? summary.inject_files_expected : [];
+    const expectedInjectFilesByNode = (summary.inject_files_expected_by_node && typeof summary.inject_files_expected_by_node === 'object')
+        ? summary.inject_files_expected_by_node
+        : {};
     const expectedNodesList = Array.isArray(summary.expected_nodes) ? summary.expected_nodes : [];
     const actualNodesList = Array.isArray(summary.actual_nodes) ? summary.actual_nodes : [];
     const actualNodesDetail = Array.isArray(summary.actual_nodes_detail) ? summary.actual_nodes_detail : [];
     const dockerNodesList = Array.isArray(summary.docker_nodes) ? summary.docker_nodes : [];
     const dockerRunningList = Array.isArray(summary.docker_running) ? summary.docker_running : [];
     const injectsDetailList = Array.isArray(summary.injects_detail) ? summary.injects_detail : [];
+    const generatorOutputsMissingList = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing : [];
+    const generatorInjectsMissingList = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing : [];
+    const generatorValidationDetail = Array.isArray(summary.generator_validation_detail) ? summary.generator_validation_detail : [];
+    const generatorOutputsDetailItems = generatorValidationDetail.length
+        ? generatorValidationDetail.map((it) => {
+            if (!it || typeof it !== 'object') return '';
+            const node = (it.node_id || '').toString();
+            const gname = (it.generator_name || it.generator_id || node || 'generator').toString();
+            const gtype = (it.generator_type || 'generator').toString();
+            const files = Array.isArray(it.outputs_checked) && it.outputs_checked.length
+                ? it.outputs_checked
+                : (Array.isArray(it.outputs_missing) ? it.outputs_missing : []);
+            const fileText = files.length ? files.join(', ') : 'no output files';
+            return `${gtype} ${gname}: ${fileText}`;
+        }).filter(Boolean)
+        : generatorOutputsMissingList;
+    const generatorInjectsDetailItems = generatorValidationDetail.length
+        ? generatorValidationDetail.map((it) => {
+            if (!it || typeof it !== 'object') return '';
+            const node = (it.node_id || '').toString();
+            const gname = (it.generator_name || it.generator_id || node || 'generator').toString();
+            const gtype = (it.generator_type || 'generator').toString();
+            const files = Array.isArray(it.inject_checked) && it.inject_checked.length
+                ? it.inject_checked
+                : (Array.isArray(it.inject_missing) ? it.inject_missing : []);
+            const fileText = files.length ? files.join(', ') : 'no inject files';
+            return `${gtype} ${gname}: ${fileText}`;
+        }).filter(Boolean)
+        : generatorInjectsMissingList;
     executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
     if (expectedDockerNodes > 0) {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -16973,7 +17058,13 @@ function renderExecuteSummary(success) {
         const expectedFilesText = expectedInjectFiles.length ? expectedInjectFiles.join(', ') : '';
         const injectsMissingList = Array.isArray(summary.injects_missing) ? summary.injects_missing : [];
         const injectsDetailItems = injectsMissing
-            ? injectsMissingList.map((name) => expectedFilesText ? `${name}: expected ${expectedFilesText}` : name)
+            ? injectsMissingList.map((name) => {
+                const perNode = expectedInjectFilesByNode && expectedInjectFilesByNode[name];
+                const nodeText = Array.isArray(perNode) && perNode.length
+                    ? perNode.join(', ')
+                    : expectedFilesText;
+                return nodeText ? `${name}: expected ${nodeText}` : name;
+            })
             : (injectsDetailList.length
                 ? injectsDetailList
                 : (expectedInjectDirs > 0
@@ -16988,6 +17079,18 @@ function renderExecuteSummary(success) {
                     ? 'No injects detected'
                     : 'Injects detected',
             injectsDetailItems
+        ));
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Generator outputs present on CORE VM',
+            generatorOutputsMissing === 0,
+            generatorOutputsMissing ? `${generatorOutputsMissing} output(s) missing` : 'All outputs present',
+            generatorOutputsDetailItems
+        ));
+        executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+            'Generator inject sources present on CORE VM',
+            generatorInjectsMissing === 0,
+            generatorInjectsMissing ? `${generatorInjectsMissing} inject source(s) missing` : 'All inject sources present',
+            generatorInjectsDetailItems
         ));
     } else {
         executeSummaryListEl.appendChild(renderExecuteSummaryItem(
@@ -17008,6 +17111,12 @@ function buildExecuteSummaryText() {
         return lines.join('\n');
     }
     lines.push(`Status: ${summary.ok ? 'OK' : 'Issues detected'}`);
+    try {
+        const genOutMissing = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing.length : 0;
+        const genInjMissing = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing.length : 0;
+        lines.push(`Generator outputs present: ${genOutMissing === 0 ? 'OK' : `Missing ${genOutMissing}`}`);
+        lines.push(`Generator inject sources present: ${genInjMissing === 0 ? 'OK' : `Missing ${genInjMissing}`}`);
+    } catch (e) {}
     const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
     const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
     const dockerNodes = Array.isArray(summary.docker_nodes) ? summary.docker_nodes.length : 0;
@@ -17708,7 +17817,9 @@ function resetExecuteProgressUI() {
     executeProgressState.cancelHandlers = [];
     executeProgressState.logLines = [];
     executeProgressState.validationSummary = null;
+    executeProgressState.validationLogSig = '';
     executeProgressState.summaryShown = false;
+    if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.remove('d-none');
     executeSummaryRedirect = { url: null, delay: 600 };
     executeProgressState.runId = null;
     executeProgressState.heartbeatIndex = 0;
@@ -17899,6 +18010,7 @@ function handleExecuteProgressLog(line) {
         try {
             const payload = JSON.parse(validationMatch[1]);
             executeProgressState.validationSummary = payload;
+            logExecuteValidationSummary(payload);
             if (payload && typeof payload === 'object' && !payload.ok) {
                 const missingNodes = Array.isArray(payload.missing_nodes) ? payload.missing_nodes.length : 0;
                 const dockerMissing = Array.isArray(payload.docker_missing) ? payload.docker_missing.length : 0;
@@ -20538,6 +20650,7 @@ function dockLog(message, level = 'INFO') {
         if (m) {
             const payload = JSON.parse(m[1]);
             executeProgressState.validationSummary = payload;
+            logExecuteValidationSummary(payload);
         }
     } catch (e) {}
 }
@@ -20595,6 +20708,7 @@ async function pollRunStatus(runId) {
         try {
             if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                 executeProgressState.validationSummary = data.validation_summary;
+                logExecuteValidationSummary(data.validation_summary);
                 refreshExecuteSummaryIfVisible();
             }
         } catch (e) {}
@@ -21017,14 +21131,16 @@ async function runSyncWithModal(arg){
                 if (shouldLogFinalize) {
                     lastFinalizeLogTs = now;
                     const suffix = lastFinalizeDetail ? ` (${lastFinalizeDetail})` : '';
-                    let uploadPctSuffix = '';
+                    let finalizeStageSuffix = '';
                     try {
-                        const upPct = lastUploadStats && typeof lastUploadStats.percent === 'number'
-                            ? Math.max(0, Math.min(100, lastUploadStats.percent))
-                            : null;
-                        if (upPct !== null) {
-                            uploadPctSuffix = ` [upload: ${upPct.toFixed(0)}%]`;
-                        }
+                        const stage = lastFinalizeInfo && lastFinalizeInfo.stage ? String(lastFinalizeInfo.stage) : '';
+                        const status = lastFinalizeInfo && lastFinalizeInfo.status ? String(lastFinalizeInfo.status) : '';
+                        const detail = lastFinalizeInfo && lastFinalizeInfo.detail ? String(lastFinalizeInfo.detail) : '';
+                        const parts = [];
+                        if (status) parts.push(`status=${status}`);
+                        if (stage) parts.push(`stage=${stage}`);
+                        if (detail && detail !== lastFinalizeDetail) parts.push(`detail=${detail}`);
+                        if (parts.length) finalizeStageSuffix = ` [${parts.join(' | ')}]`;
                     } catch (e) {}
                     let staleSuffix = '';
                     try {
@@ -21060,7 +21176,7 @@ async function runSyncWithModal(arg){
                             extraSuffix = ` [${parts.join(' | ')}]`;
                         }
                     } catch (e) {}
-                    appendExecuteDialogLog(`Waiting for CORE host to finalize (${finalizeElapsed}s)${suffix}${uploadPctSuffix}${staleSuffix}${extraSuffix}.`);
+                    appendExecuteDialogLog(`Finalizing on CORE host (${finalizeElapsed}s)${suffix}${finalizeStageSuffix}${staleSuffix}${extraSuffix}.`);
                 }
                 // Keep the status/meta line accurate while waiting.
                 try {
@@ -21636,6 +21752,7 @@ async function runSyncWithModal(arg){
                     try {
                         if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                             executeProgressState.validationSummary = data.validation_summary;
+                            logExecuteValidationSummary(data.validation_summary);
                             refreshExecuteSummaryIfVisible();
                         }
                     } catch (e) {}

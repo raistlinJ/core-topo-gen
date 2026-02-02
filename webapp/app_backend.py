@@ -737,6 +737,10 @@ def _make_forward_handler(transport: Any, remote_host: str, remote_port: int):
                     src_addr=self.request.getpeername(),
                 )
             except Exception as exc:
+                try:
+                    logger.error('SSH tunnel channel open failed to %s:%s', remote_host, remote_port, exc_info=True)
+                except Exception:
+                    pass
                 raise _SSHTunnelError(f'Failed to open SSH channel to {remote_host}:{remote_port}: {exc}') from exc
             if chan is None:
                 raise _SSHTunnelError('SSH channel creation returned None')
@@ -1646,6 +1650,14 @@ def _extract_inject_files_from_payload(payload: Dict[str, Any]) -> List[str]:
         return []
 
     files: List[str] = []
+    def _looks_like_output_key(text: str) -> bool:
+        s = str(text or '').strip()
+        if not s:
+            return False
+        if '/' in s:
+            return False
+        return '(' in s and ')' in s
+
     for raw in inject_specs:
         src = raw
         dest = ''
@@ -1654,6 +1666,9 @@ def _extract_inject_files_from_payload(payload: Dict[str, Any]) -> List[str]:
         elif '=>' in raw:
             src, dest = raw.split('=>', 1)
         src = str(src or '').strip()
+        if _looks_like_output_key(src):
+            # Skip symbolic keys like File(path) when no outputs are resolved.
+            continue
         dest_path = _normalize_inject_dest_path_for_validation(dest, src)
         if dest_path:
             files.append(dest_path)
@@ -1842,6 +1857,96 @@ def _extract_inject_specs_from_flow_state(scenario_xml_path: str, scenario_label
     return specs
 
 
+def _extract_inject_expected_by_node(scenario_xml_path: str, scenario_label: str | None) -> Dict[str, List[str]]:
+    expected: Dict[str, List[str]] = {}
+    try:
+        flow_state = _flow_state_from_xml_path(scenario_xml_path, scenario_label)
+    except Exception:
+        flow_state = None
+    if not isinstance(flow_state, dict):
+        return expected
+    chain_ids = []
+    try:
+        chain_ids = [str(x).strip() for x in (flow_state.get('chain_ids') or []) if str(x).strip()]
+    except Exception:
+        chain_ids = []
+    chain_set = set(chain_ids)
+    assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
+
+    def _basename(path: str) -> str:
+        parts = str(path or '').replace('\\', '/').split('/')
+        parts = [p for p in parts if p]
+        return parts[-1] if parts else ''
+
+    def _looks_like_output_key(text: str) -> bool:
+        s = str(text or '').strip()
+        if not s:
+            return False
+        if '/' in s:
+            return False
+        return '(' in s and ')' in s
+
+    for entry in assigns or []:
+        if not isinstance(entry, dict):
+            continue
+        nid_raw = str(entry.get('node_id') or '').strip()
+        if not nid_raw:
+            continue
+        if chain_set and nid_raw not in chain_set:
+            continue
+        node_name = None
+        try:
+            exp = _expected_from_plan_preview(scenario_xml_path, scenario_label).get(int(nid_raw)) or {}
+            node_name = str(exp.get('name') or '').strip() or None
+        except Exception:
+            node_name = None
+        node_key = node_name or f"node-{nid_raw}"
+
+        per_node: List[str] = []
+        detail_list = entry.get('inject_files_detail') if isinstance(entry.get('inject_files_detail'), list) else []
+        if detail_list:
+            for item in detail_list:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get('path') or '').strip()
+                if path:
+                    per_node.append(path)
+        else:
+            injects = entry.get('inject_files') if isinstance(entry.get('inject_files'), list) else []
+            for raw in injects:
+                text = str(raw or '').strip()
+                if not text:
+                    continue
+                if _looks_like_output_key(text):
+                    continue
+                if '->' in text or '=>' in text:
+                    sep = '->' if '->' in text else '=>'
+                    src, dest = text.split(sep, 1)
+                    src = str(src or '').strip()
+                    dest = str(dest or '').strip()
+                    dest_dir = dest if dest.startswith('/') else '/tmp'
+                    base = _basename(src)
+                    if base:
+                        per_node.append(f"{dest_dir.rstrip('/')}/{base}")
+                    else:
+                        per_node.append(dest_dir)
+                    continue
+                if text.startswith('/'):
+                    per_node.append(text)
+                else:
+                    per_node.append(f"/tmp/{text.lstrip('./')}")
+        if per_node:
+            seen = set()
+            unique = []
+            for p in per_node:
+                if p in seen:
+                    continue
+                seen.add(p)
+                unique.append(p)
+            expected[node_key] = unique
+    return expected
+
+
 def _extract_inject_node_ids_from_flow_state(scenario_xml_path: str, scenario_label: str | None) -> set[int]:
     node_ids: set[int] = set()
     try:
@@ -1976,6 +2081,45 @@ def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_moun
             if isinstance(v, str) and v:
                 dirs.append(v)
 
+    # Fallback: scan metadata.flow (PlanPreview metadata) and FlowState in XML.
+    if not dirs:
+        try:
+            meta = payload.get('metadata') if isinstance(payload, dict) else None
+            flow = meta.get('flow') if isinstance(meta, dict) else None
+            if isinstance(flow, dict):
+                if prefer_mount_dir:
+                    for v in _iter_values_by_key(flow, {'mount_dir'}):
+                        if isinstance(v, str) and v:
+                            dirs.append(v)
+                    if not dirs:
+                        for v in _iter_values_by_key(flow, {'artifacts_dir'}):
+                            if isinstance(v, str) and v:
+                                dirs.append(v)
+                else:
+                    for v in _iter_values_by_key(flow, {'artifacts_dir'}):
+                        if isinstance(v, str) and v:
+                            dirs.append(v)
+        except Exception:
+            pass
+    if not dirs and str(preview_plan_path).lower().endswith('.xml'):
+        try:
+            flow_state = _flow_state_from_xml_path(preview_plan_path, None)
+            if isinstance(flow_state, dict):
+                if prefer_mount_dir:
+                    for v in _iter_values_by_key(flow_state, {'mount_dir'}):
+                        if isinstance(v, str) and v:
+                            dirs.append(v)
+                    if not dirs:
+                        for v in _iter_values_by_key(flow_state, {'artifacts_dir'}):
+                            if isinstance(v, str) and v:
+                                dirs.append(v)
+                else:
+                    for v in _iter_values_by_key(flow_state, {'artifacts_dir'}):
+                        if isinstance(v, str) and v:
+                            dirs.append(v)
+        except Exception:
+            pass
+
     seen: set[str] = set()
     out: List[str] = []
     for d in dirs:
@@ -2016,7 +2160,7 @@ def _upload_flow_artifacts_for_plan_to_remote(
     except Exception:
         pass
 
-    repo_root = _repo_root_path()
+    repo_root = _get_repo_root()
     outputs_root = os.path.join(repo_root, 'outputs')
     allowed_prefixes = (
         '/tmp/vulns',
@@ -5378,6 +5522,53 @@ try:
     app.logger.setLevel(getattr(logging, _log_level_name, logging.INFO))
 except Exception:
     pass
+class _SkipWebuiLogTailFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = ''
+        return '/api/webui/log_tail' not in msg
+
+try:
+    logging.getLogger('werkzeug').addFilter(_SkipWebuiLogTailFilter())
+except Exception:
+    pass
+try:
+    port = str(os.environ.get('CORETG_PORT') or '').strip() or '9090'
+except Exception:
+    port = '9090'
+try:
+    logs_dir = os.path.abspath(os.path.join(_outputs_dir(), 'logs'))
+except Exception:
+    logs_dir = os.path.abspath(os.path.join(os.getcwd(), 'outputs', 'logs'))
+try:
+    os.makedirs(logs_dir, exist_ok=True)
+except Exception:
+    pass
+try:
+    log_path = os.path.join(logs_dir, f'webui-{port}.log')
+    has_handler = False
+    for h in list(app.logger.handlers):
+        try:
+            if isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == log_path:
+                has_handler = True
+                break
+        except Exception:
+            continue
+    if not has_handler:
+        fh = logging.FileHandler(log_path)
+        fh.setLevel(getattr(logging, _log_level_name, logging.INFO))
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        app.logger.addHandler(fh)
+        try:
+            root = logging.getLogger()
+            if fh not in root.handlers:
+                root.addHandler(fh)
+        except Exception:
+            pass
+except Exception:
+    pass
 
 def _enumerate_host_interfaces(include_down: bool = False) -> List[Dict[str, Any]]:
     """Return host network interfaces available for Hardware-in-the-Loop selection."""
@@ -8324,6 +8515,7 @@ def api_flow_save_flow_state_to_xml():
     if clear_state:
         ok, msg = _clear_flow_state_in_xml(xml_path, scenario_label)
     else:
+        flow_state = _enrich_flow_state_with_artifacts(flow_state)
         ok, msg = _update_flow_state_in_xml(xml_path, scenario_label, flow_state)
     if not ok:
         return jsonify({'ok': False, 'error': msg}), 422
@@ -11313,7 +11505,149 @@ def api_flow_latest_preview_plan():
     scenario_norm = _normalize_scenario_label(scenario_label)
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
     xml_hint = (request.args.get('xml_path') or '').strip()
+    xml_path_for_core = ''
+    try:
+        if xml_hint:
+            xml_path_for_core = os.path.abspath(xml_hint)
+    except Exception:
+        xml_path_for_core = xml_hint
+    if not xml_path_for_core:
+        xml_path_for_core = _latest_xml_path_for_scenario(scenario_norm) or ''
+
+    flow_run_remote = False
+    flow_remote_forced = False
+    flow_core_cfg: Dict[str, Any] | None = None
+    try:
+        if 'run_remote' in j:
+            flow_run_remote = _coerce_bool(j.get('run_remote'))
+            flow_remote_forced = flow_run_remote
+        if 'run_local' in j and _coerce_bool(j.get('run_local')):
+            flow_run_remote = False
+            flow_remote_forced = False
+    except Exception:
+        pass
+    if not flow_run_remote:
+        try:
+            selected_cfg = _core_config_from_xml_path(xml_path_for_core, scenario_norm, include_password=True)
+            if isinstance(selected_cfg, dict):
+                selected_cfg = _apply_core_secret_to_config(selected_cfg, scenario_norm)
+            if isinstance(selected_cfg, dict) and _coerce_bool(selected_cfg.get('ssh_enabled')):
+                flow_core_cfg = selected_cfg
+                flow_run_remote = True
+        except Exception:
+            flow_core_cfg = None
+    if flow_run_remote and not flow_core_cfg:
+        try:
+            selected_cfg = _core_config_from_xml_path(xml_path_for_core, scenario_norm, include_password=True)
+            if isinstance(selected_cfg, dict):
+                flow_core_cfg = _apply_core_secret_to_config(selected_cfg, scenario_norm)
+        except Exception:
+            flow_core_cfg = None
+
+    core_validated = False
+    try:
+        if isinstance(flow_core_cfg, dict):
+            core_validated = _coerce_bool(flow_core_cfg.get('validated'))
+            if not core_validated:
+                status = str(flow_core_cfg.get('last_tested_status') or '').strip().lower()
+                if status == 'success':
+                    core_validated = True
+            if not core_validated:
+                try:
+                    hv_map = _load_scenario_hitl_validation_from_disk()
+                    hv = None
+                    if isinstance(hv_map, dict):
+                        hv = hv_map.get(scenario_norm)
+                        if hv is None:
+                            try:
+                                key = _scenario_match_key(scenario_norm)
+                            except Exception:
+                                key = ''
+                            if key:
+                                for k, v in hv_map.items():
+                                    try:
+                                        if _scenario_match_key(k) == key:
+                                            hv = v
+                                            break
+                                    except Exception:
+                                        continue
+                    hv_core = hv.get('core') if isinstance(hv, dict) else None
+                    if isinstance(hv_core, dict):
+                        if _coerce_bool(hv_core.get('validated')):
+                            core_validated = True
+                        else:
+                            hv_status = str(hv_core.get('last_tested_status') or '').strip().lower()
+                            if hv_status == 'success':
+                                core_validated = True
+                        if not core_validated and str(hv_core.get('core_secret_id') or '').strip():
+                            core_validated = True
+                except Exception:
+                    pass
+                if not core_validated:
+                    try:
+                        secret_record = _select_latest_core_secret_record(scenario_norm or None)
+                    except Exception:
+                        secret_record = None
+                    if secret_record and str(secret_record.get('identifier') or '').strip():
+                        core_validated = True
+    except Exception:
+        core_validated = False
+    if not core_validated:
+        return jsonify({
+            'ok': False,
+            'error': 'Flag sequencing requires a validated CORE VM. Validate in VM / Access and save XML, then retry.',
+        }), 422
+    flow_run_remote = True
+    core_validated = False
+    try:
+        if isinstance(flow_core_cfg, dict):
+            core_validated = _coerce_bool(flow_core_cfg.get('validated'))
+            if not core_validated:
+                status = str(flow_core_cfg.get('last_tested_status') or '').strip().lower()
+                if status == 'success':
+                    core_validated = True
+            if not core_validated:
+                try:
+                    hv_map = _load_scenario_hitl_validation_from_disk()
+                    hv = None
+                    if isinstance(hv_map, dict):
+                        hv = hv_map.get(scenario_norm)
+                        if hv is None:
+                            try:
+                                key = _scenario_match_key(scenario_norm)
+                            except Exception:
+                                key = ''
+                            if key:
+                                for k, v in hv_map.items():
+                                    try:
+                                        if _scenario_match_key(k) == key:
+                                            hv = v
+                                            break
+                                    except Exception:
+                                        continue
+                    hv_core = hv.get('core') if isinstance(hv, dict) else None
+                    if isinstance(hv_core, dict):
+                        if _coerce_bool(hv_core.get('validated')):
+                            core_validated = True
+                        else:
+                            hv_status = str(hv_core.get('last_tested_status') or '').strip().lower()
+                            if hv_status == 'success':
+                                core_validated = True
+                        if not core_validated and str(hv_core.get('core_secret_id') or '').strip():
+                            core_validated = True
+                except Exception:
+                    pass
+                if not core_validated:
+                    try:
+                        secret_record = _select_latest_core_secret_record(scenario_norm or None)
+                    except Exception:
+                        secret_record = None
+                    if secret_record and str(secret_record.get('identifier') or '').strip():
+                        core_validated = True
+    except Exception:
+        core_validated = False
     def _flow_eligibility_from_payload(payload: dict) -> tuple[int, int, bool]:
         docker_count = 0
         vuln_count = 0
@@ -11365,6 +11699,7 @@ def api_flow_latest_preview_plan():
                             'docker_count': docker_count,
                             'vuln_count': vuln_count,
                             'flow_eligible': flow_eligible,
+                            'core_validated': core_validated,
                         })
         except Exception:
             pass
@@ -11384,10 +11719,110 @@ def api_flow_latest_preview_plan():
                     'docker_count': docker_count,
                     'vuln_count': vuln_count,
                     'flow_eligible': flow_eligible,
+                    'core_validated': core_validated,
                 })
     except Exception:
         pass
     return jsonify({'ok': False, 'error': 'No XML found for this scenario. Save XML with a PlanPreview first.'}), 404
+
+
+@app.route('/api/flag-sequencing/test_core_connection', methods=['POST'])
+def api_flow_test_core_connection():
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+    try:
+        xml_hint = str(j.get('xml_path') or '').strip()
+        xml_path_for_core = ''
+        if xml_hint:
+            try:
+                xml_path_for_core = os.path.abspath(xml_hint)
+            except Exception:
+                xml_path_for_core = xml_hint
+        if not xml_path_for_core:
+            xml_path_for_core = _latest_xml_path_for_scenario(scenario_norm) or ''
+        if not xml_path_for_core:
+            return jsonify({'ok': False, 'error': 'No XML found for this scenario.'}), 404
+        flow_core_cfg = _core_config_from_xml_path(xml_path_for_core, scenario_norm, include_password=True)
+        if isinstance(flow_core_cfg, dict):
+            flow_core_cfg = _apply_core_secret_to_config(flow_core_cfg, scenario_norm)
+    except Exception:
+        flow_core_cfg = None
+    if not isinstance(flow_core_cfg, dict):
+        return jsonify({'ok': False, 'error': 'No CoreConnection configured in XML for this scenario.'}), 404
+    core_validated = False
+    try:
+        core_validated = _coerce_bool(flow_core_cfg.get('validated'))
+        if not core_validated:
+            status = str(flow_core_cfg.get('last_tested_status') or '').strip().lower()
+            if status == 'success':
+                core_validated = True
+        if not core_validated:
+            try:
+                hv_map = _load_scenario_hitl_validation_from_disk()
+                hv = None
+                if isinstance(hv_map, dict):
+                    hv = hv_map.get(scenario_norm)
+                    if hv is None:
+                        try:
+                            key = _scenario_match_key(scenario_norm)
+                        except Exception:
+                            key = ''
+                        if key:
+                            for k, v in hv_map.items():
+                                try:
+                                    if _scenario_match_key(k) == key:
+                                        hv = v
+                                        break
+                                except Exception:
+                                    continue
+                hv_core = hv.get('core') if isinstance(hv, dict) else None
+                if isinstance(hv_core, dict):
+                    if _coerce_bool(hv_core.get('validated')):
+                        core_validated = True
+                    else:
+                        hv_status = str(hv_core.get('last_tested_status') or '').strip().lower()
+                        if hv_status == 'success':
+                            core_validated = True
+                    if not core_validated and str(hv_core.get('core_secret_id') or '').strip():
+                        core_validated = True
+            except Exception:
+                pass
+        if not core_validated:
+            try:
+                secret_record = _select_latest_core_secret_record(scenario_norm or None)
+            except Exception:
+                secret_record = None
+            if secret_record and str(secret_record.get('identifier') or '').strip():
+                core_validated = True
+    except Exception:
+        core_validated = False
+    if not core_validated:
+        return jsonify({'ok': False, 'error': 'CORE VM is not validated. Validate in VM / Access and save XML, then retry.'}), 422
+    try:
+        if not _coerce_bool(flow_core_cfg.get('ssh_enabled')):
+            return jsonify({
+                'ok': False,
+                'error': 'SSH is required for CORE VM access. Enable SSH in VM / Access and re-validate.',
+                'detail': 'ssh_enabled=false',
+            }), 422
+        flow_core_cfg = _require_core_ssh_credentials(flow_core_cfg)
+        # Mirror execute path: validate via SSH on the CORE VM, no local tunnel.
+        _ensure_core_daemon_listening(flow_core_cfg, timeout=5.0)
+    except Exception as exc:
+        target = f"{flow_core_cfg.get('host')}:{flow_core_cfg.get('port')}"
+        return jsonify({
+            'ok': False,
+            'error': f'CORE connection failed to {target}: {exc}',
+            'detail': str(exc),
+        }), 502
+    return jsonify({
+        'ok': True,
+        'host': flow_core_cfg.get('host'),
+        'port': flow_core_cfg.get('port'),
+    })
 
 
 def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
@@ -12706,6 +13141,189 @@ def _flow_enrich_saved_flag_assignments(
 
         out.append(a2)
     return out
+
+
+def _infer_flow_artifacts_dir_from_assignment(assignment: dict[str, Any], *, max_dirs: int = 60) -> dict[str, str]:
+    """Infer artifacts/run/mount dirs from existing assignment data.
+
+    Returns a dict with any of: artifacts_dir, mount_dir, run_dir, outputs_manifest.
+    """
+    if not isinstance(assignment, dict):
+        return {}
+
+    rel_candidates: list[str] = []
+    for key in ('resolved_outputs',):
+        ro = assignment.get(key)
+        if isinstance(ro, dict):
+            for v in ro.values():
+                if isinstance(v, str) and v.strip():
+                    rel_candidates.append(v.strip())
+    detail_list = assignment.get('inject_files_detail') if isinstance(assignment.get('inject_files_detail'), list) else []
+    for item in detail_list:
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get('resolved') or '').strip()
+        if raw:
+            rel_candidates.append(raw)
+
+    def _to_rel(raw: str) -> str:
+        s = str(raw or '').replace('\\', '/').strip()
+        if not s:
+            return ''
+        if '/artifacts/' in s:
+            return s.split('/artifacts/', 1)[1].lstrip('/')
+        if '/flow_artifacts/' in s:
+            return s.split('/flow_artifacts/', 1)[1].lstrip('/')
+        if s.startswith('artifacts/'):
+            return s
+        if s.startswith('/tmp/'):
+            s = s[len('/tmp/'):]
+        if s.startswith('/'):
+            s = s[1:]
+        return s
+
+    rels: list[str] = []
+    for raw in rel_candidates:
+        rel = _to_rel(raw)
+        if rel and rel not in rels:
+            rels.append(rel)
+
+    if not rels:
+        return {}
+
+    outputs_root = _outputs_dir()
+    base_dirs = [
+        os.path.join('/tmp/vulns', 'flag_generators_runs'),
+        os.path.join('/tmp/vulns', 'flag_node_generators_runs'),
+        os.path.join(outputs_root, 'flag_generators_runs'),
+        os.path.join(outputs_root, 'flag_node_generators_runs'),
+        os.path.join(outputs_root, 'vulns', 'flag_generators_runs'),
+        os.path.join(outputs_root, 'vulns', 'flag_node_generators_runs'),
+    ]
+    run_dirs: list[str] = []
+    for base in base_dirs:
+        if not os.path.isdir(base):
+            continue
+        try:
+            for entry in os.scandir(base):
+                if entry.is_dir():
+                    run_dirs.append(entry.path)
+        except Exception:
+            continue
+    run_dirs.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    if max_dirs and len(run_dirs) > max_dirs:
+        run_dirs = run_dirs[:max_dirs]
+
+    def _exists_in_run(run_dir: str, rel: str) -> bool:
+        rel_clean = rel.lstrip('/')
+        if rel_clean.startswith('artifacts/'):
+            rel_clean = rel_clean[len('artifacts/'):]
+        for candidate in (
+            os.path.join(run_dir, rel),
+            os.path.join(run_dir, 'artifacts', rel_clean),
+            os.path.join(run_dir, 'injected', rel_clean),
+        ):
+            if os.path.exists(candidate):
+                return True
+        return False
+
+    for rd in run_dirs:
+        try:
+            if any(_exists_in_run(rd, rel) for rel in rels):
+                mount_dir = ''
+                if os.path.isdir(os.path.join(rd, 'artifacts')):
+                    mount_dir = os.path.join(rd, 'artifacts')
+                elif os.path.isdir(os.path.join(rd, 'injected')):
+                    mount_dir = os.path.join(rd, 'injected')
+                else:
+                    mount_dir = rd
+                out = {
+                    'artifacts_dir': rd,
+                    'mount_dir': mount_dir,
+                    'run_dir': rd,
+                }
+                manifest = os.path.join(rd, 'outputs.json')
+                if os.path.exists(manifest):
+                    out['outputs_manifest'] = manifest
+                return out
+        except Exception:
+            continue
+    return {}
+
+
+def _webui_log_path() -> str:
+    try:
+        port = str(os.environ.get('CORETG_PORT') or '').strip() or '9090'
+    except Exception:
+        port = '9090'
+    try:
+        logs_dir = os.path.abspath(os.path.join(_outputs_dir(), 'logs'))
+    except Exception:
+        logs_dir = os.path.abspath(os.path.join(os.getcwd(), 'outputs', 'logs'))
+    return os.path.join(logs_dir, f'webui-{port}.log')
+
+
+@app.route('/api/webui/log_tail')
+def api_webui_log_tail():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'ok': False, 'error': 'Admin privileges required'}), 403
+    try:
+        offset = int(request.args.get('offset') or 0)
+    except Exception:
+        offset = 0
+    try:
+        max_bytes = int(request.args.get('max_bytes') or 50000)
+    except Exception:
+        max_bytes = 50000
+    max_bytes = max(1024, min(max_bytes, 200000))
+    path = _webui_log_path()
+    if not os.path.exists(path):
+        return jsonify({'ok': False, 'error': 'Web UI log not found', 'path': path, 'offset': offset}), 404
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+    if offset < 0 or offset > size:
+        offset = max(size - max_bytes, 0)
+    data = b''
+    try:
+        with open(path, 'rb') as f:
+            f.seek(offset)
+            data = f.read(max_bytes)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Failed reading log: {exc}', 'path': path, 'offset': offset}), 500
+    new_offset = offset + len(data)
+    try:
+        text = data.decode('utf-8', errors='ignore')
+    except Exception:
+        text = ''
+    return jsonify({'ok': True, 'offset': new_offset, 'text': text})
+
+
+def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(flow_state, dict):
+        return flow_state
+    assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
+    if not assigns:
+        return flow_state
+    changed = False
+    enriched: list[dict[str, Any]] = []
+    for a in assigns:
+        if not isinstance(a, dict):
+            continue
+        a2 = dict(a)
+        needs = not any(a2.get(k) for k in ('artifacts_dir', 'mount_dir', 'run_dir', 'outputs_manifest'))
+        if needs:
+            inferred = _infer_flow_artifacts_dir_from_assignment(a2)
+            if inferred:
+                a2.update(inferred)
+                changed = True
+        enriched.append(a2)
+    if changed:
+        flow_state = dict(flow_state)
+        flow_state['flag_assignments'] = enriched
+    return flow_state
 
 
 def _flow_parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -14715,6 +15333,19 @@ def api_flow_prepare_preview_for_execute():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
+    flow_run_remote = False
+    flow_remote_forced = False
+    flow_core_cfg: Dict[str, Any] | None = None
+    try:
+        if 'run_remote' in j:
+            flow_run_remote = _coerce_bool(j.get('run_remote'))
+            flow_remote_forced = flow_run_remote
+        if 'run_local' in j and _coerce_bool(j.get('run_local')):
+            flow_run_remote = False
+            flow_remote_forced = False
+    except Exception:
+        pass
+
     canonical_plan_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
 
     base_plan_path = str(j.get('preview_plan') or '').strip() or None
@@ -14750,6 +15381,17 @@ def api_flow_prepare_preview_for_execute():
 
     if not base_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        flow_core_cfg = _core_config_from_xml_path(base_plan_path, scenario_norm, include_password=True)
+        if isinstance(flow_core_cfg, dict):
+            flow_core_cfg = _apply_core_secret_to_config(flow_core_cfg, scenario_norm)
+    except Exception:
+        flow_core_cfg = None
+    if not flow_remote_forced and isinstance(flow_core_cfg, dict) and _coerce_bool(flow_core_cfg.get('ssh_enabled')):
+        flow_run_remote = True
+    if flow_run_remote and not isinstance(flow_core_cfg, dict):
+        return jsonify({'ok': False, 'error': 'No CoreConnection configured in XML for this scenario.'}), 404
 
     initial_facts_override: dict[str, list[str]] | None = None
     goal_facts_override: dict[str, list[str]] | None = None
@@ -15317,6 +15959,64 @@ def api_flow_prepare_preview_for_execute():
         pass
 
     # Apply Flow modifications and run generators when requested (resolve/hint) or valid.
+    flow_remote_repo_dir: str | None = None
+    if run_generators and flow_run_remote:
+        if isinstance(flow_core_cfg, dict):
+            try:
+                app.logger.info('[flow.generator] syncing repo to CORE VM before remote generator run')
+            except Exception:
+                pass
+            try:
+                _push_repo_to_remote(
+                    flow_core_cfg,
+                    logger=app.logger,
+                    upload_only_injected_artifacts=False,
+                )
+            except Exception as exc:
+                if flow_remote_forced:
+                    return jsonify({'ok': False, 'error': f'Failed to sync repo to CORE VM: {exc}'}), 500
+                try:
+                    app.logger.warning('[flow.generator] repo sync failed (continuing): %s', exc)
+                except Exception:
+                    pass
+        if not isinstance(flow_core_cfg, dict):
+            if flow_remote_forced:
+                return jsonify({'ok': False, 'error': 'Remote Flow generation requested but no CORE VM config was found.'}), 400
+            flow_run_remote = False
+        else:
+            try:
+                flow_core_cfg = _require_core_ssh_credentials(flow_core_cfg)
+            except Exception as exc:
+                if flow_remote_forced:
+                    return jsonify({'ok': False, 'error': f'Remote Flow generation requires SSH credentials: {exc}'}), 400
+                flow_run_remote = False
+            if flow_run_remote:
+                client = None
+                sftp = None
+                try:
+                    client = _open_ssh_client(flow_core_cfg)
+                    sftp = client.open_sftp()
+                    flow_remote_repo_dir = _remote_static_repo_dir(sftp)
+                    runner_path = _remote_path_join(flow_remote_repo_dir, 'scripts', 'run_flag_generator.py')
+                    sftp.stat(flow_remote_repo_dir)
+                    sftp.stat(runner_path)
+                except Exception as exc:
+                    if flow_remote_forced:
+                        return jsonify({'ok': False, 'error': f'Remote Flow generation requires repo on CORE VM: {exc}'}), 400
+                    flow_run_remote = False
+                    flow_remote_repo_dir = None
+                finally:
+                    try:
+                        if sftp:
+                            sftp.close()
+                    except Exception:
+                        pass
+                    try:
+                        if client:
+                            client.close()
+                    except Exception:
+                        pass
+
     if run_generators:
         # Promote chain nodes to Docker role (flag payloads attach to Docker nodes).
         try:
@@ -15748,6 +16448,116 @@ def api_flow_prepare_preview_for_execute():
         except Exception as exc:
             return False, f'generator exception: {exc}', None
 
+    def _flow_try_run_generator_remote(
+        generator_id: str,
+        *,
+        out_dir: str,
+        config: dict[str, Any],
+        kind: str = 'flag-generator',
+        timeout_s: int = 120,
+        inject_files_override: list[str] | None = None,
+        core_cfg: dict[str, Any],
+        repo_dir: str,
+    ) -> tuple[bool, str, str | None, dict[str, Any] | None]:
+        """Run generator on CORE VM and return outputs map when available."""
+        try:
+            timeout_literal = str(int(timeout_s or 120))
+        except Exception:
+            timeout_literal = '120'
+        try:
+            cfg_json = json.dumps(config or {}, ensure_ascii=False)
+        except Exception:
+            cfg_json = '{}'
+        sudo_pw = None
+        try:
+            sudo_pw = str(core_cfg.get('ssh_password') or '').strip() if isinstance(core_cfg, dict) else None
+        except Exception:
+            sudo_pw = None
+        inject_json = None
+        try:
+            if isinstance(inject_files_override, list):
+                inject_json = json.dumps(list(inject_files_override))
+        except Exception:
+            inject_json = None
+        script = (
+            "import json, os, subprocess, sys\n"
+            f"REPO={json.dumps(str(repo_dir))}\n"
+            f"OUT={json.dumps(str(out_dir))}\n"
+            f"GEN={json.dumps(str(generator_id))}\n"
+            f"KIND={json.dumps(str(kind or 'flag-generator'))}\n"
+            f"CFG={json.dumps(cfg_json)}\n"
+            f"INJECT={inject_json if inject_json is not None else 'None'}\n"
+            "os.makedirs(OUT, exist_ok=True)\n"
+            "runner=os.path.join(REPO,'scripts','run_flag_generator.py')\n"
+            "env=os.environ.copy()\n"
+            "env['CORETG_DOCKER_USE_SUDO']='1'\n"
+            "env['CORETG_DOCKER_HOST_NETWORK']='1'\n"
+            f"SUDO_PW={json.dumps(str(sudo_pw or ''))}\n"
+            "if SUDO_PW:\n"
+            "  env['CORETG_DOCKER_SUDO_PASSWORD']=SUDO_PW\n"
+            "if INJECT is not None:\n"
+            "  try:\n"
+            "    env['CORETG_INJECT_FILES_JSON']=json.dumps(json.loads(INJECT))\n"
+            "  except Exception:\n"
+            "    env['CORETG_INJECT_FILES_JSON']=INJECT\n"
+            "cmd=[sys.executable, runner, '--kind', KIND, '--generator-id', GEN, '--out-dir', OUT, '--config', CFG, '--repo-root', REPO]\n"
+            f"p=subprocess.run(cmd, cwd=REPO, env=env, check=False, capture_output=True, text=True, timeout=max(1, int({timeout_literal})))\n"
+            "manifest=os.path.join(OUT,'outputs.json')\n"
+            "outputs=None\n"
+            "if os.path.exists(manifest):\n"
+            "  try:\n"
+            "    with open(manifest,'r',encoding='utf-8') as f:\n"
+            "      m=json.load(f) or {}\n"
+            "    outputs=m.get('outputs') if isinstance(m, dict) else None\n"
+            "  except Exception:\n"
+            "    outputs=None\n"
+            "if outputs is None:\n"
+            "  try:\n"
+            "    flag_path=os.path.join(OUT,'flag.txt')\n"
+            "    if os.path.exists(flag_path):\n"
+            "      flag_val=open(flag_path,'r',encoding='utf-8',errors='ignore').read().strip()\n"
+            "      if flag_val:\n"
+            "        outputs={'Flag(flag_id)': flag_val, 'flag': flag_val}\n"
+            "  except Exception:\n"
+            "    outputs=outputs\n"
+            "print(json.dumps({\n"
+            "  'ok': bool(p.returncode==0),\n"
+            "  'rc': int(p.returncode or 0),\n"
+            "  'stdout': (p.stdout or '')[-4000:],\n"
+            "  'stderr': (p.stderr or '')[-4000:],\n"
+            "  'manifest': manifest if os.path.exists(manifest) else None,\n"
+            "  'outputs': outputs,\n"
+            "}))\n"
+        )
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                script,
+                logger=app.logger,
+                label=f'flow.generator.remote.{generator_id}',
+                timeout=max(30.0, float(timeout_s or 120)),
+            )
+        except Exception as exc:
+            return False, f'remote generator exception: {exc}', None, None
+
+        ok = bool(payload.get('ok')) if isinstance(payload, dict) else False
+        rc = payload.get('rc') if isinstance(payload, dict) else None
+        stdout = str(payload.get('stdout') or '') if isinstance(payload, dict) else ''
+        stderr = str(payload.get('stderr') or '') if isinstance(payload, dict) else ''
+        manifest_path = payload.get('manifest') if isinstance(payload, dict) else None
+        outputs = payload.get('outputs') if isinstance(payload, dict) else None
+        note = 'ok'
+        if not ok:
+            tail = (stderr or stdout).strip()
+            note = f'remote generator failed (rc={rc}): {tail[-800:] if tail else "(no output)"}'
+        elif not manifest_path:
+            tail = (stderr or stdout).strip()
+            if tail:
+                note = f'no outputs.json (stdout/stderr): {tail[-800:]}'
+            else:
+                note = 'no outputs.json'
+        return ok, note, (str(manifest_path) if manifest_path else None), (outputs if isinstance(outputs, dict) else None)
+
     def _redact_kv_for_ui(kv: Any) -> dict[str, Any]:
         """Best-effort redaction for UI display.
 
@@ -15878,6 +16688,7 @@ def api_flow_prepare_preview_for_execute():
 
             generation_failures: list[dict[str, Any]] = []
             generation_skipped: list[dict[str, Any]] = []
+            generator_runs: list[dict[str, Any]] = []
             created_run_dirs: list[str] = []
             failed_run_dirs: list[str] = []
             seen_flag_values: set[str] = set()
@@ -16168,7 +16979,8 @@ def api_flow_prepare_preview_for_execute():
                         # these artifacts to the CORE host (where docker-compose paths resolve).
                         subdir = 'flag_node_generators_runs' if assignment_type == 'flag-node-generator' else 'flag_generators_runs'
                         flow_out_dir = os.path.join('/tmp/vulns', subdir, f"flow-{scenario_norm}-{flow_run_id}")
-                        os.makedirs(flow_out_dir, exist_ok=True)
+                        if not flow_run_remote:
+                            os.makedirs(flow_out_dir, exist_ok=True)
                         try:
                             created_run_dirs.append(str(flow_out_dir))
                         except Exception:
@@ -16177,12 +16989,13 @@ def api_flow_prepare_preview_for_execute():
                         # If any config inputs are declared as file/path types, and the user provided
                         # an override pointing to a previously-uploaded server file, stage it into
                         # the run's inputs/ directory and rewrite the config to /inputs/<filename>.
-                        try:
-                            gen_def = _gen_by_id.get(generator_id)
-                            if isinstance(gen_def, dict) and isinstance(cfg, dict):
-                                _flow_stage_file_inputs_for_generator(cfg, gen_def, run_dir=str(flow_out_dir))
-                        except Exception:
-                            pass
+                        if not flow_run_remote:
+                            try:
+                                gen_def = _gen_by_id.get(generator_id)
+                                if isinstance(gen_def, dict) and isinstance(cfg, dict):
+                                    _flow_stage_file_inputs_for_generator(cfg, gen_def, run_dir=str(flow_out_dir))
+                            except Exception:
+                                pass
 
                         remaining = None
                         if deadline is not None:
@@ -16252,22 +17065,78 @@ def api_flow_prepare_preview_for_execute():
                             return out_list
 
                         effective_injects = None
-                        try:
-                            eff = fa.get('inject_files') if isinstance(fa, dict) else None
-                            if isinstance(eff, list) and eff:
-                                effective_injects = _stage_inject_uploads(list(eff), str(flow_out_dir))
-                                fa['inject_files'] = list(effective_injects)
-                        except Exception:
-                            effective_injects = None
+                        if not flow_run_remote:
+                            try:
+                                eff = fa.get('inject_files') if isinstance(fa, dict) else None
+                                if isinstance(eff, list) and eff:
+                                    effective_injects = _stage_inject_uploads(list(eff), str(flow_out_dir))
+                                    fa['inject_files'] = list(effective_injects)
+                            except Exception:
+                                effective_injects = None
 
-                        ok_run, note, manifest_path = _flow_try_run_generator(
-                            generator_id,
-                            out_dir=flow_out_dir,
-                            config=cfg,
-                            kind=assignment_type,
-                            timeout_s=gen_timeout_s,
-                            inject_files_override=effective_injects,
-                        )
+                        manifest_outputs: dict[str, Any] | None = None
+                        if flow_run_remote and flow_remote_repo_dir and isinstance(flow_core_cfg, dict):
+                            ok_run, note, manifest_path, manifest_outputs = _flow_try_run_generator_remote(
+                                generator_id,
+                                out_dir=flow_out_dir,
+                                config=cfg,
+                                kind=assignment_type,
+                                timeout_s=gen_timeout_s,
+                                inject_files_override=effective_injects,
+                                core_cfg=flow_core_cfg,
+                                repo_dir=flow_remote_repo_dir,
+                            )
+                        else:
+                            ok_run, note, manifest_path = _flow_try_run_generator(
+                                generator_id,
+                                out_dir=flow_out_dir,
+                                config=cfg,
+                                kind=assignment_type,
+                                timeout_s=gen_timeout_s,
+                                inject_files_override=effective_injects,
+                            )
+
+                            if ok_run and not manifest_path and flow_out_dir:
+                                try:
+                                    flag_path = os.path.join(flow_out_dir, 'flag.txt')
+                                    if os.path.exists(flag_path):
+                                        with open(flag_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                            flag_val = (f.read() or '').strip()
+                                        if flag_val:
+                                            manifest_outputs = {'Flag(flag_id)': flag_val, 'flag': flag_val}
+                                except Exception:
+                                    manifest_outputs = manifest_outputs
+
+                        try:
+                            app.logger.info(
+                                '[flow.generator] node=%s generator=%s ok=%s note=%s manifest=%s out_dir=%s',
+                                cid,
+                                generator_id,
+                                bool(ok_run),
+                                str(note or ''),
+                                str(manifest_path or ''),
+                                str(flow_out_dir or ''),
+                            )
+                        except Exception:
+                            pass
+
+                        try:
+                            generator_runs.append({
+                                'node_id': cid,
+                                'node_name': str(h.get('name') or ''),
+                                'generator_id': generator_id,
+                                'type': assignment_type,
+                                'ok': bool(ok_run),
+                                'note': str(note or ''),
+                                'out_dir': str(flow_out_dir or ''),
+                                'manifest': str(manifest_path or ''),
+                            })
+                        except Exception:
+                            pass
+
+                        if ok_run and (not manifest_path) and declared_output_keys and not manifest_outputs:
+                            ok_run = False
+                            note = f"outputs.json missing for generator={generator_id}"
 
                         if not ok_run:
                             generation_failures.append({
@@ -16284,11 +17153,15 @@ def api_flow_prepare_preview_for_execute():
                                 pass
 
                         # If the generator produced a manifest, capture the actual output keys.
-                        if ok_run and manifest_path and os.path.exists(manifest_path):
+                        if ok_run and (manifest_outputs is not None or (manifest_path and os.path.exists(manifest_path))):
                             try:
-                                with open(manifest_path, 'r', encoding='utf-8') as f:
-                                    m = json.load(f) or {}
-                                outs = m.get('outputs') if isinstance(m, dict) else None
+                                outs = None
+                                if isinstance(manifest_outputs, dict):
+                                    outs = manifest_outputs
+                                elif manifest_path and os.path.exists(manifest_path):
+                                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                                        m = json.load(f) or {}
+                                    outs = m.get('outputs') if isinstance(m, dict) else None
                                 if isinstance(outs, dict):
                                     # Apply user override for FLAG value (if provided).
                                     try:
@@ -16431,16 +17304,22 @@ def api_flow_prepare_preview_for_execute():
                             # Fall back to artifacts/, then the run dir.
                             flow_mount_dir = str(flow_out_dir or '')
                             allow_hint_file = True
-                            try:
-                                if flow_out_dir:
-                                    injected = os.path.join(flow_out_dir, 'injected')
-                                    artifacts = os.path.join(flow_out_dir, 'artifacts')
-                                    if os.path.isdir(injected):
-                                        flow_mount_dir = injected
-                                    elif os.path.isdir(artifacts):
-                                        flow_mount_dir = artifacts
-                            except Exception:
-                                flow_mount_dir = str(flow_out_dir or '')
+                            if not flow_run_remote:
+                                try:
+                                    if flow_out_dir:
+                                        injected = os.path.join(flow_out_dir, 'injected')
+                                        artifacts = os.path.join(flow_out_dir, 'artifacts')
+                                        if os.path.isdir(injected):
+                                            flow_mount_dir = injected
+                                        elif os.path.isdir(artifacts):
+                                            flow_mount_dir = artifacts
+                                except Exception:
+                                    flow_mount_dir = str(flow_out_dir or '')
+                            else:
+                                try:
+                                    flow_mount_dir = posixpath.join(str(flow_out_dir or ''), 'artifacts')
+                                except Exception:
+                                    flow_mount_dir = str(flow_out_dir or '')
 
                             # Respect inject_files allowlist: only place hint.txt into the
                             # injected mount dir if the allowlist appears to include it.
@@ -16475,12 +17354,38 @@ def api_flow_prepare_preview_for_execute():
                                 if single:
                                     hint_texts = [single]
                             if flow_mount_dir and hint_texts:
-                                with open(os.path.join(flow_mount_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
-                                    if len(hint_texts) == 1:
-                                        hf.write(hint_texts[0] + "\n")
-                                    else:
-                                        for idx, ht in enumerate(hint_texts, start=1):
-                                            hf.write(f"Hint {idx}/{len(hint_texts)}: {ht}\n")
+                                if flow_run_remote and isinstance(flow_core_cfg, dict):
+                                    hint_payload = "".join(
+                                        [
+                                            (f"Hint {idx + 1}/{len(hint_texts)}: {ht}\n" if len(hint_texts) > 1 else f"{ht}\n")
+                                            for idx, ht in enumerate(hint_texts)
+                                        ]
+                                    )
+                                    script = (
+                                        "import os\n"
+                                        f"p={json.dumps(posixpath.join(flow_mount_dir, 'hint.txt'))}\n"
+                                        f"d=os.path.dirname(p)\n"
+                                        "os.makedirs(d, exist_ok=True)\n"
+                                        f"open(p,'w',encoding='utf-8').write({json.dumps(hint_payload)})\n"
+                                        "print('{}')\n"
+                                    )
+                                    try:
+                                        _run_remote_python_json(
+                                            flow_core_cfg,
+                                            script,
+                                            logger=app.logger,
+                                            label='flow.hint.remote',
+                                            timeout=20.0,
+                                        )
+                                    except Exception:
+                                        pass
+                                else:
+                                    with open(os.path.join(flow_mount_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+                                        if len(hint_texts) == 1:
+                                            hf.write(hint_texts[0] + "\n")
+                                        else:
+                                            for idx, ht in enumerate(hint_texts, start=1):
+                                                hf.write(f"Hint {idx}/{len(hint_texts)}: {ht}\n")
                         except Exception:
                             pass
 
@@ -16521,7 +17426,41 @@ def api_flow_prepare_preview_for_execute():
                             'run_dir': str(flow_out_dir or ''),
                         })
 
-                def _inject_files_for_copy_from_detail(detail_list: Any) -> list[str]:
+                def _normalize_inject_src_for_copy(raw_src: str, source_dir: str) -> str:
+                    src = str(raw_src or '').strip()
+                    if not src:
+                        return ''
+                    if not os.path.isabs(src):
+                        return src
+                    try:
+                        if source_dir:
+                            src_abs = os.path.abspath(src)
+                            base_abs = os.path.abspath(source_dir)
+                            if os.path.commonpath([src_abs, base_abs]) == base_abs:
+                                return os.path.relpath(src_abs, base_abs)
+                    except Exception:
+                        pass
+                    for marker in ('/artifacts/', '/flow_artifacts/'):
+                        if marker in src:
+                            return src.split(marker, 1)[1].lstrip('/')
+                    return ''
+
+                def _normalize_inject_spec_for_copy(raw: str, source_dir: str) -> str:
+                    text = str(raw or '').strip()
+                    if not text:
+                        return ''
+                    sep = '->' if '->' in text else '=>' if '=>' in text else ''
+                    if sep:
+                        left, right = text.split(sep, 1)
+                        src_norm = _normalize_inject_src_for_copy(left.strip(), source_dir)
+                        if not src_norm:
+                            return ''
+                        dest = right.strip()
+                        return f"{src_norm} -> {dest}" if dest else src_norm
+                    src_norm = _normalize_inject_src_for_copy(text, source_dir)
+                    return src_norm
+
+                def _inject_files_for_copy_from_detail(detail_list: Any, source_dir: str) -> list[str]:
                     if not isinstance(detail_list, list):
                         return []
                     out: list[str] = []
@@ -16533,17 +17472,29 @@ def api_flow_prepare_preview_for_execute():
                         if not path:
                             continue
                         dest_dir = os.path.dirname(path) if path.startswith('/') else ''
-                        if not dest_dir:
+                        if dest_dir == '/' and path.startswith('/'):
+                            # Single-segment absolute path (e.g., /exports) should be treated as the directory.
+                            dest_dir = path.rstrip('/') or '/'
+                        if not dest_dir or dest_dir == '/':
                             continue
-                        if resolved.startswith('/'):
-                            # Skip absolute sources outside artifacts_dir; they won't exist in source_dir.
+                        src_norm = _normalize_inject_src_for_copy(resolved, source_dir)
+                        if not src_norm:
                             continue
-                        if resolved.startswith('./'):
-                            resolved = resolved[2:]
-                        if not resolved:
-                            continue
-                        out.append(f"{resolved} -> {dest_dir}")
+                        out.append(f"{src_norm} -> {dest_dir}")
                     return out
+
+                if flow_run_remote:
+                    inject_source_dir = str(posixpath.join(str(flow_out_dir or ''), 'artifacts')) if flow_out_dir else ''
+                else:
+                    inject_source_dir = str(
+                        os.path.join(flow_out_dir, 'injected')
+                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
+                        else (
+                            os.path.join(flow_out_dir, 'artifacts')
+                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
+                            else (flow_out_dir or '')
+                        )
+                    )
 
                 meta_h['flow_flag'] = {
                     'type': assignment_type,
@@ -16553,17 +17504,11 @@ def api_flow_prepare_preview_for_execute():
                     'generator_language': str(fa.get('language') or ''),
                     'generator_source': str(fa.get('flag_generator') or ''),
                     'artifacts_dir': str(flow_out_dir or ''),
-                    'mount_dir': str(
-                        os.path.join(flow_out_dir, 'injected')
-                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
-                        else (
-                            os.path.join(flow_out_dir, 'artifacts')
-                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
-                            else (flow_out_dir or '')
-                        )
-                    ),
-                    'inject_files': _inject_files_for_copy_from_detail(fa.get('inject_files_detail')) or (
-                        list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else []
+                    'mount_dir': inject_source_dir,
+                    'inject_files': _inject_files_for_copy_from_detail(fa.get('inject_files_detail'), inject_source_dir) or (
+                        [x for x in (_normalize_inject_spec_for_copy(r, inject_source_dir) for r in (fa.get('inject_files') or []) if r is not None) if x]
+                        if isinstance(fa.get('inject_files'), list)
+                        else []
                     ),
                     'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
                     'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
@@ -16589,15 +17534,7 @@ def api_flow_prepare_preview_for_execute():
                     fa['generated'] = bool(ok_run)
                     fa['generation_note'] = str(note or '')
                     fa['artifacts_dir'] = str(flow_out_dir or '')
-                    fa['mount_dir'] = str(
-                        os.path.join(flow_out_dir, 'injected')
-                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
-                        else (
-                            os.path.join(flow_out_dir, 'artifacts')
-                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
-                            else (flow_out_dir or '')
-                        )
-                    )
+                    fa['mount_dir'] = inject_source_dir
                     fa['inject_files'] = list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else []
                     fa['outputs_manifest'] = str(manifest_path or '')
                     fa['declared_outputs'] = declared_output_keys
@@ -16624,7 +17561,7 @@ def api_flow_prepare_preview_for_execute():
                     if not flag_val:
                         try:
                             manifest_path = str(fa.get('outputs_manifest') or '').strip()
-                            if manifest_path and os.path.exists(manifest_path):
+                            if (not flow_run_remote) and manifest_path and os.path.exists(manifest_path):
                                 with open(manifest_path, 'r', encoding='utf-8') as mf:
                                     m = json.load(mf) or {}
                                 outs = m.get('outputs') if isinstance(m, dict) else None
@@ -22013,6 +22950,51 @@ def _ensure_core_vm_metadata(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return enriched
 
 
+def _apply_core_secret_to_config(core_cfg: Dict[str, Any], scenario_norm: str) -> Dict[str, Any]:
+    if not isinstance(core_cfg, dict):
+        return core_cfg
+    try:
+        secret_record = _select_latest_core_secret_record(scenario_norm or None)
+    except Exception:
+        secret_record = None
+    if not secret_record:
+        return core_cfg
+    enriched = dict(core_cfg)
+    secret_password = secret_record.get('ssh_password_plain') or secret_record.get('password_plain') or ''
+    if secret_password and not enriched.get('ssh_password'):
+        enriched['ssh_password'] = secret_password
+    if enriched.get('ssh_username') in (None, ''):
+        value = secret_record.get('ssh_username')
+        if value not in (None, ''):
+            enriched['ssh_username'] = value
+    if enriched.get('ssh_host') in (None, ''):
+        value = secret_record.get('ssh_host') or secret_record.get('host') or secret_record.get('grpc_host')
+        if value not in (None, ''):
+            enriched['ssh_host'] = value
+    if enriched.get('ssh_port') in (None, '', 0):
+        value = secret_record.get('ssh_port')
+        if value not in (None, ''):
+            enriched['ssh_port'] = value
+    if enriched.get('venv_bin') in (None, ''):
+        value = secret_record.get('venv_bin')
+        if value not in (None, ''):
+            enriched['venv_bin'] = value
+    if enriched.get('core_secret_id') in (None, ''):
+        value = secret_record.get('identifier')
+        if value not in (None, ''):
+            enriched['core_secret_id'] = value
+    if enriched.get('validated') in (None, '') and 'validated' in secret_record:
+        enriched['validated'] = secret_record.get('validated')
+    if enriched.get('last_tested_status') in (None, '') and 'last_tested_status' in secret_record:
+        enriched['last_tested_status'] = secret_record.get('last_tested_status')
+    for meta_field in ('vm_key', 'vm_name', 'vm_node', 'vmid', 'proxmox_secret_id', 'proxmox_target'):
+        if enriched.get(meta_field) in (None, '', {}):
+            value = secret_record.get(meta_field)
+            if value not in (None, ''):
+                enriched[meta_field] = value
+    return _normalize_core_config(enriched, include_password=True)
+
+
 def _build_core_vm_summary(core_cfg: Dict[str, Any]) -> tuple[bool, Optional[Dict[str, Any]]]:
     cfg = _ensure_core_vm_metadata(core_cfg)
     vm_key = str(cfg.get('vm_key') or '').strip()
@@ -22048,6 +23030,78 @@ def _select_core_config_for_page(
     include_password: bool = True,
 ) -> Dict[str, Any]:
     """Pick the most relevant CORE config (with SSH creds) for the CORE page/data views."""
+
+    try:
+        hitl_map = _load_scenario_hitl_config_from_disk()
+    except Exception:
+        hitl_map = {}
+    try:
+        hitl_validation = _load_scenario_hitl_validation_from_disk()
+    except Exception:
+        hitl_validation = {}
+
+    def _hitl_lookup(hmap: dict[str, Any], norm: str) -> dict[str, Any] | None:
+        if not norm or not isinstance(hmap, dict):
+            return None
+        if norm in hmap:
+            val = hmap.get(norm)
+            return val if isinstance(val, dict) else None
+        try:
+            key = _scenario_match_key(norm)
+        except Exception:
+            key = ''
+        if not key:
+            return None
+        for k, v in hmap.items():
+            try:
+                if _scenario_match_key(k) == key and isinstance(v, dict):
+                    return v
+            except Exception:
+                continue
+        return None
+
+    if scenario_norm and isinstance(hitl_map, dict):
+        scenario_hitl = _hitl_lookup(hitl_map, scenario_norm)
+        if isinstance(scenario_hitl, dict):
+            scenario_core_raw = scenario_hitl.get('core') if isinstance(scenario_hitl.get('core'), dict) else None
+            if isinstance(scenario_core_raw, dict) and scenario_core_raw:
+                merged = _merge_core_configs(None, scenario_core_raw, include_password=include_password)
+                validation_hitl = _hitl_lookup(hitl_validation, scenario_norm)
+                validation_core = validation_hitl.get('core') if isinstance(validation_hitl, dict) else None
+                if isinstance(validation_core, dict) and validation_core:
+                    merged = _merge_core_configs(merged, validation_core, include_password=include_password)
+                return _ensure_core_vm_metadata(_augment_core_config_from_secret(merged))
+        # Fall back to the latest VM/Access secret record for this scenario.
+        try:
+            secret_record = _select_latest_core_secret_record(scenario_norm or None)
+        except Exception:
+            secret_record = None
+        if secret_record:
+            secret_password = secret_record.get('ssh_password_plain') or secret_record.get('password_plain') or ''
+            if secret_password:
+                secret_cfg = {
+                    'host': secret_record.get('host') or secret_record.get('grpc_host') or CORE_HOST,
+                    'port': secret_record.get('port') or secret_record.get('grpc_port') or CORE_PORT,
+                    'ssh_host': secret_record.get('ssh_host') or secret_record.get('host') or secret_record.get('grpc_host'),
+                    'ssh_port': secret_record.get('ssh_port') or 22,
+                    'ssh_username': secret_record.get('ssh_username') or '',
+                    'ssh_password': secret_password,
+                    'venv_bin': secret_record.get('venv_bin') or DEFAULT_CORE_VENV_BIN,
+                    'ssh_enabled': True,
+                    'core_secret_id': secret_record.get('identifier'),
+                    'vm_key': secret_record.get('vm_key'),
+                    'vm_name': secret_record.get('vm_name'),
+                    'vm_node': secret_record.get('vm_node'),
+                    'vmid': secret_record.get('vmid'),
+                    'proxmox_secret_id': secret_record.get('proxmox_secret_id'),
+                    'proxmox_target': secret_record.get('proxmox_target'),
+                    'validated': secret_record.get('validated') if 'validated' in secret_record else None,
+                    'last_tested_status': secret_record.get('last_tested_status') if 'last_tested_status' in secret_record else None,
+                }
+                merged = _merge_core_configs(secret_cfg, include_password=include_password)
+                return _ensure_core_vm_metadata(_augment_core_config_from_secret(merged))
+        # Enforce VM/Access as the only source of truth.
+        return {}
 
     entries = list(history or _load_run_history())
 
@@ -24871,6 +25925,38 @@ def _parse_flow_bind_mount(txt: str):
     return (m.group(1) or '').strip(), (m.group(2) or '').strip()
 
 
+def _extract_label_value(txt: str, key: str):
+    patterns = [
+        rf"{re.escape(key)}\s*:\s*(['\"])(.*?)\1",
+        rf"{re.escape(key)}\s*=\s*(['\"])(.*?)\1",
+        rf"{re.escape(key)}\s*:\s*([^\n]+)",
+        rf"{re.escape(key)}\s*=\s*([^\n]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.S)
+        if not m:
+            continue
+        val = m.group(m.lastindex or 1)
+        if val is None:
+            continue
+        return str(val).strip().strip('"').strip("'")
+    return None
+
+
+def _parse_inject_labels(txt: str):
+    source_dir = _extract_label_value(txt, 'coretg.inject.source_dir') or None
+    raw_map = _extract_label_value(txt, 'coretg.inject.map') or None
+    items = []
+    if raw_map:
+        try:
+            parsed = json.loads(raw_map)
+            if isinstance(parsed, list):
+                items = [x for x in parsed if isinstance(x, dict)]
+        except Exception:
+            items = []
+    return source_dir, items
+
+
 def _compose_container_ids(project: str, yml: str):
     p = _run_docker(['compose', '-p', project, '-f', yml, 'ps', '-q'], timeout=25, capture=True)
     if getattr(p, 'returncode', 1) != 0:
@@ -24906,6 +25992,7 @@ def main():
     for node_name in sorted(assignments.keys()):
         yml = os.path.join(assign_dir, f'docker-compose-{node_name}.yml')
         if not os.path.exists(yml):
+            items.append({'node': node_name, 'compose': yml, 'ok': False, 'error': 'compose file missing'})
             continue
         try:
             txt = open(yml, 'r', encoding='utf-8', errors='ignore').read()
@@ -24918,7 +26005,10 @@ def main():
             src = src or src2
             dest = dest or dest2
 
+        inject_source, inject_items = _parse_inject_labels(txt)
+
         if not src or not dest:
+            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'flow artifacts src/dest not found'})
             continue
 
         if not os.path.isdir(src):
@@ -24948,20 +26038,61 @@ def main():
         copied_any = False
         errs = []
         commands = []
-        for t in targets:
-            # Copy directory contents into dest.
-            cp_src = src.rstrip('/') + '/.'
-            cp_dest = f"{t}:{dest}"
-            commands.append(f"docker cp {cp_src} {cp_dest}")
-            p = _run_docker(['cp', cp_src, cp_dest], timeout=60, capture=True)
-            if getattr(p, 'returncode', 1) == 0:
-                copied_any = True
-            else:
-                out = (getattr(p, 'stdout', '') or '').strip()
-                errs.append(out)
-        items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs, 'commands': commands})
+        command_outputs = []
 
-    print(json.dumps({'ok': True, 'items': items, 'timestamp': int(time.time())}))
+        # Prefer explicit inject mapping when available.
+        if inject_items:
+            source_dir = inject_source or src
+            for t in targets:
+                for entry in inject_items:
+                    rel = str(entry.get('src') or '').strip()
+                    dest_dir = str(entry.get('dest') or dest or '').strip()
+                    if not rel or not dest_dir or not dest_dir.startswith('/'):
+                        continue
+                    if os.path.isabs(rel):
+                        src_path = rel
+                        rel_path = os.path.basename(rel)
+                    else:
+                        src_path = os.path.join(source_dir, rel.lstrip('/')) if source_dir else rel
+                        rel_path = rel
+                    if not src_path or not rel_path:
+                        continue
+                    dest_path = dest_dir.rstrip('/') + '/' + rel_path.lstrip('/')
+                    rel_dir = os.path.dirname(rel_path)
+                    if rel_dir:
+                        mkdir_cmd = f"mkdir -p {dest_dir.rstrip('/')}/{rel_dir}"
+                    else:
+                        mkdir_cmd = f"mkdir -p {dest_dir.rstrip('/')}"
+                    commands.append(f"docker exec {t} sh -lc {mkdir_cmd}")
+                    _run_docker(['exec', t, 'sh', '-lc', mkdir_cmd], timeout=30, capture=True)
+                    commands.append(f"docker cp {src_path} {t}:{dest_path}")
+                    p = _run_docker(['cp', src_path, f"{t}:{dest_path}"], timeout=60, capture=True)
+                    out = (getattr(p, 'stdout', '') or '').strip()
+                    rc = int(getattr(p, 'returncode', 1) or 0)
+                    command_outputs.append({'target': t, 'rc': rc, 'out': out, 'dest': dest_path})
+                    if getattr(p, 'returncode', 1) == 0:
+                        copied_any = True
+                    else:
+                        errs.append(out)
+
+        # Fallback: copy entire artifacts directory into flow_artifacts mount path.
+        if not inject_items:
+            for t in targets:
+                # Copy directory contents into dest.
+                cp_src = src.rstrip('/') + '/.'
+                cp_dest = f"{t}:{dest}"
+                commands.append(f"docker cp {cp_src} {cp_dest}")
+                p = _run_docker(['cp', cp_src, cp_dest], timeout=60, capture=True)
+                out = (getattr(p, 'stdout', '') or '').strip()
+                rc = int(getattr(p, 'returncode', 1) or 0)
+                command_outputs.append({'target': t, 'rc': rc, 'out': out})
+                if getattr(p, 'returncode', 1) == 0:
+                    copied_any = True
+                else:
+                    errs.append(out)
+        items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs, 'commands': commands, 'command_outputs': command_outputs})
+
+    print(json.dumps({'ok': True, 'items': items, 'timestamp': int(time.time()), 'assignments_count': len(assignments), 'assignments_keys': sorted(assignments.keys())}))
 
 
 if __name__ == '__main__':
@@ -24975,6 +26106,7 @@ def _sync_local_vulns_to_remote(
     *,
     local_dir: str = "/tmp/vulns",
     remote_dir: str = "/tmp/vulns",
+    flow_plan_path: str | None = None,
     logger: Optional[logging.Logger] = None,
 ) -> bool:
     """Copy vulnerability compose artifacts created locally to the remote CORE host.
@@ -25048,6 +26180,15 @@ def _sync_local_vulns_to_remote(
     except Exception:
         local_dirs = []
 
+    # Fallback: include any Flow artifact dirs from the preview plan / FlowState (XML).
+    if flow_plan_path:
+        try:
+            for pth in _extract_flow_artifact_dirs_from_plan(flow_plan_path, prefer_mount_dir=False):
+                if pth and os.path.isdir(pth):
+                    local_dirs.append(pth)
+        except Exception:
+            pass
+
     # Wrapper build contexts are required on the CORE VM when compose files reference /tmp/vulns/docker-wrap-*.
     wrapper_dirs: List[str] = []
     try:
@@ -25057,7 +26198,7 @@ def _sync_local_vulns_to_remote(
     except Exception:
         wrapper_dirs = []
 
-    if not local_files and not wrapper_dirs:
+    if not local_files and not wrapper_dirs and not local_dirs:
         return False
 
     client = None
@@ -26012,6 +27153,57 @@ def _parse_scenarios_xml(path):
         # If scenario-level density_count was absent but Node Information section provided one, keep existing.
         data["scenarios"].append(scen)
     return data
+
+
+def _core_config_from_xml_path(
+    xml_path: str | None,
+    scenario_norm: str,
+    *,
+    include_password: bool = True,
+) -> Dict[str, Any] | None:
+    if not xml_path:
+        return None
+    try:
+        xml_abs = os.path.abspath(xml_path)
+    except Exception:
+        return None
+    if not os.path.exists(xml_abs):
+        return None
+    try:
+        payload = _parse_scenarios_xml(xml_abs)
+    except Exception:
+        return None
+
+    scenario_core: Dict[str, Any] | None = None
+    scen_list = payload.get('scenarios') if isinstance(payload, dict) else None
+    if isinstance(scen_list, list):
+        for sc in scen_list:
+            if not isinstance(sc, dict):
+                continue
+            nm = str(sc.get('name') or '').strip()
+            if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
+                continue
+            hitl = sc.get('hitl') if isinstance(sc.get('hitl'), dict) else None
+            if isinstance(hitl, dict) and isinstance(hitl.get('core'), dict):
+                scenario_core = hitl.get('core')
+            if scenario_norm:
+                break
+            if scenario_core:
+                break
+
+    global_core: Dict[str, Any] | None = None
+    try:
+        tree = ET.parse(xml_abs)
+        root = tree.getroot()
+        core_el = root.find('CoreConnection')
+        if core_el is not None:
+            global_core = _extract_optional_core_config(dict(core_el.attrib), include_password=include_password)
+    except Exception:
+        global_core = None
+
+    if not scenario_core and not global_core:
+        return None
+    return _merge_core_configs(global_core, scenario_core, include_password=include_password)
 
 
 def _flow_state_from_latest_xml(scenario_norm: str) -> dict[str, Any] | None:
@@ -28481,7 +29673,13 @@ def run_cli():
         # so the remote Docker Compose card and DockerComposeService can access them.
         uploaded_vuln_artifacts = False
         try:
-            uploaded_vuln_artifacts = bool(_sync_local_vulns_to_remote(core_cfg, logger=app.logger))
+            uploaded_vuln_artifacts = bool(
+                _sync_local_vulns_to_remote(
+                    core_cfg,
+                    flow_plan_path=xml_path,
+                    logger=app.logger,
+                )
+            )
         except Exception as exc:
             uploaded_vuln_artifacts = False
             try:
@@ -30544,6 +31742,7 @@ def main():
         inject_count = 0
         inject_samples = []
         inject_dirs_found = []
+        debug_logs = []
         if exists:
             for d in INJECT_DIRS:
                 if not d:
@@ -30563,6 +31762,17 @@ def main():
                         inject_dirs_found.append(d)
                         inject_samples = (inject_samples + lines)[:5]
                         inject_count += len(lines)
+                else:
+                    if d:
+                        shell_dbg = (
+                            'set -e; '
+                            'mesg n >/dev/null 2>&1 || true; '
+                            f"if [ -d {d} ]; then ls -la {d} 2>&1 | head -n 10; else echo 'MISSING_DIR:{d}'; fi; "
+                        )
+                        p3 = _run(['docker', 'exec', c, 'sh', '-c', shell_dbg], timeout=20)
+                        dbg = (p3.stdout or '').strip()
+                        if dbg:
+                            debug_logs.append(dbg)
         items.append({
             'container': c,
             'exists': exists,
@@ -30570,6 +31780,7 @@ def main():
             'inject_count': inject_count,
             'inject_samples': inject_samples,
             'inject_dirs_found': inject_dirs_found,
+            'debug_logs': debug_logs,
         })
     print(json.dumps({'ok': True, 'items': items}))
 
@@ -30581,6 +31792,195 @@ if __name__ == '__main__':
      .replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal) \
      .replace('__MAX_FIND_LITERAL__', max_find_literal) \
      .replace('__INJECT_DIRS_LITERAL__', inject_dirs_literal)
+
+
+def _remote_flow_artifacts_validation_script(assignments: List[Dict[str, Any]]) -> str:
+    assignments_literal = json.dumps(assignments or [])
+    return (
+        r"""
+import json, os
+
+ASSIGNMENTS = __ASSIGNMENTS_LITERAL__
+
+
+def _safe_exists(p: str) -> bool:
+    try:
+        return bool(p and os.path.exists(p))
+    except Exception:
+        return False
+
+
+def _looks_like_path(key, val) -> bool:
+    try:
+        if not isinstance(val, str):
+            return False
+        v = val.strip()
+        if not v:
+            return False
+        k = str(key or '').lower()
+        if 'path' in k or 'file' in k:
+            return True
+        if v.startswith('/') or v.startswith('artifacts/'):
+            return True
+        if '/' in v:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _resolve_output_path(val: str, run_dir: str, artifacts_dir: str) -> str:
+    v = str(val or '').strip()
+    if not v:
+        return ''
+    if os.path.isabs(v):
+        return v
+    if v.startswith('artifacts/') and artifacts_dir:
+        return os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/'))
+    if run_dir:
+        return os.path.join(run_dir, v.lstrip('/'))
+    if artifacts_dir:
+        return os.path.join(artifacts_dir, v.lstrip('/'))
+    return v
+
+
+def _normalize_inject_src_for_copy(raw_src: str, source_dir: str) -> str:
+    src = str(raw_src or '').strip()
+    if not src:
+        return ''
+    if not os.path.isabs(src):
+        return src
+    try:
+        if source_dir:
+            src_abs = os.path.abspath(src)
+            base_abs = os.path.abspath(source_dir)
+            if os.path.commonpath([src_abs, base_abs]) == base_abs:
+                return os.path.relpath(src_abs, base_abs)
+    except Exception:
+        pass
+    for marker in ('/artifacts/', '/flow_artifacts/'):
+        if marker in src:
+            return src.split(marker, 1)[1].lstrip('/')
+    return ''
+
+
+def _normalize_inject_spec_for_copy(raw: str, source_dir: str) -> str:
+    text = str(raw or '').strip()
+    if not text:
+        return ''
+    sep = '->' if '->' in text else '=>' if '=>' in text else ''
+    if sep:
+        left, _right = text.split(sep, 1)
+        src_norm = _normalize_inject_src_for_copy(left.strip(), source_dir)
+        return src_norm
+    return _normalize_inject_src_for_copy(text, source_dir)
+
+
+def _inject_files_for_copy_from_detail(detail_list, source_dir: str) -> list[str]:
+    if not isinstance(detail_list, list):
+        return []
+    out = []
+    for entry in detail_list:
+        if not isinstance(entry, dict):
+            continue
+        resolved = str(entry.get('resolved') or '').strip()
+        path = str(entry.get('path') or '').strip()
+        if not path:
+            continue
+        dest_dir = os.path.dirname(path) if path.startswith('/') else ''
+        if dest_dir == '/' and path.startswith('/'):
+            dest_dir = path.rstrip('/') or '/'
+        if not dest_dir or dest_dir == '/':
+            continue
+        src_norm = _normalize_inject_src_for_copy(resolved, source_dir)
+        if not src_norm:
+            continue
+        out.append(src_norm)
+    return out
+
+
+def main():
+    items = []
+    for a in (ASSIGNMENTS or []):
+        if not isinstance(a, dict):
+            continue
+        node_id = str(a.get('node_id') or '')
+        gen_id = str(a.get('id') or a.get('generator_id') or '')
+        gen_name = str(a.get('generator_name') or a.get('name') or '')
+        gen_type = str(a.get('generator_type') or a.get('type') or '')
+        run_dir = str(a.get('run_dir') or a.get('artifacts_dir') or '')
+        artifacts_dir = str(a.get('mount_dir') or a.get('artifacts_dir') or '')
+        outputs_manifest = str(a.get('outputs_manifest') or '')
+        outputs_missing = []
+        outputs_checked = []
+        manifest_expected = bool(outputs_manifest)
+        manifest_exists = _safe_exists(outputs_manifest)
+        outs = None
+        if manifest_expected and not manifest_exists:
+            outputs_missing.append(f"missing manifest: {outputs_manifest}")
+        if manifest_exists:
+            try:
+                with open(outputs_manifest, 'r', encoding='utf-8') as f:
+                    m = json.load(f) or {}
+                outs = m.get('outputs') if isinstance(m, dict) else None
+            except Exception:
+                outs = None
+        if manifest_exists and not (isinstance(outs, dict) and outs):
+            outputs_missing.append(f"empty manifest: {outputs_manifest}")
+        if isinstance(outs, dict):
+            for k, v in outs.items():
+                if not _looks_like_path(k, v):
+                    continue
+                p = _resolve_output_path(str(v), run_dir, artifacts_dir)
+                if not p:
+                    continue
+                outputs_checked.append(p)
+                if not _safe_exists(p):
+                    outputs_missing.append(p)
+
+        source_dir = artifacts_dir or run_dir
+        inject_sources = _inject_files_for_copy_from_detail(a.get('inject_files_detail'), source_dir)
+        if not inject_sources:
+            inj = a.get('inject_files') if isinstance(a.get('inject_files'), list) else []
+            for raw in inj:
+                src_norm = _normalize_inject_spec_for_copy(raw, source_dir)
+                if src_norm:
+                    inject_sources.append(src_norm)
+        inject_missing = []
+        inject_checked = []
+        for src in inject_sources:
+            if os.path.isabs(src):
+                p = src
+            elif source_dir:
+                p = os.path.join(source_dir, src.lstrip('/'))
+            else:
+                p = src
+            inject_checked.append(p)
+            if not _safe_exists(p):
+                inject_missing.append(p)
+
+        items.append({
+            'node_id': node_id,
+            'generator_id': gen_id,
+            'generator_name': gen_name,
+            'generator_type': gen_type,
+            'run_dir': run_dir,
+            'artifacts_dir': artifacts_dir,
+            'outputs_manifest': outputs_manifest,
+            'outputs_manifest_exists': bool(manifest_exists),
+            'outputs_checked': outputs_checked,
+            'outputs_missing': outputs_missing,
+            'inject_checked': inject_checked,
+            'inject_missing': inject_missing,
+        })
+
+    print(json.dumps({'ok': True, 'items': items}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__ASSIGNMENTS_LITERAL__', assignments_literal)
 
 
 def _remote_vuln_assignments_script(assignments_path: str = '/tmp/vulns/compose_assignments.json') -> str:
@@ -30644,6 +32044,10 @@ def _validate_session_nodes_and_injects(
         'injects_detail': [],
         'inject_dirs_expected': [],
         'inject_nodes_expected': [],
+        'inject_files_expected_by_node': {},
+        'generator_outputs_missing': [],
+        'generator_injects_missing': [],
+        'generator_validation_detail': [],
     }
     if not scenario_xml_path or not session_xml_path:
         summary['ok'] = False
@@ -30698,6 +32102,7 @@ def _validate_session_nodes_and_injects(
         pass
 
     flow_inject_specs = _extract_inject_specs_from_flow_state(scenario_xml_path, scenario_label)
+    inject_expected_by_node = _extract_inject_expected_by_node(scenario_xml_path, scenario_label)
     if flow_inject_specs:
         flow_payload = {'inject_files': flow_inject_specs}
         expected_inject_dirs = _extract_inject_dirs_from_payload(flow_payload)
@@ -30732,6 +32137,7 @@ def _validate_session_nodes_and_injects(
             pass
     summary['inject_dirs_expected'] = expected_inject_dirs
     summary['inject_files_expected'] = expected_inject_files
+    summary['inject_files_expected_by_node'] = inject_expected_by_node
 
     expected_docker_nodes, expected_vuln_nodes = _extract_expected_docker_and_vuln_nodes_from_plan_xml(
         scenario_xml_path,
@@ -30790,13 +32196,34 @@ def _validate_session_nodes_and_injects(
         containers_for_injects = docker_nodes
         if inject_node_names:
             containers_for_injects = [n for n in docker_nodes if n in set(inject_node_names)]
+        def _safe_inject_dir(path: str) -> str | None:
+            p = str(path or '').strip()
+            if not p or p == '/':
+                return None
+            if p.endswith('/'):
+                p = p.rstrip('/') or '/'
+            if not p or p == '/':
+                return None
+            try:
+                d = os.path.dirname(p)
+            except Exception:
+                d = ''
+            if d == '/' and p.startswith('/'):
+                # Single-segment absolute path like /tmp should be its own dir.
+                return p
+            return d or p
+
+        if inject_expected_by_node:
+            inject_dirs = sorted({d for paths in inject_expected_by_node.values() for p in paths if p.startswith('/') for d in (_safe_inject_dir(p),) if d})
+        else:
+            inject_dirs = expected_inject_dirs if expected_inject_dirs else None
         try:
             payload = _run_remote_python_json(
                 core_cfg,
                 _remote_docker_injects_status_script(
                     containers=containers_for_injects,
                     sudo_password=core_cfg.get('ssh_password'),
-                    inject_dirs=expected_inject_dirs if expected_inject_dirs else None,
+                    inject_dirs=inject_dirs,
                 ),
                 logger=app.logger,
                 label='docker.exec.injects_status',
@@ -30823,6 +32250,10 @@ def _validate_session_nodes_and_injects(
                         samples = it.get('inject_samples') if isinstance(it.get('inject_samples'), list) else []
                         inject_count = int(it.get('inject_count') or 0)
                         inject_dirs_found = it.get('inject_dirs_found') if isinstance(it.get('inject_dirs_found'), list) else []
+                        debug_logs = it.get('debug_logs') if isinstance(it.get('debug_logs'), list) else []
+                        expected_paths = []
+                        if inject_expected_by_node:
+                            expected_paths = inject_expected_by_node.get(name) or []
                         if expected_inject_dirs or inject_count > 0 or samples:
                             if inject_dirs_found:
                                 dirs_text = ', '.join(str(d) for d in inject_dirs_found)
@@ -30835,14 +32266,187 @@ def _validate_session_nodes_and_injects(
                                 detail += f" in {dirs_text}"
                             if samples:
                                 detail += f" (e.g., {', '.join(str(s) for s in samples)})"
+                            if expected_paths:
+                                exp_preview = ', '.join(str(p) for p in expected_paths[:3])
+                                more = f" (+{len(expected_paths)-3} more)" if len(expected_paths) > 3 else ''
+                                detail += f"; expected {exp_preview}{more}"
+                            if debug_logs:
+                                dbg = ' | '.join(str(x) for x in debug_logs[:2])
+                                detail += f"; debug: {dbg}"
                             summary['injects_detail'].append(detail)
                     except Exception:
                         pass
-                    if expected_inject_dirs and int(it.get('inject_count') or 0) <= 0:
+                    if inject_dirs and int(it.get('inject_count') or 0) <= 0:
                         summary['injects_missing'].append(name)
         except Exception as exc:
             summary['ok'] = False
             summary['error'] = f'failed docker injects validation: {exc}'
+
+    # Validate Flow generator outputs/inject sources on the CORE VM (remote).
+    gen_validation_error: str | None = None
+    assignments_list: List[Dict[str, Any]] | None = None
+    try:
+        flow_state = _flow_state_from_xml_path(scenario_xml_path or '', scenario_label)
+        assignments = flow_state.get('flag_assignments') if isinstance(flow_state, dict) else None
+        if isinstance(assignments, list) and assignments:
+            assignments_list = [a for a in assignments if isinstance(a, dict)]
+        if isinstance(assignments_list, list) and assignments_list and isinstance(core_cfg, dict):
+            check_items: List[Dict[str, Any]] = []
+            for fa in assignments_list:
+                check_items.append({
+                    'node_id': fa.get('node_id'),
+                    'generator_id': fa.get('id') or fa.get('generator_id'),
+                    'generator_name': fa.get('name'),
+                    'generator_type': fa.get('type') or fa.get('generator_type'),
+                    'run_dir': fa.get('run_dir') or fa.get('artifacts_dir'),
+                    'artifacts_dir': fa.get('artifacts_dir'),
+                    'mount_dir': fa.get('mount_dir'),
+                    'outputs_manifest': fa.get('outputs_manifest'),
+                    'inject_files_detail': fa.get('inject_files_detail'),
+                    'inject_files': fa.get('inject_files'),
+                })
+            try:
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_flow_artifacts_validation_script(check_items),
+                    logger=app.logger,
+                    label='flow.artifacts.validate',
+                    timeout=60.0,
+                )
+                items = payload.get('items') if isinstance(payload, dict) else None
+                if isinstance(items, list):
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        node_id = str(it.get('node_id') or '').strip()
+                        gen_id = str(it.get('generator_id') or '').strip()
+                        miss_out = it.get('outputs_missing') if isinstance(it.get('outputs_missing'), list) else []
+                        miss_inj = it.get('inject_missing') if isinstance(it.get('inject_missing'), list) else []
+                        if miss_out:
+                            for p in miss_out:
+                                summary['generator_outputs_missing'].append(f"{node_id or gen_id}: {p}")
+                        if miss_inj:
+                            for p in miss_inj:
+                                summary['generator_injects_missing'].append(f"{node_id or gen_id}: {p}")
+                        summary['generator_validation_detail'].append(it)
+                else:
+                    gen_validation_error = 'no generator validation items returned'
+            except Exception as exc:
+                gen_validation_error = f"generator validation failed: {exc}"
+        elif isinstance(assignments_list, list) and assignments_list and not isinstance(core_cfg, dict):
+            gen_validation_error = 'generator validation skipped (no core config)'
+    except Exception as exc:
+        gen_validation_error = f"generator validation exception: {exc}"
+
+    def _looks_like_path_local(val: Any) -> bool:
+        try:
+            s = str(val or '').strip()
+        except Exception:
+            return False
+        if not s:
+            return False
+        return '/' in s or s.startswith('artifacts/') or s.startswith('flow_artifacts/')
+
+    def _resolve_output_path_local(val: str, run_dir: str, artifacts_dir: str) -> str:
+        v = str(val or '').strip()
+        if not v:
+            return ''
+        if os.path.isabs(v):
+            return v
+        if v.startswith('artifacts/') and artifacts_dir:
+            return os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/'))
+        if run_dir:
+            return os.path.join(run_dir, v.lstrip('/'))
+        if artifacts_dir:
+            return os.path.join(artifacts_dir, v.lstrip('/'))
+        return v
+
+    def _normalize_inject_source_local(raw: str, run_dir: str, artifacts_dir: str) -> str:
+        text = str(raw or '').strip()
+        if not text:
+            return ''
+        for sep in ('->', '=>'):
+            if sep in text:
+                text = text.split(sep, 1)[0].strip()
+                break
+        if not text:
+            return ''
+        if os.path.isabs(text):
+            for marker in ('/artifacts/', '/flow_artifacts/'):
+                if marker in text:
+                    rel = text.split(marker, 1)[1].lstrip('/')
+                    base = artifacts_dir or run_dir
+                    return os.path.join(base, rel) if base else text
+            return text
+        if text.startswith('artifacts/'):
+            base = artifacts_dir or run_dir
+            return os.path.join(base, text.split('artifacts/', 1)[1].lstrip('/')) if base else text
+        base = artifacts_dir or run_dir
+        return os.path.join(base, text.lstrip('/')) if base else text
+
+    if isinstance(assignments_list, list) and assignments_list and not summary['generator_validation_detail']:
+        for fa in assignments_list:
+            run_dir = str(fa.get('run_dir') or fa.get('artifacts_dir') or '')
+            artifacts_dir = str(fa.get('artifacts_dir') or fa.get('mount_dir') or '')
+            outputs_checked: List[str] = []
+            inject_checked: List[str] = []
+            try:
+                resolved_detail = fa.get('resolved_outputs_detail') if isinstance(fa.get('resolved_outputs_detail'), list) else []
+                for item in resolved_detail:
+                    if not isinstance(item, dict):
+                        continue
+                    val = item.get('resolved') or item.get('path')
+                    if _looks_like_path_local(val):
+                        p = _resolve_output_path_local(str(val), run_dir, artifacts_dir)
+                        if p:
+                            outputs_checked.append(p)
+            except Exception:
+                pass
+            try:
+                resolved_outputs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
+                if isinstance(resolved_outputs, dict):
+                    for v in resolved_outputs.values():
+                        if _looks_like_path_local(v):
+                            p = _resolve_output_path_local(str(v), run_dir, artifacts_dir)
+                            if p:
+                                outputs_checked.append(p)
+            except Exception:
+                pass
+            try:
+                inject_detail = fa.get('inject_files_detail') if isinstance(fa.get('inject_files_detail'), list) else []
+                for item in inject_detail:
+                    if not isinstance(item, dict):
+                        continue
+                    src = item.get('resolved') or item.get('path')
+                    p = _normalize_inject_source_local(str(src), run_dir, artifacts_dir)
+                    if p:
+                        inject_checked.append(p)
+            except Exception:
+                pass
+            try:
+                inject_files = fa.get('inject_files') if isinstance(fa.get('inject_files'), list) else []
+                for raw in inject_files:
+                    p = _normalize_inject_source_local(str(raw), run_dir, artifacts_dir)
+                    if p:
+                        inject_checked.append(p)
+            except Exception:
+                pass
+            summary['generator_validation_detail'].append({
+                'node_id': fa.get('node_id'),
+                'generator_id': fa.get('id') or fa.get('generator_id'),
+                'generator_name': fa.get('name'),
+                'generator_type': fa.get('type') or fa.get('generator_type'),
+                'run_dir': run_dir,
+                'artifacts_dir': artifacts_dir,
+                'outputs_manifest': fa.get('outputs_manifest'),
+                'outputs_checked': sorted(set(outputs_checked)),
+                'outputs_missing': [],
+                'inject_checked': sorted(set(inject_checked)),
+                'inject_missing': [],
+                'validation_error': gen_validation_error,
+            })
+        if gen_validation_error:
+            summary['generator_outputs_missing'].append(f"generator validation error: {gen_validation_error}")
 
     if (
         summary['missing_nodes']
@@ -30852,6 +32456,8 @@ def _validate_session_nodes_and_injects(
         or summary['missing_docker_nodes']
         or summary['extra_docker_nodes']
         or summary['missing_vuln_nodes']
+        or summary['generator_outputs_missing']
+        or summary['generator_injects_missing']
     ):
         summary['ok'] = False
     return summary
@@ -30882,6 +32488,16 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
             label=f'docker.copy_flow_artifacts({stage})',
             timeout=180.0,
         )
+        try:
+            if isinstance(payload, dict) and payload.get('error'):
+                _append_async_run_log_line(meta, f"{log_prefix}docker.copy_flow_artifacts({stage}) error={payload.get('error')}")
+            if isinstance(payload, dict) and 'assignments_count' in payload:
+                _append_async_run_log_line(
+                    meta,
+                    f"{log_prefix}docker.copy_flow_artifacts({stage}) assignments={payload.get('assignments_count')} keys={payload.get('assignments_keys')}",
+                )
+        except Exception:
+            pass
         items = payload.get('items') if isinstance(payload, dict) else None
         copied_total = len(items or []) if isinstance(items, list) else 0
         copied_ok = (
@@ -30905,6 +32521,7 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
                 err = it.get('error') or ''
                 errs = it.get('errors') or []
                 commands = it.get('commands') or []
+                cmd_outs = it.get('command_outputs') if isinstance(it.get('command_outputs'), list) else []
                 err_tail = ''
                 try:
                     if err:
@@ -30931,6 +32548,17 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
                             cmd_str = str(cmd or '').strip()
                             if cmd_str:
                                 _append_async_run_log_line(meta, f"{log_prefix}cmd: {cmd_str}")
+                    if cmd_outs:
+                        for entry in cmd_outs[:8]:
+                            if not isinstance(entry, dict):
+                                continue
+                            tgt = str(entry.get('target') or '').strip()
+                            rc = entry.get('rc')
+                            out = str(entry.get('out') or '').strip()
+                            _append_async_run_log_line(meta, f"{log_prefix}cmd: docker cp target={tgt or 'unknown'} rc={rc}")
+                            if out:
+                                for line in out.splitlines()[:10]:
+                                    _append_async_run_log_line(meta, f"{log_prefix}cmd: {line}")
                 except Exception:
                     pass
 
@@ -31652,6 +33280,15 @@ def run_cli_async():
                 return jsonify({
                     'error': 'No Flow flag assignments found. Generate the chain and resolve flags before Execute.',
                 }), 422
+            flow_remote_expected = False
+            try:
+                history = _load_run_history()
+                scenario_label = scenario_for_plan or scenario_name_hint or ''
+                selected_cfg = _select_core_config_for_page(_normalize_scenario_label(str(scenario_label or '')), history, include_password=True)
+                if isinstance(selected_cfg, dict) and _coerce_bool(selected_cfg.get('ssh_enabled')):
+                    flow_remote_expected = True
+            except Exception:
+                flow_remote_expected = False
             missing_values: list[dict[str, Any]] = []
             for idx, fa in enumerate(flag_assignments or []):
                 if not isinstance(fa, dict):
@@ -31669,7 +33306,8 @@ def run_cli_async():
                 has_outputs = False
                 if art_dir:
                     try:
-                        has_outputs = bool(_flow_read_outputs_map_from_artifacts_dir(art_dir))
+                        if not flow_remote_expected:
+                            has_outputs = bool(_flow_read_outputs_map_from_artifacts_dir(art_dir))
                     except Exception:
                         has_outputs = False
                 if not flag_val and not has_outputs:
@@ -31679,7 +33317,7 @@ def run_cli_async():
                         'generator_id': gen_id,
                         'reason': 'missing flag outputs',
                     })
-                elif art_dir and (not os.path.isdir(art_dir)):
+                elif art_dir and (not flow_remote_expected) and (not os.path.isdir(art_dir)):
                     missing_values.append({
                         'index': idx,
                         'node_id': node_id,
@@ -33187,14 +34825,6 @@ def run_cli_async():
         'history_added': False,
         'preview_plan_path': preview_plan_path,
         'summary_path': None,
-        'remote': True,
-        'remote_context': remote_ctx,
-        'remote_run_dir': (remote_ctx or {}).get('run_dir'),
-        'remote_repo_dir': (remote_ctx or {}).get('repo_dir'),
-        'remote_xml_path': (remote_ctx or {}).get('xml_path'),
-        'remote_base_dir': (remote_ctx or {}).get('base_dir'),
-        'remote_preview_plan_path': (remote_ctx or {}).get('preview_plan_path'),
-        'flow_artifacts_copied': False,
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):

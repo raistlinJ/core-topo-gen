@@ -410,7 +410,7 @@
     if(flowVizCardEl) flowVizCardEl.classList.toggle('d-none', !enabled);
     if(flowEnabledHelpEl){
       if(!flowEligible){
-        flowEnabledHelpEl.textContent = 'Disabled: topology has no Docker or vulnerability nodes.';
+        flowEnabledHelpEl.textContent = 'Disabled: CORE VM must be validated (VM / Access) and topology must include Docker or vulnerability nodes.';
       } else if(!enabled){
         flowEnabledHelpEl.textContent = 'Flag sequencing disabled; Execute will run without flows.';
       } else {
@@ -734,10 +734,15 @@
           const destTrim = String(dest || '').trim();
           const destDir = destTrim && destTrim.startsWith('/') ? destTrim.replace(/\/+$/g, '') || '/tmp' : '/tmp';
           let resolvedRel = String(resolvedSrc || '').replace('\\', '/');
-          if (resolvedRel.startsWith('/')) {
-            resolvedRel = resolvedRel.replace(/^\/+/, '');
+          let destPath = '';
+          if (!destTrim && resolvedRel.startsWith('/tmp/')) {
+            destPath = resolvedRel;
+          } else {
+            if (resolvedRel.startsWith('/')) {
+              resolvedRel = resolvedRel.replace(/^\/+/, '');
+            }
+            destPath = resolvedRel ? `${destDir}/${resolvedRel}` : destDir;
           }
-          const destPath = resolvedRel ? `${destDir}/${resolvedRel}` : destDir;
           if (!isTokenLike && destTrim) {
             // Preserve explicit destinations exactly as authored.
             outList.push(destPath);
@@ -793,6 +798,7 @@
         rawList.forEach((raw, idx)=>{
           const text = String(raw || '').trim();
           if(!text) return;
+          const isTokenLike = !text.includes('/') && !text.includes('->') && !text.includes('=>');
           let src = text;
           let dest = '';
           if(text.includes('->')){
@@ -808,10 +814,17 @@
           const destTrim = String(dest || '').trim();
           const destDir = destTrim && destTrim.startsWith('/') ? destTrim.replace(/\/+$/g, '') || '/tmp' : '/tmp';
           let resolvedRel = String(resolvedSrc || '').replace('\\', '/');
-          if (resolvedRel.startsWith('/')) {
-            resolvedRel = resolvedRel.replace(/^\/+/, '');
+          let destPath = '';
+          if (!destTrim && text.startsWith('/') && !isTokenLike) {
+            destPath = text;
+          } else if (!destTrim && resolvedRel.startsWith('/tmp/')) {
+            destPath = resolvedRel;
+          } else {
+            if (resolvedRel.startsWith('/')) {
+              resolvedRel = resolvedRel.replace(/^\/+/, '');
+            }
+            destPath = resolvedRel ? `${destDir}/${resolvedRel}` : destDir;
           }
-          const destPath = resolvedRel ? `${destDir}/${resolvedRel}` : destDir;
           const itemId = `inject:${nodeId || 'node'}:${idx}:${src}`;
           details.push({
             id: itemId,
@@ -875,6 +888,19 @@
       const hintOvr = (curA && Array.isArray(curA.hint_overrides)) ? curA.hint_overrides : undefined;
       const flagOvr = (curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) ? String(curA.flag_override).trim() : undefined;
 
+      const artifactsDir = (curA && typeof curA.artifacts_dir === 'string' && curA.artifacts_dir.trim())
+        ? String(curA.artifacts_dir).trim()
+        : undefined;
+      const mountDir = (curA && typeof curA.mount_dir === 'string' && curA.mount_dir.trim())
+        ? String(curA.mount_dir).trim()
+        : undefined;
+      const runDir = (curA && typeof curA.run_dir === 'string' && curA.run_dir.trim())
+        ? String(curA.run_dir).trim()
+        : undefined;
+      const outputsManifest = (curA && typeof curA.outputs_manifest === 'string' && curA.outputs_manifest.trim())
+        ? String(curA.outputs_manifest).trim()
+        : undefined;
+
       const typeVal = (curA && typeof curA.type === 'string' && curA.type.trim()) ? String(curA.type).trim() : undefined;
       const genLabel = (curA && typeof curA.flag_generator === 'string' && curA.flag_generator.trim()) ? String(curA.flag_generator).trim() : undefined;
       const inputFields = (curA && Array.isArray(curA.input_fields)) ? curA.input_fields.map(String).filter(Boolean) : undefined;
@@ -892,6 +918,10 @@
       if(injOvr !== undefined) out.inject_files_override = injOvr;
       if(injectFiles !== undefined) out.inject_files = injectFiles;
       if(injectFilesDetail.length) out.inject_files_detail = injectFilesDetail;
+      if(artifactsDir !== undefined) out.artifacts_dir = artifactsDir;
+      if(mountDir !== undefined) out.mount_dir = mountDir;
+      if(runDir !== undefined) out.run_dir = runDir;
+      if(outputsManifest !== undefined) out.outputs_manifest = outputsManifest;
       if(inputDetails.length) out.resolved_inputs_detail = inputDetails;
       if(outputDetails.length) out.resolved_outputs_detail = outputDetails;
       if(hintOvr !== undefined) out.hint_overrides = hintOvr;
@@ -1419,9 +1449,10 @@
       const data = await fetchJson(url);
       try{
         const eligible = (data && data.flow_eligible !== undefined) ? !!data.flow_eligible : true;
+        const coreValidated = (data && data.core_validated !== undefined) ? !!data.core_validated : true;
         const dockerCount = Number.isFinite(+data.docker_count) ? (+data.docker_count) : 0;
         const vulnCount = Number.isFinite(+data.vuln_count) ? (+data.vuln_count) : 0;
-        flowEligible = eligible || (dockerCount > 0 || vulnCount > 0);
+        flowEligible = (coreValidated && (eligible || (dockerCount > 0 || vulnCount > 0)));
         if(!flowEligible){
           setFlowEnabled(false, { skipPersist: false });
         }
@@ -3460,6 +3491,7 @@
                 }
 
                 const name = filenameFromPath(displaySrc);
+                const tokenLike = !displaySrc.includes('/') && /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(displaySrc);
                 const destDir = normalizeDestDir(dest);
 
                 const entries = resolvedTargets.length ? resolvedTargets : [''];
@@ -3483,7 +3515,11 @@
                   }
                   const resolvedBase = resolvedRel ? resolvedRel : basenameFrom(resolvedVal ? resolvedVal : displaySrc);
                   const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
-                  tdPath.textContent = destPath || '-';
+                  if(!resolvedVal && tokenLike){
+                    tdPath.textContent = '<unresolved>';
+                  } else {
+                    tdPath.textContent = destPath || '-';
+                  }
 
                   tr.appendChild(tdName);
                   tr.appendChild(tdResolved);
@@ -6966,7 +7002,7 @@
     if(metaStatsEl) metaStatsEl.textContent = '';
     if(jsonEl) jsonEl.textContent = '';
 
-    const progressSteps = ['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'];
+    const progressSteps = ['Testing connection', 'Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'];
     let resolvedOk = false;
     let usedBestEffort = false;
     try {
@@ -6985,10 +7021,20 @@
           throw new Error('Save helper unavailable; refresh and try again.');
         }
 
-        setStatus('Saving XML…', false);
-        showLoading('Saving XML…');
+        setStatus('Testing connection…', false);
+        showLoading('Testing connection…');
         setLoadingSteps(progressSteps, 0);
         clearLoadingLog();
+        appendLoadingLog('Checking CORE VM connectivity');
+        const testResp = await postJson('/api/flag-sequencing/test_core_connection', { scenario });
+        if(!testResp || !testResp.ok){
+          throw new Error((testResp && testResp.error) ? testResp.error : 'CORE VM connection failed');
+        }
+        appendLoadingLog('CORE VM connection OK');
+
+        setStatus('Saving XML…', false);
+        showLoading('Saving XML…');
+        setLoadingSteps(progressSteps, 1);
         appendLoadingLog(`Preset: ${preset || 'Random'} | Length: ${length}`);
         const xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
         if(!xmlPath){
@@ -7001,7 +7047,7 @@
 
         setStatus('Generating preview plan…', false);
         showLoading('Generating preview plan…');
-        setLoadingSteps(progressSteps, 1);
+        setLoadingSteps(progressSteps, 2);
         appendLoadingLog('Ensuring planner plan');
         let seed = null;
         try {
@@ -7088,7 +7134,7 @@
           if(runSavePreviewResolve){
             setStatus('Sequencing chain…', false);
             showLoading('Sequencing chain…');
-            setLoadingSteps(progressSteps, 2);
+            setLoadingSteps(progressSteps, 3);
             appendLoadingLog(`Sequencing attempt ${retryIndex + 1}`);
             data = await postJson('/api/flag-sequencing/sequence_preview_plan', {
               scenario,
@@ -7242,7 +7288,7 @@
           try{
             setStatus('Resolving values…', false);
             showLoading('Resolving values…');
-            setLoadingSteps(['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'], 3);
+            setLoadingSteps(progressSteps, 4);
             appendLoadingLog(`Resolving values via prepare_preview_for_execute (attempt ${resolveAttempts})`);
             const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
             const prepData = await postJson(
@@ -7263,6 +7309,19 @@
               { timeoutMs: 120000 }
             );
             lastResolvePayload = prepData;
+            try{
+              const runs = (prepData && Array.isArray(prepData.generator_runs)) ? prepData.generator_runs : [];
+              if(runs.length){
+                appendLoadingLog(`Generator runs (${runs.length}):`);
+                runs.forEach((r)=>{
+                  const ok = r && r.ok ? 'ok' : 'fail';
+                  const gid = String((r && (r.generator_id || r.id)) || '').trim() || 'unknown';
+                  const node = String((r && (r.node_name || r.node_id)) || '').trim();
+                  const note = String((r && r.note) || '').trim();
+                  appendLoadingLog(`- ${gid}${node ? ` @ ${node}` : ''}: ${ok}${note ? ` (${note})` : ''}`);
+                });
+              }
+            } catch(e) {}
             setFlowValidityFromPayload(prepData);
             if(prepData && Array.isArray(prepData.chain)){
               currentChain = prepData.chain.slice();

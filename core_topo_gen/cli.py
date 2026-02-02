@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import datetime
 import json
 import logging
 import random
@@ -37,6 +38,52 @@ from .utils.vuln_process import (
     detect_docker_conflicts_for_compose_files,
     remove_docker_conflicts,
 )
+
+
+def _flow_state_from_xml(xml_path: str, scenario_name: str | None) -> dict[str, Any] | None:
+    if not xml_path or not os.path.exists(xml_path):
+        return None
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception:
+        return None
+    scen_el = None
+    try:
+        scenarios = root.findall('.//Scenario')
+        if scenario_name:
+            for sc in scenarios:
+                nm = (sc.get('name') or '').strip()
+                if nm and nm == str(scenario_name).strip():
+                    scen_el = sc
+                    break
+        if scen_el is None and scenarios:
+            scen_el = scenarios[0]
+    except Exception:
+        scen_el = None
+    if scen_el is None:
+        return None
+    try:
+        flow_el = scen_el.find('.//FlagSequencing/FlowState')
+        if flow_el is None:
+            return None
+        raw = (flow_el.text or '').strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _export_flow_assignments_to_env(xml_path: str, scenario_name: str | None) -> None:
+    try:
+        fs = _flow_state_from_xml(xml_path, scenario_name)
+        assigns = fs.get('flag_assignments') if isinstance(fs, dict) else None
+        if isinstance(assigns, list) and assigns:
+            os.environ['CORETG_FLOW_ASSIGNMENTS_JSON'] = json.dumps(assigns, ensure_ascii=False)
+    except Exception:
+        pass
 from .utils.services import ensure_service
 from .utils.hitl import attach_hitl_rj45_nodes
 
@@ -362,6 +409,12 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+
+    # Expose FlowState assignments so compose prep can overlay flow artifacts.
+    try:
+        _export_flow_assignments_to_env(args.xml, args.scenario)
+    except Exception:
+        pass
 
     if args.seed is not None:
         random.seed(args.seed)

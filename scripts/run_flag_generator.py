@@ -15,6 +15,31 @@ def repo_root_from_here() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _docker_use_sudo() -> bool:
+    flag = str(os.getenv('CORETG_DOCKER_USE_SUDO') or '').strip().lower()
+    return flag in ('1', 'true', 'yes', 'y', 'on')
+
+
+def _docker_sudo_password() -> str | None:
+    pw = os.getenv('CORETG_DOCKER_SUDO_PASSWORD')
+    if pw is None:
+        return None
+    pw = str(pw).rstrip('\n')
+    return pw if pw else None
+
+
+def _wrap_docker_cmd(cmd: list[str]) -> tuple[list[str], str | None]:
+    if not cmd or cmd[0] != 'docker':
+        return cmd, None
+    use_sudo = _docker_use_sudo() or (_docker_sudo_password() is not None)
+    if not use_sudo:
+        return cmd, None
+    pw = _docker_sudo_password()
+    if pw is None:
+        return ['sudo', '-E'] + cmd, None
+    return ['sudo', '-E', '-S'] + cmd, (pw + '\n')
+
+
 def _norm_inject_path(raw: str) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -332,6 +357,43 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         print(f"[inject_files] warning: failed to write rewritten compose: {exc}")
 
 
+def _rewrite_compose_host_network(compose_path: Path) -> None:
+    """Force docker-compose services/builds to use host networking."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        print('[compose] warning: PyYAML unavailable; cannot rewrite docker-compose.yml for host network')
+        return
+
+    try:
+        obj = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore')) or {}
+    except Exception as exc:
+        print(f"[compose] warning: failed to parse compose yaml for host network: {exc}")
+        return
+
+    services = obj.get('services') if isinstance(obj, dict) else None
+    if not isinstance(services, dict):
+        return
+
+    for _svc_name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        svc['network_mode'] = 'host'
+        svc.pop('networks', None)
+        build = svc.get('build')
+        if isinstance(build, dict):
+            build = dict(build)
+            build.setdefault('network', 'host')
+            svc['build'] = build
+        elif isinstance(build, str):
+            svc['build'] = {'context': build, 'network': 'host'}
+
+    try:
+        compose_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
+    except Exception as exc:
+        print(f"[compose] warning: failed to write host-network compose: {exc}")
+
+
 def find_generator(repo_root: Path, kind: str, generator_id: str) -> tuple[dict[str, Any], Path]:
     # When executed as a script (python scripts/run_flag_generator.py), Python
     # adds only the scripts/ directory to sys.path. Ensure the repo root is on
@@ -477,7 +539,37 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
 
 
 def run_cmd(cmd: list[str], workdir: Path, env: dict[str, str]) -> None:
-    subprocess.run(cmd, cwd=str(workdir), env={**os.environ, **env}, check=True)
+    wrapped_cmd, stdin_data = _wrap_docker_cmd(cmd)
+    p = subprocess.run(
+        wrapped_cmd,
+        cwd=str(workdir),
+        env={**os.environ, **env},
+        check=False,
+        text=True,
+        capture_output=True,
+        input=stdin_data,
+    )
+    if p.returncode != 0:
+        out = (p.stdout or '').strip()
+        err = (p.stderr or '').strip()
+        if out:
+            print(f"[cmd] stdout: {out[-1200:]}")
+        if err:
+            print(f"[cmd] stderr: {err[-1200:]}")
+        raise subprocess.CalledProcessError(p.returncode, wrapped_cmd, output=p.stdout, stderr=p.stderr)
+
+
+def run_cmd_capture(cmd: list[str], workdir: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    wrapped_cmd, stdin_data = _wrap_docker_cmd(cmd)
+    return subprocess.run(
+        wrapped_cmd,
+        cwd=str(workdir),
+        env={**os.environ, **env},
+        check=False,
+        capture_output=True,
+        text=True,
+        input=stdin_data,
+    )
 
 
 def slugify(value: str) -> str:
@@ -548,14 +640,7 @@ def run_compose(
         print(f"[cleanup] compose project={project}")
         print(f"[cleanup] running: {' '.join(down_cmd)}")
         try:
-            p = subprocess.run(
-                down_cmd,
-                cwd=str(source_dir),
-                env={**os.environ, **compose_env},
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            p = run_cmd_capture(down_cmd, source_dir, compose_env)
             print(f"[cleanup] compose down rc={p.returncode}")
             if p.returncode != 0:
                 err = (p.stderr or "").strip()
@@ -621,7 +706,12 @@ def main() -> int:
     # Env: pass OUT_DIR and also config keys uppercased
     env = {"OUT_DIR": str(out_dir), "CONFIG_PATH": str(config_path)}
     for k, v in config.items():
-        env[str(k).upper()] = str(v)
+        raw_key = str(k).upper()
+        key = "".join([c if c.isalnum() else "_" for c in raw_key])
+        if key and not (key[0].isalpha() or key[0] == "_"):
+            key = f"VAR_{key}"
+        if key:
+            env[key] = str(v)
 
     # Allow generator definitions to include fixed env values.
     gen_env = gen.get("env")
@@ -643,6 +733,23 @@ def main() -> int:
     if isinstance(compose, dict):
         compose_file = str(compose.get("file") or "docker-compose.yml")
         service = str(compose.get("service") or "generator")
+
+        # Optional: force host networking (useful when docker bridge is disabled).
+        try:
+            use_host_network = str(os.getenv('CORETG_DOCKER_HOST_NETWORK') or '').strip().lower() in (
+                '1', 'true', 'yes', 'y', 'on'
+            )
+        except Exception:
+            use_host_network = False
+        if use_host_network:
+            try:
+                compose_src = (source_dir / compose_file).resolve() if not Path(compose_file).is_absolute() else Path(compose_file).resolve()
+                compose_out = compose_src.parent / f"{compose_src.stem}.hostnet{compose_src.suffix}"
+                compose_out.write_text(compose_src.read_text('utf-8', errors='ignore'), encoding='utf-8')
+                _rewrite_compose_host_network(compose_out)
+                compose_file = str(compose_out)
+            except Exception as exc:
+                print(f"[compose] warning: host-network rewrite failed: {exc}")
 
         run_compose(
             source_dir=source_dir,

@@ -120,10 +120,49 @@
   const ACTIVE_RUN_ID_KEY = 'coretg_active_run_id';
   function inferLevelFromLine(raw){
     const line = String(raw || '');
-    if(/\bERROR\b/.test(line)) return 'ERROR';
-    if(/\bWARN(ING)?\b/.test(line)) return 'WARN';
-    if(/\bDEBUG\b/.test(line)) return 'DEBUG';
+    if(/\bERROR\b/i.test(line)) return 'ERROR';
+    if(/\bWARN(ING)?\b/i.test(line)) return 'WARN';
+    if(/\bDEBUG\b/i.test(line)) return 'DEBUG';
+    if(/Traceback \(most recent call last\)/i.test(line)) return 'ERROR';
+    if(/\bIndentationError\b|\bSyntaxError\b|\bTypeError\b|\bValueError\b|\bRuntimeError\b/i.test(line)) return 'ERROR';
+    if(/\bException\b/i.test(line)) return 'ERROR';
     return 'INFO';
+  }
+  let webuiLogTailOffset = 0;
+  let webuiLogTailTimer = null;
+  let webuiLogTailBlocked = false;
+  async function pollWebuiLogTail(){
+    if(webuiLogTailBlocked) return;
+    const dock = document.getElementById('dockPanel');
+    if(!dock || dock.classList.contains('d-none')) return;
+    try {
+      const res = await fetch(`/api/webui/log_tail?offset=${webuiLogTailOffset}&max_bytes=50000`, { credentials: 'same-origin' });
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = null; }
+      if(!res.ok){
+        if(res.status === 403){
+          webuiLogTailBlocked = true;
+        }
+        return;
+      }
+      if(data && typeof data.offset === 'number'){
+        webuiLogTailOffset = data.offset;
+      }
+      const text = data && data.text ? String(data.text) : '';
+      if(text){
+        const lines = text.split(/\r?\n/).filter(Boolean);
+        lines.forEach((line)=>{
+          if(/\b\/api\/webui\/log_tail\b/.test(line)) return;
+          const lvl = inferLevelFromLine(line);
+          try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: line } })); } catch (e) {}
+        });
+      }
+    } catch (e) {}
+  }
+  function startWebuiLogTail(){
+    if(webuiLogTailTimer) return;
+    webuiLogTailTimer = setInterval(pollWebuiLogTail, 2000);
+    pollWebuiLogTail();
   }
   function attachRunStream(runId, { auto = false } = {}){
     const rid = String(runId || '').trim();
@@ -233,6 +272,7 @@
   }
   function init(){
     setupDock();
+    startWebuiLogTail();
     try { const savedFollow = localStorage.getItem(LOG_FOLLOW_KEY); if(savedFollow !== null){ followLogs = savedFollow !== '0'; } } catch(e){}
     try { const raw = localStorage.getItem(LOG_STORE_KEY); if(raw){ const arr = JSON.parse(raw); if(Array.isArray(arr)){ logBuffer = arr; if(window._coretg_logBuffer) window._coretg_logBuffer = logBuffer; } } } catch(e){}
     try { const savedLvl = localStorage.getItem('coretg_log_level'); if(savedLvl && LOG_LEVELS[savedLvl] !== undefined){ currentLogLevel = LOG_LEVELS[savedLvl]; const sel=document.getElementById('logLevelFilter'); if(sel) sel.value=savedLvl; } } catch(e){}
