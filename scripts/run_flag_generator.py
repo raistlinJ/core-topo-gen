@@ -165,7 +165,11 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
     return injected_dir
 
 
-def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, inject_files: list[str]) -> None:
+def _rewrite_compose_injected_to_volume_copy(
+    out_dir: Path,
+    compose_path: Path,
+    inject_files: list[str],
+) -> Path | None:
     """Rewrite relative binds to named volumes and add an init-copy service.
 
     The init service copies allowlisted injected files into per-destination
@@ -175,17 +179,17 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         import yaml  # type: ignore
     except Exception:
         print('[inject_files] warning: PyYAML unavailable; cannot rewrite docker-compose.yml')
-        return
+        return None
 
     try:
         obj = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore')) or {}
     except Exception as exc:
         print(f"[inject_files] warning: failed to parse compose yaml: {exc}")
-        return
+        return None
 
     services = obj.get('services') if isinstance(obj, dict) else None
     if not isinstance(services, dict):
-        return
+        return None
 
     # Build inject mapping: normalized source -> dest_dir (default /tmp).
     inject_map: dict[str, str] = {}
@@ -198,7 +202,7 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         inject_map[src_norm] = dest_dir
 
     if not inject_map:
-        return
+        return None
 
     def _is_relative_bind_src(src: str) -> bool:
         s = (src or '').strip()
@@ -283,7 +287,7 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         svc['volumes'] = new_vols
 
     if not dest_to_volume:
-        return
+        return None
 
     # Add init-copy service to populate volumes.
     copy_service_name = 'inject_copy'
@@ -321,7 +325,7 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" || true")
 
     if not cmds:
-        return
+        return None
 
     services[copy_service_name] = {
         'image': 'alpine:3.19',
@@ -353,8 +357,19 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
 
     try:
         compose_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
+        return compose_path
     except Exception as exc:
-        print(f"[inject_files] warning: failed to write rewritten compose: {exc}")
+        try:
+            alt_path = compose_path.with_name(f"{compose_path.stem}.inject{compose_path.suffix}")
+            alt_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
+            print(
+                f"[inject_files] warning: failed to write rewritten compose to {compose_path}: {exc}; "
+                f"wrote {alt_path} instead"
+            )
+            return alt_path
+        except Exception as exc2:
+            print(f"[inject_files] warning: failed to write rewritten compose: {exc}; {exc2}")
+            return None
 
 
 def _rewrite_compose_host_network(compose_path: Path) -> None:
@@ -549,9 +564,13 @@ def run_cmd(cmd: list[str], workdir: Path, env: dict[str, str]) -> None:
         capture_output=True,
         input=stdin_data,
     )
+    out = (p.stdout or '').strip()
+    err = (p.stderr or '').strip()
+    if out:
+        print(out)
+    if err:
+        print(err)
     if p.returncode != 0:
-        out = (p.stdout or '').strip()
-        err = (p.stderr or '').strip()
         if out:
             print(f"[cmd] stdout: {out[-1200:]}")
         if err:
@@ -773,7 +792,22 @@ def main() -> int:
         if injected_dir is not None:
             compose_out = out_dir / 'docker-compose.yml'
             if compose_out.exists():
-                _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
+                rewritten_path = _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
+                if rewritten_path and rewritten_path.name != compose_out.name:
+                    try:
+                        manifest = out_dir / "outputs.json"
+                        if manifest.exists():
+                            doc = json.loads(manifest.read_text("utf-8", errors="ignore") or "{}")
+                            if isinstance(doc, dict):
+                                outputs = doc.get("outputs")
+                                if isinstance(outputs, dict):
+                                    for key in ("File(path)", "File", "file", "path"):
+                                        val = outputs.get(key)
+                                        if isinstance(val, str) and val.strip() == compose_out.name:
+                                            outputs[key] = rewritten_path.name
+                                manifest.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+                    except Exception:
+                        pass
 
         manifest = out_dir / "outputs.json"
         if manifest.exists():
@@ -800,7 +834,22 @@ def main() -> int:
     if injected_dir is not None:
         compose_out = out_dir / 'docker-compose.yml'
         if compose_out.exists():
-            _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
+            rewritten_path = _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
+            if rewritten_path and rewritten_path.name != compose_out.name:
+                try:
+                    manifest = out_dir / "outputs.json"
+                    if manifest.exists():
+                        doc = json.loads(manifest.read_text("utf-8", errors="ignore") or "{}")
+                        if isinstance(doc, dict):
+                            outputs = doc.get("outputs")
+                            if isinstance(outputs, dict):
+                                for key in ("File(path)", "File", "file", "path"):
+                                    val = outputs.get(key)
+                                    if isinstance(val, str) and val.strip() == compose_out.name:
+                                        outputs[key] = rewritten_path.name
+                            manifest.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+                except Exception:
+                    pass
 
     # Print manifest if present
     manifest = out_dir / "outputs.json"

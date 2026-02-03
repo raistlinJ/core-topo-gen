@@ -184,6 +184,17 @@
               </form>
             </dialog>
 
+            <dialog id="flowComposeDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
+              <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
+                <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
+                  <div class="fw-semibold" id="flowComposeTitle">Generator Output</div>
+                </div>
+                <div class="p-3" style="flex:1 1 auto; overflow: auto;">
+                  <pre id="flowComposeBody" class="small mb-0" style="white-space: pre-wrap;"></pre>
+                </div>
+              </form>
+            </dialog>
+
             <dialog id="flowSubstituteDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
               <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
                 <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
@@ -292,6 +303,9 @@
   const factsDialogEl = document.getElementById('flowFactsDialog');
   const factsTitleEl = document.getElementById('flowFactsTitle');
   const factsBodyEl = document.getElementById('flowFactsBody');
+  const composeDialogEl = document.getElementById('flowComposeDialog');
+  const composeTitleEl = document.getElementById('flowComposeTitle');
+  const composeBodyEl = document.getElementById('flowComposeBody');
   const substituteDialogEl = document.getElementById('flowSubstituteDialog');
   const substituteTitleEl = document.getElementById('flowSubstituteTitle');
   const substituteBodyEl = document.getElementById('flowSubstituteBody');
@@ -1256,6 +1270,63 @@
       item.textContent = msg;
       loadingLogEl.appendChild(item);
     } catch(e) {}
+  }
+
+  function showComposeDialog(title, text){
+    try{
+      if(!composeDialogEl || !composeBodyEl) return;
+      if(composeTitleEl) composeTitleEl.textContent = String(title || 'Generator Output');
+      composeBodyEl.textContent = String(text || '');
+      if(typeof composeDialogEl.showModal === 'function') composeDialogEl.showModal();
+    } catch(e) {}
+  }
+
+  try{
+    if(composeDialogEl){
+      composeDialogEl.addEventListener('cancel', (ev)=>{
+        try { ev.preventDefault(); } catch(e) {}
+      });
+    }
+  } catch(e) {}
+
+  function updateComposeDialog(text){
+    try{
+      if(!composeBodyEl) return;
+      composeBodyEl.textContent = String(text || '');
+    } catch(e) {}
+  }
+
+  function appendComposeLines(lines){
+    try{
+      if(!composeBodyEl || !Array.isArray(lines) || !lines.length) return;
+      const current = composeBodyEl.textContent || '';
+      const next = current ? (current + '\n' + lines.join('\n')) : lines.join('\n');
+      composeBodyEl.textContent = next;
+    } catch(e) {}
+  }
+
+  function startFlowProgressPoll(){
+    let cancelled = false;
+    const seen = new Set();
+    const tick = async () => {
+      if(cancelled) return;
+      try{
+        const resp = await fetch('/api/flag-sequencing/flow_progress');
+        const data = await resp.json();
+        const lines = (data && Array.isArray(data.lines)) ? data.lines : [];
+        const newLines = [];
+        lines.forEach((ln)=>{
+          const s = String(ln || '').trim();
+          if(!s || seen.has(s)) return;
+          seen.add(s);
+          newLines.push(s);
+        });
+        if(newLines.length) appendComposeLines(newLines);
+      } catch(e) {}
+      setTimeout(tick, 1000);
+    };
+    tick();
+    return () => { cancelled = true; };
   }
 
   function clearLoadingLog(){
@@ -2933,6 +3004,46 @@
           code.textContent = resolvedFlag;
           addRow('Flag', code);
         }
+      } catch(e) {}
+
+      function renderResolvedMap(map){
+        if(!map || typeof map !== 'object' || Array.isArray(map)) return null;
+        const entries = Object.entries(map);
+        if(!entries.length) return null;
+        const wrap = document.createElement('div');
+        const ul = document.createElement('ul');
+        ul.className = 'mb-0 ps-3';
+        const maxItems = 12;
+        entries.slice(0, maxItems).forEach(([k, v]) => {
+          const li = document.createElement('li');
+          const keyText = String(k || '').trim() || '(key)';
+          let valText = '';
+          try{
+            if(Array.isArray(v)) valText = v.map(x => String(x ?? '')).filter(Boolean).join(', ');
+            else if(v && typeof v === 'object') valText = JSON.stringify(v);
+            else if(v !== undefined && v !== null) valText = String(v);
+          } catch(e){ valText = ''; }
+          li.textContent = keyText + (valText ? (': ' + valText) : '');
+          ul.appendChild(li);
+        });
+        if(entries.length > maxItems){
+          const li = document.createElement('li');
+          li.textContent = `…and ${entries.length - maxItems} more`;
+          ul.appendChild(li);
+        }
+        wrap.appendChild(ul);
+        return wrap;
+      }
+
+      try{
+        const rin = (fa && typeof fa.resolved_inputs === 'object' && fa.resolved_inputs && !Array.isArray(fa.resolved_inputs)) ? fa.resolved_inputs : null;
+        const rinEl = renderResolvedMap(rin);
+        if(rinEl) addRow('Resolved Inputs', rinEl);
+      } catch(e) {}
+      try{
+        const rout = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+        const routEl = renderResolvedMap(rout);
+        if(routEl) addRow('Resolved Outputs', routEl);
       } catch(e) {}
 
 
@@ -7290,6 +7401,10 @@
             showLoading('Resolving values…');
             setLoadingSteps(progressSteps, 4);
             appendLoadingLog(`Resolving values via prepare_preview_for_execute (attempt ${resolveAttempts})`);
+            try{
+              showComposeDialog('Generator Output', 'Running generators…');
+            } catch(e) {}
+            const stopProgressPoll = startFlowProgressPoll();
             const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
             const prepData = await postJson(
               '/api/flag-sequencing/prepare_preview_for_execute',
@@ -7308,9 +7423,11 @@
               },
               { timeoutMs: 120000 }
             );
+            try{ stopProgressPoll(); } catch(e) {}
             lastResolvePayload = prepData;
             try{
               const runs = (prepData && Array.isArray(prepData.generator_runs)) ? prepData.generator_runs : [];
+              const progressLog = (prepData && Array.isArray(prepData.progress_log)) ? prepData.progress_log : [];
               if(runs.length){
                 appendLoadingLog(`Generator runs (${runs.length}):`);
                 runs.forEach((r)=>{
@@ -7321,6 +7438,27 @@
                   appendLoadingLog(`- ${gid}${node ? ` @ ${node}` : ''}: ${ok}${note ? ` (${note})` : ''}`);
                 });
               }
+
+              let outputText = '';
+              if(progressLog.length){
+                outputText += '## Progress\n' + progressLog.map(x => `- ${x}`).join('\n');
+              }
+              runs.forEach((r)=>{
+                const gid = String((r && (r.generator_id || r.id)) || '').trim() || 'unknown';
+                const node = String((r && (r.node_name || r.node_id)) || '').trim();
+                const ok = r && r.ok ? 'ok' : 'fail';
+                const stdout = String((r && r.stdout) || '').trim();
+                const stderr = String((r && r.stderr) || '').trim();
+                if(!stdout && !stderr) return;
+                if(outputText) outputText += '\n\n';
+                outputText += `# ${gid}${node ? ` @ ${node}` : ''} (${ok})`;
+                if(stdout) outputText += `\n--- stdout ---\n${stdout}`;
+                if(stderr) outputText += `\n--- stderr ---\n${stderr}`;
+              });
+              if(!outputText){
+                outputText = 'No generator output captured.';
+              }
+              updateComposeDialog(outputText);
             } catch(e) {}
             setFlowValidityFromPayload(prepData);
             if(prepData && Array.isArray(prepData.chain)){

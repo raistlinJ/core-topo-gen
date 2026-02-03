@@ -481,6 +481,8 @@ REPO_PUSH_EXCLUDE_DIRS = {
     '.venv',
     'venv',
     'env',
+    '.conda',
+    '.conda-py311',
     '__pycache__',
     'node_modules',
     'dist',
@@ -1171,6 +1173,166 @@ def _resolve_repo_push_allowed_outputs(upload_only_injected_artifacts: bool) -> 
     ]
 
 
+def _flow_required_installed_generator_outputs(
+    flag_assignments: list[dict[str, Any]] | None,
+    *,
+    repo_root: str,
+) -> List[str]:
+    required: set[str] = set()
+    try:
+        if _coerce_bool(os.environ.get('CORETG_FLOW_SYNC_VULN_CATALOGS', '0')):
+            required.add('outputs/installed_vuln_catalogs')
+    except Exception:
+        pass
+    if not flag_assignments:
+        return sorted(required)
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+
+    gen_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid:
+            gen_by_key[('flag_generators', gid)] = g
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid:
+            gen_by_key[('flag_node_generators', gid)] = g
+
+    repo_root_abs = os.path.abspath(repo_root)
+    for fa in (flag_assignments or []):
+        if not isinstance(fa, dict):
+            continue
+        gid = str(fa.get('id') or fa.get('generator_id') or '').strip()
+        if not gid:
+            continue
+        cat = str(fa.get('generator_catalog') or '').strip()
+        if not cat:
+            kind = str(fa.get('type') or '').strip().lower()
+            if kind == 'flag-node-generator':
+                cat = 'flag_node_generators'
+            else:
+                cat = 'flag_generators'
+        if cat not in {'flag_generators', 'flag_node_generators'}:
+            continue
+        gen = gen_by_key.get((cat, gid))
+        if not isinstance(gen, dict):
+            continue
+        src_path = str(gen.get('_source_path') or gen.get('source', {}).get('path') or '').strip()
+        if not src_path:
+            continue
+        try:
+            if os.path.isabs(src_path):
+                src_abs = os.path.abspath(src_path)
+            else:
+                src_abs = os.path.abspath(os.path.join(repo_root_abs, src_path))
+            if os.path.commonpath([repo_root_abs, src_abs]) == repo_root_abs:
+                rel = os.path.relpath(src_abs, repo_root_abs)
+            else:
+                rel = src_path
+        except Exception:
+            rel = src_path
+        rel = rel.replace('\\', '/').lstrip('/')
+        if rel.endswith('manifest.yaml') or rel.endswith('manifest.yml'):
+            rel = posixpath.dirname(rel)
+        if rel.startswith('outputs/installed_generators/'):
+            required.add(rel)
+
+    return sorted(required)
+
+
+def _flow_required_generator_repo_paths(
+    flag_assignments: list[dict[str, Any]] | None,
+    *,
+    repo_root: str,
+) -> List[str]:
+    """Return repo-relative paths required to run the selected generators."""
+    required: set[str] = set()
+    required.add('scripts/run_flag_generator.py')
+    try:
+        if _coerce_bool(os.environ.get('CORETG_FLOW_SYNC_CORE_PKG', '0')):
+            required.add('core_topo_gen')
+    except Exception:
+        pass
+    if not flag_assignments:
+        return sorted(required)
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+
+    gen_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid:
+            gen_by_key[('flag_generators', gid)] = g
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid:
+            gen_by_key[('flag_node_generators', gid)] = g
+
+    repo_root_abs = os.path.abspath(repo_root)
+    for fa in (flag_assignments or []):
+        if not isinstance(fa, dict):
+            continue
+        gid = str(fa.get('id') or fa.get('generator_id') or '').strip()
+        if not gid:
+            continue
+        cat = str(fa.get('generator_catalog') or '').strip()
+        if not cat:
+            kind = str(fa.get('type') or '').strip().lower()
+            if kind == 'flag-node-generator':
+                cat = 'flag_node_generators'
+            else:
+                cat = 'flag_generators'
+        if cat not in {'flag_generators', 'flag_node_generators'}:
+            continue
+        gen = gen_by_key.get((cat, gid))
+        if not isinstance(gen, dict):
+            continue
+        src_path = str(gen.get('_source_path') or gen.get('source', {}).get('path') or '').strip()
+        if not src_path:
+            continue
+        try:
+            if os.path.isabs(src_path):
+                src_abs = os.path.abspath(src_path)
+            else:
+                src_abs = os.path.abspath(os.path.join(repo_root_abs, src_path))
+            if os.path.commonpath([repo_root_abs, src_abs]) == repo_root_abs:
+                rel = os.path.relpath(src_abs, repo_root_abs)
+            else:
+                rel = src_path
+        except Exception:
+            rel = src_path
+        rel = rel.replace('\\', '/').lstrip('/')
+        if rel.endswith('manifest.yaml') or rel.endswith('manifest.yml'):
+            rel = posixpath.dirname(rel)
+        if rel:
+            required.add(rel)
+
+    return sorted(required)
+
+
 def _should_exclude_repo_member(rel_path: str, *, allowed_outputs: Optional[List[str]] = None) -> bool:
     if not rel_path:
         return False
@@ -1265,6 +1427,75 @@ def _compute_repo_fingerprint(repo_root: str, *, allowed_outputs: Optional[List[
     return h.hexdigest()
 
 
+def _compute_repo_fingerprint_includes(repo_root: str, include_paths: list[str]) -> str:
+    """Compute fingerprint for specific relative paths only."""
+    import hashlib
+
+    h = hashlib.sha256()
+    root = os.path.abspath(repo_root)
+    for raw in include_paths or []:
+        rel = str(raw or '').replace('\\', '/').lstrip('/')
+        if not rel:
+            continue
+        full_path = os.path.join(root, rel)
+        if not os.path.exists(full_path):
+            continue
+        if os.path.isdir(full_path):
+            for dirpath, dirnames, filenames in os.walk(full_path):
+                rel_dir = os.path.relpath(dirpath, root)
+                if rel_dir == '.':
+                    rel_dir = ''
+                dirnames[:] = [d for d in dirnames if not d.startswith('.')]  # keep minimal
+                for fname in filenames:
+                    rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+                    full_file = os.path.join(dirpath, fname)
+                    try:
+                        st = os.stat(full_file)
+                    except Exception:
+                        continue
+                    h.update(rel_path.replace('\\', '/').encode('utf-8', 'ignore'))
+                    h.update(b'\x00')
+                    h.update(str(int(st.st_size)).encode('utf-8'))
+                    h.update(b'\x00')
+                    h.update(str(int(st.st_mtime)).encode('utf-8'))
+                    h.update(b'\n')
+        else:
+            try:
+                st = os.stat(full_path)
+            except Exception:
+                continue
+            h.update(rel.replace('\\', '/').encode('utf-8', 'ignore'))
+            h.update(b'\x00')
+            h.update(str(int(st.st_size)).encode('utf-8'))
+            h.update(b'\x00')
+            h.update(str(int(st.st_mtime)).encode('utf-8'))
+            h.update(b'\n')
+    return h.hexdigest()
+
+
+def _create_local_repo_archive_from_paths(
+    src_dir: str,
+    dest_basename: str,
+    include_paths: list[str],
+) -> str:
+    base_name = dest_basename.strip('/') or 'core-topo-gen'
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix='coretg_repo_', suffix='.tar.gz')
+    os.close(tmp_fd)
+
+    root = os.path.abspath(src_dir)
+    with tarfile.open(tmp_path, 'w:gz') as tar:
+        for raw in include_paths or []:
+            rel = str(raw or '').replace('\\', '/').lstrip('/')
+            if not rel:
+                continue
+            full = os.path.join(root, rel)
+            if not os.path.exists(full):
+                continue
+            arcname = posixpath.join(base_name, rel)
+            tar.add(full, arcname=arcname)
+    return tmp_path
+
+
 def _read_remote_repo_hash(sftp: Any, remote_repo: str) -> Optional[str]:
     try:
         remote_hash_path = _remote_path_join(remote_repo, '.coretg_repo_hash')
@@ -1291,32 +1522,53 @@ def _push_repo_to_remote(
     progress_id: Optional[str] = None,
     finalize_async: bool = False,
     upload_only_injected_artifacts: bool = False,
+    allowed_outputs_override: Optional[List[str]] = None,
+    include_repo_paths: Optional[List[str]] = None,
     log_handle: Any | None = None,
 ) -> Dict[str, Any]:
     cfg = _require_core_ssh_credentials(core_cfg)
     repo_root = _get_repo_root()
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+    log.info('[remote-sync] starting repo sync to CORE VM')
     _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=2.0, detail='Creating repository archive…')
     client = _open_ssh_client(cfg)
     sftp = None
     archive_path = None
     try:
         sftp = client.open_sftp()
+        log.info('[remote-sync] SFTP session opened')
         remote_repo = _remote_static_repo_dir(sftp)
+        log.info('[remote-sync] remote_repo=%s', remote_repo)
         remote_parent = posixpath.dirname(remote_repo.rstrip('/')) or '/'
         base_name = os.path.basename(remote_repo.rstrip('/')) or 'core-topo-gen'
-        allowed_outputs = _resolve_repo_push_allowed_outputs(bool(upload_only_injected_artifacts))
+        allowed_outputs = allowed_outputs_override
+        if not allowed_outputs:
+            allowed_outputs = _resolve_repo_push_allowed_outputs(bool(upload_only_injected_artifacts))
+        include_repo_paths = [
+            p for p in (include_repo_paths or [])
+            if isinstance(p, str) and str(p).strip()
+        ]
+        log.info('[remote-sync] allowed_outputs=%s', allowed_outputs)
+        if include_repo_paths:
+            log.info('[remote-sync] include_paths=%s', include_repo_paths)
         try:
             if log_handle:
                 log_handle.write(f"[remote] Repo upload: remote_repo={remote_repo}\n")
                 log_handle.write(f"[remote] Repo upload: allowed_outputs={allowed_outputs}\n")
+                if include_repo_paths:
+                    log_handle.write(f"[remote] Repo upload: include_paths={include_repo_paths}\n")
                 log_handle.flush()
         except Exception:
             pass
         if _repo_skip_if_unchanged_enabled():
             try:
-                local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
+                if include_repo_paths:
+                    local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
+                else:
+                    local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
+                log.info('[remote-sync] computed local hash')
                 remote_hash = _read_remote_repo_hash(sftp, remote_repo)
+                log.info('[remote-sync] remote hash=%s', remote_hash or 'missing')
                 if remote_hash and local_hash == remote_hash:
                     _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository unchanged; upload skipped.')
                     log.info('[remote-sync] Repository unchanged; skipping upload to %s', remote_repo)
@@ -1329,7 +1581,18 @@ def _push_repo_to_remote(
                 log_handle.flush()
         except Exception:
             pass
-        archive_path = _create_local_repo_archive(repo_root, base_name, allowed_outputs=allowed_outputs)
+        log.info('[remote-sync] creating archive snapshot')
+        t0 = time.monotonic()
+        if include_repo_paths:
+            archive_path = _create_local_repo_archive_from_paths(repo_root, base_name, include_repo_paths)
+        else:
+            archive_path = _create_local_repo_archive(repo_root, base_name, allowed_outputs=allowed_outputs)
+        t1 = time.monotonic()
+        try:
+            archive_size = os.path.getsize(archive_path) if archive_path else 0
+        except Exception:
+            archive_size = 0
+        log.info('[remote-sync] archive ready: %s (size=%s bytes, took=%.2fs)', archive_path, archive_size, (t1 - t0))
         _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=8.0, detail='Repository archive ready.')
         remote_archive = _remote_path_join(remote_parent, f"{uuid.uuid4().hex}.tar.gz")
         try:
@@ -1338,8 +1601,10 @@ def _push_repo_to_remote(
                 log_handle.flush()
         except Exception:
             pass
+        log.info('[remote-sync] uploading archive to %s', remote_archive)
         _update_repo_push_progress(progress_id, status='uploading', stage='uploading', percent=12.0, detail='Uploading snapshot to CORE host…')
         sftp.put(archive_path, remote_archive)
+        log.info('[remote-sync] upload complete')
         _update_repo_push_progress(progress_id, status='uploading', stage='uploaded', percent=40.0, detail='Upload complete; preparing remote finalize…')
         if finalize_async:
             _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=45.0, detail='Remote finalization queued…')
@@ -1364,8 +1629,10 @@ def _push_repo_to_remote(
                 log_handle.flush()
         except Exception:
             pass
+        log.info('[remote-sync] extracting archive on CORE VM')
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=60.0, detail='Extracting snapshot on CORE host…')
         _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
+        log.info('[remote-sync] extract complete')
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
         try:
@@ -1376,7 +1643,10 @@ def _push_repo_to_remote(
             pass
         try:
             if _repo_skip_if_unchanged_enabled():
-                local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
+                if include_repo_paths:
+                    local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
+                else:
+                    local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
                 _write_remote_repo_hash(client, remote_repo, local_hash)
         except Exception:
             pass
@@ -15416,6 +15686,10 @@ def api_flow_prepare_preview_for_execute():
         (total_timeout_s if total_timeout_s is not None else 'none'),
         plan_basename,
     )
+    try:
+        _flow_progress(f"Prepare start: scenario={scenario_norm} length={requested_length}")
+    except Exception:
+        pass
 
     try:
         payload = _load_preview_payload_from_path(base_plan_path, scenario_norm)
@@ -15966,12 +16240,52 @@ def api_flow_prepare_preview_for_execute():
                 app.logger.info('[flow.generator] syncing repo to CORE VM before remote generator run')
             except Exception:
                 pass
+            allowed_outputs_override = None
+            include_repo_paths = None
             try:
+                allowed_outputs_override = _flow_required_installed_generator_outputs(
+                    flag_assignments,
+                    repo_root=_get_repo_root(),
+                )
+                include_repo_paths = _flow_required_generator_repo_paths(
+                    flag_assignments,
+                    repo_root=_get_repo_root(),
+                )
+                if not include_repo_paths:
+                    raise ValueError('No generator paths resolved for Flow sync.')
+                try:
+                    generator_only = [
+                        p for p in (allowed_outputs_override or [])
+                        if p.startswith('outputs/installed_generators/')
+                    ]
+                except Exception:
+                    generator_only = []
+                if generator_only:
+                    _flow_progress(f"Syncing repo to CORE VM (generators: {len(generator_only)})")
+                else:
+                    _flow_progress('Syncing repo to CORE VM (no installed generators needed)')
+            except Exception:
+                allowed_outputs_override = None
+                include_repo_paths = None
+            try:
+                if not allowed_outputs_override:
+                    _flow_progress('Syncing repo to CORE VM (reduced snapshot)')
+            except Exception:
+                pass
+            try:
+                if not include_repo_paths:
+                    raise ValueError('Flow sync requires generator-only include paths.')
                 _push_repo_to_remote(
                     flow_core_cfg,
                     logger=app.logger,
-                    upload_only_injected_artifacts=False,
+                    upload_only_injected_artifacts=True,
+                    allowed_outputs_override=allowed_outputs_override,
+                    include_repo_paths=include_repo_paths,
                 )
+                try:
+                    _flow_progress('Repo sync complete')
+                except Exception:
+                    pass
             except Exception as exc:
                 if flow_remote_forced:
                     return jsonify({'ok': False, 'error': f'Failed to sync repo to CORE VM: {exc}'}), 500
@@ -16383,16 +16697,16 @@ def api_flow_prepare_preview_for_execute():
         kind: str = 'flag-generator',
         timeout_s: int = 120,
         inject_files_override: list[str] | None = None,
-    ) -> tuple[bool, str, str | None]:
+    ) -> tuple[bool, str, str | None, str | None, str | None]:
         """Best-effort run of scripts/run_flag_generator.py.
 
-        Returns: (ok, note_or_error, manifest_path)
+        Returns: (ok, note_or_error, manifest_path, stdout_tail, stderr_tail)
         """
         try:
             repo_root = _get_repo_root()
             runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
             if not os.path.exists(runner_path):
-                return False, 'runner script not found', None
+                return False, 'runner script not found', None, None, None
 
             cmd = [
                 sys.executable or 'python',
@@ -16426,13 +16740,15 @@ def api_flow_prepare_preview_for_execute():
                 env=env,
             )
             manifest_path = os.path.join(out_dir, 'outputs.json')
+            stdout_tail = (p.stdout or '').strip()[-4000:]
+            stderr_tail = (p.stderr or '').strip()[-4000:]
             if p.returncode != 0:
                 err = (p.stderr or p.stdout or '').strip()
                 if err:
                     err = err[-800:]
-                return False, f'generator failed (rc={p.returncode}): {err}', (manifest_path if os.path.exists(manifest_path) else None)
+                return False, f'generator failed (rc={p.returncode}): {err}', (manifest_path if os.path.exists(manifest_path) else None), stdout_tail, stderr_tail
             if os.path.exists(manifest_path):
-                return True, 'ok', manifest_path
+                return True, 'ok', manifest_path, stdout_tail, stderr_tail
             try:
                 app.logger.warning('[flow.generator] outputs.json missing for generator=%s kind=%s out_dir=%s stdout_tail=%s stderr_tail=%s',
                                    generator_id,
@@ -16442,11 +16758,11 @@ def api_flow_prepare_preview_for_execute():
                                    (p.stderr or '').strip()[-400:])
             except Exception:
                 pass
-            return True, 'ok (no outputs.json)', None
+            return True, 'ok (no outputs.json)', None, stdout_tail, stderr_tail
         except subprocess.TimeoutExpired:
-            return False, 'generator timed out', None
+            return False, 'generator timed out', None, None, None
         except Exception as exc:
-            return False, f'generator exception: {exc}', None
+            return False, f'generator exception: {exc}', None, None, None
 
     def _flow_try_run_generator_remote(
         generator_id: str,
@@ -16458,7 +16774,7 @@ def api_flow_prepare_preview_for_execute():
         inject_files_override: list[str] | None = None,
         core_cfg: dict[str, Any],
         repo_dir: str,
-    ) -> tuple[bool, str, str | None, dict[str, Any] | None]:
+    ) -> tuple[bool, str, str | None, dict[str, Any] | None, str | None, str | None]:
         """Run generator on CORE VM and return outputs map when available."""
         try:
             timeout_literal = str(int(timeout_s or 120))
@@ -16538,7 +16854,7 @@ def api_flow_prepare_preview_for_execute():
                 timeout=max(30.0, float(timeout_s or 120)),
             )
         except Exception as exc:
-            return False, f'remote generator exception: {exc}', None, None
+            return False, f'remote generator exception: {exc}', None, None, None, None
 
         ok = bool(payload.get('ok')) if isinstance(payload, dict) else False
         rc = payload.get('rc') if isinstance(payload, dict) else None
@@ -16556,7 +16872,7 @@ def api_flow_prepare_preview_for_execute():
                 note = f'no outputs.json (stdout/stderr): {tail[-800:]}'
             else:
                 note = 'no outputs.json'
-        return ok, note, (str(manifest_path) if manifest_path else None), (outputs if isinstance(outputs, dict) else None)
+        return ok, note, (str(manifest_path) if manifest_path else None), (outputs if isinstance(outputs, dict) else None), (stdout or ''), (stderr or '')
 
     def _redact_kv_for_ui(kv: Any) -> dict[str, Any]:
         """Best-effort redaction for UI display.
@@ -16691,10 +17007,23 @@ def api_flow_prepare_preview_for_execute():
             generator_runs: list[dict[str, Any]] = []
             created_run_dirs: list[str] = []
             failed_run_dirs: list[str] = []
+            progress_log: list[str] = []
+
+            def _flow_progress(msg: str) -> None:
+                try:
+                    progress_log.append(str(msg))
+                except Exception:
+                    pass
+                try:
+                    app.logger.info('[flow.progress] %s', msg)
+                except Exception:
+                    pass
             seen_flag_values: set[str] = set()
 
             deadline = (started_at + float(total_timeout_s)) if total_timeout_s is not None else None
             occurrence_ctr: dict[tuple[str, str], int] = {}
+            total_assignments = len([x for x in (flag_assignments or []) if isinstance(x, dict)])
+            run_index = 0
             for fa in (flag_assignments or []):
                 if not isinstance(fa, dict):
                     continue
@@ -16964,6 +17293,10 @@ def api_flow_prepare_preview_for_execute():
                     pass
 
                 try:
+                    run_index += 1
+                except Exception:
+                    run_index = run_index
+                try:
                     if generator_id:
                         if deadline is not None and time.monotonic() >= deadline:
                             generation_skipped.append({
@@ -16973,6 +17306,13 @@ def api_flow_prepare_preview_for_execute():
                                 'reason': 'time budget exceeded',
                             })
                             break
+
+                        try:
+                            _flow_progress(
+                                f"Running generator {run_index}/{total_assignments}: {generator_id} @ {str(h.get('name') or '')}"
+                            )
+                        except Exception:
+                            pass
 
                         flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
                         # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
@@ -17075,8 +17415,10 @@ def api_flow_prepare_preview_for_execute():
                                 effective_injects = None
 
                         manifest_outputs: dict[str, Any] | None = None
+                        run_stdout: str | None = None
+                        run_stderr: str | None = None
                         if flow_run_remote and flow_remote_repo_dir and isinstance(flow_core_cfg, dict):
-                            ok_run, note, manifest_path, manifest_outputs = _flow_try_run_generator_remote(
+                            ok_run, note, manifest_path, manifest_outputs, run_stdout, run_stderr = _flow_try_run_generator_remote(
                                 generator_id,
                                 out_dir=flow_out_dir,
                                 config=cfg,
@@ -17087,7 +17429,7 @@ def api_flow_prepare_preview_for_execute():
                                 repo_dir=flow_remote_repo_dir,
                             )
                         else:
-                            ok_run, note, manifest_path = _flow_try_run_generator(
+                            ok_run, note, manifest_path, run_stdout, run_stderr = _flow_try_run_generator(
                                 generator_id,
                                 out_dir=flow_out_dir,
                                 config=cfg,
@@ -17130,7 +17472,16 @@ def api_flow_prepare_preview_for_execute():
                                 'note': str(note or ''),
                                 'out_dir': str(flow_out_dir or ''),
                                 'manifest': str(manifest_path or ''),
+                                'stdout': (run_stdout or '')[-4000:] if isinstance(run_stdout, str) else '',
+                                'stderr': (run_stderr or '')[-4000:] if isinstance(run_stderr, str) else '',
                             })
+                        except Exception:
+                            pass
+
+                        try:
+                            _flow_progress(
+                                f"Completed generator {run_index}/{total_assignments}: {generator_id} -> {'ok' if ok_run else 'failed'}"
+                            )
                         except Exception:
                             pass
 
@@ -17897,6 +18248,12 @@ def api_flow_prepare_preview_for_execute():
         'base_preview_plan_path': base_plan_path,
         'best_effort': bool(best_effort),
         'elapsed_s': round(float(time.monotonic() - started_at), 3),
+        'generator_runs': generator_runs,
+        'progress_log': progress_log,
+        'generation_failures': generation_failures,
+        'generation_skipped': generation_skipped,
+        'created_run_dirs': created_run_dirs,
+        'failed_run_dirs': failed_run_dirs,
         **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
         **({'warning': warning} if warning else {}),
     })
@@ -40594,6 +40951,27 @@ def vuln_catalog_items_set_disabled():
     state['catalogs'] = catalogs
     _write_vuln_catalogs_state(state)
     return jsonify({'ok': True})
+
+
+@app.route('/api/flag-sequencing/flow_progress', methods=['GET'])
+def api_flow_progress():
+    """Return recent Flow-related log lines for the Generator Output modal."""
+    try:
+        port = int(os.environ.get('CORETG_PORT') or 9090)
+    except Exception:
+        port = 9090
+    log_path = os.path.join(_outputs_dir(), 'logs', f'webui-{port}.log')
+    lines: list[str] = []
+    try:
+        if os.path.exists(log_path):
+            with open(log_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                raw = fh.read().splitlines()[-400:]
+            for ln in raw:
+                if ('[flow.progress]' in ln) or ('[flow.' in ln) or ('[remote-sync]' in ln) or ('Repo upload' in ln):
+                    lines.append(ln.strip())
+    except Exception:
+        lines = []
+    return jsonify({'ok': True, 'lines': lines})
 
 
 @app.route('/vuln_catalog_items/delete', methods=['POST'])
