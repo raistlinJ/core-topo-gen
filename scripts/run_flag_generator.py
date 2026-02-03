@@ -40,6 +40,64 @@ def _wrap_docker_cmd(cmd: list[str]) -> tuple[list[str], str | None]:
     return ['sudo', '-E', '-S'] + cmd, (pw + '\n')
 
 
+def _fix_output_permissions(out_dir: Path) -> None:
+    try:
+        target = out_dir.resolve()
+    except Exception:
+        target = out_dir
+    try:
+        for root, dirnames, filenames in os.walk(target):
+            for d in dirnames:
+                try:
+                    os.chmod(os.path.join(root, d), 0o775)
+                except Exception:
+                    pass
+            for f in filenames:
+                try:
+                    os.chmod(os.path.join(root, f), 0o664)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        uid = os.getuid()
+        gid = os.getgid()
+    except Exception:
+        uid = None
+        gid = None
+
+    if uid is None or gid is None:
+        return
+
+    try:
+        for root, dirnames, filenames in os.walk(target):
+            for d in dirnames:
+                try:
+                    os.chown(os.path.join(root, d), uid, gid)
+                except Exception:
+                    pass
+            for f in filenames:
+                try:
+                    os.chown(os.path.join(root, f), uid, gid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # If files are root-owned, local chmod/chown may fail; try sudo when password is available.
+    try:
+        sudo_pw = _docker_sudo_password()
+        if not sudo_pw:
+            return
+        cmd = ['sudo', '-S', 'chown', '-R', f"{uid}:{gid}", str(target)]
+        subprocess.run(cmd, input=(sudo_pw + '\n'), text=True, capture_output=True, check=False)
+        cmd = ['sudo', '-S', 'chmod', '-R', 'u+rwX,g+rwX', str(target)]
+        subprocess.run(cmd, input=(sudo_pw + '\n'), text=True, capture_output=True, check=False)
+    except Exception:
+        pass
+
+
 def _norm_inject_path(raw: str) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -359,17 +417,8 @@ def _rewrite_compose_injected_to_volume_copy(
         compose_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
         return compose_path
     except Exception as exc:
-        try:
-            alt_path = compose_path.with_name(f"{compose_path.stem}.inject{compose_path.suffix}")
-            alt_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
-            print(
-                f"[inject_files] warning: failed to write rewritten compose to {compose_path}: {exc}; "
-                f"wrote {alt_path} instead"
-            )
-            return alt_path
-        except Exception as exc2:
-            print(f"[inject_files] warning: failed to write rewritten compose: {exc}; {exc2}")
-            return None
+        print(f"[inject_files] warning: failed to write rewritten compose: {exc}")
+        return None
 
 
 def _rewrite_compose_host_network(compose_path: Path) -> None:
@@ -784,6 +833,8 @@ def main() -> int:
             },
         )
 
+        _fix_output_permissions(out_dir)
+
         # If this generator declares inject_files, stage and enforce that only
         # staged files can be mounted into the generated compose container.
         expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
@@ -821,12 +872,14 @@ def main() -> int:
         cmd = substitute_vars(build.get("cmd"), mapping)
         workdir = substitute_vars(build.get("workdir", "${source.path}"), mapping)
         run_cmd([str(x) for x in cmd], Path(str(workdir)), env)
+        _fix_output_permissions(out_dir)
 
     run = gen.get("run")
     if isinstance(run, dict) and isinstance(run.get("cmd"), list):
         cmd = substitute_vars(run.get("cmd"), mapping)
         workdir = substitute_vars(run.get("workdir", "${source.path}"), mapping)
         run_cmd([str(x) for x in cmd], Path(str(workdir)), env)
+        _fix_output_permissions(out_dir)
 
     expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
     expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)

@@ -184,16 +184,28 @@
               </form>
             </dialog>
 
-            <dialog id="flowComposeDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
-              <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
-                <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
-                  <div class="fw-semibold" id="flowComposeTitle">Generator Output</div>
+            <div class="modal fade" id="flowComposeDialog" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+              <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" style="max-width: 1150px;">
+                <div class="modal-content">
+                  <div class="modal-header">
+                    <div class="d-flex align-items-center gap-2">
+                      <span id="flowComposeSpinner" class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+                      <h5 class="modal-title mb-0" id="flowComposeTitle">Generator Output</h5>
+                    </div>
+                  </div>
+                  <div class="modal-body">
+                    <div class="small text-muted mb-2" id="flowComposeStatus">Running generators…</div>
+                    <div class="progress mb-3" role="progressbar" aria-label="Generator progress" aria-valuemin="0" aria-valuemax="100">
+                      <div class="progress-bar progress-bar-striped progress-bar-animated" id="flowComposeProgressBar" style="width: 100%">Working…</div>
+                    </div>
+                    <pre id="flowComposeBody" class="small bg-light p-2 mb-0" style="max-height: 60vh; overflow: auto; white-space: pre-wrap;"></pre>
+                  </div>
+                  <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" id="flowComposeCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
+                  </div>
                 </div>
-                <div class="p-3" style="flex:1 1 auto; overflow: auto;">
-                  <pre id="flowComposeBody" class="small mb-0" style="white-space: pre-wrap;"></pre>
-                </div>
-              </form>
-            </dialog>
+              </div>
+            </div>
 
             <dialog id="flowSubstituteDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
               <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
@@ -306,6 +318,11 @@
   const composeDialogEl = document.getElementById('flowComposeDialog');
   const composeTitleEl = document.getElementById('flowComposeTitle');
   const composeBodyEl = document.getElementById('flowComposeBody');
+  const composeStatusEl = document.getElementById('flowComposeStatus');
+  const composeProgressBarEl = document.getElementById('flowComposeProgressBar');
+  const composeCloseBtnEl = document.getElementById('flowComposeCloseBtn');
+  const composeSpinnerEl = document.getElementById('flowComposeSpinner');
+  let composeModalInstance = null;
   const substituteDialogEl = document.getElementById('flowSubstituteDialog');
   const substituteTitleEl = document.getElementById('flowSubstituteTitle');
   const substituteBodyEl = document.getElementById('flowSubstituteBody');
@@ -1277,22 +1294,35 @@
       if(!composeDialogEl || !composeBodyEl) return;
       if(composeTitleEl) composeTitleEl.textContent = String(title || 'Generator Output');
       composeBodyEl.textContent = String(text || '');
-      if(typeof composeDialogEl.showModal === 'function') composeDialogEl.showModal();
+      if(composeStatusEl) composeStatusEl.textContent = 'Running generators…';
+      if(composeProgressBarEl){
+        composeProgressBarEl.textContent = 'Working…';
+        composeProgressBarEl.style.width = '100%';
+        composeProgressBarEl.classList.add('progress-bar-striped', 'progress-bar-animated');
+        composeProgressBarEl.classList.remove('text-bg-success');
+      }
+      if(composeCloseBtnEl) composeCloseBtnEl.disabled = true;
+      if(composeSpinnerEl) composeSpinnerEl.classList.remove('d-none');
+      if(window.bootstrap && window.bootstrap.Modal){
+        composeModalInstance = bootstrap.Modal.getOrCreateInstance(composeDialogEl, { backdrop: 'static', keyboard: false });
+        composeModalInstance.show();
+      }
     } catch(e) {}
   }
-
-  try{
-    if(composeDialogEl){
-      composeDialogEl.addEventListener('cancel', (ev)=>{
-        try { ev.preventDefault(); } catch(e) {}
-      });
-    }
-  } catch(e) {}
 
   function updateComposeDialog(text){
     try{
       if(!composeBodyEl) return;
       composeBodyEl.textContent = String(text || '');
+      if(composeStatusEl) composeStatusEl.textContent = 'Generator output ready.';
+      if(composeProgressBarEl){
+        composeProgressBarEl.textContent = 'Complete';
+        composeProgressBarEl.style.width = '100%';
+        composeProgressBarEl.classList.remove('progress-bar-animated', 'progress-bar-striped');
+        composeProgressBarEl.classList.add('text-bg-success');
+      }
+      if(composeCloseBtnEl) composeCloseBtnEl.disabled = false;
+      if(composeSpinnerEl) composeSpinnerEl.classList.add('d-none');
     } catch(e) {}
   }
 
