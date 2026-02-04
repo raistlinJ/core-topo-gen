@@ -82,6 +82,9 @@
               <div class="col-md-6">
                 <div class="d-flex gap-2 flex-nowrap align-items-end">
                   <div>
+                    <button id="flowRevalidateBtn" class="btn btn-outline-primary text-nowrap" type="button">Re-Validate</button>
+                  </div>
+                  <div>
                     <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
                   </div>
                   <div>
@@ -185,7 +188,7 @@
             </dialog>
 
             <div class="modal fade" id="flowComposeDialog" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
-              <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" style="max-width: 1150px;">
+              <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable" style="max-width: 1200px; width: calc(100% - 2rem);">
                 <div class="modal-content">
                   <div class="modal-header">
                     <div class="d-flex align-items-center gap-2">
@@ -198,7 +201,10 @@
                     <div class="progress mb-3" role="progressbar" aria-label="Generator progress" aria-valuemin="0" aria-valuemax="100">
                       <div class="progress-bar progress-bar-striped progress-bar-animated" id="flowComposeProgressBar" style="width: 100%">Working…</div>
                     </div>
-                    <pre id="flowComposeBody" class="small bg-light p-2 mb-0" style="max-height: 60vh; overflow: auto; white-space: pre-wrap;"></pre>
+                    <div class="small text-muted mb-1" id="flowComposeStepsLabel">Progress steps</div>
+                    <ul id="flowComposeSteps" class="small mb-3"></ul>
+                    <div class="small text-muted mb-1" id="flowComposeLogLabel">Output / Log</div>
+                    <div id="flowComposeBody" class="small bg-light p-2 mb-0" style="max-height: 55vh; overflow: auto;"></div>
                   </div>
                   <div class="modal-footer">
                     <button type="button" class="btn btn-outline-secondary" id="flowComposeCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
@@ -296,6 +302,7 @@
   const lengthEl = document.getElementById('flowLength');
   const presetEl = document.getElementById('flowPreset');
   const btnEl = document.getElementById('flowGenerateBtn');
+  const revalidateBtnEl = document.getElementById('flowRevalidateBtn');
   const generateMaxRetriesEl = document.getElementById('flowGenerateMaxRetries');
   const restoreBadgeEl = document.getElementById('flowRestoreBadge');
   const saveXmlEl = document.getElementById('saveXmlBtn');
@@ -322,7 +329,12 @@
   const composeProgressBarEl = document.getElementById('flowComposeProgressBar');
   const composeCloseBtnEl = document.getElementById('flowComposeCloseBtn');
   const composeSpinnerEl = document.getElementById('flowComposeSpinner');
+  const composeStepsEl = document.getElementById('flowComposeSteps');
+  const composeStepsLabelEl = document.getElementById('flowComposeStepsLabel');
+  const composeLogLabelEl = document.getElementById('flowComposeLogLabel');
   let composeModalInstance = null;
+  let composeFinalized = false;
+  let composeModalEnabled = false;
   const substituteDialogEl = document.getElementById('flowSubstituteDialog');
   const substituteTitleEl = document.getElementById('flowSubstituteTitle');
   const substituteBodyEl = document.getElementById('flowSubstituteBody');
@@ -516,6 +528,7 @@
   let lastStats = null;
   let lastPreviewPlanPath = '';
   let currentFlagAssignments = [];
+  let lastResolvePayload = null;
   let selectedChainIndex = -1;
   let lastFlowValid = true;
   let lastFlowErrors = [];
@@ -704,8 +717,66 @@
 
   function buildPersistAssignments(chain_ids){
     const ids = Array.isArray(chain_ids) ? chain_ids : [];
+    let fallbackAssignments = null;
+    try{
+      if(lastResolvePayload && Array.isArray(lastResolvePayload.flag_assignments)){
+        const fallbackList = lastResolvePayload.flag_assignments.slice();
+        if(Array.isArray(lastResolvePayload.chain) && lastResolvePayload.chain.length){
+          fallbackAssignments = alignAssignmentsToChain(lastResolvePayload.chain, fallbackList);
+        } else {
+          const chainForAlign = ids.map(id => ({ id }));
+          fallbackAssignments = alignAssignmentsToChain(chainForAlign, fallbackList);
+        }
+      }
+    } catch(e) {
+      fallbackAssignments = null;
+    }
+    const mergeAssignment = (primary, fallback) => {
+      const base = (primary && typeof primary === 'object') ? primary : {};
+      const fb = (fallback && typeof fallback === 'object') ? fallback : {};
+      const merged = { ...fb, ...base };
+      const isEmpty = (val) => {
+        if(val === undefined || val === null) return true;
+        if(typeof val === 'string') return !val.trim();
+        if(Array.isArray(val)) return val.length === 0;
+        if(typeof val === 'object') return Object.keys(val).length === 0;
+        return false;
+      };
+      const preferFallbackKeys = [
+        'resolved_inputs',
+        'resolved_outputs',
+        'resolved_inputs_detail',
+        'resolved_outputs_detail',
+        'inject_files',
+        'inject_files_detail',
+        'artifacts_dir',
+        'mount_dir',
+        'run_dir',
+        'outputs_manifest',
+        'input_fields',
+        'input_fields_required',
+        'input_fields_optional',
+        'output_fields',
+        'produces',
+        'requires',
+        'hint',
+        'hints',
+        'description_hints',
+        'flag_value',
+        'flag_generator',
+        'type',
+      ];
+      preferFallbackKeys.forEach((key) => {
+        if(isEmpty(base[key]) && !isEmpty(fb[key])){
+          merged[key] = fb[key];
+        }
+      });
+      return merged;
+    };
     return ids.map((nid, j)=>{
-      const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+      const rawA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+      const fbA = (Array.isArray(fallbackAssignments) && fallbackAssignments[j]) ? fallbackAssignments[j] : null;
+      const curA = mergeAssignment(rawA, fbA);
       const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
       const out = { node_id: String(nid || ''), id: curId };
 
@@ -745,6 +816,11 @@
           }
           return text;
         };
+        const _fixTmpPrefix = (p) => {
+          const s = String(p || '').trim();
+          if(s.startsWith('/tmp/tmp/')) return '/tmp/' + s.slice('/tmp/tmp/'.length);
+          return s;
+        };
         const outList = [];
         rawList.forEach((raw)=>{
           const text = String(raw || '').trim();
@@ -776,15 +852,15 @@
           }
           if (!isTokenLike && destTrim) {
             // Preserve explicit destinations exactly as authored.
-            outList.push(destPath);
+            outList.push(_fixTmpPrefix(destPath));
             return;
           }
           if (!isTokenLike && text.startsWith('/')) {
             // If the user already provided an absolute path, keep it.
-            outList.push(text);
+            outList.push(_fixTmpPrefix(text));
             return;
           }
-          if(destPath) outList.push(destPath);
+          if(destPath) outList.push(_fixTmpPrefix(destPath));
         });
         return outList;
       };
@@ -825,6 +901,11 @@
           }
           return text;
         };
+        const _fixTmpPrefix = (p) => {
+          const s = String(p || '').trim();
+          if(s.startsWith('/tmp/tmp/')) return '/tmp/' + s.slice('/tmp/tmp/'.length);
+          return s;
+        };
         const details = [];
         rawList.forEach((raw, idx)=>{
           const text = String(raw || '').trim();
@@ -861,7 +942,7 @@
             id: itemId,
             field: src,
             resolved: resolvedSrc,
-            path: destPath,
+            path: _fixTmpPrefix(destPath),
           });
         });
         return details;
@@ -932,6 +1013,11 @@
         ? String(curA.outputs_manifest).trim()
         : undefined;
 
+      if(artifactsDir) out.artifacts_dir = artifactsDir;
+      if(mountDir) out.mount_dir = mountDir;
+      if(runDir) out.run_dir = runDir;
+      if(outputsManifest) out.outputs_manifest = outputsManifest;
+
       const typeVal = (curA && typeof curA.type === 'string' && curA.type.trim()) ? String(curA.type).trim() : undefined;
       const genLabel = (curA && typeof curA.flag_generator === 'string' && curA.flag_generator.trim()) ? String(curA.flag_generator).trim() : undefined;
       const inputFields = (curA && Array.isArray(curA.input_fields)) ? curA.input_fields.map(String).filter(Boolean) : undefined;
@@ -972,8 +1058,8 @@
         if(curA && typeof curA.resolved_inputs === 'object' && !Array.isArray(curA.resolved_inputs)){
           out.resolved_inputs = curA.resolved_inputs;
         }
-        if(curA && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs)){
-          out.resolved_outputs = curA.resolved_outputs;
+        if(resolvedOutputs){
+          out.resolved_outputs = resolvedOutputs;
         }
         if(curA && typeof curA.flag_value === 'string' && curA.flag_value.trim()){
           out.flag_value = curA.flag_value.trim();
@@ -1197,9 +1283,17 @@
 
   function showLoading(text){
     try{
-      if(!loadingOverlayEl) return;
       if(loadingTextEl) loadingTextEl.textContent = (text || 'Loading…').toString();
-      loadingOverlayEl.classList.remove('d-none');
+      if(composeDialogEl && composeModalEnabled){
+        if(composeStatusEl) composeStatusEl.textContent = (text || 'Working…').toString();
+        if(window.bootstrap && window.bootstrap.Modal){
+          composeModalInstance = bootstrap.Modal.getOrCreateInstance(composeDialogEl, { backdrop: 'static', keyboard: false });
+          composeModalInstance.show();
+        }
+        if(loadingOverlayEl) loadingOverlayEl.classList.add('d-none');
+        return;
+      }
+      if(loadingOverlayEl) loadingOverlayEl.classList.remove('d-none');
     } catch(e) {}
   }
 
@@ -1217,31 +1311,36 @@
     }
   }
 
+  function _renderStepsList(stepsEl, labelEl, steps, activeIndex){
+    if(!stepsEl) return;
+    if(!Array.isArray(steps) || steps.length === 0){
+      stepsEl.innerHTML = '';
+      stepsEl.classList.add('d-none');
+      if(labelEl) labelEl.classList.add('d-none');
+      return;
+    }
+    if(labelEl) labelEl.classList.remove('d-none');
+    stepsEl.classList.remove('d-none');
+    const idx = Number.isFinite(+activeIndex) ? (+activeIndex) : -1;
+    stepsEl.innerHTML = steps.map((s, i)=>{
+      const state = (i === idx) ? 'active' : (i < idx ? 'done' : 'pending');
+      const cls = state === 'active' ? 'fw-semibold text-body' : (state === 'done' ? 'text-success' : 'text-muted');
+      const badgeCls = state === 'active' ? 'text-bg-primary' : (state === 'done' ? 'text-bg-success' : 'text-bg-secondary');
+      const status = state === 'active' ? 'Working' : (state === 'done' ? 'Done' : 'Pending');
+      return `
+        <li class="d-flex align-items-center gap-2 ${cls}">
+          <span class="badge ${badgeCls}">${i + 1}</span>
+          <span>${escapeHtml(s)}</span>
+          <span class="ms-auto small text-muted">${status}</span>
+        </li>
+      `;
+    }).join('');
+  }
+
   function setLoadingSteps(steps, activeIndex){
     try{
-      if(!loadingStepsEl) return;
-      if(!Array.isArray(steps) || steps.length === 0){
-        loadingStepsEl.innerHTML = '';
-        loadingStepsEl.classList.add('d-none');
-        if(loadingStepsLabelEl) loadingStepsLabelEl.classList.add('d-none');
-        return;
-      }
-      if(loadingStepsLabelEl) loadingStepsLabelEl.classList.remove('d-none');
-      loadingStepsEl.classList.remove('d-none');
-      const idx = Number.isFinite(+activeIndex) ? (+activeIndex) : -1;
-      loadingStepsEl.innerHTML = steps.map((s, i)=>{
-        const state = (i === idx) ? 'active' : (i < idx ? 'done' : 'pending');
-        const cls = state === 'active' ? 'fw-semibold text-body' : (state === 'done' ? 'text-success' : 'text-muted');
-        const badgeCls = state === 'active' ? 'text-bg-primary' : (state === 'done' ? 'text-bg-success' : 'text-bg-secondary');
-        const status = state === 'active' ? 'Working' : (state === 'done' ? 'Done' : 'Pending');
-        return `
-          <li class="d-flex align-items-center gap-2 ${cls}">
-            <span class="badge ${badgeCls}">${i + 1}</span>
-            <span>${escapeHtml(s)}</span>
-            <span class="ms-auto small text-muted">${status}</span>
-          </li>
-        `;
-      }).join('');
+      _renderStepsList(loadingStepsEl, loadingStepsLabelEl, steps, activeIndex);
+      _renderStepsList(composeStepsEl, composeStepsLabelEl, steps, activeIndex);
     } catch(e) {}
   }
 
@@ -1278,31 +1377,57 @@
 
   function appendLoadingLog(message){
     try{
-      if(!loadingLogEl) return;
       const msg = String(message || '').trim();
       if(!msg) return;
-      if(loadingLogLabelEl) loadingLogLabelEl.classList.remove('d-none');
-      loadingLogEl.classList.remove('d-none');
-      const item = document.createElement('li');
-      item.textContent = msg;
-      loadingLogEl.appendChild(item);
+      if(loadingLogEl){
+        if(loadingLogLabelEl) loadingLogLabelEl.classList.remove('d-none');
+        loadingLogEl.classList.remove('d-none');
+        const item = document.createElement('li');
+        item.textContent = msg;
+        loadingLogEl.appendChild(item);
+      }
+      if(composeBodyEl && !composeFinalized){
+        if(composeLogLabelEl) composeLogLabelEl.classList.remove('d-none');
+        const pre = _ensureComposeLogPre();
+        if(pre){
+          const current = pre.textContent || '';
+          pre.textContent = current ? (current + '\n' + msg) : msg;
+        }
+      }
     } catch(e) {}
   }
 
   function showComposeDialog(title, text){
     try{
       if(!composeDialogEl || !composeBodyEl) return;
+      composeModalEnabled = true;
+      composeFinalized = false;
       if(composeTitleEl) composeTitleEl.textContent = String(title || 'Generator Output');
-      composeBodyEl.textContent = String(text || '');
+      const msg = String(text || '');
+      composeBodyEl.innerHTML = '';
+      if(msg){
+        const pre = document.createElement('pre');
+        pre.className = 'mb-0';
+        pre.style.whiteSpace = 'pre-wrap';
+        pre.textContent = msg;
+        composeBodyEl.appendChild(pre);
+      }
       if(composeStatusEl) composeStatusEl.textContent = 'Running generators…';
       if(composeProgressBarEl){
         composeProgressBarEl.textContent = 'Working…';
         composeProgressBarEl.style.width = '100%';
         composeProgressBarEl.classList.add('progress-bar-striped', 'progress-bar-animated');
         composeProgressBarEl.classList.remove('text-bg-success');
+        composeProgressBarEl.classList.remove('text-bg-danger');
       }
       if(composeCloseBtnEl) composeCloseBtnEl.disabled = true;
       if(composeSpinnerEl) composeSpinnerEl.classList.remove('d-none');
+      if(composeLogLabelEl) composeLogLabelEl.classList.remove('d-none');
+      if(composeStepsEl) composeStepsEl.classList.add('d-none');
+      if(composeStepsLabelEl) composeStepsLabelEl.classList.add('d-none');
+      try{
+        if(loadingOverlayEl) loadingOverlayEl.classList.add('d-none');
+      } catch(e) {}
       if(window.bootstrap && window.bootstrap.Modal){
         composeModalInstance = bootstrap.Modal.getOrCreateInstance(composeDialogEl, { backdrop: 'static', keyboard: false });
         composeModalInstance.show();
@@ -1310,10 +1435,83 @@
     } catch(e) {}
   }
 
-  function updateComposeDialog(text){
+  function _ensureComposeLogPre(){
+    if(!composeBodyEl) return null;
+    let pre = composeBodyEl.querySelector('pre');
+    if(!pre){
+      pre = document.createElement('pre');
+      pre.className = 'mb-0';
+      pre.style.whiteSpace = 'pre-wrap';
+      composeBodyEl.appendChild(pre);
+    }
+    return pre;
+  }
+
+  function _renderGeneratorOutputTable(runs, progressLog){
+    try{
+      const rows = Array.isArray(runs) ? runs : [];
+      const progress = Array.isArray(progressLog) ? progressLog : [];
+      const esc = (s)=>escapeHtml(String(s || ''));
+      const renderCheckbox = (r)=>{
+        const ok = r && r.ok ? true : false;
+        const checked = ok ? 'checked' : '';
+        return `<input type="checkbox" disabled ${checked} />`;
+      };
+      const summaryRows = rows.map((r, idx)=>{
+        const gid = String((r && (r.generator_id || r.id)) || '').trim() || 'unknown';
+        const node = String((r && (r.node_name || r.node_id)) || '').trim();
+        const note = String((r && r.note) || '').trim();
+        const logPath = String((r && r.log_path) || '').trim();
+        const logHref = logPath ? `/download_report?path=${encodeURIComponent(logPath)}` : '';
+        return `
+          <li class="d-flex align-items-center gap-2">
+            <span>${renderCheckbox(r)}</span>
+            <span class="text-muted">${idx + 1}.</span>
+            <span class="fw-semibold">${esc(gid)}</span>
+            <span class="text-muted">${esc(node || '')}</span>
+            ${note ? `<span class="small text-muted">(${esc(note)})</span>` : ''}
+            ${logHref ? `<a class="small" href="${logHref}" target="_blank" rel="noopener">log file</a>` : ''}
+          </li>
+        `;
+      }).join('');
+      const progressHtml = progress.length
+        ? `<div class="small text-muted mb-2">Progress</div><ul class="small mb-3">${progress.map(p=>`<li>${esc(p)}</li>`).join('')}</ul>`
+        : '';
+      const outputLines = rows.map((r)=>{
+        const gid = String((r && (r.generator_id || r.id)) || '').trim() || 'unknown';
+        const node = String((r && (r.node_name || r.node_id)) || '').trim();
+        const stdout = String((r && r.stdout) || '').trim();
+        const stderr = String((r && r.stderr) || '').trim();
+        const parts = [stdout ? `stdout:\n${stdout}` : '', stderr ? `stderr:\n${stderr}` : ''].filter(Boolean);
+        if(!parts.length) return '';
+        return `# ${gid}${node ? ` @ ${node}` : ''}\n${parts.join('\n\n')}`;
+      }).filter(Boolean).join('\n\n');
+      return `
+        ${progressHtml}
+        <div class="small text-muted mb-2">Summary</div>
+        <ul class="small mb-3" style="list-style: none; padding-left: 0;">
+          ${summaryRows || '<li class="text-muted">No generator output captured.</li>'}
+        </ul>
+        <div class="small text-muted mb-1">Output / Log</div>
+        <pre class="small bg-white border p-2 mb-0" style="white-space: pre-wrap;">${esc(outputLines || 'No generator output captured.')}</pre>
+      `;
+    } catch(e){
+      return '<div class="text-muted">No generator output captured.</div>';
+    }
+  }
+
+  function updateComposeDialog(payload){
     try{
       if(!composeBodyEl) return;
-      composeBodyEl.textContent = String(text || '');
+      composeFinalized = true;
+      composeModalEnabled = false;
+      if(payload && typeof payload === 'object' && payload.html){
+        composeBodyEl.innerHTML = String(payload.html || '');
+      } else {
+        const text = (payload && typeof payload === 'object' && payload.text) ? payload.text : payload;
+        const pre = _ensureComposeLogPre();
+        if(pre) pre.textContent = String(text || '');
+      }
       if(composeStatusEl) composeStatusEl.textContent = 'Generator output ready.';
       if(composeProgressBarEl){
         composeProgressBarEl.textContent = 'Complete';
@@ -1326,12 +1524,34 @@
     } catch(e) {}
   }
 
+  function setComposeError(text){
+    try{
+      composeFinalized = true;
+      composeModalEnabled = false;
+      if(composeBodyEl) composeBodyEl.textContent = String(text || 'Generator run failed.');
+      if(composeStatusEl) composeStatusEl.textContent = 'Generator run failed.';
+      if(composeProgressBarEl){
+        composeProgressBarEl.textContent = 'Failed';
+        composeProgressBarEl.style.width = '100%';
+        composeProgressBarEl.classList.remove('progress-bar-animated', 'progress-bar-striped');
+        composeProgressBarEl.classList.add('text-bg-danger');
+      }
+      if(composeCloseBtnEl) composeCloseBtnEl.disabled = false;
+      if(composeSpinnerEl) composeSpinnerEl.classList.add('d-none');
+    } catch(e) {}
+  }
+
   function appendComposeLines(lines){
     try{
       if(!composeBodyEl || !Array.isArray(lines) || !lines.length) return;
-      const current = composeBodyEl.textContent || '';
+      const pre = _ensureComposeLogPre();
+      if(!pre) return;
+      const current = pre.textContent || '';
       const next = current ? (current + '\n' + lines.join('\n')) : lines.join('\n');
-      composeBodyEl.textContent = next;
+      pre.textContent = next;
+      try{
+        composeBodyEl.scrollTop = composeBodyEl.scrollHeight;
+      } catch(e) {}
     } catch(e) {}
   }
 
@@ -7086,7 +7306,7 @@
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     let length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
-    let lastResolvePayload = null;
+    lastResolvePayload = null;
 
     if(!flowEligible){
       setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
@@ -7143,9 +7363,12 @@
     if(metaStatsEl) metaStatsEl.textContent = '';
     if(jsonEl) jsonEl.textContent = '';
 
-    const progressSteps = ['Testing connection', 'Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'];
+    const progressSteps = ['Testing connection', 'Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values', 'Saving resolved data'];
     let resolvedOk = false;
     let usedBestEffort = false;
+    const saveAfterResolve = (options && options.saveAfterResolve !== undefined)
+      ? !!options.saveAfterResolve
+      : !!runSavePreviewResolve;
     try {
       if(runSavePreviewResolve){
         const scenLabel = (scenario || activeScenario || '').toString().trim();
@@ -7430,7 +7653,7 @@
             setStatus('Resolving values…', false);
             showLoading('Resolving values…');
             setLoadingSteps(progressSteps, 4);
-            appendLoadingLog(`Resolving values via prepare_preview_for_execute (attempt ${resolveAttempts})`);
+            appendLoadingLog('Resolving values via prepare_preview_for_execute');
             try{
               showComposeDialog('Generator Output', 'Running generators…');
             } catch(e) {}
@@ -7469,26 +7692,8 @@
                 });
               }
 
-              let outputText = '';
-              if(progressLog.length){
-                outputText += '## Progress\n' + progressLog.map(x => `- ${x}`).join('\n');
-              }
-              runs.forEach((r)=>{
-                const gid = String((r && (r.generator_id || r.id)) || '').trim() || 'unknown';
-                const node = String((r && (r.node_name || r.node_id)) || '').trim();
-                const ok = r && r.ok ? 'ok' : 'fail';
-                const stdout = String((r && r.stdout) || '').trim();
-                const stderr = String((r && r.stderr) || '').trim();
-                if(!stdout && !stderr) return;
-                if(outputText) outputText += '\n\n';
-                outputText += `# ${gid}${node ? ` @ ${node}` : ''} (${ok})`;
-                if(stdout) outputText += `\n--- stdout ---\n${stdout}`;
-                if(stderr) outputText += `\n--- stderr ---\n${stderr}`;
-              });
-              if(!outputText){
-                outputText = 'No generator output captured.';
-              }
-              updateComposeDialog(outputText);
+              const html = _renderGeneratorOutputTable(runs, progressLog);
+              updateComposeDialog({ html });
             } catch(e) {}
             setFlowValidityFromPayload(prepData);
             if(prepData && Array.isArray(prepData.chain)){
@@ -7548,6 +7753,38 @@
             }
             const diagram2 = buildMermaid(currentChain);
             await renderMermaid(diagram2);
+            appendLoadingLog('Resolve completed.');
+            if(saveAfterResolve){
+              try{
+                setStatus('Saving XML…', false);
+                setLoadingSteps(progressSteps, 5);
+                appendLoadingLog('Saving XML with resolved values');
+                if(typeof window.coretgSaveXmlViaApi === 'function'){
+                  const xmlPath2 = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+                  if(xmlPath2){
+                    try {
+                      const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+                      if(xmlPathInput) xmlPathInput.value = String(xmlPath2);
+                    } catch(e) {}
+                    try {
+                      if(downloadXmlEl){
+                        downloadXmlEl.disabled = false;
+                        downloadXmlEl.removeAttribute('title');
+                      }
+                    } catch(e) {}
+                    try { await saveFlowStateToXml(xmlPath2); } catch(e) {}
+                    try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
+                    appendLoadingLog('Saved XML after resolve.');
+                  } else {
+                    appendLoadingLog('Save XML after resolve did not return a path.');
+                  }
+                } else {
+                  appendLoadingLog('Save helper unavailable; skipped post-resolve save.');
+                }
+              } catch(e){
+                appendLoadingLog('Save after resolve failed: ' + String(e && e.message || e));
+              }
+            }
             resolved = true;
           } catch(e) {
             if(_isDuplicateFlagError(e) && resolveRetriesRemaining > 0){
@@ -7556,7 +7793,7 @@
               retryIndex += 1;
               setStatus(`Resolve hit duplicate flags; retrying (${attemptedRetries})…`, true);
               showLoading('Retrying resolve…');
-              appendLoadingLog(`Duplicate flags during resolve; resequencing attempt ${retryIndex + 1}`);
+              appendLoadingLog('Duplicate flags during resolve; resequencing.');
               const data2 = await postJson('/api/flag-sequencing/sequence_preview_plan', {
                 scenario,
                 length,
@@ -7588,6 +7825,7 @@
                   appendLoadingLog(`Generators: ${ids.join(', ')}`);
                 }
               }
+              try { setComposeError(msg); } catch(_) {}
             } catch(_) {}
             setStatus('Resolve failed: ' + String(e && e.message || e), true);
             break;
@@ -7963,6 +8201,112 @@
     // Fallback: behave like old Generate (no duplicates).
     allowNodeDuplicates = false;
     generate(true, { savePreviewResolve: true, allow_node_duplicates: false, resolveOnGenerate: true });
+  });
+  if(revalidateBtnEl) revalidateBtnEl.addEventListener('click', async (e)=>{
+    try { e.preventDefault(); } catch(_) {}
+    try{
+      const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').toString().trim();
+      if(!scenario){
+        setStatus('No scenario selected.', true);
+        return;
+      }
+      const xmlPath = (typeof window.coretgGetLatestXmlPathForScenario === 'function')
+        ? window.coretgGetLatestXmlPathForScenario(scenario)
+        : '';
+      composeModalEnabled = true;
+      showComposeDialog('Re-Validate', 'Connecting to CORE VM…');
+      setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 0);
+      appendLoadingLog('Starting re-validation…');
+      let data = null;
+      try{
+        data = await postJson('/api/flag-sequencing/revalidate_flow', { scenario, xml_path: xmlPath || '' }, { timeoutMs: 60000 });
+      } catch(err){
+        setComposeError(String(err && err.message || err));
+        setStatus('Re-validate failed.', true);
+        return;
+      }
+      setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 2);
+      const missing = (data && Array.isArray(data.missing)) ? data.missing : [];
+      const esc = (s)=>escapeHtml(String(s || ''));
+      const buildRevalidateHtml = (ok, title, subtitle, detailsHtml, logText) => {
+        const alertClass = ok ? 'alert-success' : 'alert-danger';
+        const icon = ok ? '✓' : '✕';
+        const logBlock = logText
+          ? `<div class="small text-muted mb-2">Log</div><pre class="small bg-white border p-2 mb-0" style="white-space: pre-wrap;">${esc(logText)}</pre>`
+          : '';
+        return `
+          <div class="alert ${alertClass} d-flex align-items-start gap-3 mb-3">
+            <div class="fw-bold fs-2" aria-hidden="true">${icon}</div>
+            <div>
+              <div class="fs-4 fw-semibold">${esc(title)}</div>
+              ${subtitle ? `<div class="small">${esc(subtitle)}</div>` : ''}
+            </div>
+          </div>
+          ${detailsHtml || ''}
+          ${logBlock}
+        `;
+      };
+      if(data && data.ok && missing.length === 0){
+        appendLoadingLog('All expected files found on CORE VM.');
+        const snap = composeBodyEl ? (composeBodyEl.innerText || '') : '';
+        const html = buildRevalidateHtml(
+          true,
+          'Re-Validate Succeeded',
+          'All expected files found on CORE VM.',
+          '',
+          snap
+        );
+        updateComposeDialog({ html });
+        if(composeStatusEl) composeStatusEl.textContent = 'Re-Validate complete.';
+        if(composeProgressBarEl){
+          composeProgressBarEl.textContent = 'Complete';
+          composeProgressBarEl.style.width = '100%';
+          composeProgressBarEl.classList.remove('progress-bar-animated', 'progress-bar-striped');
+          composeProgressBarEl.classList.add('text-bg-success');
+        }
+        setStatus('Re-validate succeeded.', false);
+        return;
+      }
+      if(data && data.ok && missing.length){
+        appendLoadingLog(`Missing files: ${missing.length}`);
+        missing.slice(0, 8).forEach((m)=>appendLoadingLog(`- ${m}`));
+        if(missing.length > 8) appendLoadingLog(`- ... (${missing.length - 8} more)`);
+        const snap = composeBodyEl ? (composeBodyEl.innerText || '') : '';
+        const missingItems = missing.slice(0, 8).map(m=>`<li>${esc(m)}</li>`).join('');
+        const missingMore = missing.length > 8 ? `<li>... (${missing.length - 8} more)</li>` : '';
+        const detailsHtml = `
+          <div class="small text-muted mb-2">Missing files</div>
+          <ul class="small mb-3">${missingItems}${missingMore}</ul>
+        `;
+        const html = buildRevalidateHtml(
+          false,
+          'Re-Validate Failed',
+          'Missing files detected on CORE VM.',
+          detailsHtml,
+          snap
+        );
+        updateComposeDialog({ html });
+        if(composeStatusEl) composeStatusEl.textContent = 'Re-Validate failed.';
+        if(composeProgressBarEl){
+          composeProgressBarEl.textContent = 'Failed';
+          composeProgressBarEl.style.width = '100%';
+          composeProgressBarEl.classList.remove('progress-bar-animated', 'progress-bar-striped');
+          composeProgressBarEl.classList.add('text-bg-danger');
+        }
+        setStatus('Re-validate failed: missing files.', true);
+        const regen = window.confirm('Missing files on CORE VM. Generate again?');
+        if(regen){
+          if(btnEl) btnEl.click();
+        }
+        return;
+      }
+      const errMsg = (data && (data.error || data.message)) ? String(data.error || data.message) : 'Re-validate failed.';
+      setComposeError(errMsg);
+      setStatus(errMsg, true);
+    } catch(err){
+      setComposeError(String(err && err.message || err));
+      setStatus(String(err && err.message || err), true);
+    }
   });
   // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });

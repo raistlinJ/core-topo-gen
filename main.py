@@ -75,7 +75,12 @@ def main() -> None:
     # Import after logging is configured so Flask app logger inherits handlers.
     from webapp.app_backend import app
     try:
-        app.logger.propagate = True
+        app.logger.propagate = False
+        if not getattr(app.logger, 'handlers', None):
+            sh = logging.StreamHandler(stream=sys.stdout)
+            sh.setLevel(logging.getLogger().level)
+            sh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+            app.logger.addHandler(sh)
     except Exception:
         pass
 

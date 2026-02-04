@@ -12095,6 +12095,159 @@ def api_flow_test_core_connection():
     })
 
 
+@app.route('/api/flag-sequencing/revalidate_flow', methods=['POST'])
+def api_flow_revalidate_flow():
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    xml_hint = str(j.get('xml_path') or '').strip()
+    xml_path = ''
+    if xml_hint:
+        try:
+            xml_path = os.path.abspath(xml_hint)
+        except Exception:
+            xml_path = xml_hint
+    if not xml_path:
+        xml_path = _latest_xml_path_for_scenario(scenario_norm) or ''
+    if not xml_path or not os.path.exists(xml_path):
+        return jsonify({'ok': False, 'error': 'No XML found for this scenario.'}), 404
+
+    flow_state = _flow_state_from_xml_path(xml_path, scenario_norm)
+    if not isinstance(flow_state, dict):
+        return jsonify({'ok': False, 'error': 'No FlowState found in XML. Save XML after resolve.'}), 400
+
+    has_resolved = False
+    try:
+        assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
+        for entry in assigns or []:
+            if not isinstance(entry, dict):
+                continue
+            ro = entry.get('resolved_outputs')
+            if isinstance(ro, dict) and ro:
+                has_resolved = True
+                break
+    except Exception:
+        has_resolved = False
+    if not has_resolved:
+        return jsonify({'ok': False, 'error': 'No resolved outputs saved in XML. Run Generate and Save XML first.'}), 400
+
+    flat_expected: list[tuple[str, str]] = []
+    try:
+        assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
+    except Exception:
+        assigns = []
+    for entry in assigns or []:
+        if not isinstance(entry, dict):
+            continue
+        node_key = str(entry.get('node_id') or entry.get('node_name') or '').strip() or 'node'
+        artifacts_dir = str(entry.get('artifacts_dir') or '').strip()
+        outputs_manifest = str(entry.get('outputs_manifest') or '').strip()
+        run_dir = str(entry.get('run_dir') or '').strip()
+        base_dir = run_dir or artifacts_dir or (os.path.dirname(outputs_manifest) if outputs_manifest else '')
+        if artifacts_dir:
+            flat_expected.append((node_key, artifacts_dir))
+        if outputs_manifest:
+            flat_expected.append((node_key, outputs_manifest))
+
+        inject_detail = entry.get('inject_files_detail') if isinstance(entry.get('inject_files_detail'), list) else []
+        for item in inject_detail or []:
+            if not isinstance(item, dict):
+                continue
+            resolved = str(item.get('resolved') or '').strip()
+            path = str(item.get('path') or '').strip()
+            rel = ''
+            if resolved and not resolved.startswith('/'):
+                rel = resolved
+            elif resolved.startswith('artifacts/'):
+                rel = resolved
+            elif path.startswith('/tmp/'):
+                rel = os.path.basename(path)
+            if base_dir and rel:
+                flat_expected.append((node_key, os.path.join(base_dir, rel)))
+
+        try:
+            resolved_outputs = entry.get('resolved_outputs') if isinstance(entry.get('resolved_outputs'), dict) else {}
+        except Exception:
+            resolved_outputs = {}
+        try:
+            ro_detail = entry.get('resolved_outputs_detail') if isinstance(entry.get('resolved_outputs_detail'), list) else []
+            for item in ro_detail:
+                if not isinstance(item, dict):
+                    continue
+                field = str(item.get('field') or '').strip()
+                if field != 'File(path)':
+                    continue
+                val = str(item.get('resolved') or '').strip()
+                if val:
+                    resolved_outputs.setdefault('File(path)', val)
+        except Exception:
+            pass
+        try:
+            file_val = str(resolved_outputs.get('File(path)') or '').strip()
+            if file_val:
+                if file_val.startswith('/'):
+                    flat_expected.append((node_key, file_val))
+                elif base_dir:
+                    flat_expected.append((node_key, os.path.join(base_dir, file_val)))
+        except Exception:
+            pass
+
+    if not flat_expected:
+        return jsonify({'ok': True, 'missing': [], 'present': [], 'message': 'No FlowState artifacts to validate.'})
+
+    flow_core_cfg = _core_config_from_xml_path(xml_path, scenario_norm, include_password=True)
+    if isinstance(flow_core_cfg, dict):
+        flow_core_cfg = _apply_core_secret_to_config(flow_core_cfg, scenario_norm)
+    if not isinstance(flow_core_cfg, dict):
+        return jsonify({'ok': False, 'error': 'No CoreConnection configured in XML for this scenario.'}), 404
+
+    try:
+        flow_core_cfg = _require_core_ssh_credentials(flow_core_cfg)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Remote validation requires SSH credentials: {exc}'}), 400
+
+    client = None
+    missing: list[str] = []
+    present: list[str] = []
+    try:
+        client = _open_ssh_client(flow_core_cfg)
+        checks: list[str] = []
+        for node_key, path in flat_expected:
+            q = shlex.quote(path)
+            tag = f"{node_key}::{path}"
+            checks.append(f"if [ -e {q} ]; then echo ok::{tag}; else echo missing::{tag}; fi")
+        cmd = ' ; '.join(checks) if checks else 'true'
+        code, out, err = _exec_ssh_command(client, f"bash -lc {shlex.quote(cmd)}", timeout=30.0)
+        if code != 0 and not out:
+            return jsonify({'ok': False, 'error': (err or 'Remote validation failed.')}), 500
+        for raw in (out or '').splitlines():
+            line = raw.strip()
+            if line.startswith('ok::'):
+                present.append(line[len('ok::'):])
+            elif line.startswith('missing::'):
+                missing.append(line[len('missing::'):])
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Remote validation failed: {exc}'}), 500
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+    missing_sorted = sorted(set(missing))
+    present_sorted = sorted(set(present))
+    return jsonify({
+        'ok': True,
+        'missing': missing_sorted,
+        'present': present_sorted,
+        'expected': [f"{n}::{p}" for n, p in flat_expected],
+    })
+
+
 def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
     """Read a realized flag value from a generator artifacts directory.
 
@@ -13583,6 +13736,70 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
         if not isinstance(a, dict):
             continue
         a2 = dict(a)
+        try:
+            injects = a2.get('inject_files') if isinstance(a2.get('inject_files'), list) else None
+            if injects:
+                fixed = []
+                for raw in injects:
+                    s = str(raw or '').strip()
+                    if s.startswith('/tmp/tmp/'):
+                        s = '/tmp/' + s[len('/tmp/tmp/') :]
+                    fixed.append(s)
+                a2['inject_files'] = fixed
+                changed = True
+        except Exception:
+            pass
+        try:
+            detail = a2.get('inject_files_detail') if isinstance(a2.get('inject_files_detail'), list) else None
+            if detail:
+                fixed_detail = []
+                for item in detail:
+                    if not isinstance(item, dict):
+                        fixed_detail.append(item)
+                        continue
+                    item2 = dict(item)
+                    path = str(item2.get('path') or '').strip()
+                    if path.startswith('/tmp/tmp/'):
+                        path = '/tmp/' + path[len('/tmp/tmp/') :]
+                        item2['path'] = path
+                    fixed_detail.append(item2)
+                a2['inject_files_detail'] = fixed_detail
+                changed = True
+        except Exception:
+            pass
+        try:
+            ro = a2.get('resolved_outputs') if isinstance(a2.get('resolved_outputs'), dict) else None
+            if not ro:
+                detail = a2.get('resolved_outputs_detail') if isinstance(a2.get('resolved_outputs_detail'), list) else None
+                if detail:
+                    ro_map: dict[str, Any] = {}
+                    for item in detail:
+                        if not isinstance(item, dict):
+                            continue
+                        field = str(item.get('field') or '').strip()
+                        if not field:
+                            continue
+                        val = item.get('resolved')
+                        if val is not None and field not in ro_map:
+                            ro_map[field] = val
+                    if ro_map:
+                        a2['resolved_outputs'] = ro_map
+                        changed = True
+        except Exception:
+            pass
+        try:
+            ro = a2.get('resolved_outputs') if isinstance(a2.get('resolved_outputs'), dict) else None
+            if not ro:
+                manifest_path = str(a2.get('outputs_manifest') or '').strip()
+                if manifest_path and os.path.exists(manifest_path):
+                    with open(manifest_path, 'r', encoding='utf-8') as mf:
+                        m = json.load(mf) or {}
+                    outs = m.get('outputs') if isinstance(m, dict) else None
+                    if isinstance(outs, dict) and outs:
+                        a2['resolved_outputs'] = outs
+                        changed = True
+        except Exception:
+            pass
         needs = not any(a2.get(k) for k in ('artifacts_dir', 'mount_dir', 'run_dir', 'outputs_manifest'))
         if needs:
             inferred = _infer_flow_artifacts_dir_from_assignment(a2)
@@ -14812,6 +15029,26 @@ def api_flow_attackflow_preview():
                         nid = ''
                     if nid:
                         a.setdefault('node_id', nid)
+    except Exception:
+        pass
+
+    # Ensure inject_files are present from generator definitions when missing.
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            existing = fa.get('inject_files') if isinstance(fa.get('inject_files'), list) else []
+            if any(str(x or '').strip() for x in (existing or [])):
+                continue
+            gid = str(fa.get('id') or fa.get('generator_id') or '').strip()
+            if not gid:
+                continue
+            gen_def = _gen_by_id.get(gid) if isinstance(_gen_by_id, dict) else None
+            if not isinstance(gen_def, dict):
+                continue
+            inj = gen_def.get('inject_files')
+            if isinstance(inj, list) and inj:
+                fa['inject_files'] = [str(x or '').strip() for x in inj if str(x or '').strip()]
     except Exception:
         pass
 
@@ -17462,6 +17699,31 @@ def api_flow_prepare_preview_for_execute():
                         except Exception:
                             pass
 
+                        log_path = None
+                        try:
+                            logs_root = os.path.join(_outputs_dir(), 'logs', 'flow_generator_logs')
+                            os.makedirs(logs_root, exist_ok=True)
+                            safe_gen = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(generator_id or 'generator')).strip('_') or 'generator'
+                            safe_node = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(h.get('name') or cid or 'node')).strip('_') or 'node'
+                            safe_run = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(flow_run_id or uuid.uuid4().hex))
+                            filename = f"{safe_gen}_{safe_node}_{safe_run}.log"
+                            log_path = os.path.join(logs_root, filename)
+                            with open(log_path, 'w', encoding='utf-8') as lf:
+                                lf.write(f"generator_id={generator_id}\n")
+                                lf.write(f"node={safe_node}\n")
+                                lf.write(f"ok={bool(ok_run)}\n")
+                                lf.write(f"note={str(note or '')}\n\n")
+                                if isinstance(run_stdout, str) and run_stdout.strip():
+                                    lf.write("--- stdout ---\n")
+                                    lf.write(run_stdout.strip())
+                                    lf.write("\n")
+                                if isinstance(run_stderr, str) and run_stderr.strip():
+                                    lf.write("--- stderr ---\n")
+                                    lf.write(run_stderr.strip())
+                                    lf.write("\n")
+                        except Exception:
+                            log_path = None
+
                         try:
                             generator_runs.append({
                                 'node_id': cid,
@@ -17474,6 +17736,7 @@ def api_flow_prepare_preview_for_execute():
                                 'manifest': str(manifest_path or ''),
                                 'stdout': (run_stdout or '')[-4000:] if isinstance(run_stdout, str) else '',
                                 'stderr': (run_stderr or '')[-4000:] if isinstance(run_stderr, str) else '',
+                                'log_path': str(log_path or ''),
                             })
                         except Exception:
                             pass
