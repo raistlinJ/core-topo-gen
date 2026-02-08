@@ -5987,8 +5987,13 @@ def _enumerate_core_vm_interfaces_via_ssh(
     vm_context: Optional[Dict[str, Any]] = None,
     timeout: float = 10.0,
 ) -> List[Dict[str, Any]]:
-    _ensure_paramiko_available()
     logger = getattr(app, 'logger', logging.getLogger(__name__))
+    logger.info(f"[hitl-debug] entering _enumerate_core_vm_interfaces_via_ssh")
+    logger.info(f"[hitl-debug] prox_interfaces type: {type(prox_interfaces)}")
+    if prox_interfaces:
+        logger.info(f"[hitl-debug] prox_interfaces len: {len(prox_interfaces)}")
+
+    _ensure_paramiko_available()
     client = paramiko.SSHClient()  # type: ignore[assignment]
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
     try:
@@ -6048,6 +6053,9 @@ def _enumerate_core_vm_interfaces_via_ssh(
         prox_context = vm_context if isinstance(vm_context, dict) else {}
         prox_map: Dict[str, Dict[str, Any]] = {}
         if prox_interfaces and isinstance(prox_interfaces, list):
+            logger.info(f"[hitl-debug] Enumerate SSH with {len(prox_interfaces)} prox interfaces")
+            if len(prox_interfaces) > 0:
+                 logger.info(f"[hitl-debug] First prox interface sample: {prox_interfaces[0]}")
             for entry in prox_interfaces:
                 if not isinstance(entry, dict):
                     continue
@@ -6736,6 +6744,10 @@ def _parse_proxmox_net_config(raw: Any) -> Dict[str, Any]:
             # Keep first mac address discovered from model token
             continue
         result[key] = value
+    
+    # Debug logging for parsed result
+    if 'macaddr' in result:
+        print(f"DEBUG: Parsed Proxmox net config: {raw} -> {result}", flush=True)
     return result
 
 
@@ -6902,6 +6914,88 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
         'verify_ssl': record.get('verify_ssl', True),
         'vms': inventory,
     }
+
+
+def _find_proxmox_vm_config(target_node: Optional[str], target_vmid: Any) -> Optional[List[Dict[str, Any]]]:
+    """
+    Search all stored Proxmox credentials to find the VM and return its current interface config.
+    Useful when the frontend has stale data.
+    """
+    if not target_vmid:
+        return None
+    
+    try:
+        target_vmid_int = int(target_vmid)
+    except Exception:
+        return None
+
+    # List all secret files
+    try:
+        secret_dir = _proxmox_secret_dir()
+        if not os.path.exists(secret_dir):
+            return None
+        files = [f for f in os.listdir(secret_dir) if f.endswith('.json')]
+    except Exception:
+        return None
+
+    for filename in files:
+        identifier = filename[:-5] # remove .json
+        try:
+            # Short timeout to avoid hanging
+            client, _ = _connect_proxmox_from_secret(identifier, timeout=3.0)
+            
+            # If target_node provided, check if it exists
+            nodes = []
+            if target_node:
+                try:
+                    # Quick check if node exists
+                    nodes = [n for n in client.nodes.get() if n.get('node') == target_node]
+                except Exception:
+                    pass
+            
+            if not nodes:
+                # If node not specified or not found, try all nodes
+                try:
+                    nodes = client.nodes.get()
+                except Exception:
+                    continue
+            
+            for node in nodes or []:
+                node_name = node.get('node')
+                if not node_name:
+                    continue
+                
+                # Check if VM exists on this node
+                try:
+                    # Get specific VM config directly
+                    config = client.nodes(node_name).qemu(target_vmid_int).config.get()
+                    
+                    # If we got config, parse interfaces!
+                    interfaces: List[Dict[str, Any]] = []
+                    for key, value in (config or {}).items():
+                        if not isinstance(key, str) or not key.lower().startswith('net'):
+                            continue
+                        parsed = _parse_proxmox_net_config(value)
+                        iface_entry = {
+                            'id': key,
+                            'macaddr': parsed.get('macaddr') or parsed.get('hwaddr') or '',
+                            'bridge': parsed.get('bridge') or '',
+                            'model': parsed.get('model') or parsed.get('modeltype') or '',
+                            'tag': parsed.get('tag') or parsed.get('vlan') or '',
+                            'firewall': parsed.get('firewall') or '',
+                            'raw': value,
+                        }
+                        interfaces.append(iface_entry)
+                    return interfaces
+
+                except Exception:
+                    # VM not found on this node or credential permission issue
+                    continue
+
+        except Exception:
+            continue
+            
+    return None
 
 # ---------------- User persistence helpers (restored) ----------------
 def _users_db_path() -> str:
@@ -12192,11 +12286,16 @@ def api_flow_revalidate_flow():
                     flat_expected.append((node_key, file_val))
                 elif base_dir:
                     flat_expected.append((node_key, os.path.join(base_dir, file_val)))
+                elif file_val.startswith('artifacts/'):
+                    # Fallback: no base_dir but we have a relative artifacts path.
+                    # Use default CORE VM path pattern for flow generator outputs.
+                    fallback_base = f'/tmp/vulns/flag_generators_runs/flow-{scenario_norm}'
+                    flat_expected.append((node_key, os.path.join(fallback_base, file_val)))
         except Exception:
             pass
 
     if not flat_expected:
-        return jsonify({'ok': True, 'missing': [], 'present': [], 'message': 'No FlowState artifacts to validate.'})
+        return jsonify({'ok': False, 'error': 'No FlowState artifacts to validate. Run Generate and Save XML first.'}), 400
 
     flow_core_cfg = _core_config_from_xml_path(xml_path, scenario_norm, include_password=True)
     if isinstance(flow_core_cfg, dict):
@@ -12212,8 +12311,36 @@ def api_flow_revalidate_flow():
     client = None
     missing: list[str] = []
     present: list[str] = []
+    discovered_base_dir: str = ''
     try:
         client = _open_ssh_client(flow_core_cfg)
+
+        # If we have paths with the fallback pattern, try to discover the actual latest run dir.
+        needs_discovery = any(f'/tmp/vulns/flag_generators_runs/flow-{scenario_norm}' in p for _, p in flat_expected)
+        if needs_discovery:
+            try:
+                # Find the latest flow run directory for this scenario.
+                discover_cmd = f"ls -1td /tmp/vulns/flag_generators_runs/flow-{shlex.quote(scenario_norm)}-* 2>/dev/null | head -1"
+                d_code, d_out, _ = _exec_ssh_command(client, f"bash -lc {shlex.quote(discover_cmd)}", timeout=10.0)
+                if d_code == 0 and d_out.strip():
+                    discovered_base_dir = d_out.strip().split('\n')[0].strip()
+                    # Also check flag_node_generators_runs if empty
+                if not discovered_base_dir:
+                    discover_cmd2 = f"ls -1td /tmp/vulns/flag_node_generators_runs/flow-{shlex.quote(scenario_norm)}-* 2>/dev/null | head -1"
+                    d_code2, d_out2, _ = _exec_ssh_command(client, f"bash -lc {shlex.quote(discover_cmd2)}", timeout=10.0)
+                    if d_code2 == 0 and d_out2.strip():
+                        discovered_base_dir = d_out2.strip().split('\n')[0].strip()
+            except Exception:
+                discovered_base_dir = ''
+
+            # Replace fallback patterns with discovered actual path.
+            if discovered_base_dir:
+                fallback_pattern = f'/tmp/vulns/flag_generators_runs/flow-{scenario_norm}'
+                flat_expected = [
+                    (node_key, path.replace(fallback_pattern, discovered_base_dir))
+                    for node_key, path in flat_expected
+                ]
+
         checks: list[str] = []
         for node_key, path in flat_expected:
             q = shlex.quote(path)
@@ -13806,11 +13933,62 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
             if inferred:
                 a2.update(inferred)
                 changed = True
+        # Resolve relative paths in inject_files_detail and resolved_outputs to absolute paths.
+        # This ensures docker-compose generation gets full paths when loading from saved XML.
+        try:
+            art_dir = str(a2.get('artifacts_dir') or a2.get('mount_dir') or a2.get('run_dir') or '').strip()
+            if art_dir and os.path.isabs(art_dir):
+                # Resolve relative paths in inject_files_detail.resolved
+                detail = a2.get('inject_files_detail') if isinstance(a2.get('inject_files_detail'), list) else None
+                if detail:
+                    fixed_detail = []
+                    for item in detail:
+                        if not isinstance(item, dict):
+                            fixed_detail.append(item)
+                            continue
+                        item2 = dict(item)
+                        resolved = str(item2.get('resolved') or '').strip()
+                        if resolved and not os.path.isabs(resolved):
+                            # Resolve relative path to absolute using artifacts_dir
+                            full_path = os.path.join(art_dir, resolved.lstrip('/'))
+                            if not os.path.exists(full_path):
+                                # Try without 'artifacts/' prefix if it exists
+                                if resolved.startswith('artifacts/'):
+                                    alt_path = os.path.join(art_dir, resolved[len('artifacts/'):])
+                                    if os.path.exists(alt_path):
+                                        full_path = alt_path
+                            item2['resolved'] = full_path
+                            changed = True
+                        fixed_detail.append(item2)
+                    a2['inject_files_detail'] = fixed_detail
+                # Resolve relative paths in resolved_outputs values
+                ro = a2.get('resolved_outputs') if isinstance(a2.get('resolved_outputs'), dict) else None
+                if ro:
+                    fixed_ro = {}
+                    for k, v in ro.items():
+                        if isinstance(v, str) and v.strip() and not os.path.isabs(v):
+                            # Check if this looks like a file path (contains slash or file extension)
+                            if '/' in v or ('.' in v and not v.startswith('{')):
+                                full_path = os.path.join(art_dir, v.lstrip('/'))
+                                if not os.path.exists(full_path) and v.startswith('artifacts/'):
+                                    alt_path = os.path.join(art_dir, v[len('artifacts/'):])
+                                    if os.path.exists(alt_path):
+                                        full_path = alt_path
+                                fixed_ro[k] = full_path
+                                changed = True
+                            else:
+                                fixed_ro[k] = v
+                        else:
+                            fixed_ro[k] = v
+                    a2['resolved_outputs'] = fixed_ro
+        except Exception:
+            pass
         enriched.append(a2)
     if changed:
         flow_state = dict(flow_state)
         flow_state['flag_assignments'] = enriched
     return flow_state
+
 
 
 def _flow_parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -25312,7 +25490,21 @@ def api_host_interfaces():
             'vmid': core_vm_payload.get('vmid'),
         }
         if not secret_id:
-            return jsonify({'success': False, 'error': 'CORE credentials are required to enumerate interfaces from the CORE VM'}), 400
+            # Try to fetch fresh data from Proxmox directly if we know the VMID
+            fresh_prox_interfaces = None
+            if vm_context.get('vmid'):
+                fresh_prox_interfaces = _find_proxmox_vm_config(
+                    vm_context.get('vm_node'),
+                    vm_context.get('vmid'),
+                )
+            
+            if fresh_prox_interfaces:
+                # Use fresh data!
+                prox_interfaces = fresh_prox_interfaces
+                # Also fall back to this if SSH fails (handled below)
+            else:
+                return jsonify({'success': False, 'error': 'CORE credentials are required to enumerate interfaces from the CORE VM'}), 400
+
         def _fallback_from_proxmox() -> Optional[Dict[str, Any]]:
             if not prox_interfaces:
                 return None
@@ -25320,7 +25512,11 @@ def api_host_interfaces():
             for idx, vmif in enumerate(prox_interfaces):
                 if not isinstance(vmif, dict):
                     continue
-                name = str(vmif.get('name') or vmif.get('id') or vmif.get('label') or f'eth{idx}')
+                name = str(vmif.get('name') or vmif.get('id') or vmif.get('label') or f'interface-{idx}')
+                # For fallback, if we have 'id' (net0), use it as name because that's what user expects
+                if vmif.get('id'):
+                    name = vmif.get('id')
+                
                 mac = vmif.get('macaddr') or vmif.get('mac') or vmif.get('hwaddr') or ''
                 entry: Dict[str, Any] = {
                     'name': name,
@@ -25350,26 +25546,67 @@ def api_host_interfaces():
             meta = {k: v for k, v in vm_context.items() if v not in (None, '')}
             return {
                 'success': True,
-                'source': 'proxmox_inventory',
+                'source': 'proxmox_inventory_fallback',
                 'interfaces': synthesized,
                 'metadata': meta,
                 'fetched_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
                 'note': 'Using Proxmox inventory as a fallback; CORE VM SSH enumeration unavailable.'
             }
+
         try:
-            interfaces = _enumerate_core_vm_interfaces_from_secret(
-                secret_id,
-                prox_interfaces=prox_interfaces,
-                include_down=include_down,
-                vm_context=vm_context,
-            )
-            if (not interfaces) and prox_interfaces:
+            # If we have secret_id, we can try SSH.
+            # But we should still try to get fresh Proxmox data if possible, 
+            # because the frontend payload might be stale (MAC address mismatch).
+            fresh_prox_interfaces = None
+            if vm_context.get('vmid'):
+                try:
+                    fresh_prox_interfaces = _find_proxmox_vm_config(
+                        vm_context.get('vm_node'),
+                        vm_context.get('vmid'),
+                    )
+                except Exception:
+                    pass
+            
+            # Use fresh data if available, otherwise use payload
+            use_prox_interfaces = fresh_prox_interfaces if fresh_prox_interfaces else prox_interfaces
+
+            if secret_id:
+                interfaces = _enumerate_core_vm_interfaces_from_secret(
+                    secret_id,
+                    prox_interfaces=use_prox_interfaces,
+                    include_down=include_down,
+                    vm_context=vm_context,
+                )
+            else:
+                # No secret ID. if we have fresh data, stick to fallback.
+                # If we don't have fresh data and no secret ID, we errored out above (lines 25414)
+                # UNLESS we are in the path where we just have payload prox_interfaces but no secret_id
+                # (which strictly speaking lines 25414 covers)
+                # But let's be safe:
+                if use_prox_interfaces:
+                     # This will trigger the fallback check below
+                     interfaces = []
+                else:
+                     raise ValueError("CORE credentials are required")
+
+            if (not interfaces) and use_prox_interfaces:
                 # No interfaces returned from CORE VM; fall back to Proxmox inventory snapshot
+                # We need to temporarily point 'prox_interfaces' to 'use_prox_interfaces' for the closure to work?
+                # Actually _fallback_from_proxmox uses 'prox_interfaces' from outer scope.
+                # We should update that variable or pass it. 
+                # Inner function uses outer scope. Let's update outer scope variable 'prox_interfaces'.
+                prox_interfaces = use_prox_interfaces
                 fb = _fallback_from_proxmox()
                 if fb is not None:
                     return jsonify(fb)
-        except ValueError as exc:
-            return jsonify({'success': False, 'error': str(exc)}), 400
+        except ValueError:
+            # If creds are missing/invalid, try falling back to Proxmox inventory if available.
+            if fresh_prox_interfaces:
+                 prox_interfaces = fresh_prox_interfaces
+            fb = _fallback_from_proxmox()
+            if fb is not None:
+                return jsonify(fb)
+            return jsonify({'success': False, 'error': 'CORE credentials are required (and no Proxmox fallback available)'}), 400
         except _SSHTunnelError as exc:
             fb = _fallback_from_proxmox()
             if fb is not None:

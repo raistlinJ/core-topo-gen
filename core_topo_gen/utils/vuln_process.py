@@ -72,6 +72,63 @@ def _docker_sudo_password() -> Optional[str]:
 	return None
 
 
+def _discover_flow_artifacts_dir(scenario_tag: str = '', node_name: str = '', out_base: str = '/tmp/vulns') -> Optional[str]:
+	"""Discover the latest flow artifacts directory when ArtifactsDir is missing.
+
+	Scans /tmp/vulns/flag_generators_runs/ and /tmp/vulns/flag_node_generators_runs/
+	for the most recent flow run directory, optionally filtered by scenario_tag.
+
+	This is a fallback for when loading from saved XML where artifacts_dir was not persisted.
+	"""
+	try:
+		search_dirs = [
+			os.path.join(out_base, 'flag_generators_runs'),
+			os.path.join(out_base, 'flag_node_generators_runs'),
+			'/tmp/vulns/flag_generators_runs',
+			'/tmp/vulns/flag_node_generators_runs',
+		]
+		candidates: List[str] = []
+		scenario_norm = re.sub(r'[^a-zA-Z0-9_-]', '_', str(scenario_tag or '').strip().lower()) if scenario_tag else ''
+		for base_dir in search_dirs:
+			if not os.path.isdir(base_dir):
+				continue
+			try:
+				for entry in os.scandir(base_dir):
+					if not entry.is_dir():
+						continue
+					# Match flow-{scenario}-{uuid} pattern
+					if entry.name.startswith('flow-'):
+						# If scenario_tag provided, filter by it
+						if scenario_norm and scenario_norm not in entry.name.lower():
+							continue
+						candidates.append(entry.path)
+			except Exception:
+				continue
+
+		if not candidates:
+			return None
+
+		# Sort by modification time descending (most recent first)
+		candidates.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+
+		# Prefer directories with 'artifacts' subdirectory
+		for cand in candidates:
+			artifacts_sub = os.path.join(cand, 'artifacts')
+			if os.path.isdir(artifacts_sub):
+				logger.debug('[vuln] discovered flow artifacts dir: %s', artifacts_sub)
+				return artifacts_sub
+
+		# Fall back to most recent run directory directly
+		if candidates:
+			logger.debug('[vuln] discovered flow run dir (no artifacts subdir): %s', candidates[0])
+			return candidates[0]
+
+		return None
+	except Exception as exc:
+		logger.debug('[vuln] _discover_flow_artifacts_dir failed: %s', exc)
+		return None
+
+
 def _read_csv(path: str) -> List[Dict[str, str]]:
 	rows: List[Dict[str, str]] = []
 	def _get(row: Dict[str, str], key: str) -> str:
@@ -2673,6 +2730,16 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			try:
 				art_dir = str(rec.get('ArtifactsDir') or '').strip()
 				mount_path = str(rec.get('ArtifactsMountPath') or '').strip() or '/flow_artifacts'
+				# Fallback: discover latest flow artifacts directory when ArtifactsDir is missing
+				# This handles the case when loading from saved XML where artifacts_dir wasn't persisted.
+				if not art_dir:
+					scenario_tag = str(rec.get('ScenarioTag') or '').strip()
+					art_dir = _discover_flow_artifacts_dir(scenario_tag=scenario_tag, node_name=node_name, out_base=out_base) or ''
+					if art_dir:
+						logger.info('[vuln] fallback discovered artifacts for node=%s: %s', node_name, art_dir)
+						rec['ArtifactsDir'] = art_dir
+						if not rec.get('InjectSourceDir'):
+							rec['InjectSourceDir'] = art_dir
 				if art_dir:
 					# Always emit labels so callers can inspect/copy artifacts even when mounting.
 					obj = _inject_service_labels(
@@ -2688,6 +2755,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
 			except Exception:
 				pass
+
 			# Inject allowlisted files into the target container (copy by default).
 			try:
 				inject_files = rec.get('InjectFiles') or rec.get('inject_files')
