@@ -1,0 +1,3452 @@
+  document.addEventListener('DOMContentLoaded', () => {
+    // if hide_chrome
+    const IS_EMBEDDED = true;
+//    // else
+//    const IS_EMBEDDED = false;
+//    // endif
+    console.log('[DEBUG] Script started');
+
+    let previewData = {};
+    let planFlow = null;
+    let flowSourceOk = true;
+
+    const flowNodeFlagModalEl = document.getElementById('flowNodeFlagModal');
+    const flowNodeFlagModalTitleEl = document.getElementById('flowNodeFlagModalTitle');
+    const flowNodeFlagModalBodyEl = document.getElementById('flowNodeFlagModalBody');
+    const flowAlertEl = document.getElementById('fpFlowValidityAlert');
+
+    function toRoman(num) {
+      const n = Number(num);
+      if (!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+      const parts = [
+        [1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'],
+        [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'],
+        [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I'],
+      ];
+      let x = Math.floor(n);
+      let out = '';
+      for (const [v, s] of parts) {
+        while (x >= v) { out += s; x -= v; }
+      }
+      return out;
+    }
+
+    function openFlowNodeFlagModal(node) {
+      try {
+        if (!flowNodeFlagModalEl || !flowNodeFlagModalBodyEl) return;
+
+        function collectHintTexts(fa) {
+          const out = [];
+          try {
+            if (!fa || typeof fa !== 'object') return out;
+            const hs = Array.isArray(fa.hints) ? fa.hints : [];
+            hs.forEach((x) => { const s = String(x || '').trim(); if (s) out.push(s); });
+            if (typeof fa.hint === 'string') {
+              const s = fa.hint.trim();
+              if (s) out.push(s);
+            }
+            const dh = Array.isArray(fa.description_hints) ? fa.description_hints : [];
+            dh.forEach((x) => { const s = String(x || '').trim(); if (s) out.push(s); });
+          } catch (e) { }
+          return out;
+        }
+
+        // Ensure modal isn't clipped by embedded containers.
+        try {
+          if (!flowNodeFlagModalEl.__appendedToBody) {
+            document.body.appendChild(flowNodeFlagModalEl);
+            flowNodeFlagModalEl.__appendedToBody = true;
+          }
+        } catch (e) { }
+
+        const nodeId = (node && node.id !== undefined && node.id !== null) ? String(node.id) : '';
+        const nodeName = (node && (node.label || node.name)) ? String(node.label || node.name) : (nodeId || 'Node');
+        const seq = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
+        const roman = (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
+
+        if (flowNodeFlagModalTitleEl) {
+          flowNodeFlagModalTitleEl.textContent = (roman ? (roman + '. ') : '') + nodeName;
+        }
+
+        // Pull flag assignments from plan metadata flow.
+        const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+        const scenario = (flow && flow.scenario) ? String(flow.scenario)
+          : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
+            : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
+        const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+        const matches = nodeId ? fas.filter(a => a && String(a.node_id ?? a.nodeId ?? '') === nodeId) : [];
+
+        const tbl = document.createElement('table');
+        tbl.className = 'table table-sm table-borderless mb-0';
+        const tbody = document.createElement('tbody');
+        function addRow(label, valueElOrText) {
+          const tr = document.createElement('tr');
+          const tdL = document.createElement('td');
+          tdL.className = 'text-muted';
+          tdL.style.whiteSpace = 'nowrap';
+          tdL.style.width = '1%';
+          tdL.textContent = String(label || '').trim() ? (String(label).trim() + ':') : '';
+          const tdV = document.createElement('td');
+          if (valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType) {
+            tdV.appendChild(valueElOrText);
+          } else {
+            tdV.textContent = String(valueElOrText || '-');
+          }
+          tr.appendChild(tdL);
+          tr.appendChild(tdV);
+          tbody.appendChild(tr);
+        }
+
+        // Flag generator(s) on this node.
+        if (matches.length > 1) {
+          const wrap = document.createElement('div');
+          const ol = document.createElement('ol');
+          ol.className = 'mb-0 ps-3';
+          matches.forEach((fa) => {
+            const li = document.createElement('li');
+            const genId = fa && fa.id ? String(fa.id) : '-';
+            const genName = fa && fa.name ? String(fa.name) : '-';
+            li.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+            ol.appendChild(li);
+          });
+          wrap.appendChild(ol);
+          addRow('flags', wrap);
+        } else if (matches.length === 1) {
+          const fa = matches[0] || {};
+          const genId = fa && fa.id ? String(fa.id) : '-';
+          const genName = fa && fa.name ? String(fa.name) : '-';
+          addRow('flag', (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId);
+        } else {
+          addRow('flag', '-');
+        }
+
+        // Hints (prefer rendered runtime hints; fall back to static description hints).
+        const hints = [];
+        try {
+          matches.forEach((fa) => {
+            collectHintTexts(fa).forEach((s) => { if (s) hints.push(s); });
+          });
+        } catch (e) { }
+
+        const hintsUniq = Array.from(new Set(hints));
+        if (hintsUniq.length > 1) {
+          const wrap = document.createElement('div');
+          const ol = document.createElement('ol');
+          ol.className = 'mb-0 ps-3';
+          hintsUniq.forEach((t) => {
+            const li = document.createElement('li');
+            li.textContent = t;
+            ol.appendChild(li);
+          });
+          wrap.appendChild(ol);
+          addRow('hints', wrap);
+        } else if (hintsUniq.length === 1) {
+          addRow('hints', hintsUniq[0]);
+        } else {
+          addRow('hints', '-');
+        }
+
+        // Runtime flag value (only if present in the loaded data).
+        const flagValueCell = document.createElement('span');
+        flagValueCell.className = 'text-muted';
+        let fv = '';
+        try {
+          fv = (matches.length === 1 && typeof (matches[0] || {}).flag_value === 'string') ? String((matches[0] || {}).flag_value).trim() : '';
+        } catch (e) { fv = ''; }
+        if (fv) {
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.textContent = fv;
+          addRow('flag value', code);
+        } else {
+          flagValueCell.textContent = '-';
+          addRow('flag value', flagValueCell);
+        }
+
+        tbl.appendChild(tbody);
+        flowNodeFlagModalBodyEl.innerHTML = '';
+        flowNodeFlagModalBodyEl.className = 'small';
+        flowNodeFlagModalBodyEl.appendChild(tbl);
+
+        if (window.bootstrap && window.bootstrap.Modal) {
+          const m = (window.bootstrap.Modal.getOrCreateInstance
+            ? window.bootstrap.Modal.getOrCreateInstance(flowNodeFlagModalEl)
+            : new window.bootstrap.Modal(flowNodeFlagModalEl));
+          m.show();
+        }
+
+        // If the flag value isn't in the loaded preview payload, fetch it on-demand.
+        try {
+          if (!fv && scenario && nodeId && matches.length) {
+            flagValueCell.textContent = 'Loading…';
+            fetch(`/api/flag-sequencing/flag_values_for_node?scenario=${encodeURIComponent(scenario)}&node_id=${encodeURIComponent(nodeId)}`)
+              .then(r => r.json())
+              .then(d => {
+                if (!d || d.ok !== true) {
+                  flagValueCell.textContent = '-';
+                  return;
+                }
+                const flags = Array.isArray(d.flags) ? d.flags : [];
+                const vals = flags.map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '').filter(Boolean);
+                if (!vals.length) {
+                  flagValueCell.textContent = '-';
+                  return;
+                }
+                // If multiple, join with newline for readability.
+                const code = document.createElement('code');
+                code.className = 'font-monospace';
+                code.style.whiteSpace = 'pre-wrap';
+                code.textContent = vals.join('\n');
+                flagValueCell.textContent = '';
+                flagValueCell.replaceWith(code);
+              })
+              .catch(_e => { flagValueCell.textContent = '-'; });
+          }
+        } catch (e) { }
+      } catch (e) { }
+    }
+
+    function showFlowMissingAlert() {
+      if (!flowAlertEl) return;
+      flowAlertEl.classList.remove('d-none');
+      flowAlertEl.textContent = 'Flag sequence missing in XML. Save XML from Flag Sequencing, then reopen Preview.';
+    }
+
+    function renderFlagSequenceTab() {
+      const body = document.getElementById('fp-flag-sequence-body');
+      if (!body) return;
+
+      function collectHintTexts(fa) {
+        const out = [];
+        try {
+          if (!fa || typeof fa !== 'object') return out;
+          const hs = Array.isArray(fa.hints) ? fa.hints : [];
+          hs.forEach((x) => { const s = String(x || '').trim(); if (s) out.push(s); });
+          if (typeof fa.hint === 'string') {
+            const s = fa.hint.trim();
+            if (s) out.push(s);
+          }
+          const dh = Array.isArray(fa.description_hints) ? fa.description_hints : [];
+          dh.forEach((x) => { const s = String(x || '').trim(); if (s) out.push(s); });
+        } catch (e) { }
+        return out;
+      }
+
+      const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+      const flowEnabled = (flow && flow.flow_enabled !== undefined) ? !!flow.flow_enabled : true;
+      const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+      let chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
+      const scenario = (flow && flow.scenario) ? String(flow.scenario)
+        : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
+          : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
+
+      body.innerHTML = '';
+      if (flowEnabled === false) {
+        try {
+          if (flowAlertEl) {
+            flowAlertEl.classList.add('d-none');
+            flowAlertEl.textContent = '';
+          }
+        } catch (e) { }
+        const empty = document.createElement('div');
+        empty.className = 'small text-muted fst-italic';
+        empty.textContent = '(flag sequencing disabled for this scenario)';
+        body.appendChild(empty);
+        return;
+      }
+      if (!chain.length) {
+        try {
+          const chain_ids = (flow && Array.isArray(flow.chain_ids)) ? flow.chain_ids : [];
+          if (chain_ids.length && previewData && typeof previewData === 'object') {
+            const nodeMap = new Map();
+            const addNodes = (list) => {
+              if (!Array.isArray(list)) return;
+              list.forEach(n => {
+                const id = (n && n.node_id !== undefined && n.node_id !== null) ? String(n.node_id) : '';
+                if (!id || nodeMap.has(id)) return;
+                const name = (n && (n.name || n.label)) ? String(n.name || n.label) : id;
+                nodeMap.set(id, { id, name });
+              });
+            };
+            addNodes(previewData.routers);
+            addNodes(previewData.hosts);
+            addNodes(previewData.switches);
+            chain = chain_ids.map((cid) => {
+              const key = String(cid ?? '').trim();
+              return nodeMap.get(key) || { id: key, name: key };
+            }).filter(entry => entry && String(entry.id || '').trim());
+          }
+        } catch (e) { }
+      }
+      if (!chain.length) {
+        showFlowMissingAlert();
+        const empty = document.createElement('div');
+        empty.className = 'small text-muted fst-italic';
+        empty.textContent = '(no flag sequence found in XML flow state)';
+        body.appendChild(empty);
+        return;
+      }
+
+      const tableWrap = document.createElement('div');
+      tableWrap.className = 'table-responsive';
+      tableWrap.style.maxHeight = '560px';
+      tableWrap.style.overflow = 'auto';
+
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm table-bordered small align-middle mb-0';
+      const thead = document.createElement('thead');
+      thead.className = 'table-light';
+      thead.innerHTML = '<tr><th style="width:96px;">Sequence</th><th>Node</th><th style="width:260px;">Flag</th><th>Hints</th><th style="width:220px;">Flag value</th></tr>';
+      const tbody = document.createElement('tbody');
+
+      const faByNodeId = new Map();
+      fas.forEach(a => {
+        try {
+          const nid = String(a?.node_id ?? a?.nodeId ?? '').trim();
+          if (!nid) return;
+          if (!faByNodeId.has(nid)) faByNodeId.set(nid, []);
+          faByNodeId.get(nid).push(a);
+        } catch (e) { }
+      });
+
+      chain.forEach((entry, idx) => {
+        const tr = document.createElement('tr');
+        const seq = document.createElement('td');
+        seq.className = 'text-muted fw-semibold';
+        seq.textContent = toRoman(idx + 1);
+
+        let nodeId = '';
+        let nodeName = '';
+        try {
+          if (entry && typeof entry === 'object') {
+            nodeId = String(entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? '').trim();
+            nodeName = String(entry.name ?? entry.label ?? '').trim();
+          } else {
+            nodeId = String(entry ?? '').trim();
+          }
+        } catch (e) { }
+
+        const nodeTd = document.createElement('td');
+        nodeTd.textContent = nodeName ? `${nodeName} (${nodeId || '-'})` : (nodeId || '-');
+
+        const flagsTd = document.createElement('td');
+        const matches = nodeId ? (faByNodeId.get(nodeId) || []) : [];
+        if (matches.length > 1) {
+          const ol = document.createElement('ol');
+          ol.className = 'mb-0 ps-3';
+          matches.forEach((fa) => {
+            const li = document.createElement('li');
+            const genId = fa && fa.id ? String(fa.id) : '-';
+            const genName = fa && fa.name ? String(fa.name) : '-';
+            li.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+            ol.appendChild(li);
+          });
+          flagsTd.appendChild(ol);
+        } else if (matches.length === 1) {
+          const fa = matches[0] || {};
+          const genId = fa && fa.id ? String(fa.id) : '-';
+          const genName = fa && fa.name ? String(fa.name) : '-';
+          flagsTd.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+        } else {
+          flagsTd.textContent = '-';
+        }
+
+        const descTd = document.createElement('td');
+        const hints = [];
+        try {
+          matches.forEach((fa) => {
+            collectHintTexts(fa).forEach((s) => { if (s) hints.push(s); });
+          });
+        } catch (e) { }
+        const hintsUniq = Array.from(new Set(hints));
+        if (hintsUniq.length > 1) {
+          const ol = document.createElement('ol');
+          ol.className = 'mb-0 ps-3';
+          hintsUniq.forEach((t) => {
+            const li = document.createElement('li');
+            li.textContent = t;
+            ol.appendChild(li);
+          });
+          descTd.appendChild(ol);
+        } else if (hintsUniq.length === 1) {
+          descTd.textContent = hintsUniq[0];
+        } else {
+          descTd.textContent = '-';
+        }
+
+        const flagValTd = document.createElement('td');
+        let haveValue = false;
+        try {
+          const valsLocal = matches
+            .map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '')
+            .filter(Boolean);
+          if (valsLocal.length) {
+            haveValue = true;
+            const code = document.createElement('code');
+            code.className = 'font-monospace';
+            code.style.whiteSpace = 'pre-wrap';
+            code.textContent = Array.from(new Set(valsLocal)).join('\n');
+            flagValTd.appendChild(code);
+          }
+        } catch (e) { }
+
+        if (!haveValue) {
+          const status = document.createElement('span');
+          status.className = 'text-muted';
+          status.textContent = '-';
+          flagValTd.appendChild(status);
+
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'btn btn-sm btn-outline-secondary ms-2';
+          btn.textContent = 'Fetch';
+          btn.disabled = !(scenario && nodeId && matches.length);
+          btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            status.textContent = 'Loading…';
+            fetch(`/api/flag-sequencing/flag_values_for_node?scenario=${encodeURIComponent(scenario)}&node_id=${encodeURIComponent(nodeId)}`)
+              .then(r => r.json())
+              .then(d => {
+                const flags = d && d.ok === true && Array.isArray(d.flags) ? d.flags : [];
+                const vals = flags.map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '').filter(Boolean);
+                if (!vals.length) { status.textContent = '(no flag value)'; return; }
+                const code = document.createElement('code');
+                code.className = 'font-monospace';
+                code.style.whiteSpace = 'pre-wrap';
+                code.textContent = vals.join('\n');
+                flagValTd.innerHTML = '';
+                flagValTd.appendChild(code);
+              })
+              .catch(_e => { status.textContent = '(no flag value)'; });
+          });
+          flagValTd.appendChild(btn);
+        }
+
+        tr.appendChild(seq);
+        tr.appendChild(nodeTd);
+        tr.appendChild(flagsTd);
+        tr.appendChild(descTd);
+        tr.appendChild(flagValTd);
+        tbody.appendChild(tr);
+      });
+
+      tbl.appendChild(thead);
+      tbl.appendChild(tbody);
+      tableWrap.appendChild(tbl);
+      body.appendChild(tableWrap);
+    }
+    function init() {
+      console.log('[DEBUG] init called');
+      const dataEl = document.getElementById('fpDataJson');
+      try {
+        previewData = JSON.parse(dataEl.textContent);
+        console.log('[DEBUG] previewData parsed, seeds:', previewData.routers?.length, previewData.hosts?.length);
+      } catch (e) { console.warn('Failed parse preview json', e); previewData = {}; }
+      try {
+        const flowEl = document.getElementById('fpFlowMetaJson');
+        planFlow = flowEl ? JSON.parse(flowEl.textContent) : null;
+      } catch (e) { planFlow = null; }
+
+      // Flow validity warning (non-blocking): if Flow recorded an invalid chain,
+      // show a red banner to clarify that no flags will be used.
+      try {
+        const flowAlertEl = document.getElementById('fpFlowValidityAlert');
+        const flowValid = planFlow && ('flow_valid' in planFlow) ? !!planFlow.flow_valid : true;
+        const flagsEnabled = planFlow && ('flags_enabled' in planFlow) ? !!planFlow.flags_enabled : true;
+        const flowErrors = (planFlow && Array.isArray(planFlow.flow_errors)) ? planFlow.flow_errors : [];
+        if (flowAlertEl) {
+          if (flowValid && flagsEnabled) {
+            flowAlertEl.classList.add('d-none');
+            flowAlertEl.textContent = '';
+          } else {
+            const base = 'Invalid flag dependency order: execution will NOT include flags.';
+            const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
+            flowAlertEl.textContent = base + details;
+            flowAlertEl.classList.remove('d-none');
+          }
+        }
+      } catch (e) { }
+
+      try { renderFlagSequenceTab(); } catch (e) { }
+
+      let hitlConfig = { enabled: false, interfaces: [] };
+      const hitlEl = document.getElementById('fpHitlConfigJson');
+      if (hitlEl) {
+        try {
+          const parsed = JSON.parse(hitlEl.textContent || 'null');
+          if (parsed && typeof parsed === 'object') {
+            hitlConfig = parsed;
+          }
+        } catch (e) {
+          console.warn('Failed parse HITL config json', e);
+        }
+      }
+      if (!hitlConfig || typeof hitlConfig !== 'object') {
+        hitlConfig = { enabled: false, interfaces: [] };
+      }
+      if (!Array.isArray(hitlConfig.interfaces)) {
+        hitlConfig.interfaces = [];
+      }
+      let scenarioMeta = { scenario: null, xml_basename: '' };
+      const scenarioMetaEl = document.getElementById('fpScenarioMetaJson');
+      if (scenarioMetaEl) {
+        try {
+          const parsedMeta = JSON.parse(scenarioMetaEl.textContent || 'null');
+          if (parsedMeta && typeof parsedMeta === 'object') {
+            scenarioMeta = parsedMeta;
+          }
+        } catch (e) {
+          console.warn('Failed parse scenario meta json', e);
+        }
+      }
+      const scenarioNameRaw = typeof scenarioMeta.scenario === 'string' ? scenarioMeta.scenario : null;
+      const xmlBaseNameRaw = typeof scenarioMeta.xml_basename === 'string' ? scenarioMeta.xml_basename : '';
+      const scenarioKey = (hitlConfig && typeof hitlConfig.scenario_key === 'string' && hitlConfig.scenario_key.trim())
+        ? hitlConfig.scenario_key.trim()
+        : ((scenarioNameRaw && scenarioNameRaw.trim())
+          ? scenarioNameRaw.trim()
+          : (xmlBaseNameRaw || '__default__'));
+      hitlConfig.scenario_key = scenarioKey;
+
+
+      // Make buildScenarioUrl globally available for all scripts (including execute/redirect logic)
+      function buildScenarioUrl(basePath) {
+        if (!basePath || typeof basePath !== 'string') return basePath;
+        const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '').trim();
+        if (!scen) return basePath;
+        try {
+          const isAbsolute = /^https?:/i.test(basePath);
+          const url = new URL(basePath, window.location.origin);
+          url.searchParams.set('scenario', scen);
+          return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
+        } catch (e) {
+          const sep = basePath.includes('?') ? '&' : '?';
+          return `${basePath}${sep}scenario=${encodeURIComponent(scen)}`;
+        }
+      }
+
+      // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
+      function normalizeVulnerabilitiesByNode(source) {
+        const out = {};
+        if (!source) return out;
+        Object.entries(source).forEach(([key, value]) => {
+          if (key === '__density_pool__') return;
+          if (Array.isArray(value)) {
+            out[String(key)] = value;
+            const numericKey = Number(key);
+            if (Number.isFinite(numericKey)) {
+              out[numericKey] = value;
+            }
+          }
+        });
+        return out;
+      }
+
+      const ROUTER_NODE_TYPES = new Set(['router', 'prouter', 'mdr', 'core-router', 'gateway']);
+      const SWITCH_NODE_TYPES = new Set(['switch', 'lanswitch', 'l3switch', 'bridge', 'core-switch']);
+      const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
+      const VULNERABILITY_NODE_TYPES = new Set(['vulnerability', 'vuln']);
+      const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan']);
+      const WIRELESS_NODE_TYPES = new Set(['wireless', 'wirelesslan', 'wireless-lan', 'wlan', 'wifi']);
+      const RJ45_NODE_TYPES = new Set(['rj45']);
+      const HUB_NODE_TYPES = new Set(['hub', 'ethernet', 'tap']);
+
+      const NODE_TYPE_STYLE_PRESETS = {
+        router: { label: 'Router', color: '#ff7043', radius: 11 },
+        switch: { label: 'Switch', color: '#17a2b8', radius: 8 },
+        // Distinguish Docker-role hosts vs non-docker hosts.
+        host: { label: 'Host (non-docker)', color: 'var(--bs-warning-bg-subtle)', radius: 5 },
+        docker: { label: 'Host (Docker)', color: 'var(--bs-warning)', radius: 6 },
+        vulnerability: { label: 'Vulnerability', color: '#ff0000', radius: 6 },
+        network: { label: 'Network', color: '#6c757d', radius: 7 },
+        hub: { label: 'Hub', color: '#7952b3', radius: 6 },
+        rj45: { label: 'RJ45', color: '#20c997', radius: 6, shape: 'square' },
+        wireless: { label: 'Wireless', color: '#0dcaf0', radius: 6 },
+        wlan: { label: 'WLAN', color: '#0dcaf0', radius: 6 },
+        tap: { label: 'TAP', color: '#6f42c1', radius: 6 },
+      };
+
+      function canonicalNodeType(raw) {
+        if (raw === null || raw === undefined) return 'host';
+        const key = String(raw).trim().toLowerCase();
+        if (!key) return 'host';
+        if (ROUTER_NODE_TYPES.has(key)) return 'router';
+        if (SWITCH_NODE_TYPES.has(key)) return 'switch';
+        if (VULNERABILITY_NODE_TYPES.has(key)) return 'vulnerability';
+        if (RJ45_NODE_TYPES.has(key)) return 'rj45';
+        if (WIRELESS_NODE_TYPES.has(key)) return 'wireless';
+        if (NETWORK_NODE_TYPES.has(key)) return 'network';
+        if (HUB_NODE_TYPES.has(key)) return 'hub';
+        if (HOST_NODE_TYPES.has(key)) return 'host';
+        return key;
+      }
+
+      function formatNodeTypeLabel(key) {
+        if (!key) return 'Node';
+        return key.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      }
+
+      function nodeStyleForType(rawType) {
+        const key = canonicalNodeType(rawType);
+        const preset = NODE_TYPE_STYLE_PRESETS[key];
+        if (preset) {
+          const radius = Number.isFinite(preset.radius) ? preset.radius : 6;
+          const shape = preset.shape || 'circle';
+          return { ...preset, radius, shape };
+        }
+        return {
+          label: formatNodeTypeLabel(key),
+          color: '#adb5bd',
+          radius: 6,
+          shape: 'circle',
+        };
+      }
+
+      const _sha256K = new Uint32Array([
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+      ]);
+      const _sha256Init = new Uint32Array([
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+      ]);
+      function _utf8ToBytes(str) {
+        if (typeof TextEncoder !== 'undefined') {
+          return new TextEncoder().encode(str);
+        }
+        const bytes = [];
+        for (let i = 0; i < str.length; i++) {
+          let code = str.charCodeAt(i);
+          if (code < 0x80) {
+            bytes.push(code);
+          } else if (code < 0x800) {
+            bytes.push(0xc0 | (code >> 6));
+            bytes.push(0x80 | (code & 0x3f));
+          } else if (code < 0xd800 || code >= 0xe000) {
+            bytes.push(0xe0 | (code >> 12));
+            bytes.push(0x80 | ((code >> 6) & 0x3f));
+            bytes.push(0x80 | (code & 0x3f));
+          } else {
+            i++;
+            code = 0x10000 + (((code & 0x3ff) << 10) | (str.charCodeAt(i) & 0x3ff));
+            bytes.push(0xf0 | (code >> 18));
+            bytes.push(0x80 | ((code >> 12) & 0x3f));
+            bytes.push(0x80 | ((code >> 6) & 0x3f));
+            bytes.push(0x80 | (code & 0x3f));
+          }
+        }
+        return new Uint8Array(bytes);
+      }
+      function _sha256Bytes(message) {
+        const msg = message instanceof Uint8Array ? message : new Uint8Array(message || []);
+        const l = msg.length;
+        const bitLenHi = Math.floor(l >>> 29);
+        const bitLenLo = (l << 3) >>> 0;
+        const paddedLen = ((l + 9 + 63) >> 6) << 6;
+        const padded = new Uint8Array(paddedLen);
+        padded.set(msg);
+        padded[l] = 0x80;
+        const view = new DataView(padded.buffer);
+        view.setUint32(paddedLen - 8, bitLenHi >>> 0, false);
+        view.setUint32(paddedLen - 4, bitLenLo >>> 0, false);
+        const w = new Uint32Array(64);
+        const H = new Uint32Array(_sha256Init);
+        for (let offset = 0; offset < paddedLen; offset += 64) {
+          for (let i = 0; i < 16; i++) {
+            w[i] = view.getUint32(offset + (i << 2), false);
+          }
+          for (let i = 16; i < 64; i++) {
+            const s0 = ((w[i - 15] >>> 7) | (w[i - 15] << 25)) ^ ((w[i - 15] >>> 18) | (w[i - 15] << 14)) ^ (w[i - 15] >>> 3);
+            const s1 = ((w[i - 2] >>> 17) | (w[i - 2] << 15)) ^ ((w[i - 2] >>> 19) | (w[i - 2] << 13)) ^ (w[i - 2] >>> 10);
+            w[i] = (((w[i - 16] + s0) >>> 0) + ((w[i - 7] + s1) >>> 0)) >>> 0;
+          }
+          let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+          for (let i = 0; i < 64; i++) {
+            const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+            const ch = (e & f) ^ ((~e) & g);
+            const temp1 = (h + S1 + ch + _sha256K[i] + w[i]) >>> 0;
+            const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+            const maj = (a & b) ^ (a & c) ^ (b & c);
+            const temp2 = (S0 + maj) >>> 0;
+            h = g;
+            g = f;
+            f = e;
+            e = (d + temp1) >>> 0;
+            d = c;
+            c = b;
+            b = a;
+            a = (temp1 + temp2) >>> 0;
+          }
+          H[0] = (H[0] + a) >>> 0;
+          H[1] = (H[1] + b) >>> 0;
+          H[2] = (H[2] + c) >>> 0;
+          H[3] = (H[3] + d) >>> 0;
+          H[4] = (H[4] + e) >>> 0;
+          H[5] = (H[5] + f) >>> 0;
+          H[6] = (H[6] + g) >>> 0;
+          H[7] = (H[7] + h) >>> 0;
+        }
+        const out = new Uint8Array(32);
+        const outView = new DataView(out.buffer);
+        for (let i = 0; i < 8; i++) {
+          outView.setUint32(i << 2, H[i], false);
+        }
+        return out;
+      }
+      function makeDeterministicRng(seed) {
+        const base = _sha256Bytes(_utf8ToBytes(String(seed ?? '')));
+        let counter = 0;
+        const counterBytes = new Uint8Array(8);
+        const counterView = new DataView(counterBytes.buffer);
+        return () => {
+          counterView.setUint32(0, counter >>> 0, true);
+          counterView.setUint32(4, Math.floor(counter / 0x100000000) >>> 0, true);
+          counter += 1;
+          const combined = new Uint8Array(base.length + counterBytes.length);
+          combined.set(base, 0);
+          combined.set(counterBytes, base.length);
+          const digest = _sha256Bytes(combined);
+          let value = 0n;
+          for (let i = 0; i < 8; i++) {
+            value = (value << 8n) | BigInt(digest[i]);
+          }
+          return Number(value) / 18446744073709551616;
+        };
+      }
+
+      const HITL_ATTACHMENT_ALLOWED = new Set(['existing_router', 'existing_switch', 'new_router']);
+      const DEFAULT_HITL_ATTACHMENT = 'existing_router';
+
+      function normalizeHitlAttachment(value) {
+        if (value === null || value === undefined) return DEFAULT_HITL_ATTACHMENT;
+        let normalized = String(value).trim().toLowerCase();
+        if (!normalized) return DEFAULT_HITL_ATTACHMENT;
+        normalized = normalized.replace(/[\s-]+/g, '_');
+        return HITL_ATTACHMENT_ALLOWED.has(normalized) ? normalized : DEFAULT_HITL_ATTACHMENT;
+      }
+
+      function intToIpv4(value) {
+        const num = (Number(value) >>> 0);
+        const part1 = (num >>> 24) & 0xff;
+        const part2 = (num >>> 16) & 0xff;
+        const part3 = (num >>> 8) & 0xff;
+        const part4 = num & 0xff;
+        return `${part1}.${part2}.${part3}.${part4}`;
+      }
+
+      function slugifyHitlName(rawValue, fallback) {
+        let value = '';
+        if (typeof rawValue === 'string') {
+          value = rawValue.trim().toLowerCase();
+        } else if (rawValue !== null && rawValue !== undefined) {
+          value = String(rawValue).trim().toLowerCase();
+        }
+        if (!value) {
+          value = (fallback || '').toString().trim().toLowerCase();
+        }
+        const cleaned = [];
+        for (const ch of value) {
+          if (/^[a-z0-9]$/.test(ch)) {
+            cleaned.push(ch);
+          } else if (ch === '-' || ch === '_') {
+            cleaned.push(ch);
+          } else {
+            cleaned.push('-');
+          }
+        }
+        let slug = cleaned.join('').replace(/^[-_]+|[-_]+$/g, '');
+        if (!slug) {
+          slug = ((fallback || '').toString().trim().toLowerCase()).replace(/^[-_]+|[-_]+$/g, '') || 'iface';
+        }
+        if (slug.length > 48) slug = slug.slice(0, 48);
+        return slug;
+      }
+
+      function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 24) {
+        try {
+          const sanitizedPrefix = Number.isFinite(prefixLen) ? Math.min(Math.max(Math.trunc(prefixLen), 0), 32) : 24;
+          const baseNetworkInt = (10 << 24) | (254 << 16);
+          const addressSpaceSize = 1 << 16;
+          const hostBlock = sanitizedPrefix >= 32 ? 1 : (1 << Math.max(0, 32 - sanitizedPrefix));
+          if (hostBlock < 8) {
+            return null;
+          }
+          const subnetSpan = Math.max(0, sanitizedPrefix - 16);
+          const totalSubnets = Math.max(1, Math.pow(2, subnetSpan));
+          const seed = `${scenarioKey || '__default__'}|${ifaceName || ordinal}|${ordinal}|hitl-link`;
+          const rng = makeDeterministicRng(seed);
+          const subnetIndex = Math.floor(rng() * totalSubnets) % totalSubnets;
+          let networkAddressInt = (baseNetworkInt + (subnetIndex * hostBlock)) >>> 0;
+          const maxAddressInt = (baseNetworkInt + addressSpaceSize - 1) >>> 0;
+          if (networkAddressInt > maxAddressInt) {
+            networkAddressInt = (baseNetworkInt + (networkAddressInt % addressSpaceSize)) >>> 0;
+          }
+          let broadcastInt = (networkAddressInt + hostBlock - 1) >>> 0;
+          if (broadcastInt > maxAddressInt) {
+            broadcastInt = (baseNetworkInt + (broadcastInt % addressSpaceSize)) >>> 0;
+          }
+          const hostInts = [];
+          for (let addr = (networkAddressInt + 1) >>> 0; addr < broadcastInt; addr = (addr + 1) >>> 0) {
+            hostInts.push(addr >>> 0);
+          }
+          if (hostInts.length < 3) {
+            return null;
+          }
+          const netmaskInt = sanitizedPrefix === 0 ? 0 : ((0xffffffff << (32 - sanitizedPrefix)) >>> 0);
+          const pool = hostInts.slice();
+          const selections = [];
+          for (let i = 0; i < 3; i++) {
+            if (!pool.length) break;
+            const choiceIdx = Math.floor(rng() * pool.length) % pool.length;
+            selections.push(pool.splice(choiceIdx, 1)[0]);
+          }
+          if (selections.length < 3) {
+            return null;
+          }
+          return {
+            network: intToIpv4(networkAddressInt),
+            network_cidr: `${intToIpv4(networkAddressInt)}/${sanitizedPrefix}`,
+            prefix_len: sanitizedPrefix,
+            netmask: intToIpv4(netmaskInt),
+            broadcast_ip4: intToIpv4(broadcastInt),
+            existing_router_ip4: intToIpv4(selections[0]),
+            new_router_ip4: intToIpv4(selections[1]),
+            rj45_ip4: intToIpv4(selections[2]),
+          };
+        } catch (err) {
+          console.warn('HITL: failed to compute preview link IPs', err);
+          return null;
+        }
+      }
+
+      function deriveHitlLinkMeta(iface, ordinal, totalCount, scenarioKey) {
+        if (!iface || typeof iface !== 'object') {
+          return {};
+        }
+        const previewRouter = iface.preview_router || iface.previewRouter || null;
+        const previewMetadata = (previewRouter && previewRouter.metadata) || {};
+        const result = {
+          network: iface.link_network || iface.linkNetwork || null,
+          networkCidr: iface.link_network_cidr || iface.linkNetworkCidr || null,
+          prefixLen: Number.isFinite(iface.prefix_len) ? Number(iface.prefix_len) : null,
+          netmask: iface.netmask || null,
+          existingRouterIp4: iface.existing_router_ip4 || null,
+          newRouterIp4: iface.new_router_ip4 || null,
+          rj45Ip4: iface.rj45_ip4 || null,
+          broadcastIp4: iface.broadcast_ip4 || null,
+        };
+        if (!result.network && previewMetadata.link_network) result.network = previewMetadata.link_network;
+        if (!result.networkCidr && previewMetadata.link_network) result.networkCidr = previewMetadata.link_network;
+        if (!result.prefixLen && Number.isFinite(previewMetadata.prefix_len)) result.prefixLen = Number(previewMetadata.prefix_len);
+        if (!result.netmask && previewMetadata.netmask) result.netmask = previewMetadata.netmask;
+        if (!result.existingRouterIp4 && previewMetadata.existing_router_ip4) result.existingRouterIp4 = previewMetadata.existing_router_ip4;
+        if (!result.newRouterIp4 && previewMetadata.new_router_ip4) result.newRouterIp4 = previewMetadata.new_router_ip4;
+        if (!result.rj45Ip4 && previewMetadata.rj45_ip4) result.rj45Ip4 = previewMetadata.rj45_ip4;
+        if (!result.broadcastIp4 && previewMetadata.broadcast_ip4) result.broadcastIp4 = previewMetadata.broadcast_ip4;
+        if (previewRouter && typeof previewRouter.ip4 === 'string' && !result.newRouterIp4) {
+          result.newRouterIp4 = previewRouter.ip4;
+        }
+        if (result.newRouterIp4 && typeof result.newRouterIp4 === 'string' && result.newRouterIp4.includes('/')) {
+          const parts = result.newRouterIp4.split('/', 2);
+          result.newRouterIp4 = parts[0];
+          if (!result.prefixLen && parts[1]) {
+            const parsed = parseInt(parts[1], 10);
+            if (!Number.isNaN(parsed)) {
+              result.prefixLen = parsed;
+            }
+          }
+        }
+        if (!result.networkCidr && result.network && Number.isFinite(result.prefixLen)) {
+          result.networkCidr = `${result.network}/${result.prefixLen}`;
+        }
+        const needsFallback = !result.networkCidr || !result.newRouterIp4 || !result.rj45Ip4 || !result.existingRouterIp4;
+        if (needsFallback) {
+          const fallback = computeHitlPreviewLinkIps(scenarioKey, iface.name || `iface-${ordinal + 1}`, ordinal);
+          if (fallback) {
+            result.network = result.network || fallback.network;
+            result.networkCidr = result.networkCidr || fallback.network_cidr || fallback.network;
+            result.prefixLen = result.prefixLen || fallback.prefix_len;
+            result.netmask = result.netmask || fallback.netmask;
+            result.existingRouterIp4 = result.existingRouterIp4 || fallback.existing_router_ip4;
+            result.newRouterIp4 = result.newRouterIp4 || fallback.new_router_ip4;
+            result.rj45Ip4 = result.rj45Ip4 || fallback.rj45_ip4;
+            result.broadcastIp4 = result.broadcastIp4 || fallback.broadcast_ip4;
+          }
+        }
+        if (result.network && Number.isFinite(result.prefixLen) && !result.netmask) {
+          const prefix = Math.min(Math.max(Number(result.prefixLen), 0), 32);
+          const maskInt = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+          result.netmask = intToIpv4(maskInt);
+        }
+        if (result.network && Number.isFinite(result.prefixLen) && !result.networkCidr) {
+          result.networkCidr = `${result.network}/${result.prefixLen}`;
+        }
+        return result;
+      }
+
+      function hitlAttachmentAttemptOrder(preference) {
+        const normalized = normalizeHitlAttachment(preference);
+        if (normalized === 'existing_router') {
+          return ['existing_router', 'existing_switch', 'new_router'];
+        }
+        if (normalized === 'existing_switch') {
+          return ['existing_switch', 'existing_router', 'new_router'];
+        }
+        return ['new_router', 'existing_router', 'existing_switch'];
+      }
+
+      function deriveStandaloneHitlArtifacts(preview, hitlCfg, scenarioKeySeed) {
+        if (!preview || typeof preview !== 'object') return null;
+        if (!hitlCfg || typeof hitlCfg !== 'object' || !hitlCfg.enabled) return null;
+        const rawInterfaces = Array.isArray(hitlCfg.interfaces) ? hitlCfg.interfaces : [];
+        const totalInterfaces = rawInterfaces.length;
+        const scenarioSeed = (typeof scenarioKeySeed === 'string' && scenarioKeySeed.trim())
+          ? scenarioKeySeed.trim()
+          : ((preview && preview.seed !== undefined && preview.seed !== null) ? String(preview.seed) : '__standalone__');
+        const hitlScenarioKey = (typeof hitlCfg.scenario_key === 'string' && hitlCfg.scenario_key.trim())
+          ? hitlCfg.scenario_key.trim()
+          : scenarioSeed;
+
+        const normalizeList = (value) => {
+          if (Array.isArray(value)) {
+            return value.map(v => (v ?? '').toString().trim()).filter(Boolean);
+          }
+          if (typeof value === 'string') {
+            return value.split(',').map(v => v.trim()).filter(Boolean);
+          }
+          return [];
+        };
+
+        const interfaces = rawInterfaces
+          .map((entry, idx) => {
+            if (!entry || typeof entry !== 'object' || !entry.name) return null;
+            const clone = { ...entry };
+            clone.name = (clone.name || '').toString();
+            clone.alias = clone.alias ?? clone.description ?? clone.display;
+            clone.ipv4 = normalizeList(clone.ipv4);
+            clone.ipv6 = normalizeList(clone.ipv6);
+            clone.attachment = normalizeHitlAttachment(clone.attachment);
+            const fallbackSlug = `iface-${idx + 1}`;
+            const slug = slugifyHitlName(clone.name, fallbackSlug);
+            clone.slug = slug;
+            clone.ordinal = idx;
+            const linkMeta = deriveHitlLinkMeta(clone, idx, totalInterfaces, hitlScenarioKey) || {};
+            clone.hitl_link_meta = linkMeta;
+            if (linkMeta.rj45Ip4 && !clone.rj45_ip4) {
+              clone.rj45_ip4 = linkMeta.rj45Ip4;
+            }
+            if (linkMeta.newRouterIp4 && !clone.new_router_ip4) {
+              clone.new_router_ip4 = linkMeta.newRouterIp4;
+            }
+            if (linkMeta.existingRouterIp4 && !clone.existing_router_ip4) {
+              clone.existing_router_ip4 = linkMeta.existingRouterIp4;
+            }
+            if (linkMeta.networkCidr && !clone.link_network_cidr) {
+              clone.link_network_cidr = linkMeta.networkCidr;
+            }
+            if (linkMeta.netmask && !clone.netmask) {
+              clone.netmask = linkMeta.netmask;
+            }
+            return clone;
+          })
+          .filter(Boolean);
+
+        if (!interfaces.length) return null;
+
+        const normalizeName = (raw, idx) => {
+          let base = (raw || `iface-${idx}`).toString().trim().toLowerCase();
+          base = base.replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+          if (!base) base = `iface-${idx}`;
+          if (base.length > 48) base = base.slice(0, 48);
+          return base;
+        };
+
+        const existingIds = new Set();
+        const noteExisting = (val) => {
+          if (val === undefined || val === null) return;
+          existingIds.add(String(val));
+        };
+
+        const routers = Array.isArray(preview.routers) ? preview.routers : [];
+        const hosts = Array.isArray(preview.hosts) ? preview.hosts : [];
+        const switches = Array.isArray(preview.switches_detail) ? preview.switches_detail : [];
+        routers.forEach(r => noteExisting(r?.node_id ?? r?.id));
+        hosts.forEach(h => noteExisting(h?.node_id ?? h?.id));
+        switches.forEach(sw => noteExisting(sw?.switch_id ?? sw?.id));
+        const basePreview = preview.base_bridge_preview || {};
+        noteExisting(basePreview?.bridge_router_id);
+        noteExisting(basePreview?.internal_peer_router_id);
+
+        const routerPeers = routers
+          .filter(r => r && r.node_id !== undefined && r.node_id !== null)
+          .slice()
+          .sort((a, b) => {
+            const aid = Number(a?.node_id ?? a?.id ?? 0);
+            const bid = Number(b?.node_id ?? b?.id ?? 0);
+            return aid - bid;
+          });
+        const routerPeerMap = new Map();
+        routerPeers.forEach(peer => {
+          const peerId = peer?.node_id ?? peer?.id;
+          if (peerId !== undefined && peerId !== null) {
+            routerPeerMap.set(String(peerId), peer);
+          }
+        });
+        const hostPeers = hosts
+          .filter(h => h && h.node_id !== undefined && h.node_id !== null)
+          .slice()
+          .sort((a, b) => {
+            const aid = Number(a?.node_id ?? a?.id ?? 0);
+            const bid = Number(b?.node_id ?? b?.id ?? 0);
+            return aid - bid;
+          });
+        const existingSubnets = switches
+          .filter(sw => sw && sw.switch_id !== undefined && sw.switch_id !== null)
+          .slice()
+          .sort((a, b) => {
+            const aid = Number(a?.switch_id ?? a?.id ?? 0);
+            const bid = Number(b?.switch_id ?? b?.id ?? 0);
+            return aid - bid;
+          });
+
+        const hitlSwitchLookup = new Map();
+        existingSubnets.forEach(detail => {
+          if (!detail || typeof detail !== 'object') return;
+          const meta = (detail.metadata && typeof detail.metadata === 'object') ? detail.metadata : {};
+          const slugKey = meta.hitl_slug || meta.hitl_switch_slug || meta.hitl_interface_slug;
+          if (slugKey) {
+            hitlSwitchLookup.set(`slug:${String(slugKey)}`, detail);
+          }
+          const ifaceName = meta.hitl_interface_name || meta.interface_name || detail.interface_name;
+          if (ifaceName) {
+            hitlSwitchLookup.set(`name:${String(ifaceName).toLowerCase().trim()}`, detail);
+          }
+        });
+
+        const resultNodes = [];
+        const resultLinks = [];
+        const includedRouterNodeIds = new Set();
+        const includedSwitchNodeIds = new Set();
+        const routerOverlayMap = new Map();
+        const switchOverlayMap = new Map();
+        const routerSwitchInterfaceMap = new Map();
+
+        const registerRouterOverlayNode = (node) => {
+          if (!node) return;
+          const key = String(node.id ?? node.node_id);
+          if (!key) return;
+          routerOverlayMap.set(key, node);
+        };
+
+        const getOrCreateRouterOverlayNode = (routerId, fallbackLabel = null) => {
+          if (routerId === null || routerId === undefined) return null;
+          const key = String(routerId);
+          if (routerOverlayMap.has(key)) {
+            return routerOverlayMap.get(key);
+          }
+          let node = resultNodes.find(existing => String(existing.id ?? existing.node_id) === key);
+          if (!node) {
+            const basePeer = routerPeerMap.get(key);
+            const label = fallbackLabel || basePeer?.name || `Router ${routerId}`;
+            node = {
+              id: routerId,
+              node_id: routerId,
+              type: 'router',
+              label,
+              name: label,
+              isHitlRouter: true,
+            };
+            resultNodes.push(node);
+            includedRouterNodeIds.add(routerId);
+          }
+          registerRouterOverlayNode(node);
+          return node;
+        };
+
+        const registerSwitchOverlayNode = (node) => {
+          if (!node) return;
+          const key = String(node.switch_id ?? node.id);
+          if (!key) return;
+          switchOverlayMap.set(key, node);
+        };
+
+        const registerRouterSwitchInterface = (routerId, entry) => {
+          if (routerId === null || routerId === undefined) return;
+          const key = String(routerId);
+          const list = routerSwitchInterfaceMap.get(key) || [];
+          list.push(entry);
+          routerSwitchInterfaceMap.set(key, list);
+        };
+
+        const makeUniqueId = (base) => {
+          let candidate = base;
+          let suffix = 2;
+          while (existingIds.has(String(candidate))) {
+            candidate = `${base}-${suffix}`;
+            suffix += 1;
+          }
+          existingIds.add(String(candidate));
+          return candidate;
+        };
+
+        interfaces.forEach((iface, idx) => {
+          const baseName = normalizeName(iface.name, idx);
+          const attachmentPref = normalizeHitlAttachment(iface.attachment);
+          const nodeId = makeUniqueId(baseName);
+          const alias = iface.alias;
+          const labelParts = [];
+          if (iface.name) labelParts.push(iface.name);
+          if (alias && alias !== iface.name) {
+            labelParts.push(alias);
+          } else if (iface.mac) {
+            labelParts.push(iface.mac);
+          }
+          const nodeLabel = labelParts.filter(Boolean).join(' · ') || iface.name || `HITL ${idx + 1}`;
+          const linkMeta = iface.hitl_link_meta || deriveHitlLinkMeta(iface, idx, totalInterfaces, hitlScenarioKey) || {};
+          const hitlNode = {
+            id: nodeId,
+            type: 'rj45',
+            label: nodeLabel,
+            name: nodeLabel,
+            isHitl: true,
+            hitlInterface: iface,
+            attachment: attachmentPref,
+            hitlLinkMeta: linkMeta,
+          };
+          if (linkMeta && linkMeta.rj45Ip4) {
+            hitlNode.ip4 = linkMeta.rj45Ip4;
+          } else if (Array.isArray(iface.ipv4) && iface.ipv4.length) {
+            hitlNode.ip4 = iface.ipv4[0];
+          }
+          if (linkMeta && (linkMeta.networkCidr || linkMeta.network)) {
+            hitlNode.linkNetwork = linkMeta.networkCidr || linkMeta.network;
+          }
+          if (linkMeta && Number.isFinite(linkMeta.prefixLen)) {
+            hitlNode.prefixLen = Number(linkMeta.prefixLen);
+          }
+          if (linkMeta && linkMeta.newRouterIp4) {
+            hitlNode.peerRouterIp4 = linkMeta.newRouterIp4;
+          }
+          if (linkMeta && linkMeta.existingRouterIp4) {
+            hitlNode.existingRouterIp4 = linkMeta.existingRouterIp4;
+          }
+          if (linkMeta && linkMeta.netmask) {
+            hitlNode.netmask = linkMeta.netmask;
+          }
+          if (linkMeta && linkMeta.broadcastIp4) {
+            hitlNode.broadcastIp4 = linkMeta.broadcastIp4;
+          }
+          resultNodes.push(hitlNode);
+
+          const rng = makeDeterministicRng(`${scenarioSeed}|${iface.name}|${idx}|${interfaces.length}`);
+          const attempts = hitlAttachmentAttemptOrder(attachmentPref);
+          let targetId = null;
+          let assignment = null;
+          let linkKind = 'hitl-peer';
+          let uplinkRouterId = null;
+
+          const pickRouterPeer = () => {
+            if (!routerPeers.length) return null;
+            const peer = routerPeers[Math.floor(rng() * routerPeers.length) % routerPeers.length];
+            const peerId = peer?.node_id ?? peer?.id;
+            return (peerId !== undefined && peerId !== null) ? peerId : null;
+          };
+
+          const pickSwitchPeer = () => {
+            if (!existingSubnets.length) return null;
+            const subnet = existingSubnets[Math.floor(rng() * existingSubnets.length) % existingSubnets.length];
+            const candidateId = subnet?.switch_id ?? subnet?.id;
+            return (candidateId !== undefined && candidateId !== null) ? candidateId : null;
+          };
+
+          const createNewRouter = () => {
+            const previewRouterMeta = iface.preview_router || iface.previewRouter || null;
+            const matchPreviewRouter = () => {
+              if (previewRouterMeta && (previewRouterMeta.node_id ?? previewRouterMeta.nodeId ?? previewRouterMeta.id) !== undefined) {
+                return previewRouterMeta;
+              }
+              return routerPeers.find(peer => {
+                if (!peer) return false;
+                const meta = peer.metadata || peer.meta || peer.details || null;
+                if (!meta || meta.hitl_preview !== true) return false;
+                if (iface.slug && typeof meta.hitl_slug === 'string' && meta.hitl_slug === iface.slug) return true;
+                const ifaceNameLower = (iface.name || '').toString().trim().toLowerCase();
+                if (ifaceNameLower && typeof meta.hitl_interface_name === 'string' && meta.hitl_interface_name.trim().toLowerCase() === ifaceNameLower) {
+                  return true;
+                }
+                if (Number.isFinite(meta.ordinal) && meta.ordinal === idx) return true;
+                return false;
+              }) || null;
+            };
+
+            const previewRouter = matchPreviewRouter();
+            if (previewRouter) {
+              const routerId = previewRouter.node_id ?? previewRouter.nodeId ?? previewRouter.id;
+              if (routerId !== undefined && routerId !== null) {
+                noteExisting(routerId);
+                const routerLabel = previewRouter.name || `HITL Router ${idx + 1}`;
+                const meta = previewRouter.metadata || previewRouter.meta || {};
+                if (meta && meta.uplink_router_node_id !== undefined && meta.uplink_router_node_id !== null) {
+                  uplinkRouterId = meta.uplink_router_node_id;
+                } else if (meta && meta.uplinkRouterId !== undefined && meta.uplinkRouterId !== null) {
+                  uplinkRouterId = meta.uplinkRouterId;
+                }
+                const prefixCandidate = Number.isFinite(linkMeta?.prefixLen) ? Number(linkMeta.prefixLen) : (Number.isFinite(meta?.prefix_len) ? Number(meta.prefix_len) : null);
+                const routerNode = getOrCreateRouterOverlayNode(routerId, routerLabel);
+                if (routerNode) {
+                  const assignIfMissing = (key, value) => {
+                    if (value === undefined || value === null) return;
+                    if (routerNode[key] === undefined || routerNode[key] === null) {
+                      routerNode[key] = value;
+                    }
+                  };
+                  assignIfMissing('label', routerLabel);
+                  assignIfMissing('name', routerLabel);
+                  routerNode.isHitlRouter = true;
+                  routerNode.attachment = routerNode.attachment || attachmentPref;
+                  routerNode.previewRouter = routerNode.previewRouter || previewRouter;
+                  routerNode.hitlInterface = routerNode.hitlInterface || iface;
+                  if (linkMeta && !routerNode.hitlLinkMeta) {
+                    routerNode.hitlLinkMeta = linkMeta;
+                  }
+                  if (meta && meta.new_router_ip4) {
+                    const value = prefixCandidate && !String(meta.new_router_ip4).includes('/')
+                      ? `${meta.new_router_ip4}/${prefixCandidate}`
+                      : meta.new_router_ip4;
+                    assignIfMissing('ip4', value);
+                  } else if (linkMeta && linkMeta.newRouterIp4) {
+                    const value = prefixCandidate && !String(linkMeta.newRouterIp4).includes('/')
+                      ? `${linkMeta.newRouterIp4}/${prefixCandidate}`
+                      : linkMeta.newRouterIp4;
+                    assignIfMissing('ip4', value);
+                  } else if (typeof previewRouter.ip4 === 'string') {
+                    assignIfMissing('ip4', previewRouter.ip4);
+                  }
+                  if (meta && meta.existing_router_ip4) {
+                    assignIfMissing('peerRouterIp4', meta.existing_router_ip4);
+                  } else if (linkMeta && linkMeta.existingRouterIp4) {
+                    assignIfMissing('peerRouterIp4', linkMeta.existingRouterIp4);
+                  }
+                  if (linkMeta && (linkMeta.networkCidr || linkMeta.network)) {
+                    assignIfMissing('linkNetwork', linkMeta.networkCidr || linkMeta.network);
+                  } else if (meta && meta.link_network) {
+                    assignIfMissing('linkNetwork', meta.link_network);
+                  }
+                  if (Number.isFinite(prefixCandidate)) {
+                    assignIfMissing('prefixLen', prefixCandidate);
+                  }
+                  if (uplinkRouterId !== null && (routerNode.uplinkRouterId === undefined || routerNode.uplinkRouterId === null)) {
+                    routerNode.uplinkRouterId = uplinkRouterId;
+                  }
+                  registerRouterOverlayNode(routerNode);
+                }
+                if (!routerPeers.some(peer => String(peer?.node_id ?? peer?.id) === String(routerId))) {
+                  routerPeers.push(previewRouter);
+                }
+                routerPeerMap.set(String(routerId), previewRouter);
+                return routerId;
+              }
+            }
+
+            const routerId = makeUniqueId(`hitl-router-${baseName}`);
+            const routerLabel = `HITL Router ${idx + 1}`;
+            const routerNode = getOrCreateRouterOverlayNode(routerId, routerLabel);
+            if (routerNode) {
+              const assignIfMissing = (key, value) => {
+                if (value === undefined || value === null) return;
+                if (routerNode[key] === undefined || routerNode[key] === null) {
+                  routerNode[key] = value;
+                }
+              };
+              assignIfMissing('label', routerLabel);
+              assignIfMissing('name', routerLabel);
+              routerNode.isHitlRouter = true;
+              routerNode.hitlInterface = routerNode.hitlInterface || iface;
+              routerNode.attachment = routerNode.attachment || attachmentPref;
+              if (linkMeta && !routerNode.hitlLinkMeta) {
+                routerNode.hitlLinkMeta = linkMeta;
+              }
+              if (linkMeta && linkMeta.newRouterIp4) {
+                const withPrefix = Number.isFinite(linkMeta.prefixLen) && !String(linkMeta.newRouterIp4).includes('/')
+                  ? `${linkMeta.newRouterIp4}/${linkMeta.prefixLen}`
+                  : linkMeta.newRouterIp4;
+                assignIfMissing('ip4', withPrefix);
+              }
+              if (linkMeta && (linkMeta.networkCidr || linkMeta.network)) {
+                assignIfMissing('linkNetwork', linkMeta.networkCidr || linkMeta.network);
+              }
+              if (linkMeta && Number.isFinite(linkMeta.prefixLen)) {
+                assignIfMissing('prefixLen', Number(linkMeta.prefixLen));
+              }
+              if (linkMeta && linkMeta.existingRouterIp4) {
+                assignIfMissing('peerRouterIp4', linkMeta.existingRouterIp4);
+              }
+              const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+              if (routerCandidates.length) {
+                const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+                const chosenId = chosen?.node_id ?? chosen?.id;
+                if (chosenId !== undefined && chosenId !== null) {
+                  uplinkRouterId = chosenId;
+                  assignIfMissing('uplinkRouterId', chosenId);
+                  noteExisting(chosenId);
+                  resultLinks.push({ sourceId: routerId, targetId: chosenId, kind: 'hitl-router-uplink', attachment: attachmentPref, assignment: 'uplink_router', linkMeta });
+                }
+              }
+              registerRouterOverlayNode(routerNode);
+            }
+            routerPeers.push({ node_id: routerId, id: routerId, name: routerLabel, type: 'router', isHitlRouter: true });
+            routerPeerMap.set(String(routerId), { node_id: routerId, id: routerId, name: routerLabel, type: 'router', isHitlRouter: true });
+            noteExisting(routerId);
+            return routerId;
+          };
+
+          const createNewSwitch = () => {
+            const previewSwitchMetaRaw = iface.preview_switch || iface.previewSwitch || null;
+            const previewSwitchId = previewSwitchMetaRaw && (previewSwitchMetaRaw.node_id ?? previewSwitchMetaRaw.nodeId ?? previewSwitchMetaRaw.id);
+            if (previewSwitchMetaRaw && previewSwitchId !== undefined && previewSwitchId !== null) {
+              const switchId = previewSwitchId;
+              const switchLabel = previewSwitchMetaRaw.name || `HITL Switch ${idx + 1}`;
+              noteExisting(switchId);
+              let switchNode = switchOverlayMap.get(String(switchId));
+              if (!switchNode) {
+                switchNode = {
+                  id: switchId,
+                  switch_id: switchId,
+                  type: 'switch',
+                  label: switchLabel,
+                  name: switchLabel,
+                  isHitlSwitch: true,
+                  hitlInterface: iface,
+                  attachment: attachmentPref,
+                  previewSwitch: previewSwitchMetaRaw,
+                };
+                resultNodes.push(switchNode);
+                includedSwitchNodeIds.add(switchId);
+                registerSwitchOverlayNode(switchNode);
+              } else {
+                if (!switchNode.label) switchNode.label = switchLabel;
+                if (!switchNode.name) switchNode.name = switchLabel;
+                switchNode.isHitlSwitch = true;
+                switchNode.hitlInterface = switchNode.hitlInterface || iface;
+                switchNode.attachment = switchNode.attachment || attachmentPref;
+                switchNode.previewSwitch = switchNode.previewSwitch || previewSwitchMetaRaw;
+                registerSwitchOverlayNode(switchNode);
+              }
+              if (linkMeta && !switchNode.hitlLinkMeta) {
+                switchNode.hitlLinkMeta = linkMeta;
+              }
+              if (!existingSubnets.some(sw => String(sw?.switch_id ?? sw?.id) === String(switchId))) {
+                existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+              }
+              const hintedRouterId = iface.targetRouterId ?? previewSwitchMetaRaw.router_id ?? previewSwitchMetaRaw.routerId ?? null;
+              if (hintedRouterId !== null && hintedRouterId !== undefined) {
+                uplinkRouterId = hintedRouterId;
+                if (switchNode.router_id === undefined || switchNode.router_id === null) {
+                  switchNode.router_id = hintedRouterId;
+                }
+                if (switchNode.uplinkRouterId === undefined || switchNode.uplinkRouterId === null) {
+                  switchNode.uplinkRouterId = hintedRouterId;
+                }
+              }
+              return switchId;
+            }
+
+            const slugKey = iface.slug ? `slug:${iface.slug}` : null;
+            const nameKey = iface.name ? `name:${String(iface.name).toLowerCase().trim()}` : null;
+            const matchedDetail = (slugKey && hitlSwitchLookup.get(slugKey)) || (nameKey && hitlSwitchLookup.get(nameKey)) || null;
+            let switchId;
+            let switchLabel;
+            if (matchedDetail && matchedDetail.switch_id !== undefined && matchedDetail.switch_id !== null) {
+              switchId = matchedDetail.switch_id;
+              const meta = (matchedDetail.metadata && typeof matchedDetail.metadata === 'object') ? matchedDetail.metadata : {};
+              switchLabel = matchedDetail.name || matchedDetail.label || meta.name || `sw-${switchId}`;
+            } else {
+              switchId = makeUniqueId(`hitl-switch-${baseName}`);
+              switchLabel = `HITL Switch ${idx + 1}`;
+            }
+            let switchNode = switchOverlayMap.get(String(switchId));
+            if (!switchNode) {
+              switchNode = {
+                id: switchId,
+                switch_id: switchId,
+                type: 'switch',
+                label: switchLabel,
+                name: switchLabel,
+                isHitlSwitch: true,
+                hitlInterface: iface,
+                attachment: attachmentPref,
+              };
+              resultNodes.push(switchNode);
+              includedSwitchNodeIds.add(switchId);
+            } else {
+              if (!switchNode.label) switchNode.label = switchLabel;
+              if (!switchNode.name) switchNode.name = switchLabel;
+              switchNode.isHitlSwitch = true;
+              switchNode.hitlInterface = switchNode.hitlInterface || iface;
+              switchNode.attachment = switchNode.attachment || attachmentPref;
+            }
+            registerSwitchOverlayNode(switchNode);
+            const assignSwitchIfMissing = (key, value) => {
+              if (value === undefined || value === null) return;
+              if (switchNode[key] === undefined || switchNode[key] === null) {
+                switchNode[key] = value;
+              }
+            };
+            if (matchedDetail) {
+              const meta = (matchedDetail.metadata && typeof matchedDetail.metadata === 'object') ? matchedDetail.metadata : {};
+              assignSwitchIfMissing('router_id', matchedDetail.router_id ?? meta.target_router_id ?? null);
+              assignSwitchIfMissing('uplinkRouterId', matchedDetail.router_id ?? meta.target_router_id ?? null);
+              assignSwitchIfMissing('switch_ip', matchedDetail.switch_ip);
+              assignSwitchIfMissing('router_ip', matchedDetail.router_ip);
+              assignSwitchIfMissing('link_network_cidr', matchedDetail.rsw_subnet);
+              assignSwitchIfMissing('link_network', matchedDetail.rsw_subnet || matchedDetail.lan_subnet);
+              if (matchedDetail.host_if_ips && matchedDetail.host_if_ips.rj45 && (!switchNode.host_if_ips || !switchNode.host_if_ips.rj45)) {
+                switchNode.host_if_ips = switchNode.host_if_ips || {};
+                switchNode.host_if_ips.rj45 = matchedDetail.host_if_ips.rj45;
+              }
+            }
+            if (linkMeta) {
+              switchNode.hitlLinkMeta = switchNode.hitlLinkMeta || linkMeta;
+              assignSwitchIfMissing('switch_ip', linkMeta.rj45Ip4 || null);
+              assignSwitchIfMissing('router_ip', linkMeta.newRouterIp4 || null);
+              assignSwitchIfMissing('link_network_cidr', linkMeta.networkCidr || null);
+              assignSwitchIfMissing('link_network', linkMeta.network || null);
+            }
+            let routerLinkEstablished = false;
+            const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+            if (routerCandidates.length) {
+              const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+              const chosenId = chosen?.node_id ?? chosen?.id;
+              if (chosenId !== undefined && chosenId !== null) {
+                uplinkRouterId = chosenId;
+                assignSwitchIfMissing('router_id', chosenId);
+                switchNode.uplinkRouterId = switchNode.uplinkRouterId ?? chosenId;
+                noteExisting(chosenId);
+                resultLinks.push({ sourceId: switchId, targetId: chosenId, kind: 'hitl-switch-uplink', attachment: attachmentPref, assignment: 'uplink_switch' });
+                routerLinkEstablished = true;
+              }
+            }
+            if (!routerLinkEstablished) {
+              const fallbackRouterId = createNewRouter();
+              if (fallbackRouterId !== null && fallbackRouterId !== undefined) {
+                uplinkRouterId = fallbackRouterId;
+                assignSwitchIfMissing('router_id', fallbackRouterId);
+                switchNode.uplinkRouterId = fallbackRouterId;
+                noteExisting(fallbackRouterId);
+                resultLinks.push({ sourceId: switchId, targetId: fallbackRouterId, kind: 'hitl-switch-uplink', attachment: attachmentPref, assignment: 'uplink_switch' });
+                routerLinkEstablished = true;
+              }
+            }
+            if (!matchedDetail && !existingSubnets.some(sw => String(sw?.switch_id ?? sw?.id) === String(switchId))) {
+              existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+            }
+            noteExisting(switchId);
+            return switchId;
+          };
+
+          for (const attempt of attempts) {
+            if (attempt === 'existing_router') {
+              const candidate = pickRouterPeer();
+              if (candidate !== null) {
+                targetId = candidate;
+                assignment = 'existing_router';
+                linkKind = 'hitl-router';
+                noteExisting(candidate);
+                uplinkRouterId = candidate;
+                break;
+              }
+            } else if (attempt === 'existing_switch') {
+              const candidate = pickSwitchPeer();
+              if (candidate !== null) {
+                targetId = candidate;
+                assignment = 'existing_switch';
+                linkKind = 'hitl-switch';
+                noteExisting(candidate);
+                break;
+              }
+            } else if (attempt === 'new_router') {
+              const newRouterId = createNewRouter();
+              if (newRouterId !== null) {
+                targetId = newRouterId;
+                assignment = 'new_router';
+                linkKind = 'hitl-router';
+                break;
+              }
+            }
+          }
+
+          if (targetId === null) {
+            const fallbackRouter = pickRouterPeer();
+            if (fallbackRouter !== null) {
+              targetId = fallbackRouter;
+              assignment = assignment ?? 'existing_router';
+              linkKind = 'hitl-router';
+              noteExisting(fallbackRouter);
+              uplinkRouterId = fallbackRouter;
+            }
+          }
+
+          if (targetId === null && hostPeers.length) {
+            const peer = hostPeers[Math.floor(rng() * hostPeers.length) % hostPeers.length];
+            const peerId = peer?.node_id ?? peer?.id;
+            if (peerId !== undefined && peerId !== null) {
+              targetId = peerId;
+              assignment = assignment ?? 'existing_host';
+              linkKind = 'hitl-host';
+              noteExisting(peerId);
+            }
+          }
+
+          if (targetId === null) {
+            const networkId = makeUniqueId(`hitl-net-${baseName}`);
+            const networkLabel = `HITL Network ${idx + 1}`;
+            resultNodes.push({
+              id: networkId,
+              type: 'network',
+              label: networkLabel,
+              name: networkLabel,
+              isHitlNetwork: true,
+              hitlInterface: iface,
+              attachment: attachmentPref,
+            });
+            targetId = networkId;
+            assignment = assignment ?? 'network';
+            linkKind = 'hitl-network';
+          }
+
+          if (targetId !== null) {
+            hitlNode.peerNodeId = targetId;
+            hitlNode.assignment = assignment || attachmentPref;
+            if (uplinkRouterId !== null) {
+              hitlNode.uplinkRouterId = uplinkRouterId;
+            }
+            resultLinks.push({
+              sourceId: nodeId,
+              targetId,
+              kind: linkKind,
+              attachment: attachmentPref,
+              assignment: assignment || attachmentPref,
+              linkMeta,
+            });
+          }
+
+        });
+
+        routerSwitchInterfaceMap.forEach((entries, key) => {
+          const routerNode = getOrCreateRouterOverlayNode(key);
+          if (routerNode) {
+            routerNode.hitlSwitchInterfaces = entries;
+          }
+        });
+
+        return resultNodes.length ? { nodes: resultNodes, links: resultLinks, interfaces } : null;
+      }
+
+      const hitlPreviewArtifacts = deriveStandaloneHitlArtifacts(previewData, hitlConfig, scenarioKey);
+
+      function setupPreviewCollapsers() {
+        const toggles = document.querySelectorAll('[data-preview-collapse]');
+        toggles.forEach(btn => {
+          if (btn.dataset.collapserBound) return;
+          const targetId = btn.getAttribute('data-preview-collapse');
+          const target = document.getElementById(targetId);
+          if (!target) return;
+          btn.dataset.collapserBound = '1';
+          const collapseLabel = btn.dataset.labelCollapse || 'Collapse';
+          const expandLabel = btn.dataset.labelExpand || 'Expand';
+          const hasBootstrap = !!(window.bootstrap && bootstrap.Collapse);
+          if (hasBootstrap) {
+            const instance = bootstrap.Collapse.getOrCreateInstance(target, { toggle: false });
+            const updateLabel = () => {
+              btn.textContent = target.classList.contains('show') ? collapseLabel : expandLabel;
+            };
+            target.addEventListener('shown.bs.collapse', updateLabel);
+            target.addEventListener('hidden.bs.collapse', updateLabel);
+            // Default behavior:
+            // - Embedded (Preview tab): start collapsed.
+            // - Standalone full preview page: preserve prior behavior (auto-expand).
+            if (IS_EMBEDDED) {
+              try { instance.hide(); } catch (e) { }
+            } else {
+              if (!target.classList.contains('show')) {
+                instance.show();
+              }
+            }
+            updateLabel();
+            btn.addEventListener('click', ev => {
+              ev.preventDefault();
+              if (target.classList.contains('show')) {
+                instance.hide();
+              } else {
+                instance.show();
+              }
+            });
+          } else {
+            const updateLabel = () => {
+              btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
+            };
+            if (IS_EMBEDDED) {
+              target.classList.add('d-none');
+            } else {
+              target.classList.remove('d-none');
+            }
+            updateLabel();
+            btn.addEventListener('click', ev => {
+              ev.preventDefault();
+              target.classList.toggle('d-none');
+              updateLabel();
+            });
+          }
+        });
+      }
+      function buildGraph(options) {
+        const labelToggle = document.getElementById('graphLabelsToggle');
+        // In embedded Preview (iframe) mode, always show node labels so the graph
+        // mirrors the Details graph's on-node information.
+        const shouldShowLabels = IS_EMBEDDED ? true : !!(labelToggle && labelToggle.checked);
+        if (labelToggle) {
+          labelToggle.dataset.graphLabelsState = shouldShowLabels ? 'on' : 'off';
+          if (IS_EMBEDDED) labelToggle.checked = true;
+        }
+        if (!window.d3) { document.getElementById('previewGraph').textContent = 'd3 not loaded'; return; }
+        const wrap = d3.select('#previewGraph');
+        wrap.selectAll('*').remove();
+        const width = wrap.node().clientWidth; const height = wrap.node().clientHeight;
+        const svg = wrap.append('svg').attr('width', width).attr('height', height).style('cursor', 'grab');
+        const seedBase = (previewData && previewData.seed !== undefined && previewData.seed !== null)
+          ? String(previewData.seed)
+          : ((previewData && previewData.metadata && previewData.metadata.seed !== undefined && previewData.metadata.seed !== null)
+            ? String(previewData.metadata.seed)
+            : '__seed__');
+        const rngForNode = (nodeId, salt) => makeDeterministicRng(`${seedBase}|${String(nodeId || '')}|${String(salt || '')}`);
+        const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(previewData.vulnerabilities_by_node);
+        const baseBridgeInfo = previewData.base_bridge_preview || null;
+        const baseBridgeKeys = new Set();
+        const baseClusterNodeMap = new Map();
+        function resolveBaseNodeType(meta) {
+          if (!meta || typeof meta !== 'object') return 'host';
+          const raw = meta.type ?? meta.model ?? meta.kind ?? meta.role ?? '';
+          return canonicalNodeType(raw);
+        }
+        const legend = svg.append('g').attr('class', 'legend').attr('transform', 'translate(8,8)');
+        let legendOffset = 0;
+        const legendTypesSeen = new Set();
+        let legendSpacingAdded = false;
+
+        const ensureLegendEntry = (canonicalType) => {
+          if (!canonicalType || legendTypesSeen.has(canonicalType)) return;
+          legendTypesSeen.add(canonicalType);
+
+          const style = nodeStyleForType(canonicalType);
+          // Use a fixed-size swatch so all legend entries align consistently.
+          // (Previously this used the node radius, making routers appear larger.)
+          const swatch = 12;
+          const entry = legend.append('g').attr('transform', `translate(0,${legendOffset})`);
+          if (style.shape === 'square') {
+            entry.append('rect')
+              .attr('x', 0)
+              .attr('y', 0)
+              .attr('width', swatch)
+              .attr('height', swatch)
+              .attr('fill', style.color)
+              .attr('stroke', '#333')
+              .attr('stroke-width', 1);
+          } else {
+            entry.append('circle')
+              .attr('r', swatch / 2)
+              .attr('cx', swatch / 2)
+              .attr('cy', swatch / 2)
+              .attr('fill', style.color)
+              .attr('stroke', '#333')
+              .attr('stroke-width', 1);
+          }
+          entry.append('text')
+            .text(style.label)
+            .attr('x', swatch + 6)
+            .attr('y', 11)
+            .attr('font-size', '11px');
+          legendOffset += 20;
+        };
+
+        // Always include host-vs-docker distinction in the legend.
+        ensureLegendEntry('host');
+        ensureLegendEntry('docker');
+
+        const registerLegendForNodes = (list) => {
+          if (!Array.isArray(list)) return;
+          list.forEach(node => {
+            if (!node) return;
+            const canonical = canonicalNodeType(node.type ?? node.kind ?? node.role);
+            if (node.type !== canonical) node.type = canonical;
+            ensureLegendEntry(canonical);
+          });
+        };
+
+        const addLegendSpacing = () => {
+          if (!legendSpacingAdded && legendTypesSeen.size > 0) {
+            legendOffset += 6;
+            legendSpacingAdded = true;
+          }
+        };
+        const bridgeRouterIdRaw = baseBridgeInfo && baseBridgeInfo.attached ? baseBridgeInfo.bridge_router_id : null;
+        const bridgePeerIdRaw = baseBridgeInfo && baseBridgeInfo.attached ? baseBridgeInfo.internal_peer_router_id : null;
+        const bridgeRouterId = bridgeRouterIdRaw !== undefined ? bridgeRouterIdRaw : null;
+        const bridgePeerId = bridgePeerIdRaw !== undefined ? bridgePeerIdRaw : null;
+        const bridgeRouterIdValue = Number.isFinite(Number(bridgeRouterId)) ? Number(bridgeRouterId) : bridgeRouterId;
+        const bridgeRouterIdNum = Number(bridgeRouterId);
+        const bridgePeerIdNum = Number(bridgePeerId);
+        if (Number.isFinite(bridgeRouterIdNum) && Number.isFinite(bridgePeerIdNum)) {
+          const key = `${Math.min(bridgeRouterIdNum, bridgePeerIdNum)}-${Math.max(bridgeRouterIdNum, bridgePeerIdNum)}`;
+          baseBridgeKeys.add(key);
+        }
+        const baseTargetMeta = baseBridgeInfo && baseBridgeInfo.attached ? (baseBridgeInfo.target || null) : null;
+        const baseCluster = baseBridgeInfo && baseBridgeInfo.attached ? (baseBridgeInfo.target_cluster || null) : null;
+        const container = svg.append('g').attr('class', 'zoom-layer');
+        // Zoom + Pan
+        let currentTransform = d3.zoomIdentity;
+        const zoom = d3.zoom().scaleExtent([0.2, 4]).on('zoom', (event) => {
+          currentTransform = event.transform;
+          container.attr('transform', currentTransform);
+        });
+        svg.call(zoom).on('dblclick.zoom', null);
+        const nodes = [];
+        const linkDescriptors = [];
+        const vulnerabilityColor = '#ff0000';
+        const sequenceColor = '#ff0000';
+        (previewData.routers || []).forEach(r => {
+          const routerIdNum = Number(r.node_id);
+          const isBridge = bridgeRouterId !== null && (routerIdNum === Number(bridgeRouterId));
+          nodes.push({ id: r.node_id, label: r.name, type: 'router', ip4: r.ip4 || '', isBaseBridge: isBridge });
+        });
+        (previewData.hosts || []).forEach(h => {
+          const hostId = h.node_id;
+          const keyStr = String(hostId);
+          const assignment = Array.isArray(h.vulnerabilities) ? h.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
+          const vulnList = Array.isArray(assignment) ? assignment : [];
+          const hasVuln = vulnList.length > 0;
+          const roleRaw = (h && (h.role || h.kind || h.type)) ? String(h.role || h.kind || h.type) : '';
+          const isDockerRole = roleRaw.trim().toLowerCase() === 'docker';
+          const nodeType = hasVuln ? 'vulnerability' : (isDockerRole ? 'docker' : 'host');
+          nodes.push({ id: hostId, label: h.name, type: nodeType, role: roleRaw, ip4: h.ip4 || '', hasVuln: hasVuln, vulnerabilities: vulnList });
+        });
+        (previewData.switches_detail || []).forEach(sw => {
+          nodes.push({
+            id: sw.switch_id,
+            label: 'sw-' + sw.switch_id,
+            type: 'switch',
+            ip4: (sw && (sw.switch_ip || sw.router_ip)) ? (sw.switch_ip || sw.router_ip) : '',
+          });
+        });
+        (previewData.r2r_edges_preview || []).forEach(e => {
+          const a = Number(e[0]);
+          const b = Number(e[1]);
+          const key = `${Math.min(a, b)}-${Math.max(a, b)}`;
+          const kind = baseBridgeKeys.has(key) ? 'base-bridge' : 'r2r';
+          linkDescriptors.push({ sourceId: e[0], targetId: e[1], kind });
+        });
+        if (baseCluster && Array.isArray(baseCluster.nodes)) {
+          baseCluster.nodes.forEach((baseNodeMeta, idx) => {
+            if (!baseNodeMeta) return;
+            const originalId = baseNodeMeta.id !== undefined && baseNodeMeta.id !== null ? String(baseNodeMeta.id) : `idx-${idx}`;
+            if (!originalId) return;
+            if (baseClusterNodeMap.has(originalId)) return;
+            const clusterNodeId = `base-cluster-${originalId}`;
+            baseClusterNodeMap.set(originalId, clusterNodeId);
+            const baseType = resolveBaseNodeType(baseNodeMeta);
+            const clusterNode = {
+              id: clusterNodeId,
+              label: baseNodeMeta.name || `Base ${originalId}`,
+              type: baseType,
+              baseOriginal: baseNodeMeta,
+              isBase: true,
+              isBaseCluster: true,
+            };
+            if (baseNodeMeta.position && Number.isFinite(Number(baseNodeMeta.position.x)) && Number.isFinite(Number(baseNodeMeta.position.y))) {
+              clusterNode._layout = { x: Number(baseNodeMeta.position.x), y: Number(baseNodeMeta.position.y) };
+            }
+            nodes.push(clusterNode);
+          });
+        }
+        let baseAnchorNodeId = null;
+        if (baseClusterNodeMap.size > 0) {
+          const targetKey = baseTargetMeta && baseTargetMeta.id !== undefined && baseTargetMeta.id !== null ? String(baseTargetMeta.id) : null;
+          if (targetKey && baseClusterNodeMap.has(targetKey)) {
+            baseAnchorNodeId = baseClusterNodeMap.get(targetKey);
+          } else {
+            baseAnchorNodeId = baseClusterNodeMap.values().next().value;
+          }
+        } else if (baseTargetMeta && bridgeRouterId !== null) {
+          const targetId = baseTargetMeta.id || 'base';
+          baseAnchorNodeId = `base-target-${targetId}`;
+          const baseType = resolveBaseNodeType(baseTargetMeta);
+          const fallbackBaseNode = {
+            id: baseAnchorNodeId,
+            label: baseTargetMeta.name || 'Base Scenario',
+            type: baseType,
+            baseTarget: baseTargetMeta,
+            isBase: true,
+            isBaseExternal: true,
+          };
+          if (baseTargetMeta.position && Number.isFinite(Number(baseTargetMeta.position.x)) && Number.isFinite(Number(baseTargetMeta.position.y))) {
+            fallbackBaseNode._layout = { x: Number(baseTargetMeta.position.x), y: Number(baseTargetMeta.position.y) };
+          }
+          nodes.push(fallbackBaseNode);
+        }
+        if (baseCluster && Array.isArray(baseCluster.edges)) {
+          baseCluster.edges.forEach(edge => {
+            if (!Array.isArray(edge) || edge.length < 2) return;
+            const rawA = edge[0];
+            const rawB = edge[1];
+            const keyA = rawA !== undefined && rawA !== null ? String(rawA) : null;
+            const keyB = rawB !== undefined && rawB !== null ? String(rawB) : null;
+            if (!keyA || !keyB) return;
+            const mappedA = baseClusterNodeMap.get(keyA);
+            const mappedB = baseClusterNodeMap.get(keyB);
+            if (!mappedA || !mappedB) return;
+            linkDescriptors.push({ sourceId: mappedA, targetId: mappedB, kind: 'base-cluster' });
+          });
+        }
+        if (baseAnchorNodeId && bridgeRouterId !== null) {
+          linkDescriptors.push({ sourceId: bridgeRouterIdValue, targetId: baseAnchorNodeId, kind: 'base-external' });
+        }
+        const hostRouterMap = previewData.host_router_map || {};
+        (previewData.switches_detail || []).forEach(sw => {
+          (sw.hosts || []).forEach(hid => { linkDescriptors.push({ sourceId: sw.switch_id, targetId: hid, kind: 'sw-host' }); });
+          linkDescriptors.push({ sourceId: sw.router_id, targetId: sw.switch_id, kind: 'r-sw' });
+        });
+        Object.entries(hostRouterMap).forEach(([hid, rid]) => {
+          const hIdNum = parseInt(hid, 10);
+          if (!linkDescriptors.find(l => l.kind === 'sw-host' && l.targetId === hIdNum)) {
+            linkDescriptors.push({ sourceId: rid, targetId: hIdNum, kind: 'r-host' });
+          }
+        });
+
+        if (hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.nodes)) {
+          hitlPreviewArtifacts.nodes.forEach(node => {
+            if (!node) return;
+            const sourceId = node.id ?? node.node_id ?? null;
+            if (sourceId !== null) {
+              const existingIndex = nodes.findIndex(existing => String(existing.id) === String(sourceId));
+              if (existingIndex !== -1) {
+                const existing = nodes[existingIndex];
+                const mergeFieldWhenMissing = (key) => {
+                  if (node[key] !== undefined && node[key] !== null && (existing[key] === undefined || existing[key] === null)) {
+                    existing[key] = node[key];
+                  }
+                };
+                mergeFieldWhenMissing('type');
+                mergeFieldWhenMissing('label');
+                mergeFieldWhenMissing('name');
+                mergeFieldWhenMissing('ip4');
+                mergeFieldWhenMissing('linkNetwork');
+                mergeFieldWhenMissing('prefixLen');
+                mergeFieldWhenMissing('netmask');
+                mergeFieldWhenMissing('peerRouterIp4');
+                mergeFieldWhenMissing('existingRouterIp4');
+                mergeFieldWhenMissing('broadcastIp4');
+                mergeFieldWhenMissing('attachment');
+                mergeFieldWhenMissing('assignment');
+                mergeFieldWhenMissing('hitlAttachment');
+                mergeFieldWhenMissing('hitlAssignment');
+                mergeFieldWhenMissing('hitlUplinkRouterId');
+                mergeFieldWhenMissing('uplinkRouterId');
+                if (node.hitlInterface && !existing.hitlInterface) {
+                  existing.hitlInterface = node.hitlInterface;
+                }
+                if (node.hitlLinkMeta && !existing.hitlLinkMeta) {
+                  existing.hitlLinkMeta = node.hitlLinkMeta;
+                }
+                if (Array.isArray(node.hitlSwitchInterfaces) && node.hitlSwitchInterfaces.length) {
+                  if (!Array.isArray(existing.hitlSwitchInterfaces)) {
+                    existing.hitlSwitchInterfaces = node.hitlSwitchInterfaces.slice();
+                  } else {
+                    const seenKeys = new Set(existing.hitlSwitchInterfaces.map(entry => {
+                      if (!entry) return '';
+                      return entry.switch_id !== undefined && entry.switch_id !== null ? String(entry.switch_id) : JSON.stringify(entry);
+                    }));
+                    node.hitlSwitchInterfaces.forEach(entry => {
+                      if (!entry) return;
+                      const key = entry.switch_id !== undefined && entry.switch_id !== null ? String(entry.switch_id) : JSON.stringify(entry);
+                      if (!seenKeys.has(key)) {
+                        existing.hitlSwitchInterfaces.push(entry);
+                        seenKeys.add(key);
+                      }
+                    });
+                  }
+                }
+                if (node.isHitlRouter) {
+                  existing.isHitlRouter = true;
+                }
+                if (node.isHitl) {
+                  existing.isHitl = true;
+                }
+                if (node.hitlAttachment && !existing.hitlAttachment) {
+                  existing.hitlAttachment = node.hitlAttachment;
+                }
+                if (node.hitlAssignment && !existing.hitlAssignment) {
+                  existing.hitlAssignment = node.hitlAssignment;
+                }
+                if (node.hitlUplinkRouterId && !existing.hitlUplinkRouterId) {
+                  existing.hitlUplinkRouterId = node.hitlUplinkRouterId;
+                }
+                existing._hasHitlOverlay = true;
+                return;
+              }
+            }
+            nodes.push({ ...node });
+          });
+        }
+
+        if (hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.links)) {
+          hitlPreviewArtifacts.links.forEach(link => {
+            if (!link) return;
+            const sourceId = link.sourceId ?? link.source ?? null;
+            const targetId = link.targetId ?? link.target ?? null;
+            if (sourceId === null || targetId === null) return;
+            linkDescriptors.push({ sourceId, targetId, kind: link.kind || 'hitl' });
+          });
+        }
+
+        if (!nodes.length) {
+          svg.remove();
+          wrap.append('div').attr('class', 'text-muted small p-2').text('No nodes to display');
+          return;
+        }
+
+        // Sequence node annotations (for Flag Sequencing / AttackFlow overlays).
+        // We try multiple possible payload shapes so this remains backwards-compatible.
+        let hasSequenceNodes = false;
+        try {
+          const nodeById = new Map();
+          nodes.forEach(n => { if (n && n.id !== undefined && n.id !== null) nodeById.set(String(n.id), n); });
+
+          // Only these node types should ever be considered sequence nodes.
+          const isSequenceEligible = (node) => {
+            try {
+              const t = canonicalNodeType(node && (node.type ?? node.kind ?? node.role));
+              return t === 'host' || t === 'docker' || t === 'vulnerability';
+            } catch (e) {
+              return false;
+            }
+          };
+
+          // Secondary lookup by display name (only among eligible nodes, and only if unique).
+          const nodeByName = new Map();
+          const nameCounts = new Map();
+          nodes.forEach(n => {
+            if (!n || !isSequenceEligible(n)) return;
+            const nm = String(n.label ?? n.name ?? '').trim();
+            if (!nm) return;
+            const key = nm.toLowerCase();
+            nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+            nodeByName.set(key, n);
+          });
+
+          const readChain = () => {
+            const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+            const afPrev = previewData && previewData.attackflow_preview ? previewData.attackflow_preview : null;
+            const af = previewData && previewData.attackflow ? previewData.attackflow : null;
+            const direct = previewData && previewData.chain ? previewData.chain : null;
+            const flowIds = flow && Array.isArray(flow.chain_ids) ? flow.chain_ids : null;
+            // Prefer plan metadata flow ordering when present to keep preview + sequencing aligned.
+            const candidates = [flow && flow.chain, flowIds, afPrev && afPrev.chain, af && af.chain, direct];
+            for (const c of candidates) {
+              if (Array.isArray(c) && c.length) return c;
+            }
+            return null;
+          };
+
+          const chain = readChain();
+          if (Array.isArray(chain) && chain.length) {
+            const chainLen = chain.length;
+            const resolveNodeForChainEntry = (entry) => {
+              let raw = entry;
+              if (entry && typeof entry === 'object') {
+                raw = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? entry;
+              }
+              if (raw === undefined || raw === null) return null;
+
+              // Prefer exact node id matches (avoid guessing by digits, which can mis-map to switches).
+              const key = String(raw).trim();
+              if (key && nodeById.has(key)) {
+                const node = nodeById.get(key);
+                return (node && isSequenceEligible(node)) ? node : null;
+              }
+              if (/^\d+$/.test(key)) {
+                const node = nodeById.get(String(Number(key)));
+                return (node && isSequenceEligible(node)) ? node : null;
+              }
+
+              // Fallback: match by label/name if unique.
+              const nameKey = key.toLowerCase();
+              if (nameCounts.get(nameKey) === 1 && nodeByName.has(nameKey)) {
+                return nodeByName.get(nameKey);
+              }
+              return null;
+            };
+
+            const normalizeChainMeta = (entry) => {
+              if (entry && typeof entry === 'object') {
+                const rawId = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? null;
+                const rawName = entry.name ?? entry.label ?? entry.host_name ?? entry.hostName ?? null;
+                const id = rawId !== null && rawId !== undefined ? String(rawId) : '';
+                const name = rawName !== null && rawName !== undefined ? String(rawName) : '';
+                return { id, name };
+              }
+              return { id: entry !== undefined && entry !== null ? String(entry) : '', name: '' };
+            };
+
+            chain.forEach((entry, idx) => {
+              const target = resolveNodeForChainEntry(entry);
+              if (!target) return;
+              target.isSequence = true;
+              target.sequence_index = idx + 1;
+              target.sequence_chain_len = chainLen;
+              const prev = idx > 0 ? normalizeChainMeta(chain[idx - 1]) : null;
+              const next = idx < chainLen - 1 ? normalizeChainMeta(chain[idx + 1]) : null;
+              if (prev) target.sequence_prev = prev;
+              if (next) target.sequence_next = next;
+            });
+          }
+          hasSequenceNodes = nodes.some(n => n && (Number.isFinite(Number(n.sequence_index)) || Number.isFinite(Number(n.sequenceIndex))));
+        } catch (e) { }
+
+        registerLegendForNodes(nodes);
+        addLegendSpacing();
+
+        if (hasSequenceNodes) {
+          const g = legend.append('g').attr('transform', `translate(0,${legendOffset})`);
+          g.append('rect')
+            .attr('x', 0)
+            .attr('y', 0)
+            .attr('width', 12)
+            .attr('height', 12)
+            .attr('fill', 'none')
+            .attr('stroke', '#333')
+            .attr('stroke', sequenceColor)
+            .attr('stroke-width', 2);
+          g.append('text')
+            .text('Sequence Node')
+            .attr('x', 18)
+            .attr('y', 11)
+            .attr('font-size', '11px');
+          legendOffset += 20;
+        }
+
+        if (baseBridgeInfo && baseBridgeInfo.attached) {
+          const g = legend.append('g').attr('transform', `translate(0,${legendOffset})`);
+          g.append('line')
+            .attr('x1', 0).attr('y1', 8)
+            .attr('x2', 24).attr('y2', 8)
+            .attr('stroke', '#6f42c1')
+            .attr('stroke-width', 4)
+            .attr('stroke-linecap', 'round');
+          g.append('text').text('Bridge to Base Scenario').attr('x', 28).attr('y', 12).attr('font-size', '11px');
+          legendOffset += 20;
+        }
+
+        const layoutPositions = previewData.layout_positions;
+        const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
+          ? {
+            routers: layoutPositions.routers || {},
+            switches: layoutPositions.switches || {},
+            hosts: layoutPositions.hosts || {},
+          }
+          : null;
+
+        function layoutCoordForNode(node) {
+          if (!layoutMaps) return null;
+          let table = null;
+          if (node.type === 'router') table = layoutMaps.routers;
+          else if (node.type === 'switch') table = layoutMaps.switches;
+          else if (node.isBase) {
+            if (node._layout) return node._layout;
+            return null;
+          }
+          else table = layoutMaps.hosts;
+          if (!table) return null;
+          const key = String(node.id);
+          const raw = table[key] || table[node.id];
+          if (!raw) return null;
+          const x = Number(raw.x);
+          const y = Number(raw.y);
+          if (Number.isFinite(x) && Number.isFinite(y)) return { x, y };
+          return null;
+        }
+        const layoutCoords = [];
+        if (layoutMaps) {
+          nodes.forEach(n => {
+            let pos = layoutCoordForNode(n);
+            if (!pos && n.isBase && n._layout) {
+              pos = n._layout;
+            }
+            if (pos) {
+              n._layout = pos;
+              layoutCoords.push(pos);
+            } else if (n._layout && n.isBase) {
+              layoutCoords.push(n._layout);
+            }
+          });
+        }
+
+        const margin = 40;
+        const innerWidth = Math.max(width - margin * 2, 200);
+        const innerHeight = Math.max(height - margin * 2, 200);
+        let usingLayout = layoutCoords.length > 0;
+        const staticOriginalPositions = new Map();
+        let resetStaticPositions = null;
+        function applyRowJitter(list) {
+          const buckets = new Map();
+          list.forEach(node => {
+            if (!Number.isFinite(node.y)) return;
+            if (node.isBase) return;
+            const base = node._layout ? node._layout.y : node.y;
+            if (!Number.isFinite(base)) return;
+            const key = Math.round(base * 1000);
+            const bucket = buckets.get(key);
+            if (bucket) {
+              bucket.push(node);
+            } else {
+              buckets.set(key, [node]);
+            }
+          });
+          buckets.forEach(group => {
+            if (group.length <= 1) return;
+            group.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+            const mid = (group.length - 1) / 2;
+            const spacing = 8;
+            group.forEach((node, idx) => {
+              node.y += (idx - mid) * spacing;
+            });
+          });
+        }
+        let scale = 1;
+        let offsetX = margin;
+        let offsetY = margin;
+        if (usingLayout && layoutCoords.length) {
+          let minX = layoutCoords[0].x;
+          let maxX = layoutCoords[0].x;
+          let minY = layoutCoords[0].y;
+          let maxY = layoutCoords[0].y;
+          for (const coord of layoutCoords) {
+            if (coord.x < minX) minX = coord.x;
+            if (coord.x > maxX) maxX = coord.x;
+            if (coord.y < minY) minY = coord.y;
+            if (coord.y > maxY) maxY = coord.y;
+          }
+          const spanX = Math.max(1, maxX - minX);
+          const spanY = Math.max(1, maxY - minY);
+          scale = Math.min(innerWidth / spanX, innerHeight / spanY);
+          if (!Number.isFinite(scale) || scale <= 0) {
+            scale = 1;
+            usingLayout = false;
+          } else {
+            offsetX = margin + (innerWidth - spanX * scale) / 2 - minX * scale;
+            offsetY = margin + (innerHeight - spanY * scale) / 2 - minY * scale;
+          }
+        }
+
+        if (usingLayout) {
+          nodes.forEach(n => {
+            if (n._layout) {
+              n.x = offsetX + n._layout.x * scale;
+              n.y = offsetY + n._layout.y * scale;
+            } else {
+              const rnd = rngForNode(n.id || n.name || '', 'layout-fallback');
+              n.x = width / 2 + rnd() * 40 - 20;
+              n.y = height / 2 + rnd() * 40 - 20;
+            }
+          });
+          applyRowJitter(nodes);
+          nodes.forEach(n => {
+            n.layoutX = n.x;
+            n.layoutY = n.y;
+            if (Number.isFinite(n.x) && Number.isFinite(n.y)) {
+              staticOriginalPositions.set(n.id, { x: n.x, y: n.y });
+            }
+          });
+        } else {
+          nodes.forEach(n => {
+            const rnd = rngForNode(n.id || n.name || '', 'layout-random');
+            n.x = width / 2 + rnd() * 80 - 40;
+            n.y = height / 2 + rnd() * 80 - 40;
+            n.layoutX = undefined;
+            n.layoutY = undefined;
+          });
+        }
+
+        const simLinks = linkDescriptors.map(l => ({ ...l, source: l.sourceId, target: l.targetId }));
+
+        // Build per-node interface/IP hints for hover tooltips.
+        function buildIfaceHints(preview) {
+          const map = new Map();
+          const add = (id, line) => {
+            if (id === undefined || id === null || line == null) return;
+            const key = String(id);
+            const txt = String(line).trim();
+            if (!txt) return;
+            if (!map.has(key)) map.set(key, []);
+            const arr = map.get(key);
+            if (arr.length >= 20) return;
+            if (!arr.includes(txt)) arr.push(txt);
+          };
+
+          // Router-router links with explicit IPs (preferred)
+          try {
+            (preview.r2r_links_preview || []).forEach(link => {
+              const routers = link && link.routers ? link.routers : null;
+              if (!Array.isArray(routers) || routers.length !== 2) return;
+              const a = routers[0];
+              const b = routers[1];
+              const aId = a && a.id !== undefined ? a.id : null;
+              const bId = b && b.id !== undefined ? b.id : null;
+              if (aId === null || bId === null) return;
+              if (a.ip) add(aId, `to r${bId}: ${a.ip}`);
+              if (b.ip) add(bId, `to r${aId}: ${b.ip}`);
+            });
+          } catch (e) { }
+
+          // Router<->switch and host<->switch interface IPs
+          try {
+            (preview.switches_detail || []).forEach(sw => {
+              if (!sw) return;
+              const sid = sw.switch_id;
+              const rid = sw.router_id;
+              if (sw.router_ip) add(rid, `to sw${sid}: ${sw.router_ip}`);
+              const hostIps = (sw.host_if_ips && typeof sw.host_if_ips === 'object') ? sw.host_if_ips : {};
+              (sw.hosts || []).forEach(hid => {
+                const ip = hostIps[String(hid)] || hostIps[hid];
+                if (ip) add(hid, `to sw${sid}: ${ip}`);
+              });
+            });
+          } catch (e) { }
+
+          return map;
+        }
+
+        const ifaceHints = buildIfaceHints(previewData);
+
+        function nodeTitle(d) {
+          const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+          const label = (d && (d.label || d.name)) ? String(d.label || d.name) : (id || 'node');
+          const lines = [`${label} (${id || '-'})`];
+
+          const role = (d && (d.role || d.kind || d.type)) ? String(d.role || d.kind || d.type).trim() : '';
+          if (role) lines.push(`Role: ${role}`);
+
+          const ip4 = (d && typeof d.ip4 === 'string' ? d.ip4 : (d && d.ip4 ? String(d.ip4) : '')).trim();
+          if (ip4) lines.push(`IP: ${ip4}`);
+
+          // Services (mirror details graph semantics)
+          try {
+            const svcMap = (previewData && typeof previewData.services_preview === 'object' && previewData.services_preview) ? previewData.services_preview : {};
+            const svc = (svcMap[id] || svcMap[Number(id)] || d.services || []);
+            const svcList = Array.isArray(svc) ? svc : [];
+            lines.push('Services:');
+            if (svcList.length) {
+              svcList.forEach(s => { if (s) lines.push(`- ${s}`); });
+            } else {
+              lines.push('- (none)');
+            }
+          } catch (e) {
+            lines.push('Services:');
+            lines.push('- (none)');
+          }
+
+          // Interfaces (all known interface hints; do not truncate)
+          const extras = (ifaceHints.get(String(d.id)) || []).slice();
+          // HITL overlays: include any explicit peer/existing router IP hints
+          if (d.peerRouterIp4) extras.unshift(`peer: ${d.peerRouterIp4}`);
+          if (d.existingRouterIp4) extras.unshift(`uplink: ${d.existingRouterIp4}`);
+          lines.push('Interfaces:');
+          if (extras.length) {
+            extras.forEach(x => { if (x) lines.push(`- ${x}`); });
+          } else {
+            lines.push('- (none)');
+          }
+          return lines.join('\n');
+        }
+
+        const link = container.selectAll('line').data(simLinks).enter().append('line')
+          .attr('stroke', l => {
+            if (l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') return '#6f42c1';
+            if (l.kind === 'r2r') return '#007bff';
+            if (l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return '#20c997';
+            return (l.kind === 'r-sw' ? '#28a745' : '#999');
+          })
+          .attr('stroke-width', l => {
+            if (l.kind === 'base-cluster') return 3;
+            if (l.kind === 'base-bridge' || l.kind === 'base-external') return 4;
+            if (l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return 2.4;
+            return l.kind === 'r2r' ? 2 : 1.2;
+          })
+          .attr('stroke-linecap', l => (l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') ? 'round' : null)
+          .attr('stroke-dasharray', l => {
+            if (l.kind === 'r-host') return '3,3';
+            if (l.kind === 'hitl-network') return '4,2';
+            return null;
+          })
+          .attr('opacity', 0.85);
+        const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class', 'node');
+        // Native SVG tooltip on hover
+        node.insert('title', ':first-child').text(d => nodeTitle(d));
+        // Draw rectangle nodes (mirrors Details graph)
+        const servicesPreviewMap = (previewData && typeof previewData.services_preview === 'object' && previewData.services_preview) ? previewData.services_preview : {};
+        function nodeServices(d) {
+          try {
+            const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+            const v = servicesPreviewMap[id] || servicesPreviewMap[Number(id)] || d.services || [];
+            return Array.isArray(v) ? v : [];
+          } catch (e) {
+            return [];
+          }
+        }
+        function primaryIp(d) {
+          try {
+            const roleRaw = (d && (d.role || d.kind || d.type)) ? String(d.role || d.kind || d.type).toLowerCase() : '';
+            if (roleRaw.includes('switch')) return '';
+            const isRouter = roleRaw.includes('router');
+            if (isRouter) {
+              const rid = (d && d.id !== undefined && d.id !== null) ? d.id : null;
+              const sw = (previewData && Array.isArray(previewData.switches_detail)) ? previewData.switches_detail : [];
+              const matches = rid !== null ? sw.filter(x => x && x.router_id == rid) : [];
+              const primary = (matches[0] && matches[0].router_ip) ? String(matches[0].router_ip) : ((d && d.ip4) ? String(d.ip4).trim() : '');
+              const extra = matches.length > 1 ? ` + ${matches.length - 1}` : '';
+              return primary ? `${primary}${extra}` : '';
+            }
+            const ip = (d && d.ip4) ? String(d.ip4).trim() : '';
+            return ip;
+          } catch (e) {
+            return '';
+          }
+        }
+        function nodeRectW(d) {
+          const svc = nodeServices(d).length;
+          const base = 110 + Math.min(120, svc * 10);
+          const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
+          const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+          const ip = primaryIp(d);
+          const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+          const seqPrefix = (seq && Number.isFinite(seq)) ? `${toRoman(seq)} ` : '';
+          const line1 = id ? `${seqPrefix}${label} (${id})` : `${seqPrefix}${label}`;
+          const maxLen = Math.max(String(line1 || '').length, String(ip || '').length);
+          const textNeed = (maxLen * 6.4) + 26;
+          return Math.max(base, Math.min(360, textNeed));
+        }
+        function nodeRectH(d) {
+          const svc = nodeServices(d).length;
+          const base = 44 + Math.min(34, svc * 1.35);
+          return base + (primaryIp(d) ? 14 : 0);
+        }
+        function nodeFill(d) {
+          // Keep preview colors, but render all nodes as rectangles.
+          if (d && (d.type === 'host' || d.type === 'pc' || d.type === 'server') && d.hasVuln) return vulnerabilityColor;
+          const style = nodeStyleForType(d && d.type);
+          return style && style.color ? style.color : '#adb5bd';
+        }
+
+        node.append('rect')
+          .attr('width', d => nodeRectW(d))
+          .attr('height', d => nodeRectH(d))
+          .attr('x', d => -(nodeRectW(d)) / 2)
+          .attr('y', d => -(nodeRectH(d)) / 2)
+          .attr('rx', 6)
+          .attr('ry', 6)
+          .attr('fill', d => nodeFill(d))
+          .attr('stroke', d => {
+            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+            if (seq && Number.isFinite(seq)) return sequenceColor;
+            return (d && (d.isBase || d.isBaseBridge)) ? '#6f42c1' : '#222';
+          })
+          .attr('stroke-width', d => {
+            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+            if (seq && Number.isFinite(seq)) return 3;
+            return (d && d.isBaseBridge) ? 3 : (d && d.isBase) ? 2 : 1.2;
+          });
+
+        // Sequence index marker (Roman numerals) for sequence nodes
+        function toRoman(num) {
+          const n = Number(num);
+          if (!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+          const parts = [
+            [1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'],
+            [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'],
+            [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I'],
+          ];
+          let x = Math.floor(n);
+          let out = '';
+          for (const [v, s] of parts) {
+            while (x >= v) { out += s; x -= v; }
+          }
+          return out;
+        }
+
+        function sequenceBadgeTitle(d) {
+          try {
+            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+            if (!seq || !Number.isFinite(seq)) return '';
+            const roman = toRoman(seq);
+            const chainLen = (d && (d.sequence_chain_len ?? d.sequenceChainLen)) ? Number(d.sequence_chain_len ?? d.sequenceChainLen) : null;
+            const lines = [];
+            // Keep wording exactly as requested.
+            if (chainLen && Number.isFinite(chainLen)) lines.push(`Sequence ${roman} (${seq} of ${chainLen})`);
+            else lines.push(`Sequence ${roman} (${seq})`);
+
+            // Sequence name/description from flow metadata.
+            const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+            const seqName = flow && (flow.name || flow.sequence_name || flow.title) ? String(flow.name || flow.sequence_name || flow.title) : '';
+            const seqScenario = flow && flow.scenario ? String(flow.scenario) : '';
+            const seqDesc = seqName ? seqName : (seqScenario ? `Flag Sequencing (${seqScenario})` : 'Flag Sequencing');
+            lines.push(seqDesc);
+
+            // requires/provides from flag assignments (if available)
+            const nodeId = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+            let fa = null;
+            try {
+              const fas = flow && Array.isArray(flow.flag_assignments) ? flow.flag_assignments : null;
+              if (fas && nodeId) {
+                fa = fas.find(x => x && String(x.node_id ?? x.nodeId ?? x.id ?? '') === nodeId) || null;
+              }
+            } catch (e) { }
+            const req = (fa && Array.isArray(fa.inputs) && fa.inputs.length) ? fa.inputs.join(', ') : '-';
+            const prov = (fa && Array.isArray(fa.outputs) && fa.outputs.length) ? fa.outputs.join(', ') : '-';
+            lines.push(`requires: ${req}`);
+            lines.push(`provides: ${prov}`);
+            return lines.join('\n');
+          } catch (e) {
+            return '';
+          }
+        }
+
+        const seqBadge = node.append('g')
+          .attr('class', 'node-seq-badge')
+          .attr('pointer-events', 'all')
+          .style('display', d => {
+            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+            return (seq && Number.isFinite(seq)) ? null : 'none';
+          })
+          .style('cursor', 'pointer')
+          .on('click', (event, d) => {
+            try { if (event && typeof event.stopPropagation === 'function') event.stopPropagation(); } catch (e) { }
+            try { openFlowNodeFlagModal(d); } catch (e) { }
+          });
+
+        // Tooltip specifically for the badge (so hovering the Roman numerals shows sequencing info).
+        seqBadge.insert('title', ':first-child').text(d => sequenceBadgeTitle(d));
+
+        const seqBadgeWidth = (d) => {
+          const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+          const roman = toRoman(seq);
+          const w = 10 + Math.max(1, roman.length) * 7;
+          return Math.min(46, Math.max(18, w));
+        };
+
+        // Place the badge just outside the node's top-right corner.
+        seqBadge.attr('transform', d => {
+          const w = nodeRectW(d);
+          const h = nodeRectH(d);
+          const bx = (w / 2) + 6;
+          const by = -(h / 2) - 22;
+          return `translate(${bx},${by})`;
+        });
+
+        seqBadge.append('rect')
+          .attr('x', 0)
+          .attr('y', 0)
+          .attr('width', d => seqBadgeWidth(d))
+          .attr('height', 16)
+          .attr('rx', 4)
+          .attr('ry', 4)
+          .attr('fill', '#fff')
+          .attr('stroke', sequenceColor)
+          .attr('stroke-width', 2);
+
+        seqBadge.append('text')
+          .attr('class', 'node-seq-badge-text')
+          .attr('text-anchor', 'start')
+          .attr('x', 5)
+          .attr('y', 12)
+          .attr('font-size', '11px')
+          .attr('font-weight', '800')
+          .attr('fill', sequenceColor)
+          .text(d => {
+            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+            return (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
+          });
+
+        // On-node text: name (id) + first IP (mirrors Details graph)
+        const nodeLabel = node.append('text')
+          .attr('class', 'node-label-onnode node-label-onnode-line1')
+          .attr('text-anchor', 'middle')
+          .attr('y', -2)
+          .attr('font-size', '10px')
+          .attr('pointer-events', 'none')
+          .attr('fill', '#000')
+          .style('display', shouldShowLabels ? null : 'none')
+          .text(d => {
+            const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
+            const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+            const seqPrefix = (seq && Number.isFinite(seq)) ? `${toRoman(seq)} ` : '';
+            return id ? `${seqPrefix}${label} (${id})` : `${seqPrefix}${label}`;
+          });
+
+        const nodeIp = node.append('text')
+          .attr('class', 'node-label-onnode node-label-onnode-line2')
+          .attr('text-anchor', 'middle')
+          .attr('y', 12)
+          .attr('font-size', '9px')
+          .attr('pointer-events', 'none')
+          .attr('fill', '#000')
+          .style('display', shouldShowLabels ? null : 'none')
+          .text(d => primaryIp(d) || '');
+
+        // Cache node box sizes so collision/link spacing is stable and cheap.
+        const nodeBoxCache = new Map();
+        nodes.forEach(n => {
+          try {
+            const w = nodeRectW(n);
+            const h = nodeRectH(n);
+            const pad = usingLayout ? 24 : 34;
+            nodeBoxCache.set(String(n.id), { w, h, r: Math.max(w, h) / 2 + pad });
+          } catch (e) {
+            nodeBoxCache.set(String(n.id), { w: 120, h: 60, r: 90 });
+          }
+        });
+        const boxFor = (d) => nodeBoxCache.get(String(d && d.id !== undefined ? d.id : '')) || { w: 120, h: 60, r: 90 };
+
+        const simulation = d3.forceSimulation(nodes)
+          .force('link', d3.forceLink(simLinks).id(d => d.id).distance(l => {
+            // Base distance by link kind, then add an amount proportional to node size
+            // so wide rectangles don't stack/overlap.
+            let base = 60;
+            if (l.kind === 'base-cluster') base = 70;
+            else if (l.kind === 'base-bridge' || l.kind === 'base-external') base = 120;
+            else if (l.kind === 'hitl' || l.kind === 'hitl-peer') base = 90;
+            else if (l.kind === 'hitl-network') base = 75;
+            else if (l.kind === 'r2r') base = 110;
+            else if (l.kind === 'r-sw') base = 85;
+            else base = 70;
+
+            const s = (l && l.source && typeof l.source === 'object') ? l.source : null;
+            const t = (l && l.target && typeof l.target === 'object') ? l.target : null;
+            const sizeBoost = (s && t)
+              ? (Math.max(boxFor(s).w, boxFor(s).h) + Math.max(boxFor(t).w, boxFor(t).h)) / 4
+              : 0;
+            return base + Math.min(160, sizeBoost);
+          }).strength(l => {
+            if (l.kind === 'base-cluster') return 0.9;
+            if (l.kind === 'base-bridge' || l.kind === 'base-external') return 0.75;
+            if (l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return 0.65;
+            return 0.6;
+          }))
+          .force('charge', d3.forceManyBody().strength(d => (d && d.isBase) ? -220 : -360))
+          .force('collide', d3.forceCollide().radius(d => boxFor(d).r).iterations(2))
+          .force('center', d3.forceCenter(width / 2, height / 2))
+          .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : width / 2).strength(usingLayout ? 0.12 : 0.04))
+          .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : height / 2).strength(usingLayout ? 0.12 : 0.04));
+
+        simulation.alpha(1).alphaTarget(0.03).restart();
+
+        link.data(simLinks, d => `${d.source}-${d.target}`);
+
+        simulation.on('tick', () => {
+          link
+            .attr('x1', d => d.source.x)
+            .attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x)
+            .attr('y2', d => d.target.y);
+          node.attr('transform', d => `translate(${d.x},${d.y})`);
+        });
+
+        node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+
+        // Auto-fit: zoom out/in so all nodes are visible on initial render.
+        // We do this a couple times early since simulation positions settle over time.
+        let initialViewAllTransform = null;
+        const fitGraphToNodes = (opts) => {
+          try {
+            const forceCapture = !!(opts && opts.capture);
+            const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+            let found = 0;
+            for (const n of nodes) {
+              if (!n) continue;
+              const x = Number(n.x);
+              const y = Number(n.y);
+              if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+              const box = (typeof boxFor === 'function') ? boxFor(n) : { w: 120, h: 60 };
+              const hw = Math.max(20, (Number(box.w) || 120) / 2);
+              const hh = Math.max(20, (Number(box.h) || 60) / 2);
+              b.minX = Math.min(b.minX, x - hw);
+              b.maxX = Math.max(b.maxX, x + hw);
+              b.minY = Math.min(b.minY, y - hh);
+              b.maxY = Math.max(b.maxY, y + hh);
+              found += 1;
+            }
+            if (found < 2) return;
+            const pad = 40;
+            b.minX -= pad; b.minY -= pad; b.maxX += pad; b.maxY += pad;
+            const bw = Math.max(1, b.maxX - b.minX);
+            const bh = Math.max(1, b.maxY - b.minY);
+
+            const sx = width / bw;
+            const sy = height / bh;
+            let k = Math.min(sx, sy);
+            // Respect zoom scale extent.
+            k = Math.max(0.2, Math.min(4, k));
+
+            const tx = (width / 2) - k * ((b.minX + b.maxX) / 2);
+            const ty = (height / 2) - k * ((b.minY + b.maxY) / 2);
+            const t = d3.zoomIdentity.translate(tx, ty).scale(k);
+            if (forceCapture || !initialViewAllTransform) {
+              initialViewAllTransform = t;
+            }
+            svg.transition().duration(250).call(zoom.transform, t);
+          } catch (e) { }
+        };
+
+        // Fit soon after initial draw (before/while settling).
+        setTimeout(() => fitGraphToNodes({ capture: true }), 60);
+        setTimeout(() => fitGraphToNodes(), 320);
+        setTimeout(() => fitGraphToNodes(), 900);
+
+        let sim = simulation;
+
+        if (usingLayout) {
+          resetStaticPositions = () => {
+            nodes.forEach(n => {
+              const orig = staticOriginalPositions.get(n.id);
+              if (orig) {
+                n.layoutX = orig.x;
+                n.layoutY = orig.y;
+                n.x = orig.x;
+                n.y = orig.y;
+                n.vx = 0;
+                n.vy = 0;
+                n.fx = null;
+                n.fy = null;
+              }
+            });
+            simulation.alpha(0.55).restart();
+          };
+        }
+        // Build quick lookup structures for tooltips
+        const servicesByNode = previewData.services_preview || {}; // { node_id: [service,...] }
+        const vulnsByNode = vulnerabilitiesByNode;
+        const segRules = (previewData.segmentation_preview && previewData.segmentation_preview.rules) || []; // rules with node_id
+        const segCountByNode = {};
+        segRules.forEach(r => { const nid = r.node_id; segCountByNode[nid] = (segCountByNode[nid] || 0) + 1; });
+        // Traffic summary (if present) - attempt to infer send/recv counts
+        const trafficSummary = previewData.traffic_summary || previewData.traffic_plan || {}; // optional future field
+        const trafficSend = {};
+        const trafficRecv = {};
+        try {
+          (trafficSummary.flows || trafficSummary || []).forEach(f => {
+            const s = f.src_id ?? f.src ?? null; const d = f.dst_id ?? f.dst ?? null;
+            if (s !== null) trafficSend[s] = (trafficSend[s] || 0) + 1;
+            if (d !== null) trafficRecv[d] = (trafficRecv[d] || 0) + 1;
+          });
+        } catch (e) { }
+        // Hover tooltips use native SVG <title> (see nodeTitle)
+        // Populate Node Sections table
+        try {
+          const tbody = document.querySelector('#nodeSectionsTable tbody');
+          if (tbody) {
+            const hitlNodesForTable = (hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.nodes))
+              ? hitlPreviewArtifacts.nodes.filter(Boolean).map(node => {
+                const iface = node.hitlInterface || null;
+                const primaryIpv4 = iface && Array.isArray(iface.ipv4) && iface.ipv4.length ? iface.ipv4[0]
+                  : (typeof iface?.ipv4 === 'string' ? iface.ipv4 : (node.ip4 || ''));
+                return {
+                  node_id: node.id,
+                  name: node.label || node.name || String(node.id),
+                  _type: node.isHitl ? 'rj45' : (node.isHitlNetwork ? 'network' : canonicalNodeType(node.type)),
+                  role: node.isHitl ? 'hitl' : (node.isHitlNetwork ? 'network' : (node.type || 'node')),
+                  hitlInterface: iface,
+                  hitlAttachment: node.attachment || (iface && iface.attachment) || DEFAULT_HITL_ATTACHMENT,
+                  hitlAssignment: node.assignment || null,
+                  hitlUplinkRouterId: node.uplinkRouterId || null,
+                  ip4: primaryIpv4,
+                  router_id: node.router_id ?? node.uplinkRouterId ?? null,
+                  router_ip: node.router_ip ?? node.peerRouterIp4 ?? (node.hitlLinkMeta ? node.hitlLinkMeta.newRouterIp4 : null),
+                  switch_ip: node.switch_ip ?? (node.hitlLinkMeta ? node.hitlLinkMeta.rj45Ip4 : null),
+                  link_network_cidr: node.link_network_cidr ?? (node.hitlLinkMeta ? node.hitlLinkMeta.networkCidr : null),
+                  link_network: node.link_network ?? (node.hitlLinkMeta ? node.hitlLinkMeta.network : null),
+                  hitlSwitchInterfaces: Array.isArray(node.hitlSwitchInterfaces) ? node.hitlSwitchInterfaces.slice() : null,
+                  hitlLinkMeta: node.hitlLinkMeta || null,
+                  isHitlNetwork: !!node.isHitlNetwork,
+                };
+              })
+              : [];
+            const allNodes = [...(previewData.routers || []).map(r => ({ ...r, _type: 'router' })), ...(previewData.hosts || []).map(h => ({ ...h, _type: 'host' })), ...(previewData.switches_detail || []).map(s => ({ ...s, node_id: s.switch_id, name: 'sw-' + s.switch_id, _type: 'switch' })), ...hitlNodesForTable];
+            if (!allNodes.length) { tbody.innerHTML = '<tr><td colspan="10" class="text-muted fst-italic">(no nodes)</td></tr>'; return; }
+            const switchesDetail = previewData.switches_detail || [];
+            const rowsHtml = allNodes.map(n => {
+              const nid = n.node_id;
+              const svc = (servicesByNode[nid] || []).join(',');
+              const vul = (vulnsByNode[nid] || []).join(',');
+              const segC = segCountByNode[nid] || 0;
+              const ts = trafficSend[nid] || 0;
+              const tr = trafficRecv[nid] || 0;
+              let primaryIp = n.ip4 || '';
+              if (!primaryIp && n.switch_ip) primaryIp = n.switch_ip;
+              if (!primaryIp && n.router_ip) primaryIp = n.router_ip;
+              let ifaceParts = [];
+              if (n._type === 'router') {
+                const r2rInterfaces = n.r2r_interfaces || {};
+                Object.keys(r2rInterfaces).sort((a, b) => Number(a) - Number(b)).forEach(nb => {
+                  ifaceParts.push(`r${nb}:${r2rInterfaces[nb]}`);
+                });
+                switchesDetail.filter(sw => sw.router_id === nid).forEach(sw => {
+                  ifaceParts.push(`sw-${sw.switch_id}:${sw.router_ip || '-'}`);
+                });
+                if (Array.isArray(n.hitlSwitchInterfaces)) {
+                  n.hitlSwitchInterfaces.forEach(entry => {
+                    if (!entry) return;
+                    const label = entry.switch_label || (entry.switch_id !== undefined ? `sw-${entry.switch_id}` : 'hitl-switch');
+                    const routerIp = entry.router_ip || entry.switch_ip || '-';
+                    const networkInfo = entry.network_cidr || entry.network || '';
+                    const value = networkInfo ? `${routerIp} (${networkInfo})` : routerIp;
+                    ifaceParts.push(`hitl-sw:${label}:${value}`);
+                  });
+                }
+                if (n.hitlUplinkRouterId) {
+                  ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`);
+                }
+              } else if (n._type === 'switch') {
+                if (n.router_id !== undefined && n.router_id !== null) {
+                  ifaceParts.push(`router:${n.router_id}→${n.router_ip || '-'}`);
+                }
+                if (n.switch_ip) { ifaceParts.push(`uplink:${n.switch_ip}`); }
+                if (n.link_network_cidr) { ifaceParts.push(`lan:${n.link_network_cidr}`); }
+                const hostIf = n.host_if_ips || {};
+                Object.keys(hostIf).sort((a, b) => Number(a) - Number(b)).forEach(hid => {
+                  ifaceParts.push(`h${hid}:${hostIf[hid]}`);
+                });
+                if (n.hitlUplinkRouterId) {
+                  ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`);
+                }
+              } else if (n._type === 'host') {
+                const routerForHost = hostRouterMap[nid] ?? hostRouterMap[String(nid)];
+                if (routerForHost) { ifaceParts.push(`router:${routerForHost}`); }
+              } else if (n._type === 'rj45') {
+                const hi = n.hitlInterface || {};
+                if (hi && typeof hi === 'object') {
+                  if (hi.name && hi.name !== n.name) { ifaceParts.push(`iface:${hi.name}`); }
+                  if (hi.mac) { ifaceParts.push(`mac:${hi.mac}`); }
+                  if (Array.isArray(hi.ipv4) && hi.ipv4.length) { ifaceParts.push(`ipv4:${hi.ipv4.join(',')}`); }
+                  if (Array.isArray(hi.ipv6) && hi.ipv6.length) { ifaceParts.push(`ipv6:${hi.ipv6.join(',')}`); }
+                }
+                if (n.hitlAttachment) { ifaceParts.push(`attach:${n.hitlAttachment}`); }
+                if (n.hitlAssignment && n.hitlAssignment !== n.hitlAttachment) { ifaceParts.push(`assigned:${n.hitlAssignment}`); }
+                if (n.hitlUplinkRouterId) { ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`); }
+              } else if (n._type === 'network' && n.isHitlNetwork) {
+                ifaceParts.push('RJ45 isolated network');
+              }
+              const ifaceStr = ifaceParts.length ? ifaceParts.join('; ') : '-';
+              const primaryIpStr = primaryIp || '-';
+              return `<tr><td>${nid}</td><td>${n.name || ('node-' + nid)}</td><td>${n._type}</td><td>${primaryIpStr}</td><td>${ifaceStr}</td><td>${svc}</td><td>${vul}</td><td>${segC}</td><td>${ts}</td><td>${tr}</td></tr>`;
+            }).join('');
+            tbody.innerHTML = rowsHtml || '<tr><td colspan="10" class="text-muted fst-italic">(none)</td></tr>';
+          }
+        } catch (e) { console.warn('node section table build failed', e); }
+        // Node labels rendered conditionally via toggle
+        function dragstarted(event, d) {
+          try { event.sourceEvent?.stopPropagation?.(); } catch (e) { }
+          if (sim && !event.active) { sim.alphaTarget(0.35).restart(); }
+          d.fx = d.x;
+          d.fy = d.y;
+        }
+        function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
+        function dragended(event, d) {
+          if (sim && !event.active) { sim.alphaTarget(0.03); }
+          d.fx = d.x;
+          d.fy = d.y;
+          d.layoutX = d.x;
+          d.layoutY = d.y;
+        }
+        // Wire zoom control buttons
+        const zoomInBtn = document.getElementById('zoomInBtn');
+        const zoomOutBtn = document.getElementById('zoomOutBtn');
+        const zoomResetBtn = document.getElementById('zoomResetBtn');
+        if (zoomInBtn) { zoomInBtn.onclick = () => svg.transition().duration(200).call(zoom.scaleBy, 1.2); }
+        if (zoomOutBtn) { zoomOutBtn.onclick = () => svg.transition().duration(200).call(zoom.scaleBy, 1 / 1.2); }
+        if (zoomResetBtn) {
+          zoomResetBtn.onclick = () => {
+            // Reset should return to the initial "view all nodes" perspective.
+            if (resetStaticPositions) resetStaticPositions();
+            const apply = () => {
+              try {
+                if (initialViewAllTransform) {
+                  svg.transition().duration(250).call(zoom.transform, initialViewAllTransform);
+                } else {
+                  fitGraphToNodes({ capture: true });
+                }
+              } catch (e) { }
+            };
+            // If we reset static positions, give the simulation a moment to settle.
+            setTimeout(apply, 80);
+          };
+        }
+        // Improve grab cursor feedback
+        svg.on('mousedown', () => svg.style('cursor', 'grabbing'));
+        window.addEventListener('mouseup', () => svg.style('cursor', 'grab'));
+        // Close buildGraph function before invoking it
+        wrap.node().dataset.showLabels = shouldShowLabels ? 'on' : 'off';
+        wrap.selectAll('.node-label-wrapper, .node-label-onnode').style('display', shouldShowLabels ? null : 'none');
+        try { sessionStorage.setItem('coretg_graph_labels_state', shouldShowLabels ? 'on' : 'off'); } catch (e) { }
+
+        wrap.node().dispatchEvent(new CustomEvent('coretg-graph-ready', {
+          bubbles: true,
+          detail: { target: '#previewGraph', showLabels: shouldShowLabels, svg: svg.node() }
+        }));
+      } // END buildGraph
+      // Invoke graph build after definitions
+      const labelToggleEl = document.getElementById('graphLabelsToggle');
+      const wrapNode = document.getElementById('previewGraph');
+      const storageKey = 'coretg_fp_labels_state';
+      if (labelToggleEl && !labelToggleEl.dataset.bound) {
+        labelToggleEl.dataset.bound = '1';
+        labelToggleEl.addEventListener('change', () => {
+          const show = !!labelToggleEl.checked;
+          labelToggleEl.dataset.graphLabelsState = show ? 'on' : 'off';
+          if (wrapNode) {
+            wrapNode.dataset.showLabels = show ? 'on' : 'off';
+            d3.select(wrapNode).selectAll('.node-label-wrapper, .node-label-onnode').style('display', show ? null : 'none');
+          }
+          try { sessionStorage.setItem(storageKey, show ? 'on' : 'off'); } catch (e) { }
+        });
+      }
+      const savedLabelState = sessionStorage.getItem(storageKey) || labelToggleEl?.dataset.graphLabelsState;
+      if (labelToggleEl && savedLabelState) {
+        labelToggleEl.checked = savedLabelState === 'on';
+      }
+      buildGraph();
+
+      wrapNode?.addEventListener('coretg-graph-ready', (ev) => {
+        const show = ev.detail?.showLabels ?? (labelToggleEl ? labelToggleEl.checked : false);
+        if (labelToggleEl) {
+          labelToggleEl.checked = show;
+          labelToggleEl.dataset.graphLabelsState = show ? 'on' : 'off';
+          try { sessionStorage.setItem(storageKey, show ? 'on' : 'off'); } catch (e) { }
+        }
+        if (wrapNode) {
+          wrapNode.dataset.showLabels = show ? 'on' : 'off';
+          d3.select(wrapNode).selectAll('.node-label-wrapper, .node-label-onnode').style('display', show ? null : 'none');
+        }
+      });
+      setupPreviewCollapsers();
+      // Unified scripts listing modal logic
+      function openScriptsModal(initialKind) {
+        const modalEl = document.getElementById('scriptsListingModal');
+        if (!modalEl) return;
+        // Ensure modal is a direct body child to avoid stacking/overflow clipping inside tab panes
+        if (!modalEl.__appendedToBody) {
+          document.body.appendChild(modalEl);
+          modalEl.__appendedToBody = true;
+        }
+        if (window.bootstrap) {
+          const m = (window.bootstrap.Modal.getOrCreateInstance
+            ? window.bootstrap.Modal.getOrCreateInstance(modalEl)
+            : new bootstrap.Modal(modalEl));
+          m.show();
+        } else { modalEl.style.display = 'block'; }
+        const targetKind = initialKind || 'traffic';
+        const firstBtn = modalEl.querySelector(`button[data-kind='${targetKind}'][data-scope='preview']`) || modalEl.querySelector('button[data-kind]');
+        if (firstBtn) { loadScriptsListing(firstBtn.getAttribute('data-kind'), firstBtn.getAttribute('data-scope')); }
+      }
+      function loadScriptsListing(kind, scope) {
+        if (window.__SCRIPTS_LISTING_IN_FLIGHT__) return;
+        window.__SCRIPTS_LISTING_IN_FLIGHT__ = true;
+        const status = document.getElementById('scriptsListingStatus');
+        const tbody = document.querySelector('#scriptsListingTable tbody');
+        status.textContent = `Loading ${scope} ${kind} scripts...`;
+        tbody.innerHTML = `<tr><td colspan="3" class="text-muted fst-italic">Loading...</td></tr>`;
+        fetch(`/api/open_scripts?kind=${kind}&scope=${scope}`).then(r => r.json()).then(d => {
+          if (!d.ok) { status.textContent = `Failed: ${d.error || 'error'}`; tbody.innerHTML = '<tr><td colspan="3" class="text-danger">Error loading scripts</td></tr>'; return; }
+          status.textContent = `${d.files.length} file(s)`;
+          if (d.files.length === 0) { tbody.innerHTML = '<tr><td colspan="3" class="text-muted fst-italic">(none)</td></tr>'; return; }
+          const rows = d.files.slice(0, 500).map(f => {
+            const safe = f.file.replace(/"/g, '&quot;');
+            return `<tr><td class="small"><code>${safe}</code></td><td class="text-end small">${f.size}</td><td class="small"><div class="btn-group btn-group-sm" role="group"><button type="button" class="btn btn-outline-primary" data-action="view" data-file="${safe}" data-kind="${kind}" data-scope="${scope}">View</button></div></td></tr>`;
+          }).join('');
+          tbody.innerHTML = rows;
+        }).catch(e => { status.textContent = 'Error'; tbody.innerHTML = `<tr><td colspan="3" class="text-danger">${e}</td></tr>`; })
+          .finally(() => { setTimeout(() => { window.__SCRIPTS_LISTING_IN_FLIGHT__ = false; }, 120); });
+      }
+      document.getElementById('scriptsListingModal')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-kind][data-scope]');
+        if (btn && !btn.dataset.action) {
+          loadScriptsListing(btn.getAttribute('data-kind'), btn.getAttribute('data-scope'));
+          return;
+        }
+        const actionBtn = e.target.closest('button[data-action="view"]');
+        if (actionBtn) {
+          const file = actionBtn.getAttribute('data-file');
+          const kind = actionBtn.getAttribute('data-kind');
+          const scope = actionBtn.getAttribute('data-scope');
+          viewScript(kind, scope, file);
+        }
+      });
+      function viewScript(kind, scope, file) {
+        fetch(`/api/open_script_file?kind=${kind}&scope=${scope}&file=${encodeURIComponent(file)}`).then(r => r.json()).then(d => {
+          if (!d.ok) { alert('Failed to load script: ' + (d.error || '')); return; }
+          const pre = document.getElementById('segScriptContent');
+          pre.textContent = d.content || '(no content)';
+          const modalEl = document.getElementById('segScriptModal');
+          if (!modalEl.__appendedToBody) {
+            document.body.appendChild(modalEl);
+            modalEl.__appendedToBody = true;
+          }
+          if (window.bootstrap) {
+            // Reuse or create a single instance to avoid stacking backdrops; guard against double show within 200ms
+            const now = Date.now();
+            if (modalEl.__lastShowTs && (now - modalEl.__lastShowTs) < 200) {
+              return; // prevent rapid double triggering
+            }
+            modalEl.__lastShowTs = now;
+            const m = (window.bootstrap.Modal.getOrCreateInstance
+              ? window.bootstrap.Modal.getOrCreateInstance(modalEl)
+              : new bootstrap.Modal(modalEl));
+            if (!modalEl.__attachedBackdropCleaner) {
+              modalEl.addEventListener('hidden.bs.modal', () => {
+                const backs = document.querySelectorAll('.modal-backdrop');
+                if (backs.length > 1) { backs.forEach((b, i) => { if (i < backs.length - 1) b.remove(); }); }
+                document.body.classList.remove('modal-open');
+                document.body.style.removeProperty('padding-right');
+              });
+              modalEl.__attachedBackdropCleaner = true;
+            }
+            m.show();
+          } else {
+            // Fallback manual modal (no bootstrap JS loaded)
+            modalEl.style.display = 'block';
+            modalEl.style.background = 'rgba(0,0,0,0.5)';
+            // Wire close buttons manually
+            modalEl.querySelectorAll('[data-bs-dismiss="modal"]').forEach(btn => {
+              if (!btn.__manualCloseBound) {
+                btn.addEventListener('click', () => { modalEl.style.display = 'none'; modalEl.style.background = ''; });
+                btn.__manualCloseBound = true;
+              }
+            });
+          }
+        }).catch(e => alert('Error fetching script: ' + e));
+      }
+      function attachScriptDelegation(containerId, fallbackKind) {
+        const el = document.getElementById(containerId);
+        if (!el) return;
+        el.addEventListener('click', (e) => {
+          const btn = e.target.closest('.view-script-btn');
+          if (!btn) return;
+          const file = btn.getAttribute('data-file');
+          if (!file) return;
+          const kind = btn.getAttribute('data-kind') || fallbackKind || 'segmentation';
+          const scope = btn.getAttribute('data-scope') || 'preview';
+          viewScript(kind, scope, file);
+        });
+      }
+      attachScriptDelegation('fp-seg', 'segmentation');
+      attachScriptDelegation('fp-traffic', 'traffic');
+
+      // --------- Color-coded badges & collapsible tables ---------
+      function applySegmentationRowStyling() {
+        const table = document.getElementById('segRulesTable');
+        if (!table) return;
+        const rows = table.querySelectorAll('tbody tr');
+        rows.forEach((tr) => {
+          const cells = tr.children;
+          if (cells.length < 3) return;
+          const typeCell = cells[2];
+          const ruleType = (typeCell.textContent || '').trim().toLowerCase();
+          let badgeClass = 'bg-secondary';
+          if (ruleType === 'nat') badgeClass = 'bg-info';
+          else if (ruleType === 'subnet_block') badgeClass = 'bg-danger';
+          else if (ruleType === 'host_block') badgeClass = 'bg-danger-subtle border border-danger';
+          else if (ruleType === 'protect_internal') badgeClass = 'bg-warning';
+          else if (ruleType === 'allow') badgeClass = 'bg-success';
+          else if (ruleType === 'dnat') badgeClass = 'bg-primary';
+          else if (ruleType === 'custom') badgeClass = 'bg-purple';
+          typeCell.innerHTML = `<span class="badge ${badgeClass} text-dark" style="min-width:70px;display:inline-block;">${typeCell.textContent.trim() || '-'}</span>`;
+        });
+      }
+      function applyTrafficRowStyling() {
+        const table = document.getElementById('trafficFlowsTable');
+        if (!table) return;
+        const rows = table.querySelectorAll('tbody tr');
+        const limit = 40; // slightly higher for flows
+        let hiddenCt = 0;
+        rows.forEach((tr, idx) => {
+          const protoCell = tr.children[5];
+          if (protoCell) {
+            const proto = (protoCell.textContent || '').trim().toLowerCase();
+            let cls = 'bg-secondary';
+            if (proto === 'tcp') cls = 'bg-success'; else if (proto === 'udp') cls = 'bg-info'; else if (proto === 'icmp') cls = 'bg-warning';
+            protoCell.innerHTML = `<span class="badge ${cls} text-dark">${proto || '-'}</span>`;
+          }
+          if (idx >= limit) {
+            tr.classList.add('d-none', 'traffic-extra-row'); hiddenCt++;
+          }
+        });
+        if (hiddenCt > 0) {
+          const toggleBtn = document.createElement('button');
+          toggleBtn.type = 'button'; toggleBtn.className = 'btn btn-sm btn-outline-secondary my-1';
+          toggleBtn.id = 'trafficShowMoreBtn';
+          toggleBtn.textContent = `Show ${hiddenCt} more flows`;
+          table.parentElement.insertBefore(toggleBtn, table);
+          toggleBtn.addEventListener('click', () => {
+            const hidden = table.querySelectorAll('tbody tr.traffic-extra-row');
+            const collapsed = toggleBtn.getAttribute('data-collapsed') !== 'false';
+            if (collapsed) {
+              hidden.forEach(r => r.classList.remove('d-none'));
+              toggleBtn.textContent = 'Collapse flows';
+              toggleBtn.setAttribute('data-collapsed', 'false');
+            } else {
+              hidden.forEach(r => r.classList.add('d-none'));
+              toggleBtn.textContent = `Show ${hiddenCt} more flows`;
+              toggleBtn.setAttribute('data-collapsed', 'true');
+            }
+          });
+        }
+      }
+      // Delay styling until after DOM is built
+      setTimeout(() => { applySegmentationRowStyling(); applyTrafficRowStyling(); }, 0);
+    }
+    function notifyParentReady() {
+      try {
+        if (window.parent && window.parent !== window) {
+          try { console.debug('[full_preview] posting ready'); } catch (e) { }
+          window.parent.postMessage({ type: 'full-preview-ready' }, window.location.origin);
+        }
+      } catch (e) { }
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        notifyParentReady();
+        setTimeout(init, 0);
+      });
+    } else {
+      notifyParentReady();
+      setTimeout(init, 0);
+    }
+    // Export JSON
+    document.getElementById('exportJsonBtn')?.addEventListener('click', () => {
+      try {
+        const blob = new Blob([JSON.stringify(previewData, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'full_preview_seed_' + (previewData.seed || 'na') + '.json';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      } catch (e) { console.error('Export JSON failed', e); }
+    });
+    // Export Graph PNG
+    document.getElementById('exportPngBtn')?.addEventListener('click', () => {
+      try {
+        const svg = document.querySelector('#previewGraph svg');
+        if (!svg) { alert('Graph not ready'); return; }
+        const serializer = new XMLSerializer();
+        const svgStr = serializer.serializeToString(svg);
+        const canvas = document.createElement('canvas');
+        const rect = svg.getBoundingClientRect();
+        canvas.width = rect.width * 2; canvas.height = rect.height * 2; // retina
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        img.onload = function () {
+          ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob(b => {
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(b); a.download = 'full_preview_graph_' + (previewData.seed || 'na') + '.png';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+          });
+        };
+        img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgStr)));
+      } catch (e) { console.error('Export PNG failed', e); }
+    });
+
+    let executeProgressModalInst = null;
+    let executeProgressEvtSrc = null;
+    let executeProgressRunId = null;
+
+    function ensureExecuteProgressModal() {
+      const modalEl = document.getElementById('executeProgressModal');
+      if (!modalEl) return null;
+      if (!executeProgressModalInst && window.bootstrap) {
+        executeProgressModalInst = new bootstrap.Modal(modalEl, { backdrop: 'static', keyboard: false });
+      }
+      return executeProgressModalInst;
+    }
+
+    function setExecuteProgressUI(opts) {
+      const { status, meta, barText, animate, percent } = opts || {};
+      const statusEl = document.getElementById('executeProgressStatus');
+      if (statusEl !== null && status !== undefined) { statusEl.textContent = status; }
+      const metaEl = document.getElementById('executeProgressMeta');
+      if (metaEl !== null && meta !== undefined) { metaEl.textContent = meta; }
+      const bar = document.getElementById('executeProgressBar');
+      if (bar) {
+        if (barText !== undefined) { bar.textContent = barText; }
+        if (typeof percent === 'number' && Number.isFinite(percent)) {
+          const p = Math.max(0, Math.min(100, Math.round(percent)));
+          bar.style.width = p + '%';
+          bar.setAttribute('aria-valuenow', String(p));
+        }
+        if (animate === true) { bar.classList.add('progress-bar-animated', 'progress-bar-striped'); }
+        else if (animate === false) { bar.classList.remove('progress-bar-animated', 'progress-bar-striped'); }
+      }
+      try {
+        const hideBtn = document.getElementById('executeProgressHideBtn');
+        if (hideBtn) {
+          hideBtn.textContent = (animate === false) ? 'Close' : 'Hide';
+        }
+      } catch (e) { }
+    }
+
+    function openExecuteProgress(title) {
+      const inst = ensureExecuteProgressModal();
+      const modalEl = document.getElementById('executeProgressModal');
+      if (modalEl && title) {
+        const titleEl = modalEl.querySelector('.modal-title');
+        if (titleEl) titleEl.textContent = title;
+      }
+      setExecuteProgressUI({ status: 'Starting…', meta: '', barText: 'Working…', animate: true });
+      const logEl = document.getElementById('executeProgressLog');
+      if (logEl) logEl.textContent = '';
+      try { inst?.show(); } catch (e) { }
+    }
+
+    function appendExecuteProgressLog(line) {
+      const logEl = document.getElementById('executeProgressLog');
+      if (!logEl) return;
+      const text = (line === undefined || line === null) ? '' : String(line);
+      try {
+        const finalizeMatch = text.match(/\[ui\]\s*Waiting for CORE host to finalize\s*\((\d+)s\)\s*\(([^)]*)\)\s*(?:\[upload:\s*(\d+)%\])?\s*(?:\[finalize:\s*(\d+)%\])?\s*\[last update:\s*(\d+)s ago\]/i);
+        if (finalizeMatch) {
+          const elapsed = parseInt(finalizeMatch[1], 10);
+          const stage = String(finalizeMatch[2] || '').trim();
+          const uploadPct = parseInt(finalizeMatch[3], 10);
+          const finalizePct = parseInt(finalizeMatch[4], 10);
+          const pct = Number.isFinite(uploadPct) ? uploadPct : finalizePct;
+          const last = parseInt(finalizeMatch[5], 10);
+          const meta = [
+            stage ? `Stage: ${stage}` : null,
+            Number.isFinite(elapsed) ? `Elapsed: ${elapsed}s` : null,
+            Number.isFinite(last) ? `Last update: ${last}s ago` : null,
+          ].filter(Boolean).join(' • ');
+          setExecuteProgressUI({
+            status: 'Finalizing on CORE host…',
+            meta,
+            barText: Number.isFinite(pct) ? `Upload ${pct}%` : 'Finalizing…',
+            percent: Number.isFinite(pct) ? pct : undefined,
+            animate: true,
+          });
+        }
+      } catch (e) { }
+      logEl.textContent += text + '\n';
+      logEl.parentElement?.scrollTo({ top: logEl.parentElement.scrollHeight, behavior: 'auto' });
+    }
+
+    function cleanupExecuteProgress() {
+      if (executeProgressEvtSrc) {
+        try { executeProgressEvtSrc.close(); } catch (e) { }
+      }
+      executeProgressEvtSrc = null;
+      executeProgressRunId = null;
+    }
+
+    function attachExecuteProgressStream(runId) {
+      executeProgressRunId = runId;
+      executeProgressEvtSrc = new EventSource('/stream/' + runId);
+      executeProgressEvtSrc.onmessage = (ev) => {
+        if (ev && typeof ev.data === 'string') {
+          appendExecuteProgressLog(ev.data);
+        }
+      };
+      executeProgressEvtSrc.addEventListener('end', () => {
+        appendExecuteProgressLog('Execution stream ended');
+        cleanupExecuteProgress();
+      });
+      executeProgressEvtSrc.addEventListener('ping', () => {
+        try {
+          setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
+        } catch (e) { }
+      });
+      executeProgressEvtSrc.onerror = () => {
+        appendExecuteProgressLog('[ui] Stream disconnected; reconnecting…');
+        setExecuteProgressUI({ status: 'Reconnecting…', meta: 'Waiting for stream', barText: 'Working…', animate: true });
+      };
+    }
+
+    document.getElementById('executeProgressModal')?.addEventListener('hidden.bs.modal', () => {
+      cleanupExecuteProgress();
+    });
+
+    // Execute: start CLI run for provided xml_path
+    const executeRunBtn = document.getElementById('executeRunBtn');
+    if (executeRunBtn && !executeRunBtn.dataset.boundExecute) {
+      executeRunBtn.dataset.boundExecute = '1';
+      let executing = false;
+      let dockerRetryAttempted = false;
+      const originalLabel = executeRunBtn.textContent;
+      executeRunBtn.addEventListener('click', async () => {
+        if (executing) return;
+
+        // Always delegate to the Topology Execute flow so the UX and backend path are consistent.
+        try {
+          const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '{{ (scenario or "")|e }}').trim();
+          const baseUrl = '{{ url_for("index") }}';
+          const url = baseUrl
+            + '?auto_execute=1'
+            + '&xml_path=' + encodeURIComponent('{{ xml_path }}')
+            + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
+          (window.top || window).location.href = url;
+          return;
+        } catch (e) { }
+
+        const confirmMsg = 'Execute scenario now? This will invoke the CLI and start a CORE session.';
+        if (!window.confirm(confirmMsg)) return;
+        executing = true;
+        dockerRetryAttempted = false;
+        executeRunBtn.disabled = true;
+        if (originalLabel) { executeRunBtn.textContent = 'Executing…'; }
+        try {
+          openExecuteProgress('Executing scenario…');
+          appendExecuteProgressLog('Submitting run for {{ xml_path }}');
+          cleanupExecuteProgress();
+
+          function buildExecuteForm(opts) {
+            const o = opts || {};
+            const form = new FormData();
+            form.append('xml_path', '{{ xml_path }}');
+            if (o.dockerRemoveConflicts) { form.append('docker_remove_conflicts', '1'); }
+            try {
+              const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '').trim();
+              if (scen) { form.append('scenario', scen); }
+            } catch (e) { }
+            const planPath = executeRunBtn.getAttribute('data-preview-plan');
+            if (planPath && String(planPath).trim().toLowerCase().endsWith('.xml')) {
+              form.append('preview_plan', planPath);
+            }
+            try {
+              const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
+              const flowEnabled = (flow && flow.flow_enabled !== undefined) ? !!flow.flow_enabled : true;
+              form.append('flow_enabled', flowEnabled ? '1' : '0');
+            } catch (e) { }
+            return form;
+          }
+
+          let form = buildExecuteForm({ dockerRemoveConflicts: false });
+          let res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+          if (res.status === 423) {
+            let info = null;
+            try { info = await res.json(); } catch (e) { }
+            const hostPart = info && info.core_host ? String(info.core_host) : 'CORE host';
+            const portPart = info && (info.core_port || info.core_port === 0) ? `:${info.core_port}` : '';
+            const sessions = Array.isArray(info?.active_sessions) ? info.active_sessions : [];
+            const detailLines = sessions.slice(0, 3).map((entry) => {
+              const sid = entry && entry.id !== undefined ? `#${entry.id}` : '#?';
+              const state = entry && entry.state ? String(entry.state) : 'UNKNOWN';
+              const file = entry && entry.file ? String(entry.file) : '';
+              return `• Session ${sid} (${state}${file ? ` • ${file}` : ''})`;
+            }).join('\n');
+            const messageParts = [info?.error || `A run is already active on ${hostPart}${portPart}. Finish the active CORE session before starting another.`];
+            if (detailLines) { messageParts.push('', 'Active sessions:', detailLines); }
+            const proceed = window.confirm(messageParts.join('\n') + '\n\nKill the active CORE session(s) and retry now?');
+            if (!proceed) {
+              appendExecuteProgressLog('Execution blocked by active CORE session(s); user declined kill.');
+              setExecuteProgressUI({ status: 'Blocked by active session', meta: '', barText: 'Blocked', animate: false });
+              return;
+            }
+            appendExecuteProgressLog('Killing active CORE session(s)…');
+            const killRes = await fetch('/core/kill_active_sessions_api', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ kill_all: true })
+            });
+            let killInfo = null;
+            try { killInfo = await killRes.json(); } catch (e) { }
+            if (!killRes.ok || !killInfo || killInfo.ok === false) {
+              const errs = Array.isArray(killInfo?.errors) ? killInfo.errors.join('; ') : (killInfo?.error || 'Unknown error');
+              appendExecuteProgressLog('Failed to kill active CORE session(s): ' + errs);
+              setExecuteProgressUI({ status: 'Failed to kill active session(s)', meta: '', barText: 'Error', animate: false });
+              return;
+            }
+            const deleted = Array.isArray(killInfo?.deleted) ? killInfo.deleted.length : 0;
+            appendExecuteProgressLog('Killed ' + deleted + ' active CORE session(s); retrying…');
+            res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+          }
+          if (!res.ok) {
+            appendExecuteProgressLog('Failed to start execution (HTTP ' + res.status + ')');
+            setExecuteProgressUI({ status: 'Failed to start', meta: 'HTTP ' + res.status, barText: 'Error', animate: false });
+            return;
+          }
+          const initData = await res.json();
+          const run_id = initData?.run_id;
+          if (!run_id) {
+            appendExecuteProgressLog('Execution start response missing run_id');
+            setExecuteProgressUI({ status: 'Failed to start', meta: 'Missing run id', barText: 'Error', animate: false });
+            return;
+          }
+          appendExecuteProgressLog('Run ID: ' + run_id);
+          setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
+          attachExecuteProgressStream(run_id);
+          (async function poll() {
+            try {
+              const r = await fetch('/run_status/' + run_id);
+              if (!r.ok) { setTimeout(poll, 1200); return; }
+              const data = await r.json();
+              if (!data.done) { setTimeout(poll, 1000); return; }
+              cleanupExecuteProgress();
+              if (data.returncode === 0) {
+                appendExecuteProgressLog('Execution complete: success; redirecting to Reports');
+                setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
+                try {
+                  const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
+                  setTimeout(() => {
+                    try {
+                      // Use assign so the browser treats it as a navigation.
+                      window.location.assign(reportsHref);
+                    } catch (navErr) {
+                      try { appendExecuteProgressLog('Redirect to Reports failed: ' + navErr); } catch (_) { }
+                    }
+                  }, 700);
+                } catch (err) {
+                  try { appendExecuteProgressLog('Could not build Reports URL: ' + err); } catch (_) { }
+                }
+                return;
+              } else {
+                const dc = data?.docker_conflicts;
+                const containers = Array.isArray(dc?.containers) ? dc.containers : [];
+                const images = Array.isArray(dc?.images) ? dc.images : [];
+                if ((containers.length || images.length) && !dockerRetryAttempted) {
+                  dockerRetryAttempted = true;
+                  const maxShow = 10;
+                  const contLines = containers.slice(0, maxShow).map(x => `• ${x}`).join('\n');
+                  const imgLines = images.slice(0, maxShow).map(x => `• ${x}`).join('\n');
+                  const extraCont = containers.length > maxShow ? `\n(and ${containers.length - maxShow} more)` : '';
+                  const extraImg = images.length > maxShow ? `\n(and ${images.length - maxShow} more)` : '';
+                  const msgParts = [
+                    'Docker conflicts detected for compose-based Docker nodes.',
+                    '',
+                    (containers.length ? ('Conflicting containers:\n' + contLines + extraCont) : ''),
+                    (images.length ? ('Conflicting images:\n' + imgLines + extraImg) : ''),
+                  ].filter(Boolean);
+                  const proceed = window.confirm(msgParts.join('\n\n') + '\n\nRemove these now and retry?');
+                  if (!proceed) {
+                    appendExecuteProgressLog('Execution blocked by Docker conflicts; user declined removal.');
+                    setExecuteProgressUI({ status: 'Blocked by Docker conflicts', meta: '', barText: 'Blocked', animate: false });
+                    return;
+                  }
+                  appendExecuteProgressLog('Removing Docker conflicts and retrying…');
+                  setExecuteProgressUI({ status: 'Retrying…', meta: 'Removing Docker conflicts', barText: 'Working…', animate: true });
+                  cleanupExecuteProgress();
+                  form = buildExecuteForm({ dockerRemoveConflicts: true });
+                  let res2 = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+                  if (res2.status === 423) {
+                    // Preserve existing active-session kill flow for the retry as well.
+                    let info2 = null;
+                    try { info2 = await res2.json(); } catch (e) { }
+                    const hostPart = info2 && info2.core_host ? String(info2.core_host) : 'CORE host';
+                    const portPart = info2 && (info2.core_port || info2.core_port === 0) ? `:${info2.core_port}` : '';
+                    const sessions = Array.isArray(info2?.active_sessions) ? info2.active_sessions : [];
+                    const detailLines = sessions.slice(0, 3).map((entry) => {
+                      const sid = entry && entry.id !== undefined ? `#${entry.id}` : '#?';
+                      const state = entry && entry.state ? String(entry.state) : 'UNKNOWN';
+                      const file = entry && entry.file ? String(entry.file) : '';
+                      return `• Session ${sid} (${state}${file ? ` • ${file}` : ''})`;
+                    }).join('\n');
+                    const messageParts = [info2?.error || `A run is already active on ${hostPart}${portPart}. Finish the active CORE session before starting another.`];
+                    if (detailLines) { messageParts.push('', 'Active sessions:', detailLines); }
+                    const proceed2 = window.confirm(messageParts.join('\n') + '\n\nKill the active CORE session(s) and retry now?');
+                    if (!proceed2) {
+                      appendExecuteProgressLog('Retry blocked by active CORE session(s); user declined kill.');
+                      setExecuteProgressUI({ status: 'Blocked by active session', meta: '', barText: 'Blocked', animate: false });
+                      return;
+                    }
+                    appendExecuteProgressLog('Killing active CORE session(s)…');
+                    const killRes = await fetch('/core/kill_active_sessions_api', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ kill_all: true })
+                    });
+                    let killInfo = null;
+                    try { killInfo = await killRes.json(); } catch (e) { }
+                    if (!killRes.ok || !killInfo || killInfo.ok === false) {
+                      const errs = Array.isArray(killInfo?.errors) ? killInfo.errors.join('; ') : (killInfo?.error || 'Unknown error');
+                      appendExecuteProgressLog('Failed to kill active CORE session(s): ' + errs);
+                      setExecuteProgressUI({ status: 'Failed to kill active session(s)', meta: '', barText: 'Error', animate: false });
+                      return;
+                    }
+                    res2 = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+                  }
+                  if (!res2.ok) {
+                    appendExecuteProgressLog('Failed to start retry run (HTTP ' + res2.status + ')');
+                    setExecuteProgressUI({ status: 'Failed to start retry', meta: 'HTTP ' + res2.status, barText: 'Error', animate: false });
+                    return;
+                  }
+                  const initData2 = await res2.json();
+                  const run_id2 = initData2?.run_id;
+                  if (!run_id2) {
+                    appendExecuteProgressLog('Retry start response missing run_id');
+                    setExecuteProgressUI({ status: 'Failed to start retry', meta: 'Missing run id', barText: 'Error', animate: false });
+                    return;
+                  }
+                  appendExecuteProgressLog('Retry Run ID: ' + run_id2);
+                  setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
+                  attachExecuteProgressStream(run_id2);
+                  // Start a new poll loop for the retry.
+                  (async function pollRetry() {
+                    try {
+                      const r2 = await fetch('/run_status/' + run_id2);
+                      if (!r2.ok) { setTimeout(pollRetry, 1200); return; }
+                      const data2 = await r2.json();
+                      if (!data2.done) { setTimeout(pollRetry, 1000); return; }
+                      cleanupExecuteProgress();
+                      if (data2.returncode === 0) {
+                        appendExecuteProgressLog('Execution complete: success; redirecting to Reports');
+                        setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
+                        try {
+                          const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
+                          setTimeout(() => { window.location.assign(reportsHref); }, 700);
+                        } catch (_) { }
+                        return;
+                      }
+                      appendExecuteProgressLog('Execution finished with errors (code ' + data2.returncode + ')');
+                      setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code ' + data2.returncode, barText: 'Error', animate: false });
+                    } catch (e) {
+                      setTimeout(pollRetry, 1500);
+                    }
+                  })();
+                  return;
+                }
+
+                appendExecuteProgressLog('Execution finished with errors (code ' + data.returncode + ')');
+                setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code ' + data.returncode, barText: 'Error', animate: false });
+                return;
+              }
+            } catch (e) {
+              // Only retry while the run is still pending; once it completes we return above.
+              setTimeout(poll, 1500);
+            }
+          })();
+        } catch (e) {
+          appendExecuteProgressLog('Exception starting execution: ' + e);
+          setExecuteProgressUI({ status: 'Exception starting run', meta: '', barText: 'Error', animate: false });
+          cleanupExecuteProgress();
+        }
+        finally {
+          executeRunBtn.disabled = false;
+          if (originalLabel) { executeRunBtn.textContent = originalLabel; }
+          executing = false;
+        }
+      });
+    }
+    // Removed orphan IIFE closure
+    try { init(); } catch (e) { console.error('Init failed', e); }
+  });
