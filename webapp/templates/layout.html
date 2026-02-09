@@ -1,392 +1,538 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}CORE TopoGen Web GUI{% endblock %}</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' ry='3' fill='%230d6efd'/%3E%3Cpath d='M4 4h8v8H4z' fill='%23ffffff'/%3E%3Cpath d='M5.5 5.5v5h5v-5z' fill='%230d6efd'/%3E%3C/svg%3E" />
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-  <style>
-    /* Make the active navbar item stand out: blue background with white text */
-    .navbar .nav-link.active {
-      font-weight: 700;
-      background-color: var(--bs-primary) !important;
-      background-color: #0d6efd !important; /* fallback */
-      color: #fff !important;
-      border-radius: .375rem;
-      padding-left: .6rem;
-      padding-right: .6rem;
-      padding-top: .25rem;
-      padding-bottom: .25rem;
-      box-shadow: 0 2px 6px rgba(13,110,253,0.12), 0 1px 0 rgba(0,0,0,0.06) inset;
-      text-decoration: none;
-    }
-    /* Ensure participant (dark) navbar also shows the same strong highlight */
-    .navbar.participant-view .nav-link.active {
-      background-color: var(--bs-primary) !important;
-      background-color: #0d6efd !important; /* fallback */
-      color: #fff !important;
-      border-radius: .375rem;
-      padding-left: .6rem;
-      padding-right: .6rem;
-      padding-top: .25rem;
-      padding-bottom: .25rem;
-      box-shadow: 0 2px 6px rgba(13,110,253,0.12), 0 1px 0 rgba(0,0,0,0.06) inset;
-    }
-    /* Make active nav item extra-obvious when server didn't mark it: JS will add `.active` based on URL */
-    .navbar.participant-view { background: #1f2933 !important; border: none !important; color: #f8fafc; }
-    .navbar.participant-view .nav-link { color: rgba(255,255,255,0.85); }
-    .navbar.participant-view .nav-link:hover,
-    .navbar.participant-view .nav-link:focus,
-    .navbar.participant-view .nav-link.active { color: #fff; }
-    .navbar.participant-view .nav-link.disabled { color: rgba(255,255,255,0.4); }
-    .view-toggle-form { display: inline; }
-    .view-toggle-form + .view-toggle-form { margin-left: 0.25rem; }
-    .view-toggle-group .btn.active { font-weight: 600; }
-  </style>
-  {% block extra_head %}{% endblock %}
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}CORE TopoGen Web GUI{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' ry='3' fill='%230d6efd'/%3E%3Cpath d='M4 4h8v8H4z' fill='%23ffffff'/%3E%3Cpath d='M5.5 5.5v5h5v-5z' fill='%230d6efd'/%3E%3C/svg%3E" />
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        /* Make the active navbar item stand out: blue background with white text */
+        .navbar .nav-link.active {
+            font-weight: 700;
+            background-color: var(--bs-primary) !important;
+            background-color: #0d6efd !important;
+            /* fallback */
+            color: #fff !important;
+            border-radius: .375rem;
+            padding-left: .6rem;
+            padding-right: .6rem;
+            padding-top: .25rem;
+            padding-bottom: .25rem;
+            box-shadow: 0 2px 6px rgba(13, 110, 253, 0.12), 0 1px 0 rgba(0, 0, 0, 0.06) inset;
+            text-decoration: none;
+        }
+
+        /* Ensure participant (dark) navbar also shows the same strong highlight */
+        .navbar.participant-view .nav-link.active {
+            background-color: var(--bs-primary) !important;
+            background-color: #0d6efd !important;
+            /* fallback */
+            color: #fff !important;
+            border-radius: .375rem;
+            padding-left: .6rem;
+            padding-right: .6rem;
+            padding-top: .25rem;
+            padding-bottom: .25rem;
+            box-shadow: 0 2px 6px rgba(13, 110, 253, 0.12), 0 1px 0 rgba(0, 0, 0, 0.06) inset;
+        }
+
+        /* Make active nav item extra-obvious when server didn't mark it: JS will add `.active` based on URL */
+        .navbar.participant-view {
+            background: #1f2933 !important;
+            border: none !important;
+            color: #f8fafc;
+        }
+
+        .navbar.participant-view .nav-link {
+            color: rgba(255, 255, 255, 0.85);
+        }
+
+        .navbar.participant-view .nav-link:hover,
+        .navbar.participant-view .nav-link:focus,
+        .navbar.participant-view .nav-link.active {
+            color: #fff;
+        }
+
+        .navbar.participant-view .nav-link.disabled {
+            color: rgba(255, 255, 255, 0.4);
+        }
+
+        .view-toggle-form {
+            display: inline;
+        }
+
+        .view-toggle-form+.view-toggle-form {
+            margin-left: 0.25rem;
+        }
+
+        .view-toggle-group .btn.active {
+            font-weight: 600;
+        }
+    </style>
+    {% block extra_head %}{% endblock %}
 </head>
+
 <body class="{% block body_class %}{% endblock %}">
-  {% block active_page %}{% set active_page = '' %}{% endblock %}
-  {% set hide_chrome = hide_chrome|default(false) %}
-  <div class="container-fluid mt-4">
-    <div class="row">
-      <div class="col-12">
-        {% if not hide_chrome %}
-        <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
-          <div class="d-flex align-items-center gap-2">
-            {% block header_icon %}<i class="bi bi-shield-lock-fill fs-4"></i>{% endblock %}
-            <h3 class="mb-0">{% block header_title %}CORE TopoGen Web GUI{% endblock %}</h3>
-          </div>
-          <div class="d-flex align-items-center gap-4 flex-wrap justify-content-end">
-            {% block header_right_extra %}{% endblock %}
-            <div class="d-flex align-items-center gap-3">
-              {% if current_user.is_authenticated %}
-                <span class="small text-white-50">{{ current_user.username }}</span>
-                <a class="btn btn-sm btn-outline-light" href="{{ url_for('me_password') }}">Password</a>
-                <form action="{{ url_for('logout') }}" method="post" class="d-inline">
-                  <button class="btn btn-sm btn-outline-danger">Logout</button>
-                </form>
-                {% if current_user.role == 'admin' and ui_view_mode == 'admin' %}
-                <div class="dropdown">
-                  <button class="btn btn-sm btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Settings</button>
-                  <ul class="dropdown-menu dropdown-menu-end">
-                    <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
-                  </ul>
+    {% block active_page %}{% set active_page = '' %}{% endblock %}
+    {% set hide_chrome = hide_chrome|default(false) %}
+    <div class="container-fluid mt-4">
+        <div class="row">
+            <div class="col-12">
+                {% if not hide_chrome %}
+                <div
+                    class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
+                    <div class="d-flex align-items-center gap-2">
+                        {% block header_icon %}<i class="bi bi-shield-lock-fill fs-4"></i>{% endblock %}
+                        <h3 class="mb-0">{% block header_title %}CORE TopoGen Web GUI{% endblock %}</h3>
+                    </div>
+                    <div class="d-flex align-items-center gap-4 flex-wrap justify-content-end">
+                        {% block header_right_extra %}{% endblock %}
+                        <div class="d-flex align-items-center gap-3">
+                            {% if current_user.is_authenticated %}
+                            <span class="small text-white-50">{{ current_user.username }}</span>
+                            <a class="btn btn-sm btn-outline-light" href="{{ url_for('me_password') }}">Password</a>
+                            <form action="{{ url_for('logout') }}" method="post" class="d-inline">
+                                <button class="btn btn-sm btn-outline-danger">Logout</button>
+                            </form>
+                            {% if current_user.role == 'admin' and ui_view_mode == 'admin' %}
+                            <div class="dropdown">
+                                <button class="btn btn-sm btn-light dropdown-toggle" type="button"
+                                    data-bs-toggle="dropdown" aria-expanded="false">Settings</button>
+                                <ul class="dropdown-menu dropdown-menu-end">
+                                    <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
+                                </ul>
+                            </div>
+                            {% endif %}
+                            {% else %}
+                            <a class="btn btn-sm btn-light" href="{{ url_for('login') }}">Login</a>
+                            {% endif %}
+                        </div>
+                    </div>
                 </div>
+                {% set nav_scenario = request.args.get('scenario', '').strip() if request else '' %}
+                {% set nav_reports_href = url_for('reports_page', scenario=nav_scenario) if nav_scenario else
+                url_for('reports_page') %}
+                {% set nav_core_href = url_for('core_page', scenario=nav_scenario) if nav_scenario else
+                url_for('core_page') %}
+                {% set is_admin_view = (ui_view_mode == 'admin') %}
+                {% set is_builder_view = (ui_view_mode == 'builder') %}
+                {% set is_power_view = is_admin_view or is_builder_view %}
+                {% set navbar_classes = 'navbar navbar-expand rounded-bottom shadow-sm mb-3 px-2 py-0 ' ~ ('bg-light
+                border
+                admin-nav' if is_power_view else 'participant-view text-white') %}
+                {% set nav_participant_available = nav_participant_url or '' %}
+                {% set nav_participant_link = url_for('participant_ui_page', scenario=nav_scenario) if nav_scenario else
+                url_for('participant_ui_page') %}
+                <nav class="{{ navbar_classes }}">
+                    <ul class="navbar-nav me-auto mb-0 small">
+                        {% if is_power_view %}
+                        <li class="nav-item"><a class="nav-link {% if active_page=='scenarios' %}active{% endif %}"
+                                href="{{ url_for('index') }}">Scenarios</a></li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if active_page == 'flag_catalog' %}active{% endif %}"
+                                href="{{ url_for('flag_catalog_page') }}">Flag-Catalog</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if active_page == 'vuln_catalog' %}active{% endif %}"
+                                href="{{ url_for('vuln_catalog_page') }}">Vuln-Catalog</a>
+                        </li>
+                        <li class="nav-item"><a id="navReportsLink"
+                                class="nav-link {% if active_page=='reports' %}active{% endif %}"
+                                href="{{ nav_reports_href }}">Reports</a></li>
+                        <li class="nav-item"><a id="navCoreLink"
+                                class="nav-link {% if active_page=='core' %}active{% endif %}"
+                                href="{{ nav_core_href }}">CORE-Management</a></li>
+                        {% endif %}
+                        {% set show_participant_nav_anyway = (nav_participant_enabled|default(false)) %}
+                        <li class="nav-item{% if (not nav_participant_available) and (not show_participant_nav_anyway) %} d-none{% endif %}"
+                            id="navParticipantLinkWrap"
+                            data-force-visible="{{ '1' if show_participant_nav_anyway else '' }}">
+                            <a id="navParticipantLink"
+                                class="nav-link {% if active_page=='participant_ui' %}active{% endif %}"
+                                data-initial-participant-url="{{ nav_participant_available }}"
+                                href="{{ nav_participant_link }}" title="Participant-UI">Participant-UI</a>
+                        </li>
+                    </ul>
+                    <div class="d-flex align-items-center gap-3 ms-auto">
+                        <div class="d-flex align-items-center gap-2 {% if not is_power_view %}d-none{% endif %}"
+                            id="navRightExtras">
+                            {% if is_power_view %}{% block nav_right_extra %}{% endblock %}{% endif %}
+                        </div>
+                        {% if current_user.role in ['admin', 'builder'] %}
+                        {% set toggle_outline = 'btn-outline-secondary' if is_power_view else 'btn-outline-light' %}
+                        {% set next_href = request.full_path if request and request.full_path else request.path %}
+                        <div class="view-toggle-group d-flex align-items-center">
+                            {% if current_user.role == 'admin' %}
+                            <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                                <input type="hidden" name="mode" value="admin">
+                                <input type="hidden" name="next" value="{{ next_href }}">
+                                <button type="submit"
+                                    class="btn btn-sm {{ toggle_outline }} {% if is_admin_view %}active{% endif %}">Admin
+                                    View</button>
+                            </form>
+                            {% endif %}
+                            <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                                <input type="hidden" name="mode" value="builder">
+                                <input type="hidden" name="next" value="{{ next_href }}">
+                                <button type="submit"
+                                    class="btn btn-sm {{ toggle_outline }} {% if is_builder_view %}active{% endif %}">Builder
+                                    View</button>
+                            </form>
+                            <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                                <input type="hidden" name="mode" value="participant">
+                                <input type="hidden" name="next" value="{{ next_href }}">
+                                <button type="submit"
+                                    class="btn btn-sm {{ toggle_outline }} {% if ui_view_mode == 'participant' %}active{% endif %}">Participant
+                                    View</button>
+                            </form>
+                        </div>
+                        {% endif %}
+                    </div>
+                </nav>
                 {% endif %}
-              {% else %}
-                <a class="btn btn-sm btn-light" href="{{ url_for('login') }}">Login</a>
-              {% endif %}
             </div>
-          </div>
         </div>
-        {% set nav_scenario = request.args.get('scenario', '').strip() if request else '' %}
-        {% set nav_reports_href = url_for('reports_page', scenario=nav_scenario) if nav_scenario else url_for('reports_page') %}
-        {% set nav_core_href = url_for('core_page', scenario=nav_scenario) if nav_scenario else url_for('core_page') %}
-        {% set is_admin_view = (ui_view_mode == 'admin') %}
-        {% set is_builder_view = (ui_view_mode == 'builder') %}
-        {% set is_power_view = is_admin_view or is_builder_view %}
-        {% set navbar_classes = 'navbar navbar-expand rounded-bottom shadow-sm mb-3 px-2 py-0 ' ~ ('bg-light border admin-nav' if is_power_view else 'participant-view text-white') %}
-        {% set nav_participant_available = nav_participant_url or '' %}
-        {% set nav_participant_link = url_for('participant_ui_page', scenario=nav_scenario) if nav_scenario else url_for('participant_ui_page') %}
-        <nav class="{{ navbar_classes }}">
-          <ul class="navbar-nav me-auto mb-0 small">
-            {% if is_power_view %}
-            <li class="nav-item"><a class="nav-link {% if active_page=='scenarios' %}active{% endif %}" href="{{ url_for('index') }}">Scenarios</a></li>
-            <li class="nav-item">
-              <a class="nav-link {% if active_page == 'flag_catalog' %}active{% endif %}" href="{{ url_for('flag_catalog_page') }}">Flag-Catalog</a>
-            </li>
-            <li class="nav-item">
-              <a class="nav-link {% if active_page == 'vuln_catalog' %}active{% endif %}" href="{{ url_for('vuln_catalog_page') }}">Vuln-Catalog</a>
-            </li>
-            <li class="nav-item"><a id="navReportsLink" class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
-            <li class="nav-item"><a id="navCoreLink" class="nav-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}">CORE-Management</a></li>
-            {% endif %}
-            {% set show_participant_nav_anyway = (nav_participant_enabled|default(false)) %}
-            <li class="nav-item{% if (not nav_participant_available) and (not show_participant_nav_anyway) %} d-none{% endif %}" id="navParticipantLinkWrap" data-force-visible="{{ '1' if show_participant_nav_anyway else '' }}">
-              <a id="navParticipantLink" class="nav-link {% if active_page=='participant_ui' %}active{% endif %}" data-initial-participant-url="{{ nav_participant_available }}" href="{{ nav_participant_link }}" title="Participant-UI">Participant-UI</a>
-            </li>
-          </ul>
-          <div class="d-flex align-items-center gap-3 ms-auto">
-            <div class="d-flex align-items-center gap-2 {% if not is_power_view %}d-none{% endif %}" id="navRightExtras">
-              {% if is_power_view %}{% block nav_right_extra %}{% endblock %}{% endif %}
-            </div>
-            {% if current_user.role in ['admin', 'builder'] %}
-              {% set toggle_outline = 'btn-outline-secondary' if is_power_view else 'btn-outline-light' %}
-              {% set next_href = request.full_path if request and request.full_path else request.path %}
-              <div class="view-toggle-group d-flex align-items-center">
-                {% if current_user.role == 'admin' %}
-                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
-                  <input type="hidden" name="mode" value="admin">
-                  <input type="hidden" name="next" value="{{ next_href }}">
-                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if is_admin_view %}active{% endif %}">Admin View</button>
-                </form>
-                {% endif %}
-                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
-                  <input type="hidden" name="mode" value="builder">
-                  <input type="hidden" name="next" value="{{ next_href }}">
-                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if is_builder_view %}active{% endif %}">Builder View</button>
-                </form>
-                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
-                  <input type="hidden" name="mode" value="participant">
-                  <input type="hidden" name="next" value="{{ next_href }}">
-                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if ui_view_mode == 'participant' %}active{% endif %}">Participant View</button>
-                </form>
-              </div>
-            {% endif %}
-          </div>
-        </nav>
-        {% endif %}
-      </div>
-    </div>
-    {% block body_container %}
-    <div class="row">
-      <div class="col-12">
-        {% with messages = get_flashed_messages() %}
-          {% if messages %}
-            <div class="mt-2">
-              {% for msg in messages %}
-                <div class="alert alert-info alert-dismissible fade show" role="alert">
-                  {{ msg }}
-                  <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+        {% block body_container %}
+        <div class="row">
+            <div class="col-12">
+                {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                <div class="mt-2">
+                    {% for msg in messages %}
+                    <div class="alert alert-info alert-dismissible fade show" role="alert">
+                        {{ msg }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                    </div>
+                    {% endfor %}
                 </div>
-              {% endfor %}
+                {% endif %}
+                {% endwith %}
+                {% block content %}{% endblock %}
             </div>
-          {% endif %}
-        {% endwith %}
-        {% block content %}{% endblock %}
-      </div>
+        </div>
+        {% endblock %}
     </div>
-    {% endblock %}
-  </div>
 
     {% if not hide_chrome %}
-      <!-- Global navigation loading modal (used for slow CORE page loads) -->
-      <div class="modal fade" id="navLoadingModal" tabindex="-1" aria-hidden="true">
+    <!-- Global navigation loading modal (used for slow CORE page loads) -->
+    <div class="modal fade" id="navLoadingModal" tabindex="-1" aria-hidden="true">
         <div class="modal-dialog modal-dialog-centered">
-          <div class="modal-content">
-            <div class="modal-header">
-              <h5 class="modal-title">Loading…</h5>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Loading…</h5>
+                </div>
+                <div class="modal-body">
+                    <div class="small text-muted mb-2" id="navLoadingText">Loading…</div>
+                    <div class="progress" role="progressbar" aria-label="Loading" aria-valuemin="0" aria-valuemax="100">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 100%">Loading
+                        </div>
+                    </div>
+                </div>
             </div>
-            <div class="modal-body">
-              <div class="small text-muted mb-2" id="navLoadingText">Loading…</div>
-              <div class="progress" role="progressbar" aria-label="Loading" aria-valuemin="0" aria-valuemax="100">
-                <div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 100%">Loading</div>
-              </div>
-            </div>
-          </div>
         </div>
-      </div>
+    </div>
     {% endif %}
 
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- CORE Daemon Start Modal -->
+    <div class="modal fade" id="coreDaemonModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static"
+        data-bs-keyboard="false">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content border-danger">
+                <div class="modal-header bg-danger text-white">
+                    <h5 class="modal-title"><i class="bi bi-exclamation-triangle-fill me-2"></i>CORE Daemon Issue</h5>
+                </div>
+                <div class="modal-body">
+                    <p>The CORE daemon on the configured VM is unreachable.</p>
+                    <p class="small text-muted">
+                        Target: <strong id="cdmTarget"></strong><br>
+                        Status: Connection Refused
+                    </p>
+                    <div class="alert alert-light border small mb-0">
+                        It appears the <code>core-daemon</code> service is not running on the remote host.
+                        Would you like to attempt to start it using your configured credentials?
+                    </div>
+                    <div id="cdmError" class="alert alert-danger mt-3 d-none small"></div>
+                </div>
+                <div class="modal-footer bg-light">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Ignore</button>
+                    <button type="button" class="btn btn-danger" id="cdmStartBtn">
+                        <span class="spinner-border spinner-border-sm d-none me-1" role="status"
+                            aria-hidden="true"></span>
+                        Start Service
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Global Confirmation Modal -->
+    <div class="modal fade" id="confirmationModal" tabindex="-1" aria-hidden="true" style="z-index: 10000;">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="confirmationModalTitle">Confirm</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body" id="confirmationModalBody"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="confirmationModalConfirmBtn">Confirm</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Global helper for Bootstrap confirmation modal
+        window.confirmWithModal = function (title, message, confirmLabel = 'Confirm', tone = 'primary') {
+            return new Promise((resolve) => {
+                const modalEl = document.getElementById('confirmationModal');
+                if (!modalEl) {
+                    // Fallback if modal is missing
+                    resolve(window.confirm(`${title}\n\n${message}`));
+                    return;
+                }
+                const titleEl = document.getElementById('confirmationModalTitle');
+                const bodyEl = document.getElementById('confirmationModalBody');
+                const confirmBtn = document.getElementById('confirmationModalConfirmBtn');
+
+                if (titleEl) titleEl.textContent = title;
+                if (bodyEl) bodyEl.textContent = message;
+                if (bodyEl) bodyEl.style.whiteSpace = 'pre-wrap';
+
+                if (confirmBtn) {
+                    confirmBtn.textContent = confirmLabel;
+                    confirmBtn.className = `btn btn-${tone}`;
+                    const newBtn = confirmBtn.cloneNode(true);
+                    confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
+                    newBtn.addEventListener('click', () => {
+                        resolve(true);
+                        const instance = bootstrap.Modal.getInstance(modalEl);
+                        if (instance) instance.hide();
+                    });
+                }
+
+                const modal = new bootstrap.Modal(modalEl, { backdrop: 'static', keyboard: false });
+                const hiddenHandler = () => {
+                    resolve(false);
+                    modalEl.removeEventListener('hidden.bs.modal', hiddenHandler);
+                };
+                modalEl.addEventListener('hidden.bs.modal', hiddenHandler);
+                modal.show();
+            });
+        };
+    </script>
+
     {% if not hide_chrome %}
     <script>
-      // Show a loading modal when clicking the CORE navbar link.
-      (function(){
-        function shouldInterceptClick(ev){
-          if(!ev) return false;
-          if(ev.defaultPrevented) return false;
-          if(ev.button !== 0) return false;
-          if(ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
-          return true;
-        }
-        function showNavLoading(message){
-          try {
-            const el = document.getElementById('navLoadingModal');
-            if(!el) return null;
-            const textEl = document.getElementById('navLoadingText');
-            if(textEl) textEl.textContent = message || 'Loading…';
-            if(window.bootstrap && window.bootstrap.Modal){
-              const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
-              inst.show();
-              return inst;
+        // Show a loading modal when clicking the CORE navbar link.
+        (function () {
+            function shouldInterceptClick(ev) {
+                if (!ev) return false;
+                if (ev.defaultPrevented) return false;
+                if (ev.button !== 0) return false;
+                if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
+                return true;
             }
-          } catch(e) {}
-                  let navLoadingInstance = null;
-          return null;
-        }
-        document.addEventListener('click', (ev)=>{
-          try {
-            const coreLink = document.getElementById('navCoreLink');
-            if(!coreLink) return;
-            const target = ev.target && ev.target.closest ? ev.target.closest('a') : null;
-            if(!target || target !== coreLink) return;
-            const href = coreLink.getAttribute('href') || '';
-            if(!href) return;
-            if(!shouldInterceptClick(ev)) return;
-
-            const dest = new URL(href, window.location.origin);
-            const here = new URL(window.location.href);
+            function showNavLoading(message) {
+                try {
+                    const el = document.getElementById('navLoadingModal');
+                    if (!el) return null;
+                    const textEl = document.getElementById('navLoadingText');
+                    if (textEl) textEl.textContent = message || 'Loading…';
+                    if (window.bootstrap && window.bootstrap.Modal) {
                         const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
-                        navLoadingInstance = inst;
                         inst.show();
                         return inst;
-            // Show a lightweight loading indication, but do NOT prevent default navigation.
-            // Preventing + delayed location.assign can appear to “hang” if the main thread
-            // is busy (e.g., large details graphs) and the timer doesn’t get to run.
-            showNavLoading('Loading CORE…');
+                    }
+                } catch (e) { }
+                let navLoadingInstance = null;
+                return null;
+            }
+            document.addEventListener('click', (ev) => {
+                try {
+                    const coreLink = document.getElementById('navCoreLink');
+                    if (!coreLink) return;
+                    const target = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+                    if (!target || target !== coreLink) return;
+                    const href = coreLink.getAttribute('href') || '';
+                    if (!href) return;
+                    if (!shouldInterceptClick(ev)) return;
 
-                  function hideNavLoading(){
-                    try {
-                      const el = document.getElementById('navLoadingModal');
-                      if(!el || !window.bootstrap || !window.bootstrap.Modal) return;
-                      const inst = navLoadingInstance || bootstrap.Modal.getInstance(el);
-                      if(inst && typeof inst.hide === 'function') inst.hide();
-                    } catch(e) {}
-                    navLoadingInstance = null;
-                    // Defensive: if a stale backdrop survived, remove it.
-                    try {
-                      document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
-                    } catch(e) {}
-                    try { document.body.classList.remove('modal-open'); } catch(e) {}
-                  }
+                    const dest = new URL(href, window.location.origin);
+                    const here = new URL(window.location.href);
+                    const el = document.getElementById('navLoadingModal');
+                    const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+                    navLoadingInstance = inst;
+                    inst.show();
+                    return inst;
 
-                  // Expose for pages that intercept navigation (e.g., CORE nav guard).
-                  window.CORETG_HIDE_NAV_LOADING = hideNavLoading;
-          } catch(e) {}
-        }, true);
+                    function hideNavLoading() {
+                        try {
+                            const el = document.getElementById('navLoadingModal');
+                            if (!el || !window.bootstrap || !window.bootstrap.Modal) return;
+                            const inst = navLoadingInstance || bootstrap.Modal.getInstance(el);
+                            if (inst && typeof inst.hide === 'function') inst.hide();
+                        } catch (e) { }
+                        navLoadingInstance = null;
+                        // Defensive: if a stale backdrop survived, remove it.
+                        try {
+                            document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
+                        } catch (e) { }
+                        try { document.body.classList.remove('modal-open'); } catch (e) { }
+                    }
 
-        // If the page comes back from bfcache, ensure we don't keep the modal up.
-        try { window.addEventListener('pageshow', hideNavLoading); } catch(e) {}
-      })();
+                    // Expose for pages that intercept navigation (e.g., CORE nav guard).
+                    window.CORETG_HIDE_NAV_LOADING = hideNavLoading;
+                } catch (e) { }
+            }, true);
+
+            // If the page comes back from bfcache, ensure we don't keep the modal up.
+            try { window.addEventListener('pageshow', hideNavLoading); } catch (e) { }
+        })();
     </script>
     {% endif %}
-  <script>
-    (function(){
-      window.CORETG_VIEW_MODE = {{ ui_view_mode|tojson }};
-      window.CORETG_PARTICIPANT_UI_HREF = window.CORETG_PARTICIPANT_UI_HREF || '';
-      // Helper: patch CORE/Reports navbar hrefs to include the active scenario.
-      // This is needed because index.html updates ?scenario= via history.replaceState,
-      // but server-rendered hrefs won't automatically pick that up.
-      window.CORETG_PATCH_SCENARIO_NAV = function(scenarioName){
-        try {
-          const scen = (scenarioName || '').toString().trim();
-          if(!scen) return;
-          const patchLink = (id) => {
-            const el = document.getElementById(id);
-            if(!el) return;
-            const rawHref = el.getAttribute('href') || '';
-            if(!rawHref || rawHref.startsWith('#')) return;
-            const url = new URL(rawHref, window.location.origin);
-            url.searchParams.set('scenario', scen);
-            el.setAttribute('href', `${url.pathname}${url.search}${url.hash}`);
-          };
-          patchLink('navCoreLink');
-          patchLink('navReportsLink');
-          patchLink('navParticipantLink');
-        } catch(e) {}
-      };
+    <script>
+        (function () {
+            // window.CORETG_VIEW_MODE = {{ ui_view_mode |default ('participant') | tojson }};
+            window.CORETG_VIEW_MODE = 'participant';
+            window.CORETG_PARTICIPANT_UI_HREF = window.CORETG_PARTICIPANT_UI_HREF || '';
+            // Helper: patch CORE/Reports navbar hrefs to include the active scenario.
+            // This is needed because index.html updates ?scenario= via history.replaceState,
+            // but server-rendered hrefs won't automatically pick that up.
+            window.CORETG_PATCH_SCENARIO_NAV = function (scenarioName) {
+                try {
+                    const scen = (scenarioName || '').toString().trim();
+                    if (!scen) return;
+                    const patchLink = (id) => {
+                        const el = document.getElementById(id);
+                        if (!el) return;
+                        const rawHref = el.getAttribute('href') || '';
+                        if (!rawHref || rawHref.startsWith('#')) return;
+                        const url = new URL(rawHref, window.location.origin);
+                        url.searchParams.set('scenario', scen);
+                        el.setAttribute('href', `${url.pathname}${url.search}${url.hash}`);
+                    };
+                    patchLink('navCoreLink');
+                    patchLink('navReportsLink');
+                    patchLink('navParticipantLink');
+                } catch (e) { }
+            };
 
-      // Helper: show/hide Participant-UI tab (boolean-based).
-      // Used by pages that change the active scenario without full reload (CORE/Reports).
-      window.CORETG_SET_PARTICIPANT_NAV_VISIBLE = function(isVisible){
-        try {
-          const wrapperEl = document.getElementById('navParticipantLinkWrap');
-          const linkEl = document.getElementById('navParticipantLink');
-          if(!wrapperEl || !linkEl) return;
-          const visible = !!isVisible;
-          if(visible){
-            wrapperEl.classList.remove('d-none');
-            linkEl.removeAttribute('aria-disabled');
-            linkEl.setAttribute('title', 'Participant-UI');
-          } else {
-            wrapperEl.classList.add('d-none');
-            linkEl.setAttribute('aria-disabled', 'true');
-            linkEl.setAttribute('title', 'Participant-UI unavailable');
-          }
-        } catch(e) {}
-      };
-      const wrapper = document.getElementById('navParticipantLinkWrap');
-      const link = document.getElementById('navParticipantLink');
-      if(!wrapper || !link || typeof window === 'undefined') return;
-      const normalizeParticipantHref = (value) => {
-        if(value === undefined || value === null) return '';
-        let trimmed = String(value).trim();
-        if(!trimmed) return '';
-        if(!/^https?:\/\//i.test(trimmed)) trimmed = `https://${trimmed}`;
-        try {
-          const parsed = new URL(trimmed);
-          if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-          return parsed.toString();
-        } catch(err) {
-          return '';
-        }
-      };
-      const applyAvailability = (href) => {
-        const hasHref = !!href;
-        const forceVisible = (wrapper.getAttribute('data-force-visible') || '') === '1';
-        if(hasHref){
-          wrapper.classList.remove('d-none');
-          link.removeAttribute('aria-disabled');
-          link.setAttribute('title', `Participant-UI (${href})`);
-          link.dataset.participantUiHref = href;
-        } else {
-          if(!forceVisible){
-            wrapper.classList.add('d-none');
-          } else {
-            wrapper.classList.remove('d-none');
-          }
-          if(forceVisible){
-            link.removeAttribute('aria-disabled');
-            link.setAttribute('title', 'Participant-UI');
-          } else {
-            link.setAttribute('aria-disabled', 'true');
-            link.setAttribute('title', 'Participant-UI unavailable');
-          }
-          link.dataset.participantUiHref = '';
-        }
-        window.CORETG_PARTICIPANT_UI_HREF = href || '';
-      };
-      const storedDefault = normalizeParticipantHref(link.getAttribute('data-initial-participant-url'));
-      const updateFromSources = () => {
-        // Only show the Participant-UI tab when the server provided a URL for the current page/scenario
-        // (or when a page explicitly sets window.CORETG_PARTICIPANT_UI_HREF).
-        // Avoid using the editor's localStorage state here, otherwise CORE/Reports can incorrectly
-        // show Participant-UI even when no Participant URL is set.
-        const explicitHref = normalizeParticipantHref(window.CORETG_PARTICIPANT_UI_HREF || '');
-        applyAvailability(explicitHref || storedDefault || '');
-      };
-      updateFromSources();
-    })();
-  </script>
-  <script>
-    // Ensure the current page's nav link is visibly marked as active client-side
-    (function(){
-      try {
-        document.addEventListener('DOMContentLoaded', function(){
-          const links = Array.from(document.querySelectorAll('.navbar .nav-link'));
-          if(!links || links.length === 0) return;
-          const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
-          // Choose the best matching link: prefer exact match, otherwise longest prefix
-          let best = {score: -1, el: null};
-          links.forEach((a) => {
+            // Helper: show/hide Participant-UI tab (boolean-based).
+            // Used by pages that change the active scenario without full reload (CORE/Reports).
+            window.CORETG_SET_PARTICIPANT_NAV_VISIBLE = function (isVisible) {
+                try {
+                    const wrapperEl = document.getElementById('navParticipantLinkWrap');
+                    const linkEl = document.getElementById('navParticipantLink');
+                    if (!wrapperEl || !linkEl) return;
+                    const visible = !!isVisible;
+                    if (visible) {
+                        wrapperEl.classList.remove('d-none');
+                        linkEl.removeAttribute('aria-disabled');
+                        linkEl.setAttribute('title', 'Participant-UI');
+                    } else {
+                        wrapperEl.classList.add('d-none');
+                        linkEl.setAttribute('aria-disabled', 'true');
+                        linkEl.setAttribute('title', 'Participant-UI unavailable');
+                    }
+                } catch (e) { }
+            };
+            const wrapper = document.getElementById('navParticipantLinkWrap');
+            const link = document.getElementById('navParticipantLink');
+            if (!wrapper || !link || typeof window === 'undefined') return;
+            const normalizeParticipantHref = (value) => {
+                if (value === undefined || value === null) return '';
+                let trimmed = String(value).trim();
+                if (!trimmed) return '';
+                if (!/^https?:\/\//i.test(trimmed)) trimmed = `https://${trimmed}`;
+                try {
+                    const parsed = new URL(trimmed);
+                    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+                    return parsed.toString();
+                } catch (err) {
+                    return '';
+                }
+            };
+            const applyAvailability = (href) => {
+                const hasHref = !!href;
+                const forceVisible = (wrapper.getAttribute('data-force-visible') || '') === '1';
+                if (hasHref) {
+                    wrapper.classList.remove('d-none');
+                    link.removeAttribute('aria-disabled');
+                    link.setAttribute('title', `Participant-UI (${href})`);
+                    link.dataset.participantUiHref = href;
+                } else {
+                    if (!forceVisible) {
+                        wrapper.classList.add('d-none');
+                    } else {
+                        wrapper.classList.remove('d-none');
+                    }
+                    if (forceVisible) {
+                        link.removeAttribute('aria-disabled');
+                        link.setAttribute('title', 'Participant-UI');
+                    } else {
+                        link.setAttribute('aria-disabled', 'true');
+                        link.setAttribute('title', 'Participant-UI unavailable');
+                    }
+                    link.dataset.participantUiHref = '';
+                }
+                window.CORETG_PARTICIPANT_UI_HREF = href || '';
+            };
+            const storedDefault = normalizeParticipantHref(link.getAttribute('data-initial-participant-url'));
+            const updateFromSources = () => {
+                // Only show the Participant-UI tab when the server provided a URL for the current page/scenario
+                // (or when a page explicitly sets window.CORETG_PARTICIPANT_UI_HREF).
+                // Avoid using the editor's localStorage state here, otherwise CORE/Reports can incorrectly
+                // show Participant-UI even when no Participant URL is set.
+                const explicitHref = normalizeParticipantHref(window.CORETG_PARTICIPANT_UI_HREF || '');
+                applyAvailability(explicitHref || storedDefault || '');
+            };
+            updateFromSources();
+        })();
+    </script>
+    <script>
+        // Ensure the current page's nav link is visibly marked as active client-side
+        (function () {
             try {
-              const href = a.getAttribute('href') || '';
-              if(!href) return;
-              const url = new URL(href, window.location.origin);
-              const linkPath = url.pathname.replace(/\/+$/, '') || '/';
-              let score = 0;
-              if(linkPath === currentPath) {
-                score = 10000; // exact highest priority
-              } else if(linkPath !== '/' && (currentPath === linkPath || currentPath.startsWith(linkPath + '/'))) {
-                score = linkPath.length; // longer prefix wins
-              } else {
-                score = -1;
-              }
-              if(score > best.score) best = {score, el: a};
-            } catch(e) { /* ignore parse errors */ }
-          });
-          if(best.el && best.score >= 0) {
-            best.el.classList.add('active');
-            best.el.setAttribute('aria-current', 'page');
-          }
-        });
-      } catch(e) { /* noop */ }
-    })();
-  </script>
-  {% block extra_scripts %}{% endblock %}
+                document.addEventListener('DOMContentLoaded', function () {
+                    const links = Array.from(document.querySelectorAll('.navbar .nav-link'));
+                    if (!links || links.length === 0) return;
+                    const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
+                    // Choose the best matching link: prefer exact match, otherwise longest prefix
+                    let best = { score: -1, el: null };
+                    links.forEach((a) => {
+                        try {
+                            const href = a.getAttribute('href') || '';
+                            if (!href) return;
+                            const url = new URL(href, window.location.origin);
+                            const linkPath = url.pathname.replace(/\/+$/, '') || '/';
+                            let score = 0;
+                            if (linkPath === currentPath) {
+                                score = 10000; // exact highest priority
+                            } else if (linkPath !== '/' && (currentPath === linkPath || currentPath.startsWith(linkPath + '/'))) {
+                                score = linkPath.length; // longer prefix wins
+                            } else {
+                                score = -1;
+                            }
+                            if (score > best.score) best = { score, el: a };
+                        } catch (e) { /* ignore parse errors */ }
+                    });
+                    if (best.el && best.score >= 0) {
+                        best.el.classList.add('active');
+                        best.el.setAttribute('aria-current', 'page');
+                    }
+                });
+            } catch (e) { /* noop */ }
+        })();
+    </script>
+    {% block extra_scripts %}{% endblock %}
 </body>
+
 </html>

@@ -140,10 +140,7 @@
                     {% endif %}
                 </div>
                 <div class="btn-toolbar gap-1 align-items-center flex-nowrap">
-                    <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" id="toggleScenarioSeedBtn"
-                        title="Show seeds" aria-label="Toggle seed visibility">
-                        <i class="bi bi-eye" aria-hidden="true"></i>
-                    </button>
+
                     {% if not is_builder_view %}
                     <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn"
                         title="Import scenarios XML">Import</button>
@@ -495,22 +492,7 @@
         </div>
     </div>
 </div>
-<!-- Confirmation Modal -->
-<div class="modal fade" id="confirmationModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title" id="confirmationModalTitle">Confirm</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-            </div>
-            <div class="modal-body" id="confirmationModalBody"></div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" id="confirmationModalConfirmBtn">Confirm</button>
-            </div>
-        </div>
-    </div>
-</div>
+
 <!-- CORE Connection Modal -->
 <div class="modal fade" id="coreConnectionModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-xl">
@@ -1453,48 +1435,6 @@
                 try { logInfo(`Pruned ${before - after} locally-deleted scenarios after restore`); } catch (e) { }
             }
         } catch (e) { }
-    }
-
-    function confirmWithModal(title, message, confirmLabel = 'Confirm', tone = 'primary') {
-        return new Promise((resolve) => {
-            const modalEl = document.getElementById('confirmationModal');
-            if (!modalEl) {
-                // Fallback if modal is missing
-                resolve(window.confirm(`${title}\n\n${message}`));
-                return;
-            }
-            const titleEl = document.getElementById('confirmationModalTitle');
-            const bodyEl = document.getElementById('confirmationModalBody');
-            const confirmBtn = document.getElementById('confirmationModalConfirmBtn');
-
-            if (titleEl) titleEl.textContent = title;
-            if (bodyEl) bodyEl.textContent = message; // Use textContent for safety, or innerHTML if needed
-            if (bodyEl) bodyEl.style.whiteSpace = 'pre-wrap'; // Preserve newlines
-
-            if (confirmBtn) {
-                confirmBtn.textContent = confirmLabel;
-                confirmBtn.className = `btn btn-${tone}`;
-                // clear old listeners to avoid multiple resolves
-                const newBtn = confirmBtn.cloneNode(true);
-                confirmBtn.parentNode.replaceChild(newBtn, confirmBtn);
-                newBtn.addEventListener('click', () => {
-                    resolve(true);
-                    const instance = bootstrap.Modal.getInstance(modalEl);
-                    if (instance) instance.hide();
-                });
-            }
-
-            const modal = new bootstrap.Modal(modalEl, { backdrop: 'static', keyboard: false });
-
-            // Handle dismissal (Cancel/X/Backdrop)
-            const hiddenHandler = () => {
-                resolve(false);
-                modalEl.removeEventListener('hidden.bs.modal', hiddenHandler);
-            };
-            modalEl.addEventListener('hidden.bs.modal', hiddenHandler);
-
-            modal.show();
-        });
     }
 
     function showHitlFeedback(title, message, isSuccess) {
@@ -9216,7 +9156,7 @@
         logInfo(`External IFX apply initiated for bridge ${bridgeName}`);
         if (confirmUser) {
             const message = `This will create a new internal bridge named "${bridgeName}" and use it to connect the CORE VM with the selected VM.\n\nDo you want to continue?`;
-            const confirmed = await confirmWithModal('Confirm Bridge Creation', message, 'Create Bridge');
+            const confirmed = await window.confirmWithModal('Confirm Bridge Creation', message, 'Create Bridge');
             if (!confirmed) {
                 logInfo('External IFX apply cancelled by user');
                 return { ok: false, cancelled: true, message: 'Cancelled' };
@@ -11789,27 +11729,12 @@
         else { delBtn.setAttribute('disabled', 'disabled'); delBtn.title = 'No scenarios selected'; }
     }
 
-    const SIDEBAR_SEED_VISIBILITY_STORAGE_KEY = 'coretg_sidebar_show_seed';
+
     const LAST_PREVIEW_SEED_STORAGE_KEY = 'coretg_last_preview_seed';
 
-    let sidebarSeedHints = {};
-    let sidebarSeedHintsXmlPath = '';
-    let sidebarSeedHintsInFlight = false;
-    let sidebarSeedHintsDebounce = null;
 
-    function getSidebarShowSeed() {
-        try {
-            return (localStorage.getItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY) || '') === '1';
-        } catch (e) {
-            return false;
-        }
-    }
 
-    function setSidebarShowSeed(value) {
-        try {
-            localStorage.setItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY, value ? '1' : '0');
-        } catch (e) { }
-    }
+
 
     function getLastKnownPreviewSeed() {
         try {
@@ -11833,141 +11758,14 @@
         return null;
     }
 
-    function getScenarioSeedHintKey(scen) {
-        try {
-            const name = (scen && typeof scen === 'object' && scen.name) ? String(scen.name).trim() : '';
-            if (name) return name.toLowerCase();
-        } catch (e) { }
-        return null;
-    }
 
-    function getSidebarSeedForScenario(scen, idx) {
-        // Prefer the shared per-scenario seed (used by Preview/Flow) when available.
-        try {
-            const name = (scen && typeof scen === 'object' && scen.name) ? String(scen.name).trim() : '';
-            if (name) {
-                if (typeof window.coretgGetSeedForScenario === 'function') {
-                    const s = window.coretgGetSeedForScenario(name);
-                    const n = parseInt(String(s ?? ''), 10);
-                    if (!isNaN(n) && n > 0) return n;
-                }
-                if (typeof window.coretgEnsureSeedForScenario === 'function') {
-                    const s = window.coretgEnsureSeedForScenario(name);
-                    const n = parseInt(String(s ?? ''), 10);
-                    if (!isNaN(n) && n > 0) return n;
-                }
-            }
-        } catch (e) { }
 
-        // Prefer the active scenario's Full Preview seed if present.
-        try {
-            if (idx === activeIdx && previewState && previewState.fullPreview && previewState.fullPreview.seed) {
-                const s = parseInt(previewState.fullPreview.seed, 10);
-                if (!isNaN(s) && s > 0) return s;
-            }
-        } catch (e) { }
 
-        // Otherwise use server-derived per-scenario hint if we have it.
-        try {
-            const key = getScenarioSeedHintKey(scen);
-            if (key && sidebarSeedHints && Object.prototype.hasOwnProperty.call(sidebarSeedHints, key)) {
-                const s = parseInt(sidebarSeedHints[key], 10);
-                if (!isNaN(s) && s > 0) return s;
-            }
-        } catch (e) { }
 
-        // Fallback: stable local derivation based on scenario name.
-        try {
-            const name = (scen && typeof scen === 'object' && scen.name) ? String(scen.name).trim() : '';
-            if (name) {
-                const rng = makeDeterministicRng(name);
-                return Math.max(1, Math.floor(rng() * 2147483647));
-            }
-        } catch (e) { }
-        return null;
-    }
 
-    function scheduleSidebarSeedHintsFetch() {
-        try {
-            if (!getSidebarShowSeed()) return;
-            const rp = String(state?.result_path || '').trim();
-            if (!rp || !rp.endsWith('.xml')) return;
-            if (sidebarSeedHintsXmlPath !== rp) {
-                sidebarSeedHintsXmlPath = rp;
-                sidebarSeedHints = {};
-            }
-            if (sidebarSeedHintsInFlight) return;
-            if (sidebarSeedHintsDebounce) {
-                clearTimeout(sidebarSeedHintsDebounce);
-            }
-            sidebarSeedHintsDebounce = setTimeout(async () => {
-                sidebarSeedHintsDebounce = null;
-                try {
-                    const names = (state.scenarios || [])
-                        .map(s => (s && typeof s === 'object' && s.name) ? String(s.name).trim() : '')
-                        .filter(Boolean);
-                    if (!names.length) return;
-                    sidebarSeedHintsInFlight = true;
-                    const res = await fetch('/api/seed_hints', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        credentials: 'same-origin',
-                        body: JSON.stringify({ xml_path: rp, scenarios: names }),
-                    });
-                    const data = await res.json().catch(() => null);
-                    if (!res.ok || !data || !data.ok) {
-                        return;
-                    }
-                    if (data.xml_path && String(data.xml_path).trim() && String(data.xml_path).trim() !== sidebarSeedHintsXmlPath) {
-                        // Stale response.
-                        return;
-                    }
-                    if (data.seeds && typeof data.seeds === 'object') {
-                        sidebarSeedHints = { ...sidebarSeedHints, ...data.seeds };
-                    }
-                    renderSidebar();
-                } catch (e) {
-                    // ignore
-                } finally {
-                    sidebarSeedHintsInFlight = false;
-                }
-            }, 150);
-        } catch (e) { }
-    }
-
-    function syncSidebarSeedToggleButton() {
-        const btn = document.getElementById('toggleScenarioSeedBtn');
-        if (!btn) return;
-        const show = getSidebarShowSeed();
-        const icon = btn.querySelector('i');
-        if (icon) {
-            icon.classList.remove('bi-eye', 'bi-eye-slash');
-            icon.classList.add(show ? 'bi-eye-slash' : 'bi-eye');
-        }
-        btn.title = show ? 'Hide seeds' : 'Show seeds';
-    }
-
-    function bindSidebarSeedToggle() {
-        const btn = document.getElementById('toggleScenarioSeedBtn');
-        if (!btn || btn.dataset.boundSeedToggle === '1') return;
-        btn.addEventListener('click', (ev) => {
-            try { ev.preventDefault(); } catch (e) { }
-            const next = !getSidebarShowSeed();
-            setSidebarShowSeed(next);
-            syncSidebarSeedToggleButton();
-            if (next) {
-                try { scheduleSidebarSeedHintsFetch(); } catch (e) { }
-            }
-            renderSidebar();
-        });
-        btn.dataset.boundSeedToggle = '1';
-        syncSidebarSeedToggleButton();
-    }
 
     function renderSidebar() {
         ensureScenarioIds();
-        bindSidebarSeedToggle();
-        try { scheduleSidebarSeedHintsFetch(); } catch (e) { }
         const list = document.getElementById('scenarioList');
         list.innerHTML = '';
         const escapeHtml = (value) => (value ?? '').toString()
@@ -11986,17 +11784,10 @@
             const name = scen.name || `Scenario ${idx + 1}`;
             const safeName = escapeHtml(name);
             const checkboxHtml = IS_BUILDER_VIEW ? '' : `<input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked ? 'checked' : ''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />`;
-            const showSeed = getSidebarShowSeed();
-            const seedVal = showSeed ? getSidebarSeedForScenario(scen, idx) : null;
-            const seedText = showSeed ? `seed=${(seedVal !== null ? seedVal : '…')}` : '';
-            const seedTitle = (showSeed && idx === activeIdx && previewState && previewState.fullPreview && previewState.fullPreview.seed)
-                ? 'Full Preview seed'
-                : 'Derived seed (stable)';
-            const seedSpan = showSeed ? `<span class="badge text-bg-light border ms-2" title="${escapeHtml(seedTitle)}">${escapeHtml(seedText)}</span>` : '';
+
             a.innerHTML = `<div class="d-flex align-items-center">
             ${checkboxHtml}
             <span class="flex-grow-1 text-truncate" title="${safeName}">${safeName}</span>
-            ${seedSpan}
         </div>`;
             a.onclick = (e) => {
                 e.preventDefault();
@@ -18603,7 +18394,30 @@
         } else if (typeof updateRemoteDefault === 'boolean') {
             setExecuteConfirmUpdateRemotePref(updateRemoteDefault);
         }
-        if (!executeConfirmModalEl || !window.bootstrap) {
+        // Try to use Bootstrap modal first
+        if (executeConfirmModalEl && (typeof bootstrap !== 'undefined' || window.bootstrap)) {
+            try {
+                // Determine if we can create the modal
+                const BS = window.bootstrap || bootstrap;
+                if (BS && BS.Modal) {
+                    // continue to modal logic
+                } else {
+                    throw new Error('Bootstrap not found');
+                }
+            } catch (e) {
+                // Fallback below
+                const confirmed = window.confirm(message);
+                const remoteExecution = true;
+                const pushPreference = !!updateRemoteDefault;
+                return {
+                    confirmed,
+                    scenarioIndex,
+                    updateRemote: pushPreference,
+                    remoteExecution,
+                    pushPreference,
+                };
+            }
+        } else {
             const confirmed = window.confirm(message);
             const remoteExecution = true;
             const pushPreference = !!updateRemoteDefault;

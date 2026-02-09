@@ -51,6 +51,15 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
 try:
+    from flask_login import login_required, current_user
+except ImportError:
+    # If flask_login is missing, define a dummy decorator to avoid crashes,
+    # though the app likely depends on it.
+    def login_required(f):
+        return f
+    current_user = None
+
+try:
     from proxmoxer import ProxmoxAPI  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     ProxmoxAPI = None  # type: ignore
@@ -1260,21 +1269,20 @@ def _flow_required_generator_repo_paths(
     """Return repo-relative paths required to run the selected generators."""
     required: set[str] = set()
     required.add('scripts/run_flag_generator.py')
-    try:
-        if _coerce_bool(os.environ.get('CORETG_FLOW_SYNC_CORE_PKG', '0')):
-            required.add('core_topo_gen')
-    except Exception:
-        pass
+    # core_topo_gen is always required for manifest loading on remote VMs
+    required.add('core_topo_gen')
     if not flag_assignments:
         return sorted(required)
 
     try:
         gens, _ = _flag_generators_from_enabled_sources()
-    except Exception:
+    except Exception as exc:
+        app.logger.error('[flow.generator] failed to load flag_generators: %s', exc)
         gens = []
     try:
         node_gens, _ = _flag_node_generators_from_enabled_sources()
-    except Exception:
+    except Exception as exc:
+        app.logger.error('[flow.generator] failed to load flag_node_generators: %s', exc)
         node_gens = []
 
     gen_by_key: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1290,6 +1298,10 @@ def _flow_required_generator_repo_paths(
         gid = str(g.get('id') or '').strip()
         if gid:
             gen_by_key[('flag_node_generators', gid)] = g
+
+    # Track lookup failures for diagnostics
+    lookup_failures: list[str] = []
+    path_failures: list[str] = []
 
     repo_root_abs = os.path.abspath(repo_root)
     for fa in (flag_assignments or []):
@@ -1309,9 +1321,11 @@ def _flow_required_generator_repo_paths(
             continue
         gen = gen_by_key.get((cat, gid))
         if not isinstance(gen, dict):
+            lookup_failures.append(f'{cat}/{gid}')
             continue
         src_path = str(gen.get('_source_path') or gen.get('source', {}).get('path') or '').strip()
         if not src_path:
+            path_failures.append(f'{cat}/{gid} (no _source_path or source.path)')
             continue
         try:
             if os.path.isabs(src_path):
@@ -1329,6 +1343,22 @@ def _flow_required_generator_repo_paths(
             rel = posixpath.dirname(rel)
         if rel:
             required.add(rel)
+
+    # Log diagnostic information about failures
+    if lookup_failures:
+        available_keys = sorted(gen_by_key.keys())
+        app.logger.error(
+            '[flow.generator] generator lookup failed for %d assignment(s): %s. '
+            'Available generators: %s',
+            len(lookup_failures),
+            lookup_failures[:5],  # Limit to avoid huge logs
+            available_keys[:20] if len(available_keys) <= 20 else f'{available_keys[:10]} ... ({len(available_keys)} total)',
+        )
+    if path_failures:
+        app.logger.error(
+            '[flow.generator] generator source path missing for: %s',
+            path_failures,
+        )
 
     return sorted(required)
 
@@ -2793,6 +2823,23 @@ def _core_connection_via_ssh(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, in
         )
         host, port = tunnel.start()
         yield host, port
+    except Exception as exc:
+        ssh_host = str(core_cfg.get('ssh_host') or core_cfg.get('host') or 'localhost')
+        ssh_port = int(core_cfg.get('ssh_port') or 22)
+        remote_host = str(core_cfg.get('host') or 'localhost')
+        remote_port = int(core_cfg.get('port') or 50051)
+        ssh_user = str(core_cfg.get('ssh_username') or '')
+        
+        # Helper for common Docker misconfiguration
+        hint = ""
+        if remote_host in ('localhost', '127.0.0.1') and core_cfg.get('ssh_enabled'):
+            hint = " (Hint: 'localhost' usually means THIS container, not the SSH server. Did you mean to use the SSH server's internal checking address?)"
+
+        app.logger.error(
+            "SSH tunnel failed: %s. Context: ssh=%s:%s user=%s target=%s:%s%s",
+            exc, ssh_host, ssh_port, ssh_user, remote_host, remote_port, hint
+        )
+        raise exc
     finally:
         if tunnel:
             tunnel.close()
@@ -11562,7 +11609,38 @@ def _flow_node_is_vuln(node: dict[str, Any] | None) -> bool:
         return False
 
 
+def _get_flow_seed(preview: dict[str, Any] | None, flow_seed_override: int | None = None) -> int:
+    """Return the flow seed for chain/generator selection.
+
+    Priority:
+    1. flow_seed_override parameter (e.g., from retry increment)
+    2. preview.flow_seed (explicit flow seed stored in preview)
+    3. preview.seed (topology seed as fallback for backward compatibility)
+    4. 0 (default)
+    """
+    if flow_seed_override is not None:
+        try:
+            return int(flow_seed_override)
+        except (ValueError, TypeError):
+            pass
+    if isinstance(preview, dict):
+        flow_seed = preview.get('flow_seed')
+        if flow_seed is not None:
+            try:
+                return int(flow_seed)
+            except (ValueError, TypeError):
+                pass
+        seed = preview.get('seed')
+        if seed is not None:
+            try:
+                return int(seed)
+            except (ValueError, TypeError):
+                pass
+    return 0
+
+
 def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dict | None:
+
     """Best-effort: repair a persisted Flow chain/assignments against the current preview.
 
     This is intentionally conservative: if we cannot build a valid chain of the same
@@ -12721,19 +12799,14 @@ def _flow_compute_flag_assignments(
     if not eligible_gens:
         return []
 
-    # Deterministic randomness for generator selection.
+    # Deterministic randomness for generator selection using flow_seed.
     try:
         import random as _random
-        try:
-            if seed_override is not None:
-                seed_val = int(seed_override)
-            else:
-                seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
-        except Exception:
-            seed_val = 0
+        seed_val = _get_flow_seed(preview, seed_override)
         rnd = _random.Random(seed_val ^ 0xC0FFEE)
     except Exception:
         rnd = None
+
 
     # Map ids -> names/ips for THIS/NEXT substitution.
     id_to_name: dict[str, str] = {}
@@ -13849,6 +13922,22 @@ def api_webui_log_tail():
     except Exception:
         text = ''
     return jsonify({'ok': True, 'offset': new_offset, 'text': text})
+
+
+@app.route('/api/webui/log_clear', methods=['POST'])
+def api_webui_log_clear():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'ok': False, 'error': 'Admin privileges required'}), 403
+    path = _webui_log_path()
+    if not os.path.exists(path):
+         return jsonify({'ok': True, 'users_cleared': False})
+    try:
+        with open(path, 'w') as f:
+            f.truncate(0)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Failed clearing log: {exc}'}), 500
+    return jsonify({'ok': True})
 
 
 def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, Any]:
@@ -15620,6 +15709,15 @@ def api_flow_sequence_preview_plan():
     requested_length = length
     best_effort = bool(j.get('best_effort'))
 
+    # Parse flow_seed from request (for explicit control over chain/generator selection)
+    flow_seed_param: int | None = None
+    try:
+        fs_raw = j.get('flow_seed')
+        if fs_raw is not None:
+            flow_seed_param = int(fs_raw)
+    except (ValueError, TypeError):
+        flow_seed_param = None
+
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
@@ -15671,10 +15769,8 @@ def api_flow_sequence_preview_plan():
         chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
     else:
         if allow_node_duplicates:
-            try:
-                seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
-            except Exception:
-                seed_val = 0
+            # Use flow_seed for chain selection (allows retrying with different combinations)
+            seed_val = _get_flow_seed(preview, flow_seed_param)
             chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
         else:
             chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
@@ -15751,13 +15847,9 @@ def api_flow_sequence_preview_plan():
         if preset_err:
             return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
     else:
-        seed_override = None
-        try:
-            if retry_index:
-                base_seed = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
-                seed_override = base_seed ^ (retry_index * 0x9E3779B1)
-        except Exception:
-            seed_override = None
+        # Use flow_seed as base, with retry_index variation
+        base_seed = _get_flow_seed(preview, flow_seed_param)
+        seed_override = base_seed ^ (retry_index * 0x9E3779B1) if retry_index else flow_seed_param
         flag_assignments = _flow_compute_flag_assignments(
             preview,
             chain_nodes,
@@ -15967,6 +16059,9 @@ def api_flow_sequence_preview_plan():
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to persist sequence plan: {e}'}), 500
 
+    # Include flow_seed in response (the effective seed used for chain/generator selection)
+    response_flow_seed = _get_flow_seed(preview, flow_seed_param)
+
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
@@ -15978,6 +16073,7 @@ def api_flow_sequence_preview_plan():
         'flags_enabled': bool(flow_valid),
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
+        'flow_seed': response_flow_seed,
         'preview_plan_path': out_path,
         'base_preview_plan_path': preview_plan_path,
         **({'warning': warning} if warning else {}),
@@ -15985,8 +16081,16 @@ def api_flow_sequence_preview_plan():
     })
 
 
+
 @app.route('/api/flag-sequencing/prepare_preview_for_execute', methods=['POST'])
 def api_flow_prepare_preview_for_execute():
+    # Stub for early progress calls; overridden later if generator runs occur.
+    def _flow_progress(msg: str) -> None:
+        try:
+            app.logger.info('[flow.progress] %s', msg)
+        except Exception:
+            pass
+
     j = request.get_json(silent=True) or {}
     scenario_label = str(j.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
@@ -16676,31 +16780,34 @@ def api_flow_prepare_preview_for_execute():
                 except Exception:
                     generator_only = []
                 if generator_only:
-                    _flow_progress(f"Syncing repo to CORE VM (generators: {len(generator_only)})")
+                    app.logger.info('[flow.generator] Syncing repo to CORE VM (generators: %d)', len(generator_only))
                 else:
-                    _flow_progress('Syncing repo to CORE VM (no installed generators needed)')
-            except Exception:
+                    app.logger.info('[flow.generator] Syncing repo to CORE VM (no installed generators needed)')
+            except Exception as exc:
+                app.logger.error('[flow.generator] failed to resolve generator paths: %s', exc, exc_info=True)
                 allowed_outputs_override = None
                 include_repo_paths = None
             try:
                 if not allowed_outputs_override:
-                    _flow_progress('Syncing repo to CORE VM (reduced snapshot)')
+                    app.logger.info('[flow.generator] Syncing repo to CORE VM (reduced snapshot)')
             except Exception:
                 pass
             try:
                 if not include_repo_paths:
-                    raise ValueError('Flow sync requires generator-only include paths.')
-                _push_repo_to_remote(
-                    flow_core_cfg,
-                    logger=app.logger,
-                    upload_only_injected_artifacts=True,
-                    allowed_outputs_override=allowed_outputs_override,
-                    include_repo_paths=include_repo_paths,
-                )
-                try:
-                    _flow_progress('Repo sync complete')
-                except Exception:
-                    pass
+                    # No files to sync? That's fine, just skip.
+                    app.logger.info('[flow.generator] repo sync skipped (no generator paths resolved)')
+                else:
+                    _push_repo_to_remote(
+                        flow_core_cfg,
+                        logger=app.logger,
+                        upload_only_injected_artifacts=True,
+                        allowed_outputs_override=allowed_outputs_override,
+                        include_repo_paths=include_repo_paths,
+                    )
+                    try:
+                        _flow_progress('Repo sync complete')
+                    except Exception:
+                        pass
             except Exception as exc:
                 if flow_remote_forced:
                     return jsonify({'ok': False, 'error': f'Failed to sync repo to CORE VM: {exc}'}), 500
@@ -23876,7 +23983,8 @@ def _select_core_config_for_page(
             secret_record = None
         if secret_record:
             secret_password = secret_record.get('ssh_password_plain') or secret_record.get('password_plain') or ''
-            if secret_password:
+            # Key-based auth may have empty password; do not filter out.
+            if True:
                 secret_cfg = {
                     'host': secret_record.get('host') or secret_record.get('grpc_host') or CORE_HOST,
                     'port': secret_record.get('port') or secret_record.get('grpc_port') or CORE_PORT,
@@ -23897,8 +24005,15 @@ def _select_core_config_for_page(
                     'last_tested_status': secret_record.get('last_tested_status') if 'last_tested_status' in secret_record else None,
                 }
                 merged = _merge_core_configs(secret_cfg, include_password=include_password)
+                try:
+                    logger = logging.getLogger(__name__)
+                    logger.info("Selected default CORE config from secret record: %s (host=%s)", secret_record.get('identifier'), secret_cfg.get('host'))
+                except Exception:
+                    pass
                 return _ensure_core_vm_metadata(_augment_core_config_from_secret(merged))
         # Enforce VM/Access as the only source of truth.
+        logger = getattr(app, 'logger', logging.getLogger(__name__))
+        logger.info("No default CORE config found in secrets (scenario=%s). Falling back to empty/localhost.", scenario_norm)
         return {}
 
     entries = list(history or _load_run_history())
@@ -34571,7 +34686,19 @@ def run_cli_async():
             pass
     except _SSHTunnelError as exc:
         try:
-            app.logger.warning("[async] SSH tunnel setup failed: %s", exc)
+            ssh_host = str(core_cfg.get('ssh_host') or core_host)
+            ssh_port = int(core_cfg.get('ssh_port') or 22)
+            ssh_user = str(core_cfg.get('ssh_username') or '')
+            
+            # Helper for common Docker misconfiguration
+            hint = ""
+            if str(core_host) in ('localhost', '127.0.0.1') and core_cfg.get('ssh_enabled'):
+                hint = " (Hint: 'localhost' usually means THIS container. Did you mean to use the SSH server's internal checking address?)"
+
+            app.logger.warning(
+                "[async] SSH tunnel setup failed: %s. Context: ssh=%s:%s user=%s target=%s:%s%s",
+                exc, ssh_host, ssh_port, ssh_user, core_host, core_port, hint
+            )
         except Exception:
             pass
         try:
@@ -37509,6 +37636,15 @@ def core_data():
             x['session_id'] = sid
             x['running'] = sid is not None
 
+    daemon_status = 'ok'
+    if core_errors:
+        # Simple heuristic: if we have "Connection refused" or similar in errors, assume daemon is down.
+        # errors come from _list_active_core_sessions -> _list_active_core_sessions_via_remote_python
+        for err in core_errors:
+            if 'Connection refused' in err or '111' in err or 'Remote CORE session fetch failed' in err:
+                daemon_status = 'down'
+                break
+
     core_modal_href = url_for('index', core_modal=1, scenario=scenario_display) if scenario_display else url_for('index', core_modal=1)
     payload: dict[str, Any] = {
         'sessions': sessions,
@@ -37525,10 +37661,46 @@ def core_data():
         'errors': core_errors,
         'grpc_command': grpc_command,
         'logs': _current_core_ui_logs(),
+        'daemon_status': daemon_status,
     }
     if include_xmls:
         payload['xmls'] = xmls or []
     return jsonify(payload)
+
+
+@app.route('/core/restart_core_daemon', methods=['POST'])
+@login_required
+def restart_core_daemon():
+    """Attempt to restart the CORE daemon on the configured CORE VM."""
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario', ''))
+    core_cfg = _select_core_config_for_page(scenario_norm, include_password=True)
+
+    if not core_cfg.get('ssh_host'):
+        return jsonify({'error': 'No CORE VM configured via SSH.'}), 400
+
+    try:
+        app.logger.info('[core.daemon] Attempting restart via SSH')
+        client = _open_ssh_client(core_cfg)
+        exit_code, _out, err = _exec_sudo('systemctl restart core-daemon', timeout=40.0, stage='core-daemon.restart', client=client)
+        if exit_code != 0:
+            err = (err or '').strip()
+            return jsonify({'error': f'Restart failed (exit {exit_code}): {err}'}), 500
+
+        # Check status briefly
+        chk_code, _, _ = _exec_sudo('systemctl is-active core-daemon', timeout=10.0, stage='core-daemon.check', client=client)
+        if chk_code != 0:
+             return jsonify({'error': 'Restart command succeeded but service is not active.'}), 500
+
+        app.logger.info('[core.daemon] Restart successful')
+        # Allow time for gRPC to come up
+        time.sleep(2.0)
+        return jsonify({'status': 'ok', 'message': 'CORE daemon restarted successfully.'})
+    except Exception as exc:
+        app.logger.error('Failed to restart CORE daemon: %s', exc, exc_info=True)
+        msg = str(exc)
+        if 'Authentication failed' in msg:
+             msg = 'SSH authentication failed. Check your credentials in Scenarios > Config.'
+        return jsonify({'error': msg}), 500
 
 
 @app.route('/core/upload', methods=['POST'])
