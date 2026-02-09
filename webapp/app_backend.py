@@ -13374,12 +13374,12 @@ def _flow_normalize_fact_override(raw: Any) -> dict[str, list[str]] | None:
     out_artifacts = [
         str(x or '').strip()
         for x in (arts or [])
-        if str(x or '').strip() and not _is_flag_fact(str(x or '').strip())
+        if str(x or '').strip()
     ]
     out_fields = [
         str(x or '').strip()
         for x in (fields or [])
-        if str(x or '').strip() and not _is_flag_fact(str(x or '').strip())
+        if str(x or '').strip()
     ]
     if not out_artifacts and not out_fields:
         return None
@@ -17445,6 +17445,9 @@ def api_flow_prepare_preview_for_execute():
             # generator, we capture outputs.json and feed those values into subsequent generator
             # configs when they declare matching input names (e.g. Knowledge(ip), Credential(user, password)).
             flow_context: dict[str, Any] = {}
+            # Track absolute paths of file-like artifacts produced by generators
+            # so we can resolve inject_files for downstream consumers.
+            artifact_context: dict[str, str] = {}
 
             def _apply_outputs_to_hint_text(text_in: str, outs: dict[str, Any]) -> str:
                 """Replace {{OUTPUT.key}} and {{OUTPUT.key:transform}} placeholders."""
@@ -17926,6 +17929,37 @@ def api_flow_prepare_preview_for_execute():
                                 out_list.append(str(raw))
                             return out_list
 
+                        # Resolve inject_files using prior generator outputs (flow key -> absolute path).
+                        try:
+                            raw_injects = fa.get('inject_files')
+                            if isinstance(raw_injects, list):
+                                resolved_injects = []
+                                for item in raw_injects:
+                                    s = str(item or '').strip()
+                                    if not s:
+                                        continue
+                                    
+                                    # Handle "SRC -> DEST" syntax.
+                                    src, dest = _split_inject_spec(s)
+                                    final_src = src
+                                    
+                                    # If the source matches a known artifact from a prior generator,
+                                    # substitute the absolute path.
+                                    if src in artifact_context:
+                                        final_src = artifact_context[src]
+                                    elif src in flow_context:
+                                        # Fallback: if flow_context has a string value that looks like a path, try it?
+                                        # For now, trust artifact_context which is explicitly validated against disk.
+                                        pass
+                                        
+                                    if dest:
+                                        resolved_injects.append(f"{final_src} -> {dest}")
+                                    else:
+                                        resolved_injects.append(final_src)
+                                fa['inject_files'] = resolved_injects
+                        except Exception:
+                            pass
+
                         effective_injects = None
                         if not flow_run_remote:
                             try:
@@ -18194,6 +18228,21 @@ def api_flow_prepare_preview_for_execute():
                                 raise
                             except Exception:
                                 actual_output_keys = []
+
+                        # Capture absolute paths for file-like outputs to support inject_files resolution.
+                        try:
+                            if flow_out_dir:
+                                for k, v in outs.items():
+                                    if not isinstance(v, str):
+                                        continue
+                                    # Heuristic: if the value is a filename/path and exists in the run dir,
+                                    # track it as a resolvable artifact.
+                                    candidate = os.path.join(flow_out_dir, v)
+                                    if os.path.exists(candidate):
+                                        # Strip leading slash if present in key (unlikely for well-formed keys but safe).
+                                        artifact_context[str(k).strip()] = candidate
+                        except Exception:
+                            pass
 
                         # Materialize a human-readable hint file in the artifacts directory.
                         # IMPORTANT: do this after outputs.json has been applied to hints so
@@ -19297,6 +19346,14 @@ def api_flow_save_flow_substitutions():
         }
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump(out_payload, f, indent=2)
+        try:
+            xml_target = str((meta2 or {}).get('xml_path') or '').strip()
+            if not xml_target:
+                xml_target = _latest_xml_path_for_scenario(scenario_norm)
+            if xml_target and os.path.exists(xml_target):
+                _update_flow_state_in_xml(xml_target, scenario_label or scenario_norm, flow_meta)
+        except Exception:
+            pass
         try:
             _planner_set_plan(scenario_norm, plan_path=out_path, xml_path=str((meta2 or {}).get('xml_path') or ''), seed=(meta2 or {}).get('seed'))
         except Exception:
