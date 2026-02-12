@@ -2743,9 +2743,14 @@
         inTbl.style.width = '100%';
         inTbl.style.paddingLeft = '0';
         const thead = document.createElement('thead');
-        thead.innerHTML = inputsShowMissing
-          ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
-          : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+
+        if (o.isFlags) {
+          thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Flag</th><th>Generator</th><th style="width: 1%; white-space: nowrap;">Sequence</th></tr>';
+        } else {
+          thead.innerHTML = inputsShowMissing
+            ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
+            : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+        }
         inTbl.appendChild(thead);
         try {
           const firstTh = thead.querySelector('th');
@@ -2755,83 +2760,113 @@
         inputsRaw.forEach((row) => {
           if (!row || !row.name) return;
           const tr = document.createElement('tr');
-          const tdVar = document.createElement('td');
-          tdVar.style.paddingLeft = '0';
-          const code = document.createElement('code');
-          code.className = 'font-monospace';
-          code.textContent = String(row.name || '-');
-          const reqMark = document.createElement('span');
-          reqMark.className = 'ms-1 text-danger fw-semibold';
-          reqMark.textContent = '*';
-          reqMark.title = 'Required input';
-          if (row.sourceBadge && row.sourceBadge.text) {
-            const wrap = document.createElement('div');
-            wrap.className = 'd-flex align-items-center gap-2';
-            wrap.appendChild(code);
-            if (row.required) wrap.appendChild(reqMark);
-            const badge = document.createElement('span');
-            badge.className = row.sourceBadge.className || 'badge text-bg-secondary';
-            badge.textContent = String(row.sourceBadge.text || '').trim();
-            wrap.appendChild(badge);
-            tdVar.appendChild(wrap);
+
+          if (o.isFlags) {
+            const tdFlag = document.createElement('td');
+            tdFlag.style.paddingLeft = '0';
+            const code = document.createElement('code');
+            code.className = 'font-monospace';
+            code.textContent = String(row.name || '-');
+            tdFlag.appendChild(code);
+
+            const tdGen = document.createElement('td');
+            tdGen.className = 'small';
+            const genCode = document.createElement('code');
+            genCode.className = 'font-monospace text-muted';
+            genCode.textContent = String(row.resolved || '-');
+            tdGen.appendChild(genCode);
+
+            const tdSeq = document.createElement('td');
+            if (row.sourceBadge && row.sourceBadge.text) {
+              const badge = document.createElement('span');
+              badge.className = row.sourceBadge.className || 'badge text-bg-secondary';
+              badge.textContent = String(row.sourceBadge.text || '').trim();
+              tdSeq.appendChild(badge);
+            } else {
+              tdSeq.textContent = '-';
+            }
+
+            tr.appendChild(tdFlag);
+            tr.appendChild(tdGen);
+            tr.appendChild(tdSeq);
           } else {
-            if (row.required) {
+            const tdVar = document.createElement('td');
+            tdVar.style.paddingLeft = '0';
+            const code = document.createElement('code');
+            code.className = 'font-monospace';
+            code.textContent = String(row.name || '-');
+            const reqMark = document.createElement('span');
+            reqMark.className = 'ms-1 text-danger fw-semibold';
+            reqMark.textContent = '*';
+            reqMark.title = 'Required input';
+            if (row.sourceBadge && row.sourceBadge.text) {
               const wrap = document.createElement('div');
-              wrap.className = 'd-flex align-items-center gap-1';
+              wrap.className = 'd-flex align-items-center gap-2';
               wrap.appendChild(code);
-              wrap.appendChild(reqMark);
+              if (row.required) wrap.appendChild(reqMark);
+              const badge = document.createElement('span');
+              badge.className = row.sourceBadge.className || 'badge text-bg-secondary';
+              badge.textContent = String(row.sourceBadge.text || '').trim();
+              wrap.appendChild(badge);
               tdVar.appendChild(wrap);
             } else {
-              tdVar.appendChild(code);
+              if (row.required) {
+                const wrap = document.createElement('div');
+                wrap.className = 'd-flex align-items-center gap-1';
+                wrap.appendChild(code);
+                wrap.appendChild(reqMark);
+                tdVar.appendChild(wrap);
+              } else {
+                tdVar.appendChild(code);
+              }
+            }
+
+            const tdRes = document.createElement('td');
+            tdRes.className = 'small';
+            tdRes.appendChild(renderResolvedInline(row.resolved));
+
+            const tdFromChain = document.createElement('td');
+            const cbWrap1 = document.createElement('div');
+            cbWrap1.className = 'form-check mb-0';
+            const cb1 = document.createElement('input');
+            cb1.type = 'checkbox';
+            cb1.className = 'form-check-input';
+            cb1.disabled = true;
+            cb1.checked = !!row.fromChain;
+            cbWrap1.appendChild(cb1);
+            tdFromChain.appendChild(cbWrap1);
+
+            const tdFromSeq = document.createElement('td');
+            const cbWrap2 = document.createElement('div');
+            cbWrap2.className = 'form-check mb-0';
+            const cb2 = document.createElement('input');
+            cb2.type = 'checkbox';
+            cb2.className = 'form-check-input';
+            cb2.disabled = true;
+            cb2.checked = !!row.fromSeq;
+            cbWrap2.appendChild(cb2);
+            tdFromSeq.appendChild(cbWrap2);
+
+            tr.appendChild(tdVar);
+            tr.appendChild(tdRes);
+            tr.appendChild(tdFromChain);
+            tr.appendChild(tdFromSeq);
+
+            if (inputsShowMissing) {
+              const tdMiss = document.createElement('td');
+              if (row.missing) tdMiss.classList.add('text-danger');
+              const cbWrap3 = document.createElement('div');
+              cbWrap3.className = 'form-check mb-0';
+              const cb3 = document.createElement('input');
+              cb3.type = 'checkbox';
+              cb3.className = 'form-check-input';
+              cb3.disabled = true;
+              cb3.checked = !!row.missing;
+              cbWrap3.appendChild(cb3);
+              tdMiss.appendChild(cbWrap3);
+              tr.appendChild(tdMiss);
             }
           }
-
-          const tdRes = document.createElement('td');
-          tdRes.className = 'small';
-          tdRes.appendChild(renderResolvedInline(row.resolved));
-
-          const tdFromChain = document.createElement('td');
-          const cbWrap1 = document.createElement('div');
-          cbWrap1.className = 'form-check mb-0';
-          const cb1 = document.createElement('input');
-          cb1.type = 'checkbox';
-          cb1.className = 'form-check-input';
-          cb1.disabled = true;
-          cb1.checked = !!row.fromChain;
-          cbWrap1.appendChild(cb1);
-          tdFromChain.appendChild(cbWrap1);
-
-          const tdFromSeq = document.createElement('td');
-          const cbWrap2 = document.createElement('div');
-          cbWrap2.className = 'form-check mb-0';
-          const cb2 = document.createElement('input');
-          cb2.type = 'checkbox';
-          cb2.className = 'form-check-input';
-          cb2.disabled = true;
-          cb2.checked = !!row.fromSeq;
-          cbWrap2.appendChild(cb2);
-          tdFromSeq.appendChild(cbWrap2);
-
-          tr.appendChild(tdVar);
-          tr.appendChild(tdRes);
-          tr.appendChild(tdFromChain);
-          tr.appendChild(tdFromSeq);
-
-          if (inputsShowMissing) {
-            const tdMiss = document.createElement('td');
-            if (row.missing) tdMiss.classList.add('text-danger');
-            const cbWrap3 = document.createElement('div');
-            cbWrap3.className = 'form-check mb-0';
-            const cb3 = document.createElement('input');
-            cb3.type = 'checkbox';
-            cb3.className = 'form-check-input';
-            cb3.disabled = true;
-            cb3.checked = !!row.missing;
-            cbWrap3.appendChild(cb3);
-            tdMiss.appendChild(cbWrap3);
-            tr.appendChild(tdMiss);
-          }
-
           tbodyIn.appendChild(tr);
         });
         inTbl.appendChild(tbodyIn);
@@ -3343,16 +3378,7 @@
         return wrap;
       }
 
-      try {
-        const rin = (fa && typeof fa.resolved_inputs === 'object' && fa.resolved_inputs && !Array.isArray(fa.resolved_inputs)) ? fa.resolved_inputs : null;
-        const rinEl = renderResolvedMap(rin);
-        if (rinEl) addRow('Resolved Inputs', rinEl);
-      } catch (e) { }
-      try {
-        const rout = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
-        const routEl = renderResolvedMap(rout);
-        if (routEl) addRow('Resolved Outputs', routEl);
-      } catch (e) { }
+
 
 
       const descList = (fa && Array.isArray(fa.description_hints) && fa.description_hints.length)
@@ -3629,7 +3655,7 @@
           if (!(k in resolvedKv)) return document.createTextNode('-');
           const obj = {};
           obj[k] = resolvedKv[k];
-          return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 72, maxDetailItems: 25 });
+          return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 500, maxDetailItems: 25 });
         }
 
         function buildIoTable(mode) {
@@ -3928,11 +3954,7 @@
 
                 const tdPath = document.createElement('td');
                 tdPath.className = 'small text-muted';
-                let resolvedRel = resolvedVal ? String(resolvedVal || '').replace('\\', '/') : String(displaySrc || '').replace('\\', '/');
-                if (resolvedRel.startsWith('/')) {
-                  resolvedRel = resolvedRel.replace(/^\/+/, '');
-                }
-                const resolvedBase = resolvedRel ? resolvedRel : basenameFrom(resolvedVal ? resolvedVal : displaySrc);
+                const resolvedBase = basenameFrom(resolvedVal ? resolvedVal : displaySrc);
                 const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
                 if (!resolvedVal && tokenLike) {
                   tdPath.textContent = '<unresolved>';
@@ -3987,7 +4009,7 @@
         }
       } catch (e) {
         // If anything goes wrong, fall back to the old simple rows.
-        addRow(isNodeGen ? 'Flag-Node-Generator Defined Input' : 'Flag-Generator Defined Input', inputsDisplay);
+        addRow(isNodeGen ? 'Flag-Node-Generator Defined Input' : 'Flag-Generator Defined Input (Error: ' + String(e.message || e) + ')', inputsDisplay);
         addRow(isNodeGen ? 'Flag-Node-Generator Defined Output' : 'Flag-Generator Defined Output', fa && Array.isArray(fa.output_fields) && fa.output_fields.length ? fa.output_fields.join(', ') : '-');
         addRow('Chain Item Providing', fa && Array.isArray(fa.requires) && fa.requires.length ? fa.requires.join(', ') : '-');
         addRow('Providing to Chain', fa && Array.isArray(fa.produces) && fa.produces.length ? fa.produces.join(', ') : '-');
@@ -4067,126 +4089,67 @@
       let goalHints = [];
       let goalInputs = [];
       try {
-        const hlist = (faLast && Array.isArray(faLast.hints) && faLast.hints.length) ? faLast.hints : [];
-        const h1 = (faLast && typeof faLast.hint === 'string') ? String(faLast.hint).trim() : '';
-        goalHints = hlist.length ? hlist : (h1 ? [h1] : []);
-        goalHints = goalHints.map(h => _applyHintNodeIps(h, _hintNodeIpMap));
-        const ro = (faLast && typeof faLast.resolved_outputs === 'object' && faLast.resolved_outputs && !Array.isArray(faLast.resolved_outputs))
-          ? faLast.resolved_outputs
-          : null;
-        const finalFeas = chainFeasibilityFinal(currentFlagAssignments);
-        const goalArtifactsEffective = goalOverride ? goalOverride.artifacts : goalArtifacts;
-        const goalFieldsEffective = goalOverride ? goalOverride.fields : goalFields;
-        const reqArtifacts = Array.isArray(goalArtifactsEffective) ? goalArtifactsEffective.map(String).filter(Boolean) : [];
-        const defFields = Array.isArray(goalFieldsEffective) ? goalFieldsEffective.map(String).filter(Boolean) : [];
-        const providedArtifactsChain = (finalFeas && Array.isArray(finalFeas.providing_artifacts_chain)) ? finalFeas.providing_artifacts_chain.map(String).filter(Boolean) : [];
-        const providedArtifactsSeq = (finalFeas && Array.isArray(finalFeas.providing_artifacts_sequencer)) ? finalFeas.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
-        const providedFieldsChain = (finalFeas && Array.isArray(finalFeas.providing_fields_chain)) ? finalFeas.providing_fields_chain.map(String).filter(Boolean) : [];
-        const providedFieldsSeq = (finalFeas && Array.isArray(finalFeas.providing_fields_sequencer)) ? finalFeas.providing_fields_sequencer.map(String).filter(Boolean) : [];
+        const goalOverride = normalizeFactsOverride(flowGoalFactsOverride);
+        const goalArtifacts = [];
+        const goalFields = [];
+        let goalHints = [];
+        let goalFlags = [];
 
-        const goalSourceMap = buildGoalFactSourceMap(currentFlagAssignments);
+        if (Array.isArray(currentFlagAssignments)) {
+          currentFlagAssignments.forEach((fa, idx) => {
+            // We include the step if it has a generator assigned (id or name).
+            // We don't strictly require 'generated' to be true, so users can see what will be generated.
+            if (!fa || (!fa.id && !fa.name)) return;
 
-        function _goalSourceIndices(name, kind) {
-          try {
-            const n = String(name || '').trim();
-            if (!n || !goalSourceMap) return [];
-            const map = (String(kind || '').toLowerCase() === 'field') ? goalSourceMap.fields : goalSourceMap.artifacts;
-            if (!map || !map.has(n)) return [];
-            const raw = map.get(n);
-            if (Array.isArray(raw)) {
-              return raw.slice().filter(v => Number.isFinite(+v)).map(v => +v).sort((a, b) => a - b);
+            let flagVal = '';
+            try {
+              if (fa && typeof fa.flag_value === 'string' && fa.flag_value.trim()) flagVal = fa.flag_value.trim();
+            } catch (e) { }
+            if (!flagVal) {
+              try {
+                const ro = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+                if (ro) {
+                  const rf = ro['Flag(flag_id)'] || ro['flag'] || ro['FLAG'] || '';
+                  if (typeof rf === 'string' && rf.trim()) flagVal = rf.trim();
+                }
+              } catch (e) { }
             }
-            if (Number.isFinite(+raw)) return [+raw];
-          } catch (e) { }
-          return [];
+
+            const genName = (fa && fa.name && fa.name !== '-') ? String(fa.name) : ((fa && fa.id) ? String(fa.id) : '-');
+            const roman = toRoman(idx + 1);
+
+            goalFlags.push({
+              name: flagVal || '(pending)',
+              resolved: genName,
+              sourceBadge: { text: 'Seq ' + (roman || (idx + 1)), className: 'badge text-bg-primary' }
+            });
+          });
         }
 
-        const rows = [];
-        const reqArtifactSet = new Set(reqArtifacts);
-        const provArtChainSet = new Set(providedArtifactsChain);
-        const provArtSeqSet = new Set(providedArtifactsSeq);
-        reqArtifacts.map(String).filter(Boolean).sort().forEach((name) => {
-          const n = String(name || '').trim();
-          if (!n || isFlagFactName(n)) return;
-          const indices = _goalSourceIndices(n, 'Artifact');
-          if (indices.length) {
-            indices.forEach((idx) => {
-              rows.push({
-                name: n,
-                kind: 'Artifact',
-                resolved: ro ? ro[n] : undefined,
-                fromChain: provArtChainSet.has(n),
-                fromSeq: provArtSeqSet.has(n),
-                missing: !(provArtChainSet.has(n) || provArtSeqSet.has(n)),
-                required: reqArtifactSet.has(n),
-                sourceIndex: idx,
-              });
+        if (goalOverride && Array.isArray(goalOverride.artifacts)) {
+          const existingNames = new Set(goalFlags.map(f => f.name));
+          goalOverride.artifacts.forEach(art => {
+            const s = String(art || '').trim();
+            if (!s || existingNames.has(s)) return;
+            goalFlags.push({
+              name: s,
+              resolved: '-',
+              sourceBadge: { text: 'Manual', className: 'badge text-bg-warning' }
             });
-          } else {
-            rows.push({
-              name: n,
-              kind: 'Artifact',
-              resolved: ro ? ro[n] : undefined,
-              fromChain: provArtChainSet.has(n),
-              fromSeq: provArtSeqSet.has(n),
-              missing: !(provArtChainSet.has(n) || provArtSeqSet.has(n)),
-              required: reqArtifactSet.has(n),
-            });
-          }
-        });
+            existingNames.add(s);
+          });
+        }
 
-        const fieldNameSet = new Set(defFields.map(String).filter(Boolean));
-        try {
-          if ((!fieldNameSet.size) && ri && typeof ri === 'object' && !Array.isArray(ri)) {
-            Object.keys(ri).forEach(k => { if (String(k || '').trim()) fieldNameSet.add(String(k).trim()); });
-          }
-        } catch (e) { }
-        const provFldChainSet = new Set(providedFieldsChain);
-        const provFldSeqSet = new Set(providedFieldsSeq);
-        Array.from(fieldNameSet).sort().forEach((name) => {
-          const n = String(name || '').trim();
-          if (!n || isFlagFactName(n)) return;
-          if (reqArtifactSet.has(n)) return;
-          const indices = _goalSourceIndices(n, 'Field');
-          if (indices.length) {
-            indices.forEach((idx) => {
-              rows.push({
-                name: n,
-                kind: 'Field',
-                resolved: ro ? ro[n] : undefined,
-                fromChain: provFldChainSet.has(n),
-                fromSeq: provFldSeqSet.has(n),
-                missing: !(provFldChainSet.has(n) || provFldSeqSet.has(n)),
-                required: true,
-                sourceIndex: idx,
-              });
-            });
-          } else {
-            rows.push({
-              name: n,
-              kind: 'Field',
-              resolved: ro ? ro[n] : undefined,
-              fromChain: provFldChainSet.has(n),
-              fromSeq: provFldSeqSet.has(n),
-              missing: !(provFldChainSet.has(n) || provFldSeqSet.has(n)),
-              required: true,
-            });
-          }
-        });
-        goalInputs = rows.map((row) => {
-          const badge = goalFactBadgeFor(row && row.name, row, goalSourceMap);
-          return Object.assign({}, row, { sourceBadge: badge });
-        });
-        // Do not reuse generator hints for Goal Facts.
-        goalHints = [];
+        goalInputs = goalFlags;
       } catch (e) { goalHints = []; }
       renderFactSummaryRow({
         seq: 'Goal',
-        label: 'Goal Facts',
+        label: 'Goal Flags',
+        isFlags: true,
         inputs: goalInputs,
-        inputsShowMissing: goalInputs.some(r => r && r.missing),
-        artifacts: goalOverride ? goalOverride.artifacts : goalArtifacts,
-        fields: goalOverride ? goalOverride.fields : goalFields,
+        inputsShowMissing: false,
+        artifacts: [],
+        fields: [],
         hideArtifactsFields: true,
         hints: goalHints,
         onValueOverride: () => openFactsDialog('goal'),
@@ -4672,7 +4635,7 @@
         if (!(k in resolvedKv)) return document.createTextNode('-');
         const obj = {};
         obj[k] = resolvedKv[k];
-        return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 72, maxDetailItems: 25 });
+        return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 500, maxDetailItems: 25 });
       }
 
       function placeholderFromResolved(resolvedKv, key, opts) {
@@ -8443,6 +8406,35 @@
         return;
       }
       setLoadingSteps(['Sync Flow Plan', 'Connect to CORE VM', 'Verify files', 'Complete'], 3);
+
+      // Update UI with resolved paths (always, if available)
+      if (data && data.resolved_paths && Array.isArray(currentFlagAssignments)) {
+        try {
+          const rp = data.resolved_paths;
+          currentFlagAssignments.forEach(fa => {
+            // Update resolved_outputs
+            if (fa.resolved_outputs) {
+              Object.keys(fa.resolved_outputs).forEach(k => {
+                const original = fa.resolved_outputs[k];
+                if (rp[original]) fa.resolved_outputs[k] = rp[original];
+              });
+            }
+            // Update outputs manifest if present
+            if (fa.outputs_manifest && rp[fa.outputs_manifest]) {
+              fa.outputs_manifest = rp[fa.outputs_manifest];
+            }
+            // Update injects
+            if (Array.isArray(fa.inject_files_detail)) {
+              fa.inject_files_detail.forEach(ifd => {
+                const original = ifd.resolved || ifd.path;
+                if (original && rp[original]) ifd.resolved = rp[original];
+              });
+            }
+          });
+          renderChainEditor();
+        } catch (e) { console.error('Error updating resolved paths:', e); }
+      }
+
       const missing = (data && Array.isArray(data.missing)) ? data.missing : [];
       const esc = (s) => escapeHtml(String(s || ''));
       const buildRevalidateHtml = (ok, title, subtitle, detailsHtml, logText) => {
@@ -8465,6 +8457,7 @@
       };
       if (data && data.ok && missing.length === 0) {
         appendLoadingLog('All expected files found on CORE VM.');
+
         const snap = composeBodyEl ? (composeBodyEl.innerText || '') : '';
         const html = buildRevalidateHtml(
           true,

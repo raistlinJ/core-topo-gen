@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import random
+import uuid
 import os
 from xml.etree import ElementTree as ET
 from typing import Any, Dict, Tuple
@@ -1455,9 +1456,11 @@ def main():
                         gen_id = str(gen.get('id') or '').strip()
                         if not gen_id:
                             continue
-                        flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
-                        out_dir = os.path.join('/tmp/vulns', 'flag_node_generators_runs', f"cli-{scenario_tag}-{nm}-{flow_run_id}")
+                        out_dir = os.path.join('/tmp/vulns', 'flag_node_generators_runs', f"cli-{scenario_tag}-{nm}")
                         try:
+                            if os.path.exists(out_dir):
+                                import shutil
+                                shutil.rmtree(out_dir)
                             os.makedirs(out_dir, exist_ok=True)
                         except Exception:
                             pass

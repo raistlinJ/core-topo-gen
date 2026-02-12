@@ -96,8 +96,8 @@ def _discover_flow_artifacts_dir(scenario_tag: str = '', node_name: str = '', ou
 				for entry in os.scandir(base_dir):
 					if not entry.is_dir():
 						continue
-					# Match flow-{scenario}-{uuid} pattern
-					if entry.name.startswith('flow-'):
+					# Match flow-{scenario}-{uuid} or cli-{scenario}-{node}-{uuid} pattern
+					if entry.name.startswith('flow-') or entry.name.startswith('cli-'):
 						# If scenario_tag provided, filter by it
 						if scenario_norm and scenario_norm not in entry.name.lower():
 							continue
