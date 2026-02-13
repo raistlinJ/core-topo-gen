@@ -2671,9 +2671,19 @@ def _candidate_remote_python_interpreters(core_cfg: Dict[str, Any]) -> List[str]
     if venv_bin:
         sanitized = venv_bin.rstrip('/\\')
         if sanitized:
-            for exe_name in ('python3', 'python'):
-                candidates.append(posixpath.join(sanitized, exe_name))
-    candidates.extend(['python3', 'python'])
+            base_name = posixpath.basename(sanitized)
+            if base_name.startswith('python'):
+                # venv_bin may be set to an executable path (e.g., /opt/core/venv/bin/python)
+                candidates.append(sanitized)
+                bin_dir = posixpath.dirname(sanitized)
+                if bin_dir:
+                    for exe_name in ('python3', 'python', 'core-python'):
+                        candidates.append(posixpath.join(bin_dir, exe_name))
+            else:
+                # venv_bin is expected to be a bin directory.
+                for exe_name in ('python3', 'python', 'core-python'):
+                    candidates.append(posixpath.join(sanitized, exe_name))
+    candidates.extend(['core-python', 'python3', 'python'])
     ordered: List[str] = []
     seen: set[str] = set()
     for entry in candidates:
@@ -3665,9 +3675,15 @@ def _run_remote_python_json(
     try:
         interpreter_candidates = _candidate_remote_python_interpreters(cfg)
         if not interpreter_candidates:
-            interpreter_candidates = ['python3', 'python']
+            interpreter_candidates = ['core-python', 'python3', 'python']
         venv_bin = str(cfg.get('venv_bin') or '').strip()
-        activate_path = posixpath.join(venv_bin, 'activate') if venv_bin else None
+        activate_path = None
+        if venv_bin:
+            vb = venv_bin.rstrip('/\\')
+            vb_base = posixpath.basename(vb)
+            bin_dir = posixpath.dirname(vb) if vb_base.startswith('python') else vb
+            if bin_dir:
+                activate_path = posixpath.join(bin_dir, 'activate')
         last_error: Optional[str] = None
         last_stdout_text: str = ''
         last_stderr_text: str = ''
@@ -12515,77 +12531,7 @@ def api_flow_revalidate_flow():
     else:
         return jsonify({'ok': False, 'error': 'No FlowState found in XML. Generate (or Save XML) first.'}), 400
 
-    flat_expected: list[tuple[str, str]] = []
-    for entry in assigns or []:
-        if not isinstance(entry, dict):
-            continue
-        node_key = str(entry.get('node_id') or entry.get('node_name') or '').strip() or 'node'
-        artifacts_dir = str(entry.get('artifacts_dir') or '').strip()
-        outputs_manifest = str(entry.get('outputs_manifest') or '').strip()
-        run_dir = str(entry.get('run_dir') or '').strip()
-        base_dir = run_dir or artifacts_dir or (os.path.dirname(outputs_manifest) if outputs_manifest else '')
-        if artifacts_dir:
-            flat_expected.append((node_key, artifacts_dir))
-        if outputs_manifest:
-            flat_expected.append((node_key, outputs_manifest))
-
-        inject_detail = entry.get('inject_files_detail') if isinstance(entry.get('inject_files_detail'), list) else []
-        for item in inject_detail or []:
-            if not isinstance(item, dict):
-                continue
-            resolved = str(item.get('resolved') or '').strip()
-            path = str(item.get('path') or '').strip()
-            rel = ''
-            if resolved and not resolved.startswith('/'):
-                rel = resolved
-            elif resolved.startswith('artifacts/'):
-                rel = resolved
-            elif path.startswith('/tmp/'):
-                rel = os.path.basename(path)
-            if base_dir and rel:
-                flat_expected.append((node_key, os.path.join(base_dir, rel)))
-
-        try:
-            resolved_outputs = entry.get('resolved_outputs') if isinstance(entry.get('resolved_outputs'), dict) else {}
-        except Exception:
-            resolved_outputs = {}
-        try:
-            ro_detail = entry.get('resolved_outputs_detail') if isinstance(entry.get('resolved_outputs_detail'), list) else []
-            for item in ro_detail:
-                if not isinstance(item, dict):
-                    continue
-                field = str(item.get('field') or '').strip()
-                if field != 'File(path)':
-                    continue
-                val = str(item.get('resolved') or '').strip()
-                if val:
-                    resolved_outputs.setdefault('File(path)', val)
-        except Exception:
-            pass
-        try:
-            file_val = str(resolved_outputs.get('File(path)') or '').strip()
-            if file_val:
-                if file_val.startswith('/'):
-                    flat_expected.append((node_key, file_val))
-                elif base_dir:
-                    # Check literal
-                    flat_expected.append((node_key, os.path.join(base_dir, file_val)))
-                    # Check outputs/ subdirectory
-                    flat_expected.append((node_key, os.path.join(base_dir, 'outputs', file_val)))
-                    # Check flattened fallback if literal failed
-                    if file_val.startswith('artifacts/'):
-                        flat_expected.append((node_key, os.path.join(base_dir, os.path.basename(file_val))))
-                elif file_val.startswith('artifacts/'):
-                    # Fallback pattern
-                    fallback_base = f'/tmp/vulns/flag_generators_runs/flow-{scenario_safe}'
-                    # literal
-                    flat_expected.append((node_key, os.path.join(fallback_base, file_val)))
-                    # flattened
-                    flat_expected.append((node_key, os.path.join(fallback_base, os.path.basename(file_val))))
-        except Exception:
-            pass
-
-    if not flat_expected:
+    if not assigns:
         return jsonify({'ok': False, 'error': 'No FlowState artifacts to validate. Run Generate and Save XML first.'}), 400
 
     flow_core_cfg = _core_config_from_xml_path(xml_path, scenario_norm, include_password=True)
@@ -12599,132 +12545,60 @@ def api_flow_revalidate_flow():
     except Exception as exc:
         return jsonify({'ok': False, 'error': f'Remote validation requires SSH credentials: {exc}'}), 400
 
-    client = None
     missing: list[str] = []
     present: list[str] = []
-    discovered_base_dir: str = ''
+    path_map: dict[str, str] = {}
     try:
-        client = _open_ssh_client(flow_core_cfg)
+        check_items: list[dict[str, Any]] = []
+        for entry in assigns:
+            if not isinstance(entry, dict):
+                continue
+            check_items.append({
+                'node_id': entry.get('node_id') or entry.get('node_name'),
+                'generator_id': entry.get('id') or entry.get('generator_id'),
+                'generator_name': entry.get('name'),
+                'generator_type': entry.get('type') or entry.get('generator_type'),
+                'run_dir': entry.get('run_dir') or entry.get('artifacts_dir'),
+                'artifacts_dir': entry.get('artifacts_dir'),
+                'mount_dir': entry.get('mount_dir'),
+                'outputs_manifest': entry.get('outputs_manifest'),
+                'inject_files_detail': entry.get('inject_files_detail'),
+                'inject_files': entry.get('inject_files'),
+            })
 
-        # If we have paths with the fallback pattern, try to discover the actual latest run dir.
-        needs_discovery = any(
-            f'/tmp/vulns/flag_generators_runs/flow-{scenario_norm}' in p or
-            f'/tmp/vulns/flag_generators_runs/flow-{scenario_safe}' in p
-            for _, p in flat_expected
+        payload = _run_remote_python_json(
+            flow_core_cfg,
+            _remote_flow_artifacts_validation_script(check_items, scenario_label=scenario_norm),
+            logger=app.logger,
+            label='flow.revalidate.artifacts',
+            timeout=60.0,
         )
-        if needs_discovery:
-            try:
-                scenario_safe = re.sub(r'[^a-zA-Z0-9_-]', '_', scenario_norm)
-                scenario_cli_tag = ''.join([c for c in scenario_norm if c.isalnum() or c in ('-', '_')])[:40]
+        items = payload.get('items') if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return jsonify({'ok': False, 'error': 'Remote validation returned no items.'}), 500
 
-                # Check for static directories first, then fall back to latest timestamped ones.
-                # We search both flag_generators_runs and flag_node_generators_runs.
-                discover_cmd = (
-                    f"ls -1td "
-                    f"/tmp/vulns/flag_generators_runs/flow-{shlex.quote(scenario_safe)} "
-                    f"/tmp/vulns/flag_generators_runs/flow-{shlex.quote(scenario_norm)} "
-                    f"/tmp/vulns/flag_node_generators_runs/flow-{shlex.quote(scenario_safe)} "
-                    f"/tmp/vulns/flag_node_generators_runs/flow-{shlex.quote(scenario_norm)} "
-                    f"/tmp/vulns/flag_generators_runs/flow-{shlex.quote(scenario_safe)}-* "
-                    f"/tmp/vulns/flag_generators_runs/flow-{shlex.quote(scenario_norm)}-* "
-                    f"/tmp/vulns/flag_node_generators_runs/flow-{shlex.quote(scenario_safe)}-* "
-                    f"/tmp/vulns/flag_node_generators_runs/flow-{shlex.quote(scenario_norm)}-* "
-                    f"/tmp/vulns/flag_generators_runs/cli-{shlex.quote(scenario_safe)}* "
-                    f"/tmp/vulns/flag_node_generators_runs/cli-{shlex.quote(scenario_safe)}* "
-                    f"2>/dev/null | head -1"
-                )
-                d_code, d_out, _ = _exec_ssh_command(client, f"bash -lc {shlex.quote(discover_cmd)}", timeout=15.0)
-                if d_code == 0 and d_out.strip():
-                    discovered_base_dir = d_out.strip().split('\n')[0].strip()
-            except Exception:
-                discovered_base_dir = ''
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            miss_out = it.get('outputs_missing') if isinstance(it.get('outputs_missing'), list) else []
+            miss_inj = it.get('inject_missing') if isinstance(it.get('inject_missing'), list) else []
+            chk_out = it.get('outputs_checked') if isinstance(it.get('outputs_checked'), list) else []
+            chk_inj = it.get('inject_checked') if isinstance(it.get('inject_checked'), list) else []
 
-            # Replace fallback patterns with discovered actual path.
-            if discovered_base_dir:
-                legacy_pattern = f'/tmp/vulns/flag_generators_runs/flow-{scenario_norm}'
-                static_pattern = f'/tmp/vulns/flag_generators_runs/flow-{scenario_safe}'
-                new_expected = []
-                for node_key, path in flat_expected:
-                    if legacy_pattern in path:
-                        new_expected.append((node_key, path.replace(legacy_pattern, discovered_base_dir)))
-                    elif static_pattern in path:
-                        new_expected.append((node_key, path.replace(static_pattern, discovered_base_dir)))
-                    else:
-                        new_expected.append((node_key, path))
-                flat_expected = new_expected
-
-        checks: list[str] = []
-        path_map: dict[str, str] = {}
-        for node_key, path in flat_expected:
-            candidates: list[str] = []
-            # 1. Strict path (always check first)
-            candidates.append(path)
-            
-            # 2. Smart fallback: try to inject 'artifacts/' if not present in the last segment
-            try:
-                dirname = os.path.dirname(path)
-                basename = os.path.basename(path)
-                if basename and dirname and ('/artifacts/' not in path) and (not path.endswith('/artifacts')):
-                     # heuristic: if path is .../flow-xyz/file.txt -> .../flow-xyz/artifacts/file.txt
-                     smart_path = os.path.join(dirname, 'artifacts', basename)
-                     if smart_path != path:
-                         candidates.append(smart_path)
-            except Exception:
-                pass
-
-            clauses = []
-            for i, cand in enumerate(candidates):
-                q_cand = shlex.quote(cand)
-                if i == 0:
-                    clauses.append(f"if [ -e {q_cand} ]; then echo found::{node_key}::{q_cand};")
-                else:
-                    clauses.append(f"elif [ -e {q_cand} ]; then echo found::{node_key}::{q_cand};")
-            
-            if clauses:
-                clauses.append(f"else echo missing::{node_key}; fi")
-                checks.append(" ".join(clauses))
-        
-        cmd = ' ; '.join(checks) if checks else 'true'
-        code, out, err = _exec_ssh_command(client, f"bash -lc {shlex.quote(cmd)}", timeout=30.0)
-        
-        for raw in (out or '').splitlines():
-            line = raw.strip()
-            if line.startswith('found::'):
-                parts = line.split('::')
-                if len(parts) >= 3:
-                    # keys and paths might contain '::', so handle carefully? 
-                    # node_key is usually safe (uuid or simple string). path is absolute.
-                    # safer: split(..., 2)
-                    _, nk, found_path = line.split('::', 2)
-                    present.append(found_path)
-                    # Map the ORIGINAL requested path (from flat_expected) to the FOUND path?
-                    # The re-validate UI usually wants to know if the *node_key* succeeded.
-                    # But path_map is used for 'resolved_paths' return value.
-                    # We should probably map the *found path* to itself, or try to map original->found.
-                    # The cleanest is to return what we found.
-                    path_map[found_path] = found_path
-            elif line.startswith('missing::'):
-                p = line[len('missing::'):]
-                # p here is node_key
-                # We need to report WHICH file is missing. The UI expects a path/node_key.
-                # In strict mode, we reported the path. Here we report the node_key?
-                # Wait, the original code collected missing paths.
-                # If we report node_key, we need to know which path it corresponds to.
-                # Retain the original path for error reporting?
-                # "missing" list is strings. `flat_expected` has (node_key, path).
-                # simpler: just report the strict path as missing if ALL candidates fail.
-                # Find the original path for this node_key
-                orig_path = next((x[1] for x in flat_expected if x[0] == p), p)
-                missing.append(orig_path)
+            miss_set = {str(x) for x in (miss_out + miss_inj) if str(x).strip()}
+            for p in chk_out + chk_inj:
+                s = str(p).strip()
+                if not s:
+                    continue
+                if s in miss_set:
+                    continue
+                present.append(s)
+                path_map[s] = s
+            for p in miss_set:
+                missing.append(str(p))
 
     except Exception as exc:
         return jsonify({'ok': False, 'error': f'Remote validation failed: {exc}'}), 500
-    finally:
-        try:
-            if client:
-                client.close()
-        except Exception:
-            pass
 
     missing_sorted = sorted(set(missing))
     present_sorted = sorted(set(present))
@@ -12757,16 +12631,8 @@ def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
             with open(flag_txt, 'r', encoding='utf-8', errors='ignore') as f:
                 val = (f.read() or '').strip()
                 return val[:4096] if val else ''
-        flag_txt_outputs = os.path.join(dd, 'outputs', 'flag.txt')
-        if os.path.isfile(flag_txt_outputs):
-             with open(flag_txt_outputs, 'r', encoding='utf-8', errors='ignore') as f:
-                val = (f.read() or '').strip()
-                return val[:4096] if val else ''
 
         outs_path = os.path.join(dd, 'outputs.json')
-        if not os.path.isfile(outs_path):
-             outs_path = os.path.join(dd, 'outputs', 'outputs.json')
-
         if os.path.isfile(outs_path):
             try:
                 with open(outs_path, 'r', encoding='utf-8') as f:
@@ -12803,9 +12669,6 @@ def _flow_read_outputs_map_from_artifacts_dir(artifacts_dir: str) -> dict[str, A
         if not os.path.isdir(dd):
             return {}
         outs_path = os.path.join(dd, 'outputs.json')
-        if not os.path.isfile(outs_path):
-             outs_path = os.path.join(dd, 'outputs', 'outputs.json')
-        
         if not os.path.isfile(outs_path):
             return {}
         with open(outs_path, 'r', encoding='utf-8') as f:
@@ -17582,9 +17445,7 @@ def api_flow_prepare_preview_for_execute():
                 timeout=max(1, int(timeout_s or 120)),
                 env=env,
             )
-            manifest_path = os.path.join(out_dir, 'outputs', 'outputs.json')
-            if not os.path.exists(manifest_path):
-                manifest_path = os.path.join(out_dir, 'outputs.json')
+            manifest_path = os.path.join(out_dir, 'outputs.json')
             stdout_tail = (p.stdout or '').strip()[-4000:]
             stderr_tail = (p.stderr or '').strip()[-4000:]
             if p.returncode != 0:
@@ -17663,10 +17524,8 @@ def api_flow_prepare_preview_for_execute():
             "    env['CORETG_INJECT_FILES_JSON']=INJECT\n"
             "cmd=[sys.executable, runner, '--kind', KIND, '--generator-id', GEN, '--out-dir', OUT, '--config', CFG, '--repo-root', REPO]\n"
             f"p=subprocess.run(cmd, cwd=REPO, env=env, check=False, capture_output=True, text=True, timeout=max(1, int({timeout_literal})))\n"
-            "OUT_ARTIFACTS=os.path.join(OUT,'outputs')\n"
-            "manifest=os.path.join(OUT_ARTIFACTS,'outputs.json')\n"
-            "if not os.path.exists(manifest):\n"
-            "  manifest=os.path.join(OUT,'outputs.json')\n"
+            "OUT_ARTIFACTS=OUT\n"
+            "manifest=os.path.join(OUT,'outputs.json')\n"
             "outputs=None\n"
             "if os.path.exists(manifest):\n"
             "  try:\n"
@@ -17694,14 +17553,11 @@ def api_flow_prepare_preview_for_execute():
             "      checked=[v]\n"
             "      if not exists:\n"
             "        candidates=[]\n"
-            "        candidates.append(os.path.join(OUT_ARTIFACTS,v.lstrip('/')))\n"
             "        candidates.append(os.path.join(OUT,v.lstrip('/')))\n"
-            "        candidates.append(os.path.join(OUT_ARTIFACTS,os.path.basename(v)))\n"
             "        candidates.append(os.path.join(OUT,os.path.basename(v)))\n"
             "        if v.startswith('artifacts/'):\n"
             "          tail=v.split('artifacts/',1)[1].lstrip('/')\n"
             "          candidates.append(os.path.join(OUT,'artifacts',tail))\n"
-            "          candidates.append(os.path.join(OUT_ARTIFACTS,'artifacts',tail))\n"
             "          candidates.append(os.path.join(OUT,'artifacts',os.path.basename(v)))\n"
             "        for cand in candidates:\n"
             "          if not cand or cand in checked:\n"
@@ -17986,8 +17842,13 @@ def api_flow_prepare_preview_for_execute():
 
                 cfg = cfg_full
                 inputs_mismatch: dict[str, Any] = {}
+                gen_def: dict[str, Any] | None = None
                 try:
-                    gen_def = _gen_by_id.get(generator_id)
+                    gd = _gen_by_id.get(generator_id)
+                    gen_def = gd if isinstance(gd, dict) else None
+                except Exception:
+                    gen_def = None
+                try:
                     if isinstance(gen_def, dict):
                         allowed = _all_input_names_of(gen_def)
                         # Ensure synthesized inputs are always allowed/passed for flag generators (implicit inputs)
@@ -18436,44 +18297,19 @@ def api_flow_prepare_preview_for_execute():
                                             verification_outs = m.get('outputs')
                                     except Exception:
                                         pass
-
-                                    # Check for outputs.json in outputs/ subdirectory
-                                    flow_out_artifacts_dir = os.path.join(flow_out_dir, 'outputs')
-                                    manifest_path = os.path.join(flow_out_artifacts_dir, 'outputs.json')
-                                    manifest_outputs = None
-                                    if os.path.exists(manifest_path):
-                                        try:
-                                            with open(manifest_path, 'r', encoding='utf-8') as mf:
-                                                mdoc = json.load(mf)
-                                                manifest_outputs = mdoc.get('outputs') if isinstance(mdoc, dict) else None
-                                        except Exception:
-                                            manifest_outputs = None
-                                    
-                                    if manifest_outputs is None:
-                                        try:
-                                            flag_path = os.path.join(flow_out_artifacts_dir, 'flag.txt')
-                                            if os.path.exists(flag_path):
-                                                with open(flag_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                                    flag_val = (f.read() or '').strip()
-                                                if flag_val:
-                                                    manifest_outputs = {'Flag(flag_id)': flag_val, 'flag': flag_val}
-                                        except Exception:
-                                            manifest_outputs = manifest_outputs
-
-                                    if ok_run and manifest_outputs:
-                                        # Incremental Validation: check disk for reported artifacts.
-                                        for kk, vv in manifest_outputs.items():
-                                            if isinstance(vv, str) and (vv.startswith('/') or '/' in vv or '.' in vv):
-                                                exists = os.path.exists(vv)
-                                                if not exists:
-                                                    # Fallback: check relative to flow_out_artifacts_dir
-                                                    cand = os.path.join(flow_out_artifacts_dir, vv.lstrip('/'))
-                                                    if os.path.exists(cand):
-                                                        exists = True
-                                                if not exists:
-                                                     ok_run = False
-                                                     note = f"Artifact verification failed: {vv} does not exist on local disk"
-                                                     break
+                                if ok_run and verification_outs:
+                                    # Incremental Validation: check disk for reported artifacts.
+                                    for kk, vv in verification_outs.items():
+                                        if isinstance(vv, str) and (vv.startswith('/') or '/' in vv or '.' in vv):
+                                            exists = os.path.exists(vv)
+                                            if not exists:
+                                                cand = os.path.join(flow_out_dir, vv.lstrip('/'))
+                                                if os.path.exists(cand):
+                                                    exists = True
+                                            if not exists:
+                                                ok_run = False
+                                                note = f"Artifact verification failed: {vv} does not exist on local disk"
+                                                break
 
                         try:
                             app.logger.info(
@@ -18612,17 +18448,7 @@ def api_flow_prepare_preview_for_execute():
                                                 flat_v = os.path.basename(v)
                                                 # 1. Try literal join in root
                                                 abs_candidate = os.path.join(flow_out_dir, v.lstrip('/'))
-                                                # 2. Try literal join in outputs/
-                                                if not os.path.exists(abs_candidate):
-                                                    cand = os.path.join(flow_out_dir, 'outputs', v.lstrip('/'))
-                                                    if os.path.exists(cand):
-                                                        abs_candidate = cand
-                                                # 3. Try flattened fallback in outputs/
-                                                if not os.path.exists(abs_candidate):
-                                                    cand = os.path.join(flow_out_dir, 'outputs', flat_v)
-                                                    if os.path.exists(cand):
-                                                        abs_candidate = cand
-                                                # 4. Try flattened fallback in root
+                                                # 2. Try flattened fallback in root
                                                 if not os.path.exists(abs_candidate):
                                                     cand = os.path.join(flow_out_dir, flat_v)
                                                     if os.path.exists(cand):
@@ -18679,6 +18505,45 @@ def api_flow_prepare_preview_for_execute():
                                                         pass
                                     except Exception:
                                         pass
+
+                                    # Hard rule for flag-node-generators: they must be compose-backed
+                                    # and emit a docker-compose file through File(path).
+                                    try:
+                                        if assignment_type == 'flag-node-generator':
+                                            compose_cfg = gen_def.get('compose') if isinstance(gen_def, dict) else None
+                                            if not isinstance(compose_cfg, dict):
+                                                ok_run = False
+                                                note = 'flag-node-generator must declare docker-compose runtime.'
+                                            else:
+                                                compose_file_val = str(
+                                                    outs.get('File(path)')
+                                                    or outs.get('file')
+                                                    or outs.get('File')
+                                                    or ''
+                                                ).strip()
+                                                if not compose_file_val:
+                                                    ok_run = False
+                                                    note = 'flag-node-generator must output File(path) for docker-compose file.'
+                                                else:
+                                                    compose_base = os.path.basename(compose_file_val).strip().lower()
+                                                    if compose_base not in ('docker-compose.yml', 'docker-compose.yaml'):
+                                                        ok_run = False
+                                                        note = f'flag-node-generator File(path) must be docker-compose.yml/.yaml (got {compose_file_val}).'
+                                                    else:
+                                                        compose_candidates = []
+                                                        if os.path.isabs(compose_file_val):
+                                                            compose_candidates.append(compose_file_val)
+                                                        if flow_out_dir:
+                                                            compose_candidates.extend([
+                                                                os.path.join(flow_out_dir, compose_file_val.lstrip('/')),
+                                                                os.path.join(flow_out_dir, compose_base),
+                                                            ])
+                                                        if not any(os.path.exists(p) for p in compose_candidates if p):
+                                                            ok_run = False
+                                                            note = f'flag-node-generator compose output missing on disk: {compose_file_val}'
+                                    except Exception as _exc_node_compose:
+                                        ok_run = False
+                                        note = f'flag-node-generator compose validation failed: {_exc_node_compose}'
 
                                     actual_output_keys = sorted([str(k) for k in outs.keys() if str(k).strip()])
 
@@ -18966,6 +18831,17 @@ def api_flow_prepare_preview_for_execute():
                         )
                     )
 
+                inject_detail_raw = fa.get('inject_files_detail')
+                inject_from_detail = _inject_files_for_copy_from_detail(inject_detail_raw, inject_source_dir)
+                if isinstance(inject_detail_raw, list):
+                    normalized_inject_files = inject_from_detail
+                else:
+                    normalized_inject_files = (
+                        [x for x in (_normalize_inject_spec_for_copy(r, inject_source_dir) for r in (fa.get('inject_files') or []) if r is not None) if x]
+                        if isinstance(fa.get('inject_files'), list)
+                        else []
+                    )
+
                 meta_h['flow_flag'] = {
                     'type': assignment_type,
                     'generator_catalog': generator_catalog,
@@ -18975,11 +18851,7 @@ def api_flow_prepare_preview_for_execute():
                     'generator_source': str(fa.get('flag_generator') or ''),
                     'artifacts_dir': str(flow_out_dir or ''),
                     'mount_dir': inject_source_dir,
-                    'inject_files': _inject_files_for_copy_from_detail(fa.get('inject_files_detail'), inject_source_dir) or (
-                        [x for x in (_normalize_inject_spec_for_copy(r, inject_source_dir) for r in (fa.get('inject_files') or []) if r is not None) if x]
-                        if isinstance(fa.get('inject_files'), list)
-                        else []
-                    ),
+                    'inject_files': normalized_inject_files,
                     'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
                     'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
                     'hint_template': str(fa.get('hint_template') or ''),
@@ -33433,6 +33305,8 @@ def _looks_like_path(key, val) -> bool:
         k = str(key or '').lower()
         if 'path' in k or 'file' in k:
             return True
+        if 'directory' in k or 'dir' in k:
+            return True
         if v.startswith('/') or v.startswith('artifacts/'):
             return True
         if '/' in v:
@@ -33554,6 +33428,7 @@ def main():
         outputs_manifest = str(a.get('outputs_manifest') or '')
         outputs_missing = []
         outputs_checked = []
+        outputs_resolved = {}
         manifest_expected = bool(outputs_manifest)
         manifest_exists = _safe_exists(outputs_manifest)
         outs = None
@@ -33569,7 +33444,6 @@ def main():
         if manifest_exists and not (isinstance(outs, dict) and outs):
             outputs_missing.append(f"empty manifest: {outputs_manifest}")
         if isinstance(outs, dict):
-            outputs_resolved = {}
             # Derive scenario tag from label if possible
             st = ''
             try:
@@ -33590,6 +33464,25 @@ def main():
                 outputs_checked.append(p)
                 if not _safe_exists(p):
                     outputs_missing.append(p)
+
+            # Hard rule: flag-node-generators must provide docker-compose.yml/.yaml via File(path).
+            try:
+                gen_type_l = str(gen_type or '').strip().lower()
+                if gen_type_l == 'flag-node-generator':
+                    compose_val = str(
+                        outs.get('File(path)')
+                        or outs.get('file')
+                        or outs.get('File')
+                        or ''
+                    ).strip()
+                    if not compose_val:
+                        outputs_missing.append('missing required output File(path) for flag-node-generator')
+                    else:
+                        compose_base = os.path.basename(compose_val).strip().lower()
+                        if compose_base not in ('docker-compose.yml', 'docker-compose.yaml'):
+                            outputs_missing.append(f'invalid File(path) for flag-node-generator: {compose_val}')
+            except Exception:
+                pass
 
         source_dir = artifacts_dir or run_dir
         inject_sources = _inject_files_for_copy_from_detail(a.get('inject_files_detail'), source_dir)
@@ -33634,7 +33527,8 @@ def main():
 if __name__ == '__main__':
     main()
 """
-    ).replace('__ASSIGNMENTS_LITERAL__', assignments_literal)
+    ).replace('__ASSIGNMENTS_LITERAL__', assignments_literal) \
+     .replace('__SCENARIO_LABEL_LITERAL__', scenario_label_literal)
 
 
 def _remote_vuln_assignments_script(assignments_path: str = '/tmp/vulns/compose_assignments.json') -> str:

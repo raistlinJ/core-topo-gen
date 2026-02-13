@@ -198,9 +198,20 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
     for rel in cleaned:
         dest = (injected_dir / rel).resolve()
         try:
-            # Sourcing from sibling 'outputs' directory.
-            src = (out_dir / 'outputs' / rel).resolve()
-            if not src.exists():
+            # Sourcing from canonical generator out directory.
+            # Prefer direct relative path first, then common artifacts-prefixed forms.
+            candidates: list[Path] = [
+                (out_dir / rel).resolve(),
+                (out_dir / 'artifacts' / rel).resolve(),
+            ]
+            rel_norm = str(rel or '').replace('\\', '/').lstrip('/')
+            if rel_norm.startswith('artifacts/'):
+                tail = rel_norm.split('artifacts/', 1)[1].lstrip('/')
+                if tail:
+                    candidates.append((out_dir / tail).resolve())
+                    candidates.append((out_dir / 'artifacts' / tail).resolve())
+            src = next((c for c in candidates if c.exists()), None)
+            if src is None:
                 missing.append(rel)
                 continue
             _copy_tree_or_file(src, dest)
@@ -212,8 +223,53 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
         # hint.txt is commonly materialized after generator execution (e.g., by Flow)
         # and may not exist at staging time.
         if missing_set != {'hint.txt'}:
-            print(f"[inject_files] warning: missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+            summary = f"missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}"
+            print(f"[inject_files] error: {summary}")
+            raise FileNotFoundError(f"inject_files staging failed: {summary}")
     return injected_dir
+
+
+def _validate_injected_sources_exist(out_dir: Path, inject_files: list[str]) -> None:
+    """Validate that inject source files produced by a generator exist.
+
+    This is a generation-time validation only. It does NOT pre-stage files or
+    rewrite compose mounts.
+    """
+    cleaned = []
+    for raw in inject_files or []:
+        src_raw, _dest = _split_inject_spec(str(raw))
+        p = _norm_inject_path(str(src_raw))
+        if p:
+            cleaned.append(p)
+    cleaned = sorted(set(cleaned))
+    if not cleaned:
+        return
+
+    missing: list[str] = []
+    for rel in cleaned:
+        try:
+            candidates: list[Path] = [
+                (out_dir / rel).resolve(),
+                (out_dir / 'artifacts' / rel).resolve(),
+            ]
+            rel_norm = str(rel or '').replace('\\', '/').lstrip('/')
+            if rel_norm.startswith('artifacts/'):
+                tail = rel_norm.split('artifacts/', 1)[1].lstrip('/')
+                if tail:
+                    candidates.append((out_dir / tail).resolve())
+                    candidates.append((out_dir / 'artifacts' / tail).resolve())
+            found = any(c.exists() for c in candidates)
+            if not found:
+                missing.append(rel)
+        except Exception:
+            missing.append(rel)
+
+    if missing:
+        missing_set = set(missing)
+        if missing_set != {'hint.txt'}:
+            summary = f"missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}"
+            print(f"[inject_files] error: {summary}")
+            raise FileNotFoundError(f"inject_files validation failed: {summary}")
 
 
 def _rewrite_compose_injected_to_volume_copy(
@@ -349,8 +405,8 @@ def _rewrite_compose_injected_to_volume_copy(
         copy_service_name = f"inject_copy_{i}"
 
     copy_vols: list[Any] = []
-    # Source from sibling 'outputs' directory.
-    copy_vols.append(f"{out_dir / 'outputs'}:/src:ro")
+    # Source from canonical generator out directory.
+    copy_vols.append(f"{out_dir}:/src:ro")
     dest_mounts: dict[str, str] = {}
     for dest_dir, vol_name in dest_to_volume.items():
         slug = vol_name.replace('inject-', '')
@@ -555,9 +611,46 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
     if not isinstance(outputs, dict):
         return list(inject_files or [])
 
+    def _resolve_key_by_output_value_basename(key: str) -> tuple[str | None, Any]:
+        k = str(key or '').strip()
+        if not k:
+            return None, None
+        kl = k.lower()
+        try:
+            for out_key, out_val in outputs.items():
+                if isinstance(out_val, str):
+                    vv = out_val.strip()
+                    if not vv:
+                        continue
+                    base = vv.replace('\\', '/').split('/')[-1]
+                    if base and base.lower() == kl:
+                        return str(out_key), out_val
+                elif isinstance(out_val, list):
+                    for item in out_val:
+                        s = str(item or '').strip()
+                        if not s:
+                            continue
+                        base = s.replace('\\', '/').split('/')[-1]
+                        if base and base.lower() == kl:
+                            return str(out_key), out_val
+        except Exception:
+            return None, None
+        return None, None
+
     def _looks_like_path(s: str) -> bool:
         # Heuristic: treat slash-containing values as paths.
         return '/' in (s or '')
+
+    def _is_injectable_output_path(s: str) -> bool:
+        # Inject staging expects paths relative to out_dir/outputs (or artifacts/*).
+        # Absolute paths like "/exports" are typically metadata outputs (e.g. Directory)
+        # and are not files available for staging.
+        v = str(s or '').strip()
+        if not v:
+            return False
+        if v.startswith('/'):
+            return False
+        return _looks_like_path(v)
 
     out: list[str] = []
     for raw in inject_files or []:
@@ -565,21 +658,33 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
         key = str(src_raw or '').strip()
         if not key:
             continue
-        if key in outputs:
-            v = outputs.get(key)
+        output_lookup_key = key
+        v = outputs.get(output_lookup_key) if output_lookup_key in outputs else None
+        if v is None and key not in outputs and ('/' not in key):
+            # Back-compat: some older inject specs use bare filenames (e.g. "exports")
+            # while outputs declare path-valued facts. Try basename matching first.
+            matched_key, matched_val = _resolve_key_by_output_value_basename(key)
+            if matched_key is not None:
+                output_lookup_key = matched_key
+                v = matched_val
+
+        if output_lookup_key in outputs or v is not None:
             if isinstance(v, str):
                 vv = v.strip()
-                if vv and _looks_like_path(vv):
+                if vv and _is_injectable_output_path(vv):
                     if dest_raw:
                         out.append(f"{vv} -> {dest_raw}")
                     else:
                         out.append(vv)
                     continue
+                # Key resolved, but output is not an injectable file path.
+                # Skip instead of treating the key as a literal path.
+                continue
             if isinstance(v, list):
                 vals: list[str] = []
                 for item in v:
                     s = str(item or '').strip()
-                    if s and _looks_like_path(s):
+                    if s and _is_injectable_output_path(s):
                         vals.append(s)
                 if vals:
                     if dest_raw:
@@ -587,6 +692,8 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
                     else:
                         out.extend(vals)
                     continue
+                # Key resolved, but no injectable file paths in output list.
+                continue
             # If the output value doesn't look like a path, fall through and
             # treat the entry as a literal path.
         if dest_raw:
@@ -730,9 +837,8 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     inputs_dir = out_dir / 'inputs'
-    outputs_dir = out_dir / 'outputs'
+    outputs_dir = out_dir
     inputs_dir.mkdir(parents=True, exist_ok=True)
-    outputs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         config = json.loads(args.config)
@@ -766,8 +872,6 @@ def main() -> int:
     # Write inputs config (mounted into compose at /inputs/config.json)
     config_path = inputs_dir / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
-    # Env: pass OUT_DIR and also config keys uppercased
     env = {"OUT_DIR": str(out_dir), "CONFIG_PATH": str(config_path)}
     for k, v in config.items():
         raw_key = str(k).upper()
@@ -807,11 +911,12 @@ def main() -> int:
             use_host_network = False
         if use_host_network:
             try:
-                compose_src = (source_dir / compose_file).resolve() if not Path(compose_file).is_absolute() else Path(compose_file).resolve()
-                compose_out = compose_src.parent / f"{compose_src.stem}.hostnet{compose_src.suffix}"
-                compose_out.write_text(compose_src.read_text('utf-8', errors='ignore'), encoding='utf-8')
-                _rewrite_compose_host_network(compose_out)
-                compose_file = str(compose_out)
+                compose_src = (source_dir / compose_file).resolve()
+                if compose_src.exists():
+                    compose_out = (out_dir / 'docker-compose.hostnet.yml').resolve()
+                    compose_out.write_text(compose_src.read_text('utf-8', errors='ignore'), encoding='utf-8')
+                    _rewrite_compose_host_network(compose_out)
+                    compose_file = str(compose_out)
             except Exception as exc:
                 print(f"[compose] warning: host-network rewrite failed: {exc}")
 
@@ -831,30 +936,11 @@ def main() -> int:
 
         _fix_output_permissions(out_dir)
 
-        # If this generator declares inject_files, stage and enforce that only
-        # staged files can be mounted into the generated compose container.
+        # Validate inject sources generated by this run, but do not pre-stage or
+        # rewrite compose during Generate/Resolve.
         expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
         expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)
-        injected_dir = _stage_injected_dir(out_dir, expanded_inject)
-        if injected_dir is not None:
-            compose_out = out_dir / 'docker-compose.yml'
-            if compose_out.exists():
-                rewritten_path = _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
-                if rewritten_path and rewritten_path.name != compose_out.name:
-                    try:
-                        manifest = out_dir / "outputs.json"
-                        if manifest.exists():
-                            doc = json.loads(manifest.read_text("utf-8", errors="ignore") or "{}")
-                            if isinstance(doc, dict):
-                                outputs = doc.get("outputs")
-                                if isinstance(outputs, dict):
-                                    for key in ("File(path)", "File", "file", "path"):
-                                        val = outputs.get(key)
-                                        if isinstance(val, str) and val.strip() == compose_out.name:
-                                            outputs[key] = rewritten_path.name
-                                manifest.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-                    except Exception:
-                        pass
+        _validate_injected_sources_exist(out_dir, expanded_inject)
 
         manifest = out_dir / "outputs.json"
         if manifest.exists():
@@ -879,26 +965,7 @@ def main() -> int:
 
     expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
     expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)
-    injected_dir = _stage_injected_dir(out_dir, expanded_inject)
-    if injected_dir is not None:
-        compose_out = out_dir / 'docker-compose.yml'
-        if compose_out.exists():
-            rewritten_path = _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
-            if rewritten_path and rewritten_path.name != compose_out.name:
-                try:
-                    manifest = out_dir / "outputs.json"
-                    if manifest.exists():
-                        doc = json.loads(manifest.read_text("utf-8", errors="ignore") or "{}")
-                        if isinstance(doc, dict):
-                            outputs = doc.get("outputs")
-                            if isinstance(outputs, dict):
-                                for key in ("File(path)", "File", "file", "path"):
-                                    val = outputs.get(key)
-                                    if isinstance(val, str) and val.strip() == compose_out.name:
-                                        outputs[key] = rewritten_path.name
-                            manifest.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-                except Exception:
-                    pass
+    _validate_injected_sources_exist(out_dir, expanded_inject)
 
     # Print manifest if present
     manifest = out_dir / "outputs.json"

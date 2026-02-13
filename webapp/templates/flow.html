@@ -3917,9 +3917,42 @@
 
             function resolvedTargetsFor(src) {
               if (!resolvedMap) return [];
-              const key = String(src || '').trim();
-              if (!key || !(key in resolvedMap)) return [];
-              const v = resolvedMap[key];
+              const raw = String(src || '').trim();
+              if (!raw) return [];
+              const keyCandidates = [];
+              keyCandidates.push(raw);
+              const rawLower = raw.toLowerCase();
+              const factLike = /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(raw);
+              if (raw.includes('/')) {
+                const base = basenameFrom(raw);
+                if (base) keyCandidates.push(base);
+                const baseFactLike = /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(base);
+                if (baseFactLike && !keyCandidates.includes(base)) keyCandidates.push(base);
+              } else if (factLike && !keyCandidates.includes(raw)) {
+                keyCandidates.push(raw);
+              }
+
+              let matchedKey = '';
+              for (const k of keyCandidates) {
+                if (k in resolvedMap) {
+                  matchedKey = k;
+                  break;
+                }
+              }
+              if (!matchedKey) {
+                const keys = Object.keys(resolvedMap || {});
+                for (const rk of keys) {
+                  const lk = String(rk || '').toLowerCase();
+                  if (!lk) continue;
+                  if (lk === rawLower || keyCandidates.some(c => String(c || '').toLowerCase() === lk)) {
+                    matchedKey = rk;
+                    break;
+                  }
+                }
+              }
+              if (!matchedKey) return [];
+
+              const v = resolvedMap[matchedKey];
               if (Array.isArray(v)) {
                 return v.map(x => String(x ?? '')).filter(x => x.trim());
               }
@@ -3951,6 +3984,9 @@
 
               const name = filenameFromPath(displaySrc);
               const tokenLike = !displaySrc.includes('/') && /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(displaySrc);
+              const likelySymbolicToken = !displaySrc.includes('/')
+                && !displaySrc.startsWith('artifacts/')
+                && !/\.[A-Za-z0-9]{1,16}$/.test(displaySrc);
               const destDir = normalizeDestDir(dest);
 
               const entries = resolvedTargets.length ? resolvedTargets : [''];
@@ -3964,13 +4000,13 @@
 
                 const tdResolved = document.createElement('td');
                 tdResolved.className = 'small text-muted';
-                tdResolved.textContent = resolvedVal ? resolvedVal : (resolvedTargets.length ? '-' : '');
+                tdResolved.textContent = resolvedVal ? resolvedVal : (resolvedTargets.length ? '-' : (likelySymbolicToken ? '<unresolved>' : ''));
 
                 const tdPath = document.createElement('td');
                 tdPath.className = 'small text-muted';
                 const resolvedBase = basenameFrom(resolvedVal ? resolvedVal : displaySrc);
                 const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
-                if (!resolvedVal && tokenLike) {
+                if (!resolvedVal && (tokenLike || likelySymbolicToken)) {
                   tdPath.textContent = '<unresolved>';
                 } else {
                   tdPath.textContent = destPath || '-';
@@ -5206,9 +5242,31 @@
 
           function resolvedTargetsFor(srcKey) {
             if (!resolvedOutputs || typeof resolvedOutputs !== 'object' || Array.isArray(resolvedOutputs)) return [];
-            const k = String(srcKey || '').trim();
-            if (!k || !(k in resolvedOutputs)) return [];
-            const v = resolvedOutputs[k];
+            const raw = String(srcKey || '').trim();
+            if (!raw) return [];
+            const candidates = [raw];
+            if (raw.includes('/')) {
+              const base = basenameFromPath(raw);
+              if (base) candidates.push(base);
+            }
+            let key = '';
+            for (const c of candidates) {
+              if (c in resolvedOutputs) {
+                key = c;
+                break;
+              }
+            }
+            if (!key) {
+              const want = candidates.map(c => String(c || '').toLowerCase());
+              for (const rk of Object.keys(resolvedOutputs || {})) {
+                if (want.includes(String(rk || '').toLowerCase())) {
+                  key = rk;
+                  break;
+                }
+              }
+            }
+            if (!key) return [];
+            const v = resolvedOutputs[key];
             if (Array.isArray(v)) {
               return v.map(x => String(x ?? '')).filter(x => x.trim());
             }
