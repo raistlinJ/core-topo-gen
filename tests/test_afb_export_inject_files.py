@@ -17,6 +17,24 @@ def _find_named_objects(afb: dict, obj_id: str) -> list[str]:
     return names
 
 
+def _find_key_artifact_notes(afb: dict) -> list[str]:
+    out: list[str] = []
+    for o in afb.get("objects") or []:
+        if not isinstance(o, dict):
+            continue
+        if o.get("id") != "note":
+            continue
+        props = o.get("properties")
+        if not isinstance(props, list):
+            continue
+        for pair in props:
+            if isinstance(pair, list) and len(pair) == 2 and pair[0] == "name":
+                name = str(pair[1] or "")
+                if name.startswith("Key Artifact: "):
+                    out.append(name.removeprefix("Key Artifact: "))
+    return out
+
+
 def test_afb_export_emits_inject_files_as_artifact_nodes():
     chain_nodes = [{"id": "n1", "name": "Node 1", "ipv4": "10.0.0.1"}]
     flag_assignments = [
@@ -37,6 +55,6 @@ def test_afb_export_emits_inject_files_as_artifact_nodes():
         flag_assignments=flag_assignments,
     )
 
-    artifact_names = _find_named_objects(afb, "artifact")
+    artifact_names = _find_key_artifact_notes(afb)
     assert "injected/flag.txt" in artifact_names
     assert "hint.txt" in artifact_names

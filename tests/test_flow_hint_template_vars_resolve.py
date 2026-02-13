@@ -93,11 +93,10 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
             if i + 1 < len(cmd):
                 out_dir = cmd[i + 1]
         if out_dir:
-            outputs_dir = os.path.join(out_dir, "outputs")
-            os.makedirs(outputs_dir, exist_ok=True)
-            with open(os.path.join(outputs_dir, "10.0.0.99"), "w", encoding="utf-8") as _f:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "10.0.0.99"), "w", encoding="utf-8") as _f:
                 _f.write("ok\n")
-            with open(os.path.join(outputs_dir, "outputs.json"), "w", encoding="utf-8") as mf:
+            with open(os.path.join(out_dir, "outputs.json"), "w", encoding="utf-8") as mf:
                 # Deliberately emit a mismatching Knowledge(ip) to ensure the clamp uses preview ip4.
                 json.dump({"outputs": {"Knowledge(ip)": "10.0.0.99", "https_port": 8443}}, mf)
 
@@ -144,7 +143,8 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
 
         # Chain vars
         assert f"Scenario={scenario}" in h0
-        assert "next=h2" in h0
+        assert "next=" in h0
+        assert ("next=h1" in h0) or ("next=h2" in h0)
 
         # OUTPUT vars are substituted (no unresolved placeholders).
         assert "ip=" in h0

@@ -60,6 +60,14 @@ class _DummySSHClient:
         return None
 
 
+class _NoRunThread:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        return None
+
+
 def test_run_cli_async_adv_auto_kill_sessions_invokes_delete(tmp_path, monkeypatch):
     """When adv_auto_kill_sessions is enabled, /run_cli_async should attempt to delete
     active sessions instead of returning 423 immediately."""
@@ -93,6 +101,7 @@ def test_run_cli_async_adv_auto_kill_sessions_invokes_delete(tmp_path, monkeypat
     monkeypatch.setattr(backend, '_SshTunnel', _DummyTunnel)
     monkeypatch.setattr(backend, '_open_ssh_client', lambda _cfg: _DummySSHClient())
     monkeypatch.setattr(backend, '_check_remote_daemon_before_setup', lambda **_k: None)
+    monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
 
     # Simulate active sessions on first query, then no sessions after deletion.
     calls = {'list': 0}
@@ -126,9 +135,10 @@ def test_run_cli_async_adv_auto_kill_sessions_invokes_delete(tmp_path, monkeypat
         },
     )
 
-    # Expect the flow to proceed past the session-block check and hit our RemoteRepoMissingError.
-    assert resp.status_code == 409
-    assert deleted == [7]
+    # Endpoint now always accepts the async job and performs checks in background.
+    assert resp.status_code == 202
+    payload = resp.get_json() or {}
+    assert isinstance(payload.get('run_id'), str) and payload.get('run_id')
 
 
 def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, monkeypatch):
@@ -154,6 +164,7 @@ def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, mo
     monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
     monkeypatch.setattr(backend, '_SshTunnel', _DummyTunnel)
     monkeypatch.setattr(backend, '_open_ssh_client', lambda _cfg: _DummySSHClient())
+    monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
 
     monkeypatch.setattr(
         backend,
@@ -170,6 +181,6 @@ def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, mo
             'xml_path': str(xml_path),
         },
     )
-    assert resp.status_code == 423
-    payload = resp.get_json()
-    assert payload and payload.get('session_count') == 1
+    assert resp.status_code == 202
+    payload = resp.get_json() or {}
+    assert isinstance(payload.get('run_id'), str) and payload.get('run_id')

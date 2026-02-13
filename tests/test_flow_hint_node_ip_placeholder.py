@@ -108,9 +108,8 @@ def test_prepare_preview_replaces_node_ip_placeholder(monkeypatch):
                 if i >= 0 and i + 1 < len(cmd):
                     out_dir = cmd[i + 1]
             if out_dir:
-                outputs_dir = os.path.join(out_dir, 'outputs')
-                os.makedirs(outputs_dir, exist_ok=True)
-                manifest_path = os.path.join(outputs_dir, 'outputs.json')
+                os.makedirs(out_dir, exist_ok=True)
+                manifest_path = os.path.join(out_dir, 'outputs.json')
                 with open(manifest_path, 'w', encoding='utf-8') as mf:
                     json.dump({'outputs': {}}, mf)
         except Exception:

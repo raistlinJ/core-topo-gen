@@ -14,7 +14,7 @@ def test_flow_reorder_chain_by_generator_dag_reorders_nodes_and_updates_next_fie
             "id": "g_consumer",
             "name": "Consumer",
             "type": "flag-generator",
-            "inputs": ["token"],
+            "inputs": ["Knowledge(token)"],
             "outputs": [],
             "hint_template": "Next: {{NEXT_NODE_ID}}",
         },
@@ -24,7 +24,7 @@ def test_flow_reorder_chain_by_generator_dag_reorders_nodes_and_updates_next_fie
             "name": "Producer",
             "type": "flag-generator",
             "inputs": [],
-            "outputs": ["token"],
+            "outputs": ["Knowledge(token)"],
             "hint_template": "Next: {{NEXT_NODE_ID}}",
         },
     ]
@@ -35,14 +35,14 @@ def test_flow_reorder_chain_by_generator_dag_reorders_nodes_and_updates_next_fie
             "plugin_type": "flag-generator",
             "version": "test",
             "requires": [],
-            "produces": [{"artifact": "token"}],
+            "produces": [{"artifact": "Knowledge(token)"}],
             "inputs": {},
         },
         "g_consumer": {
             "plugin_id": "g_consumer",
             "plugin_type": "flag-generator",
             "version": "test",
-            "requires": ["token"],
+            "requires": ["Knowledge(token)"],
             "produces": [],
             "inputs": {},
         },
@@ -68,4 +68,4 @@ def test_flow_reorder_chain_by_generator_dag_reorders_nodes_and_updates_next_fie
     assert dag_debug.get("order") == ["n1", "n2"]
     edges = dag_debug.get("edges")
     assert isinstance(edges, list)
-    assert any(e.get("src") == "n1" and e.get("dst") == "n2" and e.get("artifact") == "token" for e in edges)
+    assert any(e.get("src") == "n1" and e.get("dst") == "n2" and e.get("artifact") == "Knowledge(token)" for e in edges)

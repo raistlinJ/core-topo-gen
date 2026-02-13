@@ -45,14 +45,14 @@ def test_flow_optional_inputs_excluded_from_effective_inputs(monkeypatch: pytest
 
     preview = {
         "seed": 1,
-        "hosts": [{"node_id": "h1", "name": "host-1", "role": "Docker", "vulnerabilities": []}],
+        "hosts": [{"node_id": "h1", "name": "host-1", "role": "Docker", "vulnerabilities": [{"name": "v1"}]}],
         "routers": [],
         "switches": [],
         "switches_detail": [],
         "host_router_map": {},
         "r2r_links_preview": [],
     }
-    chain_nodes = [{"id": "h1", "name": "host-1", "type": "docker", "is_vuln": False}]
+    chain_nodes = [{"id": "h1", "name": "host-1", "type": "docker", "is_vuln": True}]
 
     fas = app_backend._flow_compute_flag_assignments(preview, chain_nodes, "zz-test")
     assert len(fas) == 1

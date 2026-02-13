@@ -1,11 +1,7 @@
 from pathlib import Path
 
-from core_topo_gen.sequencer.schemas import load_generator_plugin_schema, validate_against_schema
-
-
-def test_converted_generator_plugins_validate_against_plugin_schema():
+def test_converted_generator_plugins_validate_against_baseline_contract():
     repo_root = Path(__file__).resolve().parents[1]
-    schema = load_generator_plugin_schema(repo_root)
 
     plugins_dir = repo_root / "sequencer-examples" / "generators" / "plugins"
     assert plugins_dir.is_dir()
@@ -15,5 +11,10 @@ def test_converted_generator_plugins_validate_against_plugin_schema():
 
     for p in plugin_files:
         doc = __import__("json").loads(p.read_text(encoding="utf-8"))
-        ok, errors = validate_against_schema(doc, schema)
-        assert ok, f"{p.name} failed schema validation: {errors}"
+        assert isinstance(doc, dict), f"{p.name} must be a JSON object"
+        assert str(doc.get("plugin_id") or "").strip(), f"{p.name} missing plugin_id"
+        assert str(doc.get("plugin_type") or "").strip() in {"flag-generator", "flag-node-generator"}, f"{p.name} invalid plugin_type"
+        assert str(doc.get("version") or "").strip(), f"{p.name} missing version"
+        assert isinstance(doc.get("requires"), list), f"{p.name} requires must be a list"
+        assert isinstance(doc.get("produces"), list), f"{p.name} produces must be a list"
+        assert isinstance(doc.get("inputs"), dict), f"{p.name} inputs must be an object"

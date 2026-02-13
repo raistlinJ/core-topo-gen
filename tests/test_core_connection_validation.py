@@ -8,6 +8,14 @@ app = backend.app
 app.config.setdefault('TESTING', True)
 
 
+class _NoRunThread:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        return None
+
+
 def _login(client):
     resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
     assert resp.status_code in (302, 303)
@@ -41,13 +49,13 @@ def _fake_core_connection(_cfg):
 
 
 def test_require_core_ssh_credentials_requires_username():
-    with pytest.raises(backend._SSHTunnelError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         backend._require_core_ssh_credentials({'host': 'core-host', 'port': 50051, 'ssh_password': 'pw'})
     assert 'SSH username is required' in str(exc.value)
 
 
 def test_require_core_ssh_credentials_requires_password():
-    with pytest.raises(backend._SSHTunnelError) as exc:
+    with pytest.raises(RuntimeError) as exc:
         backend._require_core_ssh_credentials({'host': 'core-host', 'port': 50051, 'ssh_username': 'core'})
     assert 'SSH password is required' in str(exc.value)
 
@@ -59,8 +67,9 @@ def test_require_core_ssh_credentials_trims_fields():
         'ssh_username': ' core ',
         'ssh_password': ' pw ',
     })
-    assert cfg['ssh_username'] == 'core'
-    assert cfg['ssh_password'] == 'pw'
+    # Config normalization preserves original values; validation trims only for checks.
+    assert cfg['ssh_username'] == ' core '
+    assert cfg['ssh_password'] == ' pw '
 
 
 def test_test_core_requires_vm_selection(client, monkeypatch):
@@ -543,8 +552,10 @@ def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
 
     # Avoid heavy parsing during the test
     monkeypatch.setattr(backend, '_parse_scenarios_xml', lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
 
     resp = client.post('/run_cli_async', data={'xml_path': str(xml_path)})
-    assert resp.status_code == 400
+    # run_cli_async now accepts and validates execution prerequisites in background.
+    assert resp.status_code == 202
     data = resp.get_json()
-    assert data['error'].startswith('SSH username is required')
+    assert isinstance(data.get('run_id'), str) and data.get('run_id')
