@@ -1219,6 +1219,14 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                     artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
                 except Exception:
                     pass
+            
+            # Check for outputs/ subdirectory (new standard)
+            try:
+                outputs_sub = os.path.join(artifacts_dir, 'outputs')
+                if os.path.isdir(outputs_sub):
+                    artifacts_dir = outputs_sub
+            except Exception:
+                pass
             hint_text = str(flow_flag.get('hint') or '').strip()
             mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
             rec2: Dict[str, str] = {
@@ -1268,6 +1276,14 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
                 artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
             except Exception:
                 pass
+
+        # Check for outputs/ subdirectory (new standard)
+        try:
+            outputs_sub = os.path.join(artifacts_dir, 'outputs')
+            if os.path.isdir(outputs_sub):
+                artifacts_dir = outputs_sub
+        except Exception:
+            pass
         hint_text = str(flow_flag.get('hint') or '').strip()
         mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
         overlay: Dict[str, str] = {
@@ -1331,6 +1347,14 @@ def _flow_flag_artifacts_overlay_from_env(hdata: Any) -> Optional[Dict[str, str]
                 artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
             except Exception:
                 pass
+        
+        # Check for outputs/ subdirectory (new standard)
+        try:
+            outputs_sub = os.path.join(artifacts_dir, 'outputs')
+            if os.path.isdir(outputs_sub):
+                artifacts_dir = outputs_sub
+        except Exception:
+            pass
         mount_path = '/flow_artifacts'
         overlay: Dict[str, str] = {
             'ArtifactsDir': artifacts_dir,

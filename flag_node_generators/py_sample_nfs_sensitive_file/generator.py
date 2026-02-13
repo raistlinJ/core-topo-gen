@@ -46,10 +46,8 @@ def main() -> None:
 
     flag_value = _compute_flag(seed=seed, node_name=node_name, flag_prefix=flag_prefix)
 
-    exports_dir = outputs_dir / "exports"
-    exports_dir.mkdir(parents=True, exist_ok=True)
-    _write_text(exports_dir / "creds.txt", credential_pair + "\n")
-    _write_text(exports_dir / "flag.txt", flag_value + "\n")
+    _write_text(outputs_dir / "creds.txt", credential_pair + "\n")
+    _write_text(outputs_dir / "flag.txt", flag_value + "\n")
 
     compose_text = (
         "services:\n"
@@ -61,7 +59,7 @@ def main() -> None:
         "    ports:\n"
         f"      - \"{nfs_port}:2049\"\n"
         "    volumes:\n"
-        "      - ./exports:/exports\n"
+        "      - .:/exports\n"
     )
 
     compose_path = outputs_dir / "docker-compose.yml"
@@ -74,7 +72,7 @@ def main() -> None:
             "Credential(user, password)": credential_pair,
             "File(path)": str(compose_path.name),
             "PortForward(host, port)": nfs_port,
-            "Directory(host, path)": "/exports",
+            "Directory(host, path)": ".",
         },
     }
     _write_text(outputs_dir / "outputs.json", json.dumps(manifest, indent=2) + "\n")

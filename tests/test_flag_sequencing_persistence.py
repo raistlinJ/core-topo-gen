@@ -1,9 +1,48 @@
 import json
 import os
-import time
+import shutil
+import tempfile
 import uuid
 
 from webapp import app_backend
+
+
+def _seed_xml_plan(scenario: str, full_preview: dict, flow_meta: dict | None = None) -> tuple[str, str]:
+        td = tempfile.mkdtemp(prefix="coretg-flow-persist-")
+        xml_path = os.path.join(td, f"{scenario}.xml")
+        xml = f"""<Scenarios>
+    <Scenario name='{scenario}'>
+        <ScenarioEditor>
+            <section name='Node Information'>
+                <item selected='Docker' v_metric='Count' v_count='2'/>
+            </section>
+            <section name='Routing' density='0.0'></section>
+            <section name='Services' density='0.0'></section>
+            <section name='Vulnerabilities' density='0.0'></section>
+            <section name='Segmentation' density='0.0'></section>
+            <section name='Traffic' density='0.0'></section>
+        </ScenarioEditor>
+    </Scenario>
+</Scenarios>"""
+        with open(xml_path, "w", encoding="utf-8") as f:
+                f.write(xml)
+
+        payload = {
+                "full_preview": full_preview,
+                "metadata": {
+                        "xml_path": xml_path,
+                        "scenario": scenario,
+                        "seed": full_preview.get("seed"),
+                },
+        }
+        if isinstance(flow_meta, dict) and flow_meta:
+                payload["metadata"]["flow"] = flow_meta
+        ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, payload)
+        assert ok, err
+        if isinstance(flow_meta, dict) and flow_meta:
+                ok2, err2 = app_backend._update_flow_state_in_xml(xml_path, scenario, flow_meta)
+                assert ok2, err2
+        return xml_path, td
 
 
 def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_path):
@@ -24,7 +63,7 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
         'switches_detail': [],
         'hosts': [
             {'node_id': 'h1', 'name': 'host-1', 'role': 'Docker', 'vulnerabilities': []},
-            {'node_id': 'h2', 'name': 'host-2', 'role': 'Docker', 'vulnerabilities': []},
+            {'node_id': 'h2', 'name': 'host-2', 'role': 'Docker', 'vulnerabilities': [{'id': 'dummy'}]},
         ],
         'host_router_map': {},
         'r2r_links_preview': [],
@@ -54,31 +93,19 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
         },
     ]
 
-    plan_payload = {
-        'full_preview': full_preview,
-        'metadata': {
-            'xml_path': '/tmp/does-not-matter.xml',
+    plan_path, plan_dir = _seed_xml_plan(
+        scenario,
+        full_preview,
+        flow_meta={
             'scenario': scenario,
-            'seed': 123,
-            'flow': {
-                'scenario': scenario,
-                'length': 2,
-                'chain': saved_chain,
-                'flag_assignments': saved_assignments,
-                'modified_at': '2026-01-06T00:00:00Z',
-            },
+            'length': 2,
+            'chain': saved_chain,
+            'flag_assignments': saved_assignments,
+            'modified_at': '2026-01-06T00:00:00Z',
         },
-    }
-
-    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
-    with open(plan_path, 'w', encoding='utf-8') as f:
-        json.dump(plan_payload, f)
+    )
 
     try:
-        # Ensure the helper prefers the flow plan (scenario is unique).
-        chosen = app_backend._latest_preview_plan_for_scenario_norm(scenario)
-        assert chosen == plan_path
-
         # Now fetch preview using this plan explicitly.
         resp = client.get('/api/flag-sequencing/attackflow_preview', query_string={
             'scenario': scenario,
@@ -98,10 +125,7 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
         assert [fa.get('id') for fa in fas] == ['binary_embed_text', 'nfs_sensitive_file']
         assert [fa.get('hint') for fa in fas] == ['saved hint 2', 'saved hint 1']
     finally:
-        try:
-            os.remove(plan_path)
-        except Exception:
-            pass
+        shutil.rmtree(plan_dir, ignore_errors=True)
 
 
 def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(tmp_path):
@@ -151,25 +175,17 @@ def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(t
         },
     ]
 
-    plan_payload = {
-        'full_preview': full_preview,
-        'metadata': {
-            'xml_path': '/tmp/does-not-matter.xml',
+    plan_path, plan_dir = _seed_xml_plan(
+        scenario,
+        full_preview,
+        flow_meta={
             'scenario': scenario,
-            'seed': 123,
-            'flow': {
-                'scenario': scenario,
-                'length': 2,
-                'chain': saved_chain,
-                'flag_assignments': saved_assignments,
-                'modified_at': '2026-01-06T00:00:00Z',
-            },
+            'length': 2,
+            'chain': saved_chain,
+            'flag_assignments': saved_assignments,
+            'modified_at': '2026-01-06T00:00:00Z',
         },
-    }
-
-    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
-    with open(plan_path, 'w', encoding='utf-8') as f:
-        json.dump(plan_payload, f)
+    )
 
     try:
         resp = client.get('/api/flag-sequencing/attackflow_preview', query_string={
@@ -185,7 +201,4 @@ def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(t
         chain = data.get('chain') or []
         assert [c.get('id') for c in chain] == ['h2', 'h1']
     finally:
-        try:
-            os.remove(plan_path)
-        except Exception:
-            pass
+        shutil.rmtree(plan_dir, ignore_errors=True)

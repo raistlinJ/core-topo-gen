@@ -2010,20 +2010,11 @@ def _extract_inject_files_from_payload(payload: Dict[str, Any]) -> List[str]:
 
 
 def _load_plan_preview_payload_from_path(path: str, scenario_label: str | None) -> Dict[str, Any] | None:
-    if not path:
+    ap = _existing_xml_path_or_none(path)
+    if not ap:
         return None
     try:
-        ap = os.path.abspath(str(path))
-    except Exception:
-        ap = str(path)
-    if not ap or not os.path.exists(ap):
-        return None
-    try:
-        if ap.lower().endswith('.xml'):
-            return _load_plan_preview_from_xml(ap, scenario_label)
-        with open(ap, 'r', encoding='utf-8') as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else None
+        return _load_plan_preview_from_xml(ap, scenario_label)
     except Exception:
         return None
 
@@ -6282,6 +6273,168 @@ def _reports_dir() -> str:
     d = os.path.join(_get_repo_root(), 'reports')
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _abs_path_or_original(path_value: Any, *, base_dir: str | None = None) -> str:
+    try:
+        raw = str(path_value or '').strip()
+    except Exception:
+        return ''
+    if not raw:
+        return ''
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(raw))
+    except Exception:
+        expanded = raw
+    try:
+        if os.path.isabs(expanded):
+            return os.path.abspath(expanded)
+        if base_dir:
+            return os.path.abspath(os.path.join(base_dir, expanded))
+        return os.path.abspath(expanded)
+    except Exception:
+        return raw
+
+
+def _existing_xml_path_or_none(path_value: Any) -> str | None:
+    p = _abs_path_or_original(path_value)
+    if not p:
+        return None
+    try:
+        if (not str(p).lower().endswith('.xml')) or (not os.path.exists(p)):
+            return None
+    except Exception:
+        return None
+    return p
+
+
+def _looks_like_path_field(field_name: str) -> bool:
+    try:
+        key = str(field_name or '').strip().lower()
+    except Exception:
+        return False
+    if not key:
+        return False
+    return (
+        ('path' in key)
+        or key.endswith('_dir')
+        or key.endswith('_file')
+        or key.endswith('_filepath')
+        or key in {'file', 'mount_dir', 'run_dir', 'outputs_manifest'}
+    )
+
+
+def _canonicalize_flow_assignment_paths(assignment: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(assignment, dict):
+        return assignment
+    out = dict(assignment)
+    for key in ('artifacts_dir', 'mount_dir', 'run_dir', 'outputs_manifest'):
+        if key in out:
+            out[key] = _abs_path_or_original(out.get(key))
+    base_dir = (
+        str(out.get('run_dir') or '').strip()
+        or str(out.get('artifacts_dir') or '').strip()
+        or str(out.get('mount_dir') or '').strip()
+        or ''
+    )
+    if not base_dir:
+        try:
+            manifest = str(out.get('outputs_manifest') or '').strip()
+            if manifest:
+                base_dir = os.path.dirname(manifest)
+        except Exception:
+            base_dir = ''
+
+    inject_files = out.get('inject_files') if isinstance(out.get('inject_files'), list) else None
+    if inject_files is not None:
+        fixed_injects: list[Any] = []
+        for item in inject_files:
+            if isinstance(item, str):
+                fixed_injects.append(_abs_path_or_original(item, base_dir=base_dir or None))
+            else:
+                fixed_injects.append(item)
+        out['inject_files'] = fixed_injects
+
+    detail = out.get('inject_files_detail') if isinstance(out.get('inject_files_detail'), list) else None
+    if detail is not None:
+        fixed_detail: list[Any] = []
+        for item in detail:
+            if not isinstance(item, dict):
+                fixed_detail.append(item)
+                continue
+            item2 = dict(item)
+            if 'path' in item2:
+                item2['path'] = _abs_path_or_original(item2.get('path'), base_dir=base_dir or None)
+            if 'resolved' in item2:
+                item2['resolved'] = _abs_path_or_original(item2.get('resolved'), base_dir=base_dir or None)
+            fixed_detail.append(item2)
+        out['inject_files_detail'] = fixed_detail
+
+    ro = out.get('resolved_outputs') if isinstance(out.get('resolved_outputs'), dict) else None
+    if ro is not None:
+        fixed_ro: dict[str, Any] = {}
+        for key, value in ro.items():
+            if isinstance(value, str) and _looks_like_path_field(str(key)):
+                fixed_ro[key] = _abs_path_or_original(value, base_dir=base_dir or None)
+            else:
+                fixed_ro[key] = value
+        out['resolved_outputs'] = fixed_ro
+
+    ro_detail = out.get('resolved_outputs_detail') if isinstance(out.get('resolved_outputs_detail'), list) else None
+    if ro_detail is not None:
+        fixed_ro_detail: list[Any] = []
+        for item in ro_detail:
+            if not isinstance(item, dict):
+                fixed_ro_detail.append(item)
+                continue
+            item2 = dict(item)
+            field = str(item2.get('field') or '').strip()
+            if isinstance(item2.get('resolved'), str) and _looks_like_path_field(field):
+                item2['resolved'] = _abs_path_or_original(item2.get('resolved'), base_dir=base_dir or None)
+            fixed_ro_detail.append(item2)
+        out['resolved_outputs_detail'] = fixed_ro_detail
+
+    return out
+
+
+def _canonicalize_flow_state_paths(flow_state: dict[str, Any], *, xml_path: str | None = None) -> dict[str, Any]:
+    if not isinstance(flow_state, dict):
+        return flow_state
+    out = dict(flow_state)
+    xml_abs = _abs_path_or_original(xml_path) if xml_path else ''
+    xml_dir = os.path.dirname(xml_abs) if xml_abs else ''
+
+    for key in ('source_preview_plan_path', 'preview_plan_path', 'base_preview_plan_path', 'xml_path'):
+        if key in out:
+            out[key] = _abs_path_or_original(out.get(key), base_dir=xml_dir or None)
+
+    assigns = out.get('flag_assignments') if isinstance(out.get('flag_assignments'), list) else None
+    if assigns is not None:
+        out['flag_assignments'] = [
+            _canonicalize_flow_assignment_paths(a) if isinstance(a, dict) else a
+            for a in assigns
+        ]
+    return out
+
+
+def _canonicalize_plan_payload_paths(plan_payload: dict[str, Any], *, xml_path: str | None = None) -> dict[str, Any]:
+    if not isinstance(plan_payload, dict):
+        return plan_payload
+    out = dict(plan_payload)
+    xml_abs = _abs_path_or_original(xml_path) if xml_path else ''
+
+    meta = out.get('metadata') if isinstance(out.get('metadata'), dict) else {}
+    meta2 = dict(meta)
+    meta_xml = _abs_path_or_original(meta2.get('xml_path') or '', base_dir=os.path.dirname(xml_abs) if xml_abs else None)
+    if not meta_xml and xml_abs:
+        meta_xml = xml_abs
+    if meta_xml:
+        meta2['xml_path'] = meta_xml
+    flow_meta = meta2.get('flow') if isinstance(meta2.get('flow'), dict) else None
+    if isinstance(flow_meta, dict):
+        meta2['flow'] = _canonicalize_flow_state_paths(flow_meta, xml_path=meta_xml or xml_abs)
+    out['metadata'] = meta2
+    return out
 
 def _node_schema_authoring_path() -> str:
     return os.path.join(_get_repo_root(), 'new-schema', 'node_schema_authoring.yaml')
@@ -11576,7 +11729,7 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
 def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[str], *, repair: bool = True) -> dict | None:
     """Best-effort: load saved Flag Sequencing (flow) metadata for a full_preview payload.
 
-    Flow state is sourced only from the scenario XML (FlagSequencing/FlowState).
+    Flow state is sourced only from scenario XML (FlagSequencing/FlowState).
     Returns the flow metadata without mutating the full_preview.
     """
     try:
@@ -11727,6 +11880,10 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
     used: set[str] = set()
     chain_out: list[dict[str, str]] = []
     assignments_out: list[dict[str, Any]] | None = [] if assignments is not None else None
+    all_nodes_sorted = sorted(
+        [n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()],
+        key=lambda x: str(x.get('id') or ''),
+    )
 
     for i, step in enumerate(chain_in):
         step_id = str((step or {}).get('id') or '').strip() if isinstance(step, dict) else ''
@@ -11738,7 +11895,7 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
             except Exception:
                 kind = 'flag-generator'
 
-        need_nonvuln_docker = (kind == 'flag-node-generator')
+        need_nonvuln_docker = (kind == 'flag-node-generator') if assignments is not None else None
 
         cand = id_map.get(step_id) if step_id else None
         if cand is not None:
@@ -11747,7 +11904,9 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
             if ok:
                 is_docker = _flow_node_is_docker_role(cand)
                 is_vuln = _flow_node_is_vuln(cand)
-                if need_nonvuln_docker:
+                if need_nonvuln_docker is None:
+                    ok = True
+                elif need_nonvuln_docker:
                     ok = bool(is_docker and (not is_vuln))
                 else:
                     ok = bool(is_vuln)
@@ -11755,7 +11914,10 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
                 cand = None
 
         if cand is None:
-            pool = eligible_nonvuln_docker if need_nonvuln_docker else eligible_any
+            if need_nonvuln_docker is None:
+                pool = all_nodes_sorted
+            else:
+                pool = eligible_nonvuln_docker if need_nonvuln_docker else eligible_any
             pick = None
             for n in pool:
                 nid = str(n.get('id') or '').strip()
@@ -12315,29 +12477,45 @@ def api_flow_revalidate_flow():
         return jsonify({'ok': False, 'error': 'No XML found for this scenario.'}), 404
 
     flow_state = _flow_state_from_xml_path(xml_path, scenario_norm)
-    if not isinstance(flow_state, dict):
-        return jsonify({'ok': False, 'error': 'No FlowState found in XML. Save XML after resolve.'}), 400
 
-    has_resolved = False
+    def _has_resolved_outputs(assignments: Any) -> bool:
+        try:
+            arr = assignments if isinstance(assignments, list) else []
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    continue
+                ro = entry.get('resolved_outputs')
+                if isinstance(ro, dict) and ro:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    xml_assigns: list[dict[str, Any]] = []
     try:
-        assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
-        for entry in assigns or []:
-            if not isinstance(entry, dict):
-                continue
-            ro = entry.get('resolved_outputs')
-            if isinstance(ro, dict) and ro:
-                has_resolved = True
-                break
+        if isinstance(flow_state, dict) and isinstance(flow_state.get('flag_assignments'), list):
+            xml_assigns = [x for x in flow_state.get('flag_assignments') if isinstance(x, dict)]
     except Exception:
-        has_resolved = False
-    if not has_resolved:
+        xml_assigns = []
+
+    request_assigns: list[dict[str, Any]] = []
+    try:
+        raw_req_assigns = j.get('flag_assignments')
+        if isinstance(raw_req_assigns, list):
+            request_assigns = [x for x in raw_req_assigns if isinstance(x, dict)]
+    except Exception:
+        request_assigns = []
+
+    if _has_resolved_outputs(xml_assigns):
+        assigns = xml_assigns
+    elif _has_resolved_outputs(request_assigns):
+        assigns = request_assigns
+    elif isinstance(flow_state, dict):
         return jsonify({'ok': False, 'error': 'No resolved outputs saved in XML. Run Generate and Save XML first.'}), 400
+    else:
+        return jsonify({'ok': False, 'error': 'No FlowState found in XML. Generate (or Save XML) first.'}), 400
 
     flat_expected: list[tuple[str, str]] = []
-    try:
-        assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else []
-    except Exception:
-        assigns = []
     for entry in assigns or []:
         if not isinstance(entry, dict):
             continue
@@ -12390,12 +12568,20 @@ def api_flow_revalidate_flow():
                 if file_val.startswith('/'):
                     flat_expected.append((node_key, file_val))
                 elif base_dir:
+                    # Check literal
                     flat_expected.append((node_key, os.path.join(base_dir, file_val)))
+                    # Check outputs/ subdirectory
+                    flat_expected.append((node_key, os.path.join(base_dir, 'outputs', file_val)))
+                    # Check flattened fallback if literal failed
+                    if file_val.startswith('artifacts/'):
+                        flat_expected.append((node_key, os.path.join(base_dir, os.path.basename(file_val))))
                 elif file_val.startswith('artifacts/'):
-                    # Fallback: no base_dir but we have a relative artifacts path.
-                    # Use default CORE VM path pattern for flow generator outputs (prioritize static naming).
+                    # Fallback pattern
                     fallback_base = f'/tmp/vulns/flag_generators_runs/flow-{scenario_safe}'
+                    # literal
                     flat_expected.append((node_key, os.path.join(fallback_base, file_val)))
+                    # flattened
+                    flat_expected.append((node_key, os.path.join(fallback_base, os.path.basename(file_val))))
         except Exception:
             pass
 
@@ -12571,7 +12757,16 @@ def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
             with open(flag_txt, 'r', encoding='utf-8', errors='ignore') as f:
                 val = (f.read() or '').strip()
                 return val[:4096] if val else ''
+        flag_txt_outputs = os.path.join(dd, 'outputs', 'flag.txt')
+        if os.path.isfile(flag_txt_outputs):
+             with open(flag_txt_outputs, 'r', encoding='utf-8', errors='ignore') as f:
+                val = (f.read() or '').strip()
+                return val[:4096] if val else ''
+
         outs_path = os.path.join(dd, 'outputs.json')
+        if not os.path.isfile(outs_path):
+             outs_path = os.path.join(dd, 'outputs', 'outputs.json')
+
         if os.path.isfile(outs_path):
             try:
                 with open(outs_path, 'r', encoding='utf-8') as f:
@@ -12608,6 +12803,9 @@ def _flow_read_outputs_map_from_artifacts_dir(artifacts_dir: str) -> dict[str, A
         if not os.path.isdir(dd):
             return {}
         outs_path = os.path.join(dd, 'outputs.json')
+        if not os.path.isfile(outs_path):
+             outs_path = os.path.join(dd, 'outputs', 'outputs.json')
+        
         if not os.path.isfile(outs_path):
             return {}
         with open(outs_path, 'r', encoding='utf-8') as f:
@@ -14136,13 +14334,23 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
                         resolved = str(item2.get('resolved') or '').strip()
                         if resolved and not os.path.isabs(resolved):
                             # Resolve relative path to absolute using artifacts_dir
+                            # 1. Try literal join
                             full_path = os.path.join(art_dir, resolved.lstrip('/'))
+                            # 2. Try outputs/ subdirectory
                             if not os.path.exists(full_path):
-                                # Try without 'artifacts/' prefix if it exists
+                                cand = os.path.join(art_dir, 'outputs', resolved.lstrip('/'))
+                                if os.path.exists(cand):
+                                    full_path = cand
+                            # 3. Try without 'artifacts/' prefix if it exists
+                            if not os.path.exists(full_path):
                                 if resolved.startswith('artifacts/'):
                                     alt_path = os.path.join(art_dir, resolved[len('artifacts/'):])
                                     if os.path.exists(alt_path):
                                         full_path = alt_path
+                                    else:
+                                        alt_path = os.path.join(art_dir, 'outputs', resolved[len('artifacts/'):])
+                                        if os.path.exists(alt_path):
+                                            full_path = alt_path
                             item2['resolved'] = full_path
                             changed = True
                         fixed_detail.append(item2)
@@ -14155,11 +14363,23 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
                         if isinstance(v, str) and v.strip() and not os.path.isabs(v):
                             # Check if this looks like a file path (contains slash or file extension)
                             if '/' in v or ('.' in v and not v.startswith('{')):
+                                # Try to find the file in art_dir or art_dir/outputs
+                                flat_v = os.path.basename(v)
                                 full_path = os.path.join(art_dir, v.lstrip('/'))
-                                if not os.path.exists(full_path) and v.startswith('artifacts/'):
-                                    alt_path = os.path.join(art_dir, v[len('artifacts/'):])
-                                    if os.path.exists(alt_path):
-                                        full_path = alt_path
+                                if not os.path.exists(full_path):
+                                    cand = os.path.join(art_dir, 'outputs', v.lstrip('/'))
+                                    if os.path.exists(cand):
+                                        full_path = cand
+                                if not os.path.exists(full_path):
+                                    # Try flattened fallback in outputs/
+                                    cand = os.path.join(art_dir, 'outputs', flat_v)
+                                    if os.path.exists(cand):
+                                        full_path = cand
+                                if not os.path.exists(full_path):
+                                    # Try flattened fallback in root
+                                    cand = os.path.join(art_dir, flat_v)
+                                    if os.path.exists(cand):
+                                        full_path = cand
                                 fixed_ro[k] = full_path
                                 changed = True
                             else:
@@ -16076,7 +16296,7 @@ def api_flow_sequence_preview_plan():
     try:
         meta = payload.get('metadata') if isinstance(payload, dict) else {}
         flow_meta = {
-            'source_preview_plan_path': preview_plan_path,
+            'source_preview_plan_path': _abs_path_or_original(preview_plan_path),
             'scenario': scenario_label or scenario_norm,
             'length': len(chain_nodes),
             'requested_length': requested_length,
@@ -16234,30 +16454,18 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         pass
 
-    canonical_plan_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
-
     base_plan_path = str(j.get('preview_plan') or '').strip() or None
     if base_plan_path:
-        try:
-            base_plan_path = os.path.abspath(base_plan_path)
-            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
-            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
-                base_plan_path = None
-            elif not os.path.exists(base_plan_path):
-                base_plan_path = None
-        except Exception:
-            base_plan_path = None
-    try:
-        if canonical_plan_path and os.path.exists(canonical_plan_path):
-            if not base_plan_path or os.path.abspath(base_plan_path) != os.path.abspath(canonical_plan_path):
-                base_plan_path = canonical_plan_path
-    except Exception:
-        pass
+        base_plan_path = _existing_xml_path_or_none(base_plan_path)
     if not base_plan_path:
         try:
             entry = _planner_get_plan(scenario_norm)
             if entry:
-                base_plan_path = entry.get('plan_path') or base_plan_path
+                base_plan_path = (
+                    _existing_xml_path_or_none(entry.get('plan_path'))
+                    or _existing_xml_path_or_none(entry.get('xml_path'))
+                    or base_plan_path
+                )
         except Exception:
             base_plan_path = base_plan_path
 
@@ -17053,10 +17261,23 @@ def api_flow_prepare_preview_for_execute():
             return False
         return False
 
-    def _flow_unique_dest_filename(dir_path: str, filename: str) -> str:
+    def _flow_unique_dest_filename(dir_path: str, filename: str, sequence: int = None) -> str:
         base = secure_filename(filename) or 'upload'
         cand = base
+        if not os.path.exists(os.path.join(dir_path, cand)):
+            return cand
+        
         root, ext = os.path.splitext(base)
+        import random
+        # User requested sequence and random number on conflict.
+        seq_str = f"{sequence:02d}_" if sequence is not None else ""
+        for _ in range(100):
+            rand = random.randint(1000, 9999)
+            cand = f"{seq_str}{rand}_{root}{ext}"
+            if not os.path.exists(os.path.join(dir_path, cand)):
+                return cand
+        
+        # Fallback
         i = 1
         while os.path.exists(os.path.join(dir_path, cand)):
             cand = f"{root}_{i}{ext}"
@@ -17065,7 +17286,7 @@ def api_flow_prepare_preview_for_execute():
                 break
         return cand
 
-    def _flow_stage_file_inputs_for_generator(cfg_to_pass: dict[str, Any], gen_def: dict[str, Any], *, run_dir: str) -> None:
+    def _flow_stage_file_inputs_for_generator(cfg_to_pass: dict[str, Any], gen_def: dict[str, Any], *, run_dir: str, run_index: int = None) -> None:
         if not isinstance(cfg_to_pass, dict) or not isinstance(gen_def, dict):
             return
         if not run_dir:
@@ -17090,8 +17311,9 @@ def api_flow_prepare_preview_for_execute():
         if not file_input_names and not file_list_input_names:
             return
 
-        inputs_dir = os.path.join(str(run_dir), 'inputs')
-        os.makedirs(inputs_dir, exist_ok=True)
+        # Staging: place files in run_dir/inputs/
+        target_dir = os.path.join(run_dir, 'inputs')
+        os.makedirs(target_dir, exist_ok=True)
 
         for key in list(cfg_to_pass.keys()):
             # file
@@ -17102,7 +17324,7 @@ def api_flow_prepare_preview_for_execute():
                 raw = val.strip()
                 if not raw:
                     continue
-                # Already a container path.
+                # Already a container path (we still use /inputs/ as a virtual prefix in config)
                 if raw.startswith('/inputs/'):
                     continue
                 if not _flow_is_allowed_upload_path(raw):
@@ -17115,8 +17337,8 @@ def api_flow_prepare_preview_for_execute():
                     base = os.path.basename(src) or f"{key}.upload"
                 except Exception:
                     base = f"{key}.upload"
-                dest_name = _flow_unique_dest_filename(inputs_dir, base)
-                dest = os.path.join(inputs_dir, dest_name)
+                dest_name = _flow_unique_dest_filename(target_dir, base, sequence=run_index)
+                dest = os.path.join(target_dir, dest_name)
                 try:
                     shutil.copyfile(src, dest)
                     cfg_to_pass[key] = f"/inputs/{dest_name}"
@@ -17148,8 +17370,8 @@ def api_flow_prepare_preview_for_execute():
                         base = os.path.basename(src) or f"{key}.upload"
                     except Exception:
                         base = f"{key}.upload"
-                    dest_name = _flow_unique_dest_filename(inputs_dir, base)
-                    dest = os.path.join(inputs_dir, dest_name)
+                    dest_name = _flow_unique_dest_filename(target_dir, base, sequence=run_index)
+                    dest = os.path.join(target_dir, dest_name)
                     try:
                         shutil.copyfile(src, dest)
                         staged.append(f"/inputs/{dest_name}")
@@ -17360,7 +17582,9 @@ def api_flow_prepare_preview_for_execute():
                 timeout=max(1, int(timeout_s or 120)),
                 env=env,
             )
-            manifest_path = os.path.join(out_dir, 'outputs.json')
+            manifest_path = os.path.join(out_dir, 'outputs', 'outputs.json')
+            if not os.path.exists(manifest_path):
+                manifest_path = os.path.join(out_dir, 'outputs.json')
             stdout_tail = (p.stdout or '').strip()[-4000:]
             stderr_tail = (p.stderr or '').strip()[-4000:]
             if p.returncode != 0:
@@ -17439,7 +17663,10 @@ def api_flow_prepare_preview_for_execute():
             "    env['CORETG_INJECT_FILES_JSON']=INJECT\n"
             "cmd=[sys.executable, runner, '--kind', KIND, '--generator-id', GEN, '--out-dir', OUT, '--config', CFG, '--repo-root', REPO]\n"
             f"p=subprocess.run(cmd, cwd=REPO, env=env, check=False, capture_output=True, text=True, timeout=max(1, int({timeout_literal})))\n"
-            "manifest=os.path.join(OUT,'outputs.json')\n"
+            "OUT_ARTIFACTS=os.path.join(OUT,'outputs')\n"
+            "manifest=os.path.join(OUT_ARTIFACTS,'outputs.json')\n"
+            "if not os.path.exists(manifest):\n"
+            "  manifest=os.path.join(OUT,'outputs.json')\n"
             "outputs=None\n"
             "if os.path.exists(manifest):\n"
             "  try:\n"
@@ -17450,20 +17677,51 @@ def api_flow_prepare_preview_for_execute():
             "    outputs=None\n"
             "if outputs is None:\n"
             "  try:\n"
-            "    flag_path=os.path.join(OUT,'flag.txt')\n"
+            "    flag_path=os.path.join(OUT_ARTIFACTS,'flag.txt')\n"
             "    if os.path.exists(flag_path):\n"
             "      flag_val=open(flag_path,'r',encoding='utf-8',errors='ignore').read().strip()\n"
             "      if flag_val:\n"
             "        outputs={'Flag(flag_id)': flag_val, 'flag': flag_val}\n"
             "  except Exception:\n"
             "    outputs=outputs\n"
+            "ok=bool(p.returncode==0)\n"
+            "err=None\n"
+            "if ok and outputs:\n"
+            "  for k,v in outputs.items():\n"
+            "    if isinstance(v,str) and (v.startswith('/') or '/' in v or '.' in v):\n"
+            "      v=v.strip()\n"
+            "      exists=os.path.exists(v)\n"
+            "      checked=[v]\n"
+            "      if not exists:\n"
+            "        candidates=[]\n"
+            "        candidates.append(os.path.join(OUT_ARTIFACTS,v.lstrip('/')))\n"
+            "        candidates.append(os.path.join(OUT,v.lstrip('/')))\n"
+            "        candidates.append(os.path.join(OUT_ARTIFACTS,os.path.basename(v)))\n"
+            "        candidates.append(os.path.join(OUT,os.path.basename(v)))\n"
+            "        if v.startswith('artifacts/'):\n"
+            "          tail=v.split('artifacts/',1)[1].lstrip('/')\n"
+            "          candidates.append(os.path.join(OUT,'artifacts',tail))\n"
+            "          candidates.append(os.path.join(OUT_ARTIFACTS,'artifacts',tail))\n"
+            "          candidates.append(os.path.join(OUT,'artifacts',os.path.basename(v)))\n"
+            "        for cand in candidates:\n"
+            "          if not cand or cand in checked:\n"
+            "            continue\n"
+            "          checked.append(cand)\n"
+            "          if os.path.exists(cand):\n"
+            "            exists=True\n"
+            "            break\n"
+            "      if not exists:\n"
+            "        ok=False\n"
+            "        err=f'Artifact verification failed: {v} does not exist on remote disk (checked: {checked})'\n"
+            "        break\n"
             "print(json.dumps({\n"
-            "  'ok': bool(p.returncode==0),\n"
+            "  'ok': ok,\n"
             "  'rc': int(p.returncode or 0),\n"
             "  'stdout': (p.stdout or '')[-4000:],\n"
             "  'stderr': (p.stderr or '')[-4000:],\n"
             "  'manifest': manifest if os.path.exists(manifest) else None,\n"
             "  'outputs': outputs,\n"
+            "  'error': err,\n"
             "}))\n"
         )
         try:
@@ -17483,10 +17741,14 @@ def api_flow_prepare_preview_for_execute():
         stderr = str(payload.get('stderr') or '') if isinstance(payload, dict) else ''
         manifest_path = payload.get('manifest') if isinstance(payload, dict) else None
         outputs = payload.get('outputs') if isinstance(payload, dict) else None
+        remote_err = payload.get('error') if isinstance(payload, dict) else None
         note = 'ok'
         if not ok:
             tail = (stderr or stdout).strip()
-            note = f'remote generator failed (rc={rc}): {tail[-800:] if tail else "(no output)"}'
+            if remote_err:
+                note = str(remote_err)
+            else:
+                note = f'remote generator failed (rc={rc}): {tail[-800:] if tail else "(no output)"}'
         elif not manifest_path:
             tail = (stderr or stdout).strip()
             if tail:
@@ -18011,7 +18273,7 @@ def api_flow_prepare_preview_for_execute():
                             try:
                                 gen_def = _gen_by_id.get(generator_id)
                                 if isinstance(gen_def, dict) and isinstance(cfg, dict):
-                                    _flow_stage_file_inputs_for_generator(cfg, gen_def, run_dir=str(flow_out_dir))
+                                    _flow_stage_file_inputs_for_generator(cfg, gen_def, run_dir=str(flow_out_dir), run_index=run_index)
                             except Exception:
                                 pass
 
@@ -18043,7 +18305,8 @@ def api_flow_prepare_preview_for_execute():
                             except Exception:
                                 repo_root = os.getcwd()
                             allowed_root = os.path.abspath(_flow_inject_uploads_dir())
-                            art_dir = os.path.join(run_dir, 'artifacts')
+                            # Standard: use run_dir/injects/ subdirectory.
+                            art_dir = os.path.join(run_dir, 'injects')
                             os.makedirs(art_dir, exist_ok=True)
 
                             out_list: list[str] = []
@@ -18064,12 +18327,15 @@ def api_flow_prepare_preview_for_execute():
                                     try:
                                         if os.path.commonpath([allowed_root, abs_src]) == allowed_root:
                                             base = os.path.basename(abs_src.rstrip('/')) or 'upload'
-                                            dest_path = os.path.join(art_dir, base)
+                                            # Use conflict resolution with run_index.
+                                            dest_name = _flow_unique_dest_filename(art_dir, base, sequence=run_index)
+                                            dest_path = os.path.join(art_dir, dest_name)
                                             if os.path.isdir(abs_src):
                                                 shutil.copytree(abs_src, dest_path, dirs_exist_ok=True)
                                             else:
                                                 shutil.copy2(abs_src, dest_path)
-                                            new_src = f"artifacts/{base}"
+                                            # Flat reference: no "artifacts/" prefix.
+                                            new_src = dest_name
                                             if dest_raw:
                                                 out_list.append(f"{new_src} -> {dest_raw}")
                                             else:
@@ -18100,6 +18366,8 @@ def api_flow_prepare_preview_for_execute():
                                     # substitute the absolute path.
                                     if src in artifact_context:
                                         final_src = artifact_context[src]
+                                    elif f"artifacts/{src}" in artifact_context:
+                                        final_src = artifact_context[f"artifacts/{src}"]
                                     elif src in flow_context:
                                         # Fallback: if flow_context has a string value that looks like a path, try it?
                                         # For now, trust artifact_context which is explicitly validated against disk.
@@ -18157,6 +18425,55 @@ def api_flow_prepare_preview_for_execute():
                                             manifest_outputs = {'Flag(flag_id)': flag_val, 'flag': flag_val}
                                 except Exception:
                                     manifest_outputs = manifest_outputs
+
+                            # Local artifact verification
+                            if ok_run and flow_out_dir and os.path.isdir(flow_out_dir):
+                                verification_outs = manifest_outputs
+                                if not verification_outs and manifest_path and os.path.exists(manifest_path):
+                                    try:
+                                        with open(manifest_path, 'r', encoding='utf-8') as f:
+                                            m = json.load(f) or {}
+                                            verification_outs = m.get('outputs')
+                                    except Exception:
+                                        pass
+
+                                    # Check for outputs.json in outputs/ subdirectory
+                                    flow_out_artifacts_dir = os.path.join(flow_out_dir, 'outputs')
+                                    manifest_path = os.path.join(flow_out_artifacts_dir, 'outputs.json')
+                                    manifest_outputs = None
+                                    if os.path.exists(manifest_path):
+                                        try:
+                                            with open(manifest_path, 'r', encoding='utf-8') as mf:
+                                                mdoc = json.load(mf)
+                                                manifest_outputs = mdoc.get('outputs') if isinstance(mdoc, dict) else None
+                                        except Exception:
+                                            manifest_outputs = None
+                                    
+                                    if manifest_outputs is None:
+                                        try:
+                                            flag_path = os.path.join(flow_out_artifacts_dir, 'flag.txt')
+                                            if os.path.exists(flag_path):
+                                                with open(flag_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                                    flag_val = (f.read() or '').strip()
+                                                if flag_val:
+                                                    manifest_outputs = {'Flag(flag_id)': flag_val, 'flag': flag_val}
+                                        except Exception:
+                                            manifest_outputs = manifest_outputs
+
+                                    if ok_run and manifest_outputs:
+                                        # Incremental Validation: check disk for reported artifacts.
+                                        for kk, vv in manifest_outputs.items():
+                                            if isinstance(vv, str) and (vv.startswith('/') or '/' in vv or '.' in vv):
+                                                exists = os.path.exists(vv)
+                                                if not exists:
+                                                    # Fallback: check relative to flow_out_artifacts_dir
+                                                    cand = os.path.join(flow_out_artifacts_dir, vv.lstrip('/'))
+                                                    if os.path.exists(cand):
+                                                        exists = True
+                                                if not exists:
+                                                     ok_run = False
+                                                     note = f"Artifact verification failed: {vv} does not exist on local disk"
+                                                     break
 
                         try:
                             app.logger.info(
@@ -18237,6 +18554,10 @@ def api_flow_prepare_preview_for_execute():
                                     failed_run_dirs.append(str(flow_out_dir))
                             except Exception:
                                 pass
+                            
+                            if not best_effort:
+                                # Early exit: stop generation on first failure.
+                                break
 
                         # If the generator produced a manifest, capture the actual output keys.
                         if ok_run and (manifest_outputs is not None or (manifest_path and os.path.exists(manifest_path))):
@@ -18276,78 +18597,41 @@ def api_flow_prepare_preview_for_execute():
                                     except Exception:
                                         pass
 
-                                    # Normalize artifact paths: if reported as "file.txt" but exists as "subdir/file.txt", fix it.
-                                    try:
-                                        if flow_out_dir and os.path.isdir(flow_out_dir):
-                                            # Scan all immediate subdirectories for missing files.
-                                            subdirs = []
-                                            try:
-                                                subdirs = [
-                                                    d for d in os.listdir(flow_out_dir) 
-                                                    if os.path.isdir(os.path.join(flow_out_dir, d)) 
-                                                    and not d.startswith('.')
-                                                ]
-                                                # Prioritize 'artifacts' if present, else alphanumeric sort.
-                                                subdirs.sort(key=lambda x: (0 if x == 'artifacts' else 1, x))
-                                            except Exception:
-                                                pass
-
-                                            if subdirs:
-                                                updates = {}
-                                                for k, v in outs.items():
-                                                    if not isinstance(v, str) or not v.strip():
-                                                        continue
-                                                    # Skip if already absolute or looks like a URL/IP
-                                                    if v.startswith('/') or '://' in v:
-                                                        continue
-                                                    
-                                                    # Check root existence
-                                                    root_path = os.path.join(flow_out_dir, v)
-                                                    if os.path.exists(root_path):
-                                                        continue
-                                                    
-                                                    # Not found in root. Check subdirs.
-                                                    for sd in subdirs:
-                                                        # Avoid double-nesting if v already starts with sd
-                                                        # But simpler logic: construct path and check.
-                                                        candidate_rel = os.path.join(sd, v)
-                                                        candidate_full = os.path.join(flow_out_dir, candidate_rel)
-                                                        if os.path.exists(candidate_full):
-                                                            # Found match! Update to relative path.
-                                                            updates[k] = candidate_rel
-                                                            break
-                                                
-                                                if updates:
-                                                    outs.update(updates)
-                                                    # Persist corrections back to disk so re-validate/UI see the full path.
-                                                    if manifest_path:
-                                                        try:
-                                                            with open(manifest_path, 'w', encoding='utf-8') as f:
-                                                                json.dump({'outputs': outs}, f, indent=2)
-                                                        except Exception:
-                                                            pass
-                                    except Exception:
-                                        pass
-
-                                    # Final Pass: Convert all resolved relative paths to absolute paths.
+                                    # Normalize artifact paths: ensure absolute host paths for everything.
                                     try:
                                         if flow_out_dir and os.path.isdir(flow_out_dir):
                                             updates = {}
                                             for k, v in outs.items():
                                                 if not isinstance(v, str) or not v.strip():
                                                     continue
-                                                
+
                                                 # Skip if already absolute or looks like a URL/IP
                                                 if v.startswith('/') or '://' in v:
                                                     continue
-                                                
-                                                # Construct absolute path candidate
-                                                abs_candidate = os.path.join(flow_out_dir, v)
-                                                
-                                                # If it exists, update it.
+
+                                                flat_v = os.path.basename(v)
+                                                # 1. Try literal join in root
+                                                abs_candidate = os.path.join(flow_out_dir, v.lstrip('/'))
+                                                # 2. Try literal join in outputs/
+                                                if not os.path.exists(abs_candidate):
+                                                    cand = os.path.join(flow_out_dir, 'outputs', v.lstrip('/'))
+                                                    if os.path.exists(cand):
+                                                        abs_candidate = cand
+                                                # 3. Try flattened fallback in outputs/
+                                                if not os.path.exists(abs_candidate):
+                                                    cand = os.path.join(flow_out_dir, 'outputs', flat_v)
+                                                    if os.path.exists(cand):
+                                                        abs_candidate = cand
+                                                # 4. Try flattened fallback in root
+                                                if not os.path.exists(abs_candidate):
+                                                    cand = os.path.join(flow_out_dir, flat_v)
+                                                    if os.path.exists(cand):
+                                                        abs_candidate = cand
+
+                                                # If it exists, update it to absolute path.
                                                 if os.path.exists(abs_candidate):
                                                     updates[k] = abs_candidate
-                                            
+
                                             if updates:
                                                 outs.update(updates)
                                                 # Persist corrections back to disk so re-validate/UI see the full path.
@@ -18955,7 +19239,7 @@ def api_flow_prepare_preview_for_execute():
     try:
         persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(flag_assignments)
         flow_meta = {
-            'source_preview_plan_path': base_plan_path,
+            'source_preview_plan_path': _abs_path_or_original(base_plan_path),
             'scenario': scenario_label or scenario_norm,
             'length': length,
             'requested_length': requested_length,
@@ -18994,15 +19278,30 @@ def api_flow_prepare_preview_for_execute():
         if isinstance(meta, dict):
             meta = dict(meta)
             meta['updated_at'] = _iso_now()
-        out_path = _canonical_plan_path_for_scenario(scenario_label or scenario_norm, xml_path=str((meta or {}).get('xml_path') or ''), create_dir=True)
+        out_path = ''
+        xml_target = _existing_xml_path_or_none(str((meta or {}).get('xml_path') or '').strip())
+        if not xml_target:
+            xml_target = _existing_xml_path_or_none(base_plan_path)
+        if not xml_target:
+            xml_target = _existing_xml_path_or_none(_latest_xml_path_for_scenario(scenario_norm) or '')
+        if not xml_target:
+            return jsonify({'ok': False, 'error': 'Failed to persist flow-modified preview plan: XML path not found.'}), 500
+        if isinstance(meta, dict):
+            meta['xml_path'] = xml_target
         out_payload = {
             'full_preview': preview,
             'metadata': meta,
         }
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(out_payload, f, indent=2)
+        ok, err = _update_plan_preview_in_xml(xml_target, scenario_label or scenario_norm, out_payload)
+        if not ok:
+            return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {err}'}), 500
         try:
-            _planner_set_plan(scenario_norm, plan_path=out_path, xml_path=str((meta or {}).get('xml_path') or ''), seed=(meta or {}).get('seed'))
+            _update_flow_state_in_xml(xml_target, scenario_label or scenario_norm, flow_meta)
+        except Exception:
+            pass
+        out_path = xml_target
+        try:
+            _planner_set_plan(scenario_norm, plan_path=xml_target, xml_path=xml_target, seed=(meta or {}).get('seed'))
         except Exception:
             pass
     except Exception as e:
@@ -19078,9 +19377,12 @@ def api_flow_prepare_preview_for_execute():
         'flow_errors': list(flow_errors or []),
         **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
         **({'host_ip_map': host_ip_map} if host_ip_map else {}),
-        'xml_path': str((meta or {}).get('xml_path') or ''),
-        'preview_plan_path': out_path,
-        'base_preview_plan_path': base_plan_path,
+        'xml_path': (
+            _abs_path_or_original((meta or {}).get('xml_path') or '', base_dir=os.path.dirname(_abs_path_or_original(base_plan_path)) if base_plan_path else None)
+            or _abs_path_or_original(base_plan_path)
+        ),
+        'preview_plan_path': _abs_path_or_original(out_path),
+        'base_preview_plan_path': _abs_path_or_original(base_plan_path),
         'best_effort': bool(best_effort),
         'elapsed_s': round(float(time.monotonic() - started_at), 3),
         'generator_runs': generator_runs,
@@ -19091,7 +19393,7 @@ def api_flow_prepare_preview_for_execute():
         'failed_run_dirs': failed_run_dirs,
         **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
         **({'warning': warning} if warning else {}),
-    })
+    }), (422 if generation_failures and not best_effort else 200)
 
 
 @app.route('/api/flag-sequencing/save_flow_substitutions', methods=['POST'])
@@ -19108,8 +19410,6 @@ def api_flow_save_flow_substitutions():
     scenario_norm = _normalize_scenario_label(scenario_label)
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
-
-    canonical_plan_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
 
     allow_node_duplicates = False
     try:
@@ -19128,26 +19428,16 @@ def api_flow_save_flow_substitutions():
 
     base_plan_path = str(j.get('preview_plan') or '').strip() or None
     if base_plan_path:
-        try:
-            base_plan_path = os.path.abspath(base_plan_path)
-            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
-            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
-                base_plan_path = None
-            elif not os.path.exists(base_plan_path):
-                base_plan_path = None
-        except Exception:
-            base_plan_path = None
-    try:
-        if canonical_plan_path and os.path.exists(canonical_plan_path):
-            if not base_plan_path or os.path.abspath(base_plan_path) != os.path.abspath(canonical_plan_path):
-                base_plan_path = canonical_plan_path
-    except Exception:
-        pass
+        base_plan_path = _existing_xml_path_or_none(base_plan_path)
     if not base_plan_path:
         try:
             entry = _planner_get_plan(scenario_norm)
             if entry:
-                base_plan_path = entry.get('plan_path') or base_plan_path
+                base_plan_path = (
+                    _existing_xml_path_or_none(entry.get('plan_path'))
+                    or _existing_xml_path_or_none(entry.get('xml_path'))
+                    or base_plan_path
+                )
         except Exception:
             base_plan_path = base_plan_path
 
@@ -19549,7 +19839,7 @@ def api_flow_save_flow_substitutions():
     try:
         persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(out_assignments)
         flow_meta = {
-            'source_preview_plan_path': base_plan_path,
+            'source_preview_plan_path': _abs_path_or_original(base_plan_path),
             'scenario': scenario_label or scenario_norm,
             'length': len(chain_nodes),
             'requested_length': len(chain_nodes),
@@ -19577,23 +19867,30 @@ def api_flow_save_flow_substitutions():
         if isinstance(meta2, dict):
             meta2 = dict(meta2)
             meta2['updated_at'] = _iso_now()
-        out_path = _canonical_plan_path_for_scenario(scenario_label or scenario_norm, xml_path=str((meta2 or {}).get('xml_path') or ''), create_dir=True)
+        out_path = ''
+        xml_target = _abs_path_or_original(str((meta2 or {}).get('xml_path') or '').strip())
+        if not xml_target:
+            xml_target = _abs_path_or_original(base_plan_path)
+        if (not xml_target) or (not os.path.exists(xml_target)):
+            xml_target = _abs_path_or_original(_latest_xml_path_for_scenario(scenario_norm) or '')
+        if not xml_target or not os.path.exists(xml_target):
+            return jsonify({'ok': False, 'error': 'Failed to persist flow-modified preview plan: XML path not found.'}), 500
+        if isinstance(meta2, dict):
+            meta2['xml_path'] = xml_target
         out_payload = {
             'full_preview': preview,
             'metadata': meta2,
         }
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(out_payload, f, indent=2)
+        ok, err = _update_plan_preview_in_xml(xml_target, scenario_label or scenario_norm, out_payload)
+        if not ok:
+            return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {err}'}), 500
         try:
-            xml_target = str((meta2 or {}).get('xml_path') or '').strip()
-            if not xml_target:
-                xml_target = _latest_xml_path_for_scenario(scenario_norm)
-            if xml_target and os.path.exists(xml_target):
-                _update_flow_state_in_xml(xml_target, scenario_label or scenario_norm, flow_meta)
+            _update_flow_state_in_xml(xml_target, scenario_label or scenario_norm, flow_meta)
         except Exception:
             pass
+        out_path = xml_target
         try:
-            _planner_set_plan(scenario_norm, plan_path=out_path, xml_path=str((meta2 or {}).get('xml_path') or ''), seed=(meta2 or {}).get('seed'))
+            _planner_set_plan(scenario_norm, plan_path=xml_target, xml_path=xml_target, seed=(meta2 or {}).get('seed'))
         except Exception:
             pass
     except Exception as e:
@@ -19644,8 +19941,8 @@ def api_flow_save_flow_substitutions():
         'flow_errors': list(flow_errors or []),
         **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
         **({'host_ip_map': host_ip_map} if host_ip_map else {}),
-        'preview_plan_path': out_path,
-        'base_preview_plan_path': base_plan_path,
+        'preview_plan_path': _abs_path_or_original(out_path),
+        'base_preview_plan_path': _abs_path_or_original(base_plan_path),
         'allow_node_duplicates': bool(allow_node_duplicates),
         **({'warning': warning} if warning else {}),
         **({'initial_facts': initial_facts_override} if initial_facts_override else {}),
@@ -20064,7 +20361,7 @@ def api_flow_upload_flow_inject_file():
     try:
         persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(out_assignments)
         flow_meta = {
-            'source_preview_plan_path': base_plan_path,
+            'source_preview_plan_path': _abs_path_or_original(base_plan_path),
             'scenario': scenario_label or scenario_norm,
             'length': len(chain_nodes),
             'requested_length': len(chain_nodes),
@@ -20088,15 +20385,30 @@ def api_flow_upload_flow_inject_file():
         if isinstance(meta2, dict):
             meta2 = dict(meta2)
             meta2['updated_at'] = _iso_now()
-        out_path = _canonical_plan_path_for_scenario(scenario_label or scenario_norm, xml_path=str((meta2 or {}).get('xml_path') or ''), create_dir=True)
+        out_path = ''
+        xml_target = _existing_xml_path_or_none(str((meta2 or {}).get('xml_path') or '').strip())
+        if not xml_target:
+            xml_target = _existing_xml_path_or_none(base_plan_path)
+        if not xml_target:
+            xml_target = _existing_xml_path_or_none(_latest_xml_path_for_scenario(scenario_norm) or '')
+        if not xml_target:
+            return jsonify({'ok': False, 'error': 'Failed to persist flow-modified preview plan: XML path not found.'}), 500
+        if isinstance(meta2, dict):
+            meta2['xml_path'] = xml_target
         out_payload = {
             'full_preview': preview,
             'metadata': meta2,
         }
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(out_payload, f, indent=2)
+        ok, err = _update_plan_preview_in_xml(xml_target, scenario_label or scenario_norm, out_payload)
+        if not ok:
+            return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {err}'}), 500
         try:
-            _planner_set_plan(scenario_norm, plan_path=out_path, xml_path=str((meta2 or {}).get('xml_path') or ''), seed=(meta2 or {}).get('seed'))
+            _update_flow_state_in_xml(xml_target, scenario_label or scenario_norm, flow_meta)
+        except Exception:
+            pass
+        out_path = xml_target
+        try:
+            _planner_set_plan(scenario_norm, plan_path=xml_target, xml_path=xml_target, seed=(meta2 or {}).get('seed'))
         except Exception:
             pass
     except Exception as e:
@@ -20138,8 +20450,6 @@ def api_flow_substitution_candidates():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
-    canonical_plan_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
-
     index_raw = j.get('index')
     try:
         index = int(index_raw)
@@ -20171,21 +20481,7 @@ def api_flow_substitution_candidates():
 
     base_plan_path = str(j.get('preview_plan') or '').strip() or None
     if base_plan_path:
-        try:
-            base_plan_path = os.path.abspath(base_plan_path)
-            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
-            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
-                base_plan_path = None
-            elif not os.path.exists(base_plan_path):
-                base_plan_path = None
-        except Exception:
-            base_plan_path = None
-    try:
-        if canonical_plan_path and os.path.exists(canonical_plan_path):
-            if not base_plan_path or os.path.abspath(base_plan_path) != os.path.abspath(canonical_plan_path):
-                base_plan_path = canonical_plan_path
-    except Exception:
-        pass
+        base_plan_path = _existing_xml_path_or_none(base_plan_path)
     if not base_plan_path:
         base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=True)
     if not base_plan_path or not os.path.exists(base_plan_path):
@@ -21459,6 +21755,34 @@ def _normalize_scenario_label(value: Any) -> str:
     text = value if isinstance(value, str) else str(value)
     text = text.strip().lower()
     return re.sub(r'\s+', ' ', text)
+
+
+def _sanitize_scenario_name_strict(value: Any, fallback: str) -> str:
+    try:
+        raw = str(value or '').strip()
+    except Exception:
+        raw = ''
+    cleaned = re.sub(r'[^A-Za-z0-9]', '', raw)
+    if cleaned:
+        return cleaned
+    return re.sub(r'[^A-Za-z0-9]', '', str(fallback or '')) or 'NewScenario'
+
+
+def _normalize_scenario_names_strict(scenarios: list[Any]) -> None:
+    if not isinstance(scenarios, list):
+        return
+    seen: set[str] = set()
+    for idx, sc in enumerate(scenarios):
+        if not isinstance(sc, dict):
+            continue
+        base = _sanitize_scenario_name_strict(sc.get('name'), f'NewScenario{idx + 1}')
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in seen:
+            candidate = f"{base}{suffix}"
+            suffix += 1
+        sc['name'] = candidate
+        seen.add(candidate.casefold())
 
 
 def _scenario_match_key(value: Any) -> str:
@@ -28492,7 +28816,7 @@ def _flow_state_from_latest_xml(scenario_norm: str) -> dict[str, Any] | None:
             if _normalize_scenario_label(nm) != scen_norm:
                 continue
             fs = sc.get('flow_state')
-            return fs if isinstance(fs, dict) else None
+            return _canonicalize_flow_state_paths(fs, xml_path=xml_path) if isinstance(fs, dict) else None
         return None
     except Exception:
         return None
@@ -28502,7 +28826,7 @@ def _flow_state_from_xml_path(xml_path: str, scenario_label: str | None) -> dict
     try:
         if not xml_path:
             return None
-        xml_abs = os.path.abspath(xml_path)
+        xml_abs = _abs_path_or_original(xml_path)
         if not os.path.exists(xml_abs):
             return None
         parsed = _parse_scenarios_xml(xml_abs)
@@ -28518,7 +28842,7 @@ def _flow_state_from_xml_path(xml_path: str, scenario_label: str | None) -> dict
                 if _normalize_scenario_label(nm) != target_norm:
                     continue
                 fs = sc.get('flow_state')
-                return fs if isinstance(fs, dict) else None
+                return _canonicalize_flow_state_paths(fs, xml_path=xml_abs) if isinstance(fs, dict) else None
             return None
         # No scenario specified: return the first flow_state found.
         for sc in scen_list:
@@ -28526,7 +28850,7 @@ def _flow_state_from_xml_path(xml_path: str, scenario_label: str | None) -> dict
                 continue
             fs = sc.get('flow_state')
             if isinstance(fs, dict):
-                return fs
+                return _canonicalize_flow_state_paths(fs, xml_path=xml_abs)
         return None
     except Exception:
         return None
@@ -28582,10 +28906,12 @@ def api_latest_xml_for_scenario():
 
 def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_state: dict[str, Any]) -> tuple[bool, str]:
     """Update (or create) FlagSequencing/FlowState within a scenarios XML file."""
+    xml_path = _abs_path_or_original(xml_path)
     if not xml_path or not os.path.exists(xml_path):
         return False, 'xml_path not found'
     if not isinstance(flow_state, dict) or not flow_state:
         return False, 'flow_state empty'
+    flow_state = _canonicalize_flow_state_paths(flow_state, xml_path=xml_path)
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
@@ -28687,10 +29013,12 @@ def _update_plan_preview_in_xml(
     plan_payload: dict[str, Any],
 ) -> tuple[bool, str]:
     """Update (or create) ScenarioEditor/PlanPreview within a scenarios XML file."""
+    xml_path = _abs_path_or_original(xml_path)
     if not xml_path or not os.path.exists(xml_path):
         return False, 'xml_path not found'
     if not isinstance(plan_payload, dict) or not plan_payload:
         return False, 'plan payload empty'
+    plan_payload = _canonicalize_plan_payload_paths(plan_payload, xml_path=xml_path)
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
@@ -28729,6 +29057,7 @@ def _update_plan_preview_in_xml(
 
 def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> dict[str, Any] | None:
     """Load embedded PlanPreview JSON payload from a scenarios XML file."""
+    xml_path = _abs_path_or_original(xml_path)
     if not xml_path or not os.path.exists(xml_path):
         return None
     try:
@@ -28761,21 +29090,30 @@ def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> di
         if not raw:
             return None
         payload = json.loads(raw)
-        return payload if isinstance(payload, dict) else None
+        if isinstance(payload, dict):
+            return _canonicalize_plan_payload_paths(payload, xml_path=xml_path)
+        return None
     except Exception:
         return None
 
 
 def _load_preview_payload_from_path(path: str, scenario_label: str | None = None) -> dict[str, Any] | None:
-    """Load a preview payload from the universal XML file only.
-
-    JSON plan files are intentionally ignored.
-    """
+    """Load a preview payload from XML only."""
     try:
-        if not path or not isinstance(path, str):
+        ap = _existing_xml_path_or_none(path)
+        if not ap:
             return None
-        if path.lower().endswith('.xml'):
-            return _load_plan_preview_from_xml(path, scenario_label)
+        payload = _load_plan_preview_payload_from_path(ap, scenario_label)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+            xml_hint = _abs_path_or_original(meta.get('xml_path') or '')
+            if not xml_hint:
+                xml_hint = ap
+            return _canonicalize_plan_payload_paths(payload, xml_path=xml_hint or None)
+        except Exception:
+            return payload
     except Exception:
         return None
     return None
@@ -29020,9 +29358,10 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
     core_el.set('ssh_host', str(core_cfg.get('ssh_host') or core_cfg.get('host') or ''))
     core_el.set('ssh_port', str(core_cfg.get('ssh_port') or ''))
     core_el.set('ssh_username', str(core_cfg.get('ssh_username') or ''))
-    for scen in data_dict.get("scenarios", []):
+    for idx, scen in enumerate(data_dict.get("scenarios", [])):
         scen_el = ET.SubElement(root, "Scenario")
-        scen_el.set("name", scen.get("name", "Scenario"))
+        scen_name = _sanitize_scenario_name_strict((scen or {}).get("name"), f"NewScenario{idx + 1}")
+        scen_el.set("name", scen_name)
         # Persist scenario-level density_count (Count for Density) so parser priority can pick it up on reload.
         try:
             if 'density_count' in scen and scen.get('density_count') is not None:
@@ -30260,28 +30599,12 @@ def save_xml():
         client_project_hint = (request.form.get('project_key_hint') or '').strip()
         client_scenario_query = (request.form.get('scenario_query') or '').strip()
         normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
-        # Enforce unique scenario names (case-insensitive, trimmed) to prevent confusing overwrites.
+        # Enforce strict alphanumeric-only scenario names with deterministic uniquification.
         try:
             scenarios_list = data.get('scenarios') or []
-            seen: set[str] = set()
-            dupes: list[str] = []
             if isinstance(scenarios_list, list):
-                for idx, sc in enumerate(scenarios_list):
-                    if not isinstance(sc, dict):
-                        continue
-                    raw_name = (sc.get('name') or '').strip()
-                    name = raw_name or f"Scenario {idx + 1}"
-                    key = name.casefold()
-                    if key in seen:
-                        dupes.append(name)
-                    else:
-                        seen.add(key)
-            if dupes:
-                pretty = ', '.join(sorted(set(dupes)))
-                flash(f'Duplicate scenario names are not allowed: {pretty}')
-                return redirect(url_for('index'))
+                _normalize_scenario_names_strict(scenarios_list)
         except Exception:
-            # If validation fails unexpectedly, fall through to existing error handling.
             pass
         scenario_count = len(data.get('scenarios') or []) if isinstance(data.get('scenarios'), list) else 0
         scenario_names_desc = []
@@ -30319,7 +30642,7 @@ def save_xml():
                 if not isinstance(scen, dict):
                     continue
                 raw_name = (scen.get('name') or '').strip()
-                display_name = raw_name or f"Scenario {idx + 1}"
+                display_name = _sanitize_scenario_name_strict(raw_name, f"NewScenario{idx + 1}")
                 stem = secure_filename(display_name).strip('_-.') or f"Scenario_{idx + 1}"
                 out_path = os.path.join(out_dir, f"{stem}.xml")
                 # Ensure unique filename in this save directory.
@@ -30439,25 +30762,10 @@ def save_xml_api():
             active_index = None
         if not isinstance(scenarios, list):
             return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
-        # Enforce unique scenario names (case-insensitive, trimmed).
+        # Enforce strict alphanumeric-only scenario names with deterministic uniquification.
         try:
-            seen: set[str] = set()
-            dupes: list[str] = []
-            for idx, sc in enumerate(scenarios):
-                if not isinstance(sc, dict):
-                    continue
-                raw_name = (sc.get('name') or '').strip()
-                name = raw_name or f"Scenario {idx + 1}"
-                key = name.casefold()
-                if key in seen:
-                    dupes.append(name)
-                else:
-                    seen.add(key)
-            if dupes:
-                pretty = ', '.join(sorted(set(dupes)))
-                return jsonify({ 'ok': False, 'error': f'Duplicate scenario names are not allowed: {pretty}' }), 400
+            _normalize_scenario_names_strict(scenarios)
         except Exception:
-            # Best-effort validation; if it fails, continue with existing behavior.
             pass
         scenario_names: list[str] = []
         try:
@@ -30477,15 +30785,12 @@ def save_xml_api():
             )
         except Exception:
             pass
-        autosave = _coerce_bool(data.get('autosave'))
+        autosave = False
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        if autosave:
-            out_dir = os.path.join(_outputs_dir(), 'autosave')
-        else:
-            out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
+        out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
         try:
-            legacy_bundle = os.path.join(out_dir, 'scenarios.xml' if not autosave else 'autosave.xml')
+            legacy_bundle = os.path.join(out_dir, 'scenarios.xml')
             if os.path.exists(legacy_bundle):
                 os.remove(legacy_bundle)
         except Exception:
@@ -30499,13 +30804,9 @@ def save_xml_api():
                     scenario_paths_by_index.append(None)
                     continue
                 raw_name = (scen.get('name') or '').strip()
-                display_name = raw_name or f"Scenario {idx + 1}"
+                display_name = _sanitize_scenario_name_strict(raw_name, f"NewScenario{idx + 1}")
                 stem_raw = display_name
-                if autosave:
-                    # Always include index and scenario name so autosave never collapses
-                    # multiple scenarios into a single file.
-                    stem_raw = f"autosave-{idx + 1}-{display_name or f'Scenario_{idx + 1}'}"
-                stem = secure_filename(stem_raw).strip('_-.') or (f"autosave-{idx + 1}" if autosave else f"Scenario_{idx + 1}")
+                stem = secure_filename(stem_raw).strip('_-.') or f"NewScenario{idx + 1}"
                 out_path = os.path.join(out_dir, f"{stem}.xml")
                 if os.path.exists(out_path):
                     suffix = 2
@@ -30577,13 +30878,12 @@ def save_xml_api():
             app.logger.info('[save_xml_api] success user=%s xml=%s scen_count=%s', username or 'anonymous', out_path, len(scenarios))
         except Exception:
             pass
-        if not autosave:
-            try:
-                names_for_catalog = [name for name in scenario_names if isinstance(name, str) and name.strip()]
-                if names_for_catalog:
-                    _persist_scenario_catalog(names_for_catalog, source_path=scenario_paths_map or out_path)
-            except Exception:
-                pass
+        try:
+            names_for_catalog = [name for name in scenario_names if isinstance(name, str) and name.strip()]
+            if names_for_catalog:
+                _persist_scenario_catalog(names_for_catalog, source_path=scenario_paths_map or out_path)
+        except Exception:
+            pass
         response_payload = { 'ok': True, 'result_path': out_path, 'core': resp_core }
         if scenario_paths_map:
             response_payload['scenario_paths'] = scenario_paths_map
@@ -31267,7 +31567,18 @@ def api_plan_preview_full():
             pass
         flow_meta = None
         try:
-            flow_meta = _attach_latest_flow_into_full_preview(full_prev, scenario)
+            flow_meta = _flow_state_from_xml_path(xml_path, scenario)
+            if not isinstance(flow_meta, dict):
+                flow_meta = _attach_latest_flow_into_full_preview(full_prev, scenario)
+            elif isinstance(flow_meta, dict):
+                try:
+                    repaired = _flow_repair_saved_flow_for_preview(full_prev, flow_meta)
+                    if isinstance(repaired, dict):
+                        flow_meta = repaired
+                    else:
+                        flow_meta = None
+                except Exception:
+                    flow_meta = None
         except Exception:
             flow_meta = None
         return jsonify({'ok': True, 'full_preview': full_prev, 'plan': plan, 'breakdowns': plan.get('breakdowns'), 'flow_meta': flow_meta or {}})
@@ -31462,13 +31773,36 @@ def plan_full_preview_page():
                     if isinstance(full_prev, dict):
                         if not isinstance(meta, dict):
                             meta = {}
-                        xml_path0 = str(meta.get('xml_path') or '')
+                        xml_path0 = _abs_path_or_original(str(meta.get('xml_path') or ''))
+                        if (not xml_path0) and plan_path and str(plan_path).lower().endswith('.xml'):
+                            xml_path0 = _abs_path_or_original(plan_path)
                         scenario0 = str(meta.get('scenario') or '') or (scenario or None)
                         seed0 = meta.get('seed')
                         try:
                             seed0 = int(seed0) if seed0 is not None else full_prev.get('seed')
                         except Exception:
                             seed0 = full_prev.get('seed')
+
+                        # If a specific seed is requested and the embedded preview seed differs,
+                        # recompute from XML so this page matches /api/plan/preview_full.
+                        try:
+                            requested_seed = int(seed) if seed is not None else None
+                        except Exception:
+                            requested_seed = None
+                        if requested_seed is not None:
+                            try:
+                                current_seed = int(seed0) if seed0 is not None else None
+                            except Exception:
+                                current_seed = None
+                            if current_seed != requested_seed:
+                                try:
+                                    xml_for_compute = _abs_path_or_original(xml_path0) or _abs_path_or_original(plan_path)
+                                    from core_topo_gen.planning.orchestrator import compute_full_plan
+                                    plan2 = compute_full_plan(xml_for_compute, scenario=scenario0, seed=requested_seed, include_breakdowns=True)
+                                    full_prev = _build_full_preview_from_plan(plan2, requested_seed, [], [])
+                                    seed0 = full_prev.get('seed')
+                                except Exception:
+                                    pass
 
                     flow_meta = None
                     try:
@@ -31531,11 +31865,11 @@ def plan_full_preview_page():
                         'full_preview.html',
                         full_preview=full_prev,
                         preview_json=preview_json_str,
-                        xml_path=xml_path0,
+                            xml_path=_abs_path_or_original(xml_path0) or _abs_path_or_original(plan_path),
                         scenario=scenario0,
                         seed=seed0,
                         flow_meta=flow_meta or {},
-                        preview_plan_path=plan_path,
+                            preview_plan_path=_abs_path_or_original(plan_path),
                         display_artifacts=display_artifacts,
                         segmentation_artifacts=segmentation_artifacts,
                         hitl_config=hitl_config,
@@ -31697,11 +32031,11 @@ def plan_full_preview_page():
             'full_preview.html',
             full_preview=full_prev,
             preview_json=preview_json_str,
-            xml_path=xml_path,
+            xml_path=_abs_path_or_original(xml_path),
             scenario=scenario_name,
             seed=full_prev.get('seed'),
             flow_meta=flow_meta or {},
-            preview_plan_path=preview_plan_path,
+            preview_plan_path=_abs_path_or_original(preview_plan_path),
             display_artifacts=display_artifacts,
             segmentation_artifacts=segmentation_artifacts,
             hitl_config=hitl_config,
@@ -31984,11 +32318,11 @@ def plan_full_preview_from_xml():
             'full_preview.html',
             full_preview=full_prev,
             preview_json=preview_json_str,
-            xml_path=xml_path,
+            xml_path=_abs_path_or_original(xml_path),
             scenario=scenario_name,
             seed=seed_val,
             flow_meta=flow_meta or {},
-            preview_plan_path=xml_path,
+            preview_plan_path=_abs_path_or_original(xml_path),
             display_artifacts=display_artifacts,
             segmentation_artifacts=segmentation_artifacts,
             hitl_config=hitl_config,
@@ -32904,6 +33238,7 @@ def _session_docker_nodes_from_xml(session_xml_path: str) -> List[str]:
         return names
     try:
         import xml.etree.ElementTree as _ET
+        app.logger.info(f"_session_docker_nodes_from_xml parsing {session_xml_path}")
         root = _ET.parse(session_xml_path).getroot()
     except Exception:
         return names
@@ -32947,6 +33282,7 @@ def _session_docker_nodes_from_xml(session_xml_path: str) -> List[str]:
             continue
         seen.add(n)
         out.append(n)
+    app.logger.info(f"_session_docker_nodes_from_xml found {len(out)} nodes: {out}")
     return out
 
 
@@ -35731,6 +36067,10 @@ def run_status(run_id: str):
                         post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
                         # Parse session id from logs if available for precise save
                         sid = _extract_session_id_from_text(txt)
+                        if sid:
+                            app.logger.info("[async] Extracted session ID: %s", sid)
+                        else:
+                             app.logger.warning("[async] Could not extract session ID from logs")
                         scenario_label = meta.get('scenario_name') or active_scenario_name
                         if not scenario_label:
                             try:
@@ -44200,10 +44540,18 @@ def _compose_candidates(base_dir: str):
     cands = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']
     out = []
     try:
+        # Check root first
         for name in cands:
             p = os.path.join(base_dir, name)
             if os.path.exists(p):
                 out.append(p)
+        # Check artifacts/ subdirectory
+        art_dir = os.path.join(base_dir, 'artifacts')
+        if os.path.isdir(art_dir):
+            for name in cands:
+                p = os.path.join(art_dir, name)
+                if os.path.exists(p):
+                    out.append(p)
     except Exception:
         pass
     return out

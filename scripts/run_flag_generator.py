@@ -181,7 +181,7 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
     if not cleaned:
         return None
 
-    injected_dir = (out_dir / 'injected').resolve()
+    injected_dir = (out_dir / 'injects').resolve()
     injected_dir.mkdir(parents=True, exist_ok=True)
 
     # Rebuild injected dir from scratch to guarantee no extra files remain.
@@ -194,20 +194,13 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
         except Exception:
             pass
 
-    artifacts_dir = (out_dir / 'artifacts').resolve()
-
     missing: list[str] = []
     for rel in cleaned:
         dest = (injected_dir / rel).resolve()
         try:
-            src1 = (artifacts_dir / rel).resolve()
-            src2 = (out_dir / rel).resolve()
-            src = None
-            if src1.exists():
-                src = src1
-            elif src2.exists():
-                src = src2
-            if src is None:
+            # Sourcing from sibling 'outputs' directory.
+            src = (out_dir / 'outputs' / rel).resolve()
+            if not src.exists():
                 missing.append(rel)
                 continue
             _copy_tree_or_file(src, dest)
@@ -356,7 +349,8 @@ def _rewrite_compose_injected_to_volume_copy(
         copy_service_name = f"inject_copy_{i}"
 
     copy_vols: list[Any] = []
-    copy_vols.append('./injected:/src:ro')
+    # Source from sibling 'outputs' directory.
+    copy_vols.append(f"{out_dir / 'outputs'}:/src:ro")
     dest_mounts: dict[str, str] = {}
     for dest_dir, vol_name in dest_to_volume.items():
         slug = vol_name.replace('inject-', '')
@@ -735,8 +729,10 @@ def main() -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    inputs_dir = out_dir / "inputs"
+    inputs_dir = out_dir / 'inputs'
+    outputs_dir = out_dir / 'outputs'
     inputs_dir.mkdir(parents=True, exist_ok=True)
+    outputs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         config = json.loads(args.config)

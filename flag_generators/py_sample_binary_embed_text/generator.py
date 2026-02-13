@@ -104,8 +104,9 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    artifacts_dir = out_dir / 'artifacts'
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # artifacts_dir = out_dir / 'artifacts'
+    # artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir = out_dir
 
     generator_id = str(cfg.get("generator_id") or "sample.binary_embed_text")
     cfg_flag = str(cfg.get("Flag(flag_id)") or "").strip()
@@ -175,7 +176,7 @@ def main() -> int:
         "generator_id": generator_id,
         "outputs": {
             "Flag(flag_id)": flag_value,
-            "File(path)": f"artifacts/{bin_name}",
+            "File(path)": bin_name,
         },
     }
 

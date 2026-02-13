@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import time
 import uuid
 
 from webapp import app_backend
@@ -61,24 +60,14 @@ def test_preview_full_attaches_latest_flow_chain_when_present():
                 "type": "docker",
             })
 
-        plan_payload = {
-            "full_preview": {"seed": full_preview1.get("seed")},
-            "metadata": {
-                "xml_path": xml_path,
-                "scenario": scenario,
-                "seed": full_preview1.get("seed"),
-                "flow": {
-                    "scenario": scenario,
-                    "length": len(chain),
-                    "chain": chain,
-                    "modified_at": "2026-01-06T00:00:00Z",
-                },
-            },
+        flow_meta = {
+            "scenario": scenario,
+            "length": len(chain),
+            "chain": chain,
+            "modified_at": "2026-01-06T00:00:00Z",
         }
-
-        plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f)
+        ok, err = app_backend._update_flow_state_in_xml(xml_path, scenario, flow_meta)
+        assert ok, err
 
         try:
             # Second request: should return flow metadata alongside full_preview.
@@ -90,10 +79,7 @@ def test_preview_full_attaches_latest_flow_chain_when_present():
             flow = payload2.get("flow_meta") or {}
             assert flow.get("chain") == chain
         finally:
-            try:
-                os.remove(plan_path)
-            except Exception:
-                pass
+            pass
 
 
 def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
@@ -148,25 +134,15 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
         chain = [{"id": non_docker_id, "name": "bad-host", "type": "host"}]
         flag_assignments = [{"node_id": non_docker_id, "id": "dummy", "name": "dummy", "type": "flag-node-generator"}]
 
-        plan_payload = {
-            "full_preview": {"seed": full_preview1.get("seed")},
-            "metadata": {
-                "xml_path": xml_path,
-                "scenario": scenario,
-                "seed": full_preview1.get("seed"),
-                "flow": {
-                    "scenario": scenario,
-                    "length": 1,
-                    "chain": chain,
-                    "flag_assignments": flag_assignments,
-                    "modified_at": "2026-01-06T00:00:00Z",
-                },
-            },
+        flow_meta = {
+            "scenario": scenario,
+            "length": 1,
+            "chain": chain,
+            "flag_assignments": flag_assignments,
+            "modified_at": "2026-01-06T00:00:00Z",
         }
-
-        plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f)
+        ok, err = app_backend._update_flow_state_in_xml(xml_path, scenario, flow_meta)
+        assert ok, err
 
         try:
             second = client.post("/api/plan/preview_full", json={"xml_path": xml_path, "scenario": scenario})
@@ -189,7 +165,4 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
             assert isinstance(fas, list) and fas
             assert str((fas[0] or {}).get("node_id") or "") == repaired_id
         finally:
-            try:
-                os.remove(plan_path)
-            except Exception:
-                pass
+            pass

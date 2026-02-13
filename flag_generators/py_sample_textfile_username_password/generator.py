@@ -47,8 +47,9 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    artifacts_dir = out_dir / 'artifacts'
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # artifacts_dir = out_dir / 'artifacts'
+    # artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir = out_dir
 
     user, pw = _derive_user_pass(seed)
     generator_id = str(cfg.get("generator_id") or "sample.textfile_username_password")
@@ -60,7 +61,7 @@ def main() -> int:
         "generator_id": generator_id,
         "outputs": {
             "Flag(flag_id)": flag_value,
-            "File(path)": "artifacts/secrets.txt",
+            "File(path)": "secrets.txt",
         },
     }
 

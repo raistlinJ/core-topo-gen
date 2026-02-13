@@ -54,7 +54,7 @@
   </div>
 </div>
 
-<!-- Progress overlay for long-running Save XML work (e.g., checking vuln readiness) -->
+<!-- Progress overlay for long-running Save XML work -->
 <div id="coretgProgressOverlay" style="display:none; position:fixed; inset:0; z-index: 4000; background: rgba(0,0,0,0.35); align-items:center; justify-content:center;">
   <div style="width: min(560px, calc(100vw - 24px)); background:#fff; border-radius:14px; padding:16px 16px 14px 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.25);">
     <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
@@ -67,22 +67,22 @@
     <div style="margin-top:12px; height:10px; background: rgba(0,0,0,0.10); border-radius: 999px; overflow:hidden;">
       <div id="coretgProgressBar" style="height: 100%; width: 0%; background: #0d6efd; border-radius: 999px;"></div>
     </div>
-    <div style="margin-top:10px; font-size:12px; color: rgba(0,0,0,0.55);">This may take a moment while checking Docker images.</div>
+    <div style="margin-top:10px; font-size:12px; color: rgba(0,0,0,0.55);">This may take a moment while preparing scenario data.</div>
   </div>
 </div>
 
 <script>
 (function(){
-  const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
-  const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
-  const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_project_active_idx_map_v1';
-  const LATEST_XML_BY_SCENARIO_STORAGE_KEY = 'coretg_latest_xml_by_scenario_v1';
-  const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v1';
-  const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
-  const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v1';
-  const TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY = 'coretg_topology_signature_by_scenario_v1';
-  const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v1';
-  const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v1';
+  const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v3';
+  const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key_v3';
+  const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_project_active_idx_map_v3';
+  const LATEST_XML_BY_SCENARIO_STORAGE_KEY = 'coretg_latest_xml_by_scenario_v3';
+  const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v3';
+  const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v3';
+  const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v3';
+  const TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY = 'coretg_topology_signature_by_scenario_v3';
+  const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v3';
+  const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v3';
 
   function getActiveTabName(){
     try {
@@ -1246,6 +1246,11 @@
         const msg = 'Topology was saved after a Flag Sequencing chain was created for this scenario.\n\nOpen Flag Sequencing to review/update the chain before Preview?';
         const goFlow = confirm(msg);
         if (goFlow) {
+          try {
+            if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+              window.coretgAllowUnsavedNavOnce();
+            }
+          } catch (e) {}
           window.location.href = '/scenarios/flag-sequencing?scenario=' + encodeURIComponent(scenario);
           return;
         }
@@ -1254,6 +1259,11 @@
 
     const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
     const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '');
+    try {
+      if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+        window.coretgAllowUnsavedNavOnce();
+      }
+    } catch (e) {}
     window.location.href = url;
   }
 

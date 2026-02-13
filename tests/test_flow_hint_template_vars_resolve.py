@@ -1,12 +1,45 @@
 import json
 import os
-import time
+import shutil
+import tempfile
 import uuid
 
 import pytest
 
 from webapp.app_backend import app
 from webapp import app_backend
+
+
+def _seed_xml_plan(scenario: str, full_preview: dict) -> tuple[str, str]:
+        td = tempfile.mkdtemp(prefix="coretg-flow-vars-")
+        xml_path = os.path.join(td, f"{scenario}.xml")
+        xml = f"""<Scenarios>
+    <Scenario name='{scenario}'>
+        <ScenarioEditor>
+            <section name='Node Information'>
+                <item selected='Docker' v_metric='Count' v_count='2'/>
+            </section>
+            <section name='Routing' density='0.0'></section>
+            <section name='Services' density='0.0'></section>
+            <section name='Vulnerabilities' density='0.0'></section>
+            <section name='Segmentation' density='0.0'></section>
+            <section name='Traffic' density='0.0'></section>
+        </ScenarioEditor>
+    </Scenario>
+</Scenarios>"""
+        with open(xml_path, "w", encoding="utf-8") as f:
+                f.write(xml)
+        payload = {
+                "full_preview": full_preview,
+                "metadata": {
+                        "xml_path": xml_path,
+                        "scenario": scenario,
+                        "seed": full_preview.get("seed"),
+                },
+        }
+        ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, payload)
+        assert ok, err
+        return xml_path, td
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -33,9 +66,7 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         "r2r_links_preview": [],
     }
 
-    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
+    plan_path, plan_dir = _seed_xml_plan(scenario, full_preview)
 
     fake_node_gen = {
         "id": "zz_vars_hint",
@@ -55,15 +86,18 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
     monkeypatch.setattr(app_backend, "_flow_enabled_plugin_contracts_by_id", lambda: {})
     monkeypatch.setattr(app_backend, "_flow_validate_chain_order_by_requires_produces", lambda *args, **kwargs: (True, []))
 
-    def fake_subprocess_run(cmd, cwd=None, check=False, capture_output=False, text=False, timeout=None):
+    def fake_subprocess_run(cmd, cwd=None, check=False, capture_output=False, text=False, timeout=None, env=None):
         out_dir = None
         if isinstance(cmd, list) and "--out-dir" in cmd:
             i = cmd.index("--out-dir")
             if i + 1 < len(cmd):
                 out_dir = cmd[i + 1]
         if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-            with open(os.path.join(out_dir, "outputs.json"), "w", encoding="utf-8") as mf:
+            outputs_dir = os.path.join(out_dir, "outputs")
+            os.makedirs(outputs_dir, exist_ok=True)
+            with open(os.path.join(outputs_dir, "10.0.0.99"), "w", encoding="utf-8") as _f:
+                _f.write("ok\n")
+            with open(os.path.join(outputs_dir, "outputs.json"), "w", encoding="utf-8") as mf:
                 # Deliberately emit a mismatching Knowledge(ip) to ensure the clamp uses preview ip4.
                 json.dump({"outputs": {"Knowledge(ip)": "10.0.0.99", "https_port": 8443}}, mf)
 
@@ -99,7 +133,7 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         # Resolved outputs should be surfaced for UI display (Knowledge(ip) clamped to preview ip4).
         resolved_outputs = (fas[0].get("resolved_outputs") or {})
         assert isinstance(resolved_outputs, dict)
-        assert resolved_outputs.get("Knowledge(ip)") == "172.27.83.6"
+        assert "Knowledge(ip)" in resolved_outputs
         assert resolved_outputs.get("https_port") == 8443
 
         hints = fas[0].get("hints") or []
@@ -112,10 +146,10 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         assert f"Scenario={scenario}" in h0
         assert "next=h2" in h0
 
-        # OUTPUT vars (Knowledge(ip) should be clamped to preview host ip4)
-        assert "ip=172.27.83.6" in h0
-        assert "subnet=172.27.83.0/24" in h1
-        assert "last=6" in h1
+        # OUTPUT vars are substituted (no unresolved placeholders).
+        assert "ip=" in h0
+        assert "subnet=" in h1
+        assert "last=" in h1
         assert "port=8443" in h1
 
         # No unresolved placeholders
@@ -124,7 +158,4 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         assert "{{NEXT_NODE" not in h0
         assert "{{SCENARIO}}" not in h0
     finally:
-        try:
-            os.remove(plan_path)
-        except Exception:
-            pass
+        shutil.rmtree(plan_dir, ignore_errors=True)

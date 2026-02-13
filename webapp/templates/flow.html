@@ -424,6 +424,15 @@
   let flowEnabled = true;
   let flowEligible = true;
 
+  function simplifyResolvedValue(val) {
+    if (typeof val !== 'string') return val;
+    if (val.startsWith('/')) {
+      const lastSlash = val.lastIndexOf('/');
+      if (lastSlash >= 0) return val.slice(lastSlash + 1);
+    }
+    return val;
+  }
+
   async function clearFlowStateInXml() {
     try {
       const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
@@ -2691,18 +2700,23 @@
       const hideArtifactsFields = !!o.hideArtifactsFields;
       function renderResolvedInline(val) {
         let resolvedText = '';
+        let fullText = '';
         try {
           if (Array.isArray(val)) {
-            resolvedText = val.map(x => (x === null || x === undefined) ? '' : String(x)).filter(Boolean).join(', ');
+            resolvedText = val.map(x => simplifyResolvedValue(String(x ?? ''))).filter(Boolean).join(', ');
+            fullText = val.map(x => String(x ?? '')).filter(Boolean).join(', ');
           } else if (val && typeof val === 'object') {
             resolvedText = JSON.stringify(val);
+            fullText = resolvedText;
           } else if (val !== undefined && val !== null) {
-            resolvedText = String(val);
+            fullText = String(val);
+            resolvedText = simplifyResolvedValue(fullText);
           }
-        } catch (e) { resolvedText = ''; }
+        } catch (e) { resolvedText = ''; fullText = ''; }
         if (!resolvedText) return document.createTextNode('-');
         const vcode = document.createElement('code');
         vcode.className = 'font-monospace';
+        vcode.title = fullText;
         vcode.textContent = resolvedText;
         return vcode;
       }
@@ -3460,7 +3474,7 @@
         function renderResolvedCell(kv, keysOrder, opts) {
           const options = (opts && typeof opts === 'object') ? opts : {};
           const maxItems = Number.isFinite(+options.maxItems) ? (+options.maxItems) : 3;
-          const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 60;
+          const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 3000;
           const maxDetailItems = Number.isFinite(+options.maxDetailItems) ? (+options.maxDetailItems) : 25;
 
           const obj = (kv && typeof kv === 'object' && !Array.isArray(kv)) ? kv : null;
@@ -3487,11 +3501,11 @@
             const v = obj[kk];
             if (v === undefined) continue;
             const full = _stringifyAny(v);
-            let short = full;
-            if (typeof short === 'string' && short.length > maxLen) {
-              short = short.slice(0, Math.max(0, maxLen - 1)) + '…';
+            let display = simplifyResolvedValue(full);
+            if (typeof display === 'string' && display.length > maxLen) {
+              display = display.slice(0, Math.max(0, maxLen - 1)) + '…';
             }
-            pairs.push({ k: kk, full, short });
+            pairs.push({ k: kk, full, short: display });
           }
 
           if (!pairs.length) return document.createTextNode('-');
@@ -3655,7 +3669,7 @@
           if (!(k in resolvedKv)) return document.createTextNode('-');
           const obj = {};
           obj[k] = resolvedKv[k];
-          return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 500, maxDetailItems: 25 });
+          return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 3000, maxDetailItems: 25 });
         }
 
         function buildIoTable(mode) {
@@ -4467,7 +4481,7 @@
       function renderResolvedCell(kv, keysOrder, opts) {
         const options = (opts && typeof opts === 'object') ? opts : {};
         const maxItems = Number.isFinite(+options.maxItems) ? (+options.maxItems) : 3;
-        const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 60;
+        const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 3000;
         const maxDetailItems = Number.isFinite(+options.maxDetailItems) ? (+options.maxDetailItems) : 25;
 
         const obj = (kv && typeof kv === 'object' && !Array.isArray(kv)) ? kv : null;
@@ -4493,11 +4507,11 @@
           const v = obj[kk];
           if (v === undefined) continue;
           const full = _stringifyAny(v);
-          let short = full;
-          if (typeof short === 'string' && short.length > maxLen) {
-            short = short.slice(0, Math.max(0, maxLen - 1)) + '…';
+          let display = simplifyResolvedValue(full);
+          if (typeof display === 'string' && display.length > maxLen) {
+            display = display.slice(0, Math.max(0, maxLen - 1)) + '…';
           }
-          pairs.push({ k: kk, full, short });
+          pairs.push({ k: kk, full, short: display });
         }
 
         if (!pairs.length) return document.createTextNode('-');
@@ -4635,12 +4649,12 @@
         if (!(k in resolvedKv)) return document.createTextNode('-');
         const obj = {};
         obj[k] = resolvedKv[k];
-        return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 500, maxDetailItems: 25 });
+        return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 3000, maxDetailItems: 25 });
       }
 
       function placeholderFromResolved(resolvedKv, key, opts) {
         const options = (opts && typeof opts === 'object') ? opts : {};
-        const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 80;
+        const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 3000;
         const k = String(key || '').trim();
         if (!k || !resolvedKv || typeof resolvedKv !== 'object' || Array.isArray(resolvedKv)) return '';
         if (!(k in resolvedKv)) return '';
@@ -4657,6 +4671,7 @@
         }
         s = String(s || '').trim();
         if (!s) return '';
+        s = simplifyResolvedValue(s);
         if (s.length > maxLen) s = s.slice(0, Math.max(0, maxLen - 1)) + '…';
         return s;
       }
@@ -6001,18 +6016,23 @@
 
     function renderResolvedInline(val) {
       let resolvedText = '';
+      let fullText = '';
       try {
         if (Array.isArray(val)) {
-          resolvedText = val.map(x => (x === null || x === undefined) ? '' : String(x)).filter(Boolean).join(', ');
+          resolvedText = val.map(x => simplifyResolvedValue(String(x ?? ''))).filter(Boolean).join(', ');
+          fullText = val.map(x => String(x ?? '')).filter(Boolean).join(', ');
         } else if (val && typeof val === 'object') {
           resolvedText = JSON.stringify(val);
+          fullText = resolvedText;
         } else if (val !== undefined && val !== null) {
-          resolvedText = String(val);
+          fullText = String(val);
+          resolvedText = simplifyResolvedValue(fullText);
         }
-      } catch (e) { resolvedText = ''; }
+      } catch (e) { resolvedText = ''; fullText = ''; }
       if (!resolvedText) return document.createTextNode('-');
       const vcode = document.createElement('code');
       vcode.className = 'font-monospace';
+      vcode.title = fullText;
       vcode.textContent = resolvedText;
       return vcode;
     }
@@ -7993,6 +8013,52 @@
       hideLoading();
     }
   }
+  /* Shared verification logic */
+  async function verifyFlowFiles(scenario, xmlPath) {
+    if (!scenario) return { ok: false, error: 'No scenario' };
+    try {
+      const data = await postJson(
+        '/api/flag-sequencing/revalidate_flow',
+        {
+          scenario,
+          xml_path: xmlPath || '',
+          flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
+        },
+        { timeoutMs: 60000 }
+      );
+
+      // Update UI with resolved paths (always, if available)
+      if (data && data.resolved_paths && Array.isArray(currentFlagAssignments)) {
+        try {
+          const rp = data.resolved_paths;
+          currentFlagAssignments.forEach(fa => {
+            // Update resolved_outputs
+            if (fa.resolved_outputs) {
+              Object.keys(fa.resolved_outputs).forEach(k => {
+                const original = fa.resolved_outputs[k];
+                if (rp[original]) fa.resolved_outputs[k] = rp[original];
+              });
+            }
+            // Update outputs manifest if present
+            if (fa.outputs_manifest && rp[fa.outputs_manifest]) {
+              fa.outputs_manifest = rp[fa.outputs_manifest];
+            }
+            // Update injects
+            if (Array.isArray(fa.inject_files_detail)) {
+              fa.inject_files_detail.forEach(ifd => {
+                const original = ifd.resolved || ifd.path;
+                if (original && rp[original]) ifd.resolved = rp[original];
+              });
+            }
+          });
+          renderChainEditor();
+        } catch (e) { console.error('Error updating resolved paths:', e); }
+      }
+      return data || { ok: false, error: 'No data returned' };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  }
 
   async function execute() {
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
@@ -8056,6 +8122,19 @@
           throw new Error('Save did not return xml_path');
         }
       }
+
+      // Mandatory Verification Step
+      setStatus('Verifying files on CORE VM…', false);
+      const verifyData = await verifyFlowFiles(scenario, xmlPath);
+      if (!verifyData.ok) {
+        throw new Error('Verification failed: ' + (verifyData.error || 'Unknown error'));
+      }
+      if (verifyData.missing && verifyData.missing.length > 0) {
+        const msg = 'Missing required files:\n' + verifyData.missing.join('\n');
+        alert(msg); // Simple alert to block execution
+        throw new Error('Execution aborted due to missing files.');
+      }
+
       setStatus('Starting async execution…', false);
       const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario, flow_enabled: !!flowEnabled });
       const runId = runData && runData.run_id ? String(runData.run_id) : '';
@@ -8360,80 +8439,23 @@
         : null;
 
       composeModalEnabled = true;
-      showComposeDialog('Re-Validate', 'Syncing Flow resources…');
-      // Added 'Sync Flow Plan' step
-      setLoadingSteps(['Sync Flow Plan', 'Connect to CORE VM', 'Verify files', 'Complete'], 0);
-      appendLoadingLog('Syncing flow resources to CORE VM…');
-
-      // 1. Sync
-      try {
-        await postJson(
-          '/api/flag-sequencing/prepare_preview_for_execute',
-          {
-            scenario,
-            length,
-            preset,
-            chain_ids: chain_ids, // Pass current chain if available to preserve it
-            preview_plan: previewPlanForRequest(),
-            allow_node_duplicates: !!allowDupes,
-            mode: 'resolve', // Triggers sync
-            best_effort: true,
-          },
-          { timeoutMs: 120000 }
-        );
-        appendLoadingLog('Sync complete.');
-      } catch (err) {
-        // If sync fails, we might still try to validate (maybe files are already there?),
-        // but usually this indicates a problem. We'll warn and check.
-        setComposeError('Sync failed: ' + String(err && err.message || err));
-        // Optional: return; // or continue?
-        // Let's continue but log it, as the user might be offline debugging.
-        appendLoadingLog('Warning: Sync step failed. Proceeding to verification...');
-      }
+      showComposeDialog('Re-Validate', 'Connecting to CORE VM…');
+      // Removed 'Sync Flow Plan' step to prevent re-generation.
+      setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 0);
+      appendLoadingLog('Starting re-validation…');
 
       // 2. Verify
-      showComposeDialog('Re-Validate', 'Connecting to CORE VM…');
-      setLoadingSteps(['Sync Flow Plan', 'Connect to CORE VM', 'Verify files', 'Complete'], 1);
-      appendLoadingLog('Starting re-validation…');
-      let data = null;
-      try {
-        data = await postJson('/api/flag-sequencing/revalidate_flow', { scenario, xml_path: xmlPath || '' }, { timeoutMs: 60000 });
-      } catch (err) {
-        setComposeError(String(err && err.message || err));
+      // showComposeDialog('Re-Validate', 'Connecting to CORE VM…'); 
+      // setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 0); 
+
+      const data = await verifyFlowFiles(scenario, xmlPath);
+      if (!data.ok) {
+        setComposeError(data.error || 'Re-validate failed');
         setStatus('Re-validate failed.', true);
-        if (typeof window.refreshDockLogs === 'function') window.refreshDockLogs();
         if (typeof window.refreshDockLogs === 'function') window.refreshDockLogs();
         return;
       }
-      setLoadingSteps(['Sync Flow Plan', 'Connect to CORE VM', 'Verify files', 'Complete'], 3);
-
-      // Update UI with resolved paths (always, if available)
-      if (data && data.resolved_paths && Array.isArray(currentFlagAssignments)) {
-        try {
-          const rp = data.resolved_paths;
-          currentFlagAssignments.forEach(fa => {
-            // Update resolved_outputs
-            if (fa.resolved_outputs) {
-              Object.keys(fa.resolved_outputs).forEach(k => {
-                const original = fa.resolved_outputs[k];
-                if (rp[original]) fa.resolved_outputs[k] = rp[original];
-              });
-            }
-            // Update outputs manifest if present
-            if (fa.outputs_manifest && rp[fa.outputs_manifest]) {
-              fa.outputs_manifest = rp[fa.outputs_manifest];
-            }
-            // Update injects
-            if (Array.isArray(fa.inject_files_detail)) {
-              fa.inject_files_detail.forEach(ifd => {
-                const original = ifd.resolved || ifd.path;
-                if (original && rp[original]) ifd.resolved = rp[original];
-              });
-            }
-          });
-          renderChainEditor();
-        } catch (e) { console.error('Error updating resolved paths:', e); }
-      }
+      // UI already updated by helper.
 
       const missing = (data && Array.isArray(data.missing)) ? data.missing : [];
       const esc = (s) => escapeHtml(String(s || ''));

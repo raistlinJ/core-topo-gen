@@ -1318,12 +1318,12 @@
         ? initialPayload.scenario_query.trim()
         : '';
     const LEGACY_EDITOR_STATE_STORAGE_KEY = 'coretg_editor_state';
-    const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
-    const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_active_idx_map_v1';
-    const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
+    const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v3';
+    const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_active_idx_map_v3';
+    const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key_v3';
     const DEFAULT_PROJECT_KEY = '__default_project__';
-    const DELETED_SCENARIO_IDS_STORAGE_KEY = 'coretg_deleted_scenario_ids_v1';
-    const DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY = 'coretg_deleted_scenario_name_keys_v1';
+    const DELETED_SCENARIO_IDS_STORAGE_KEY = 'coretg_deleted_scenario_ids_v3';
+    const DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY = 'coretg_deleted_scenario_name_keys_v3';
 
     // HITL attachment constants must be defined early because the editor can merge
     // persisted snapshots during initial load, and that merge path calls
@@ -1825,7 +1825,7 @@
 
     function normalizeScenarioName(value) {
         if (value === null || value === undefined) return '';
-        return String(value).replace(/\s+/g, ' ').trim();
+        return String(value).replace(/[^A-Za-z0-9]/g, '').trim();
     }
 
     function scenarioNameKey(value) {
@@ -1834,7 +1834,7 @@
     }
 
     function ensureUniqueScenarioName(desiredName, scenarios, selfIndex) {
-        const base = normalizeScenarioName(desiredName) || 'Scenario';
+        const base = normalizeScenarioName(desiredName) || 'NewScenario';
         const existing = new Set();
         try {
             (scenarios || []).forEach((sc, idx) => {
@@ -1853,10 +1853,10 @@
         } catch (e) { }
         if (!existing.has(scenarioNameKey(base))) return base;
         for (let n = 2; n < 1000; n++) {
-            const candidate = `${base} (${n})`;
+            const candidate = `${base}${n}`;
             if (!existing.has(scenarioNameKey(candidate))) return candidate;
         }
-        return `${base} (${Date.now()})`;
+        return `${base}${Date.now()}`;
     }
 
     function generateScenarioSid() {
@@ -1868,7 +1868,7 @@
     function defaultScenario(name) {
         return {
             _sid: generateScenarioSid(),
-            name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
+            name: name || `NewScenario${document.querySelectorAll('.scenario-card').length + 1}`,
             base: { filepath: '' },
             hitl: { enabled: false, interfaces: [] },
             density_count: 10,
@@ -4614,7 +4614,7 @@
     }
 
     // Base state is from server payload or default
-    let state = initialPayload ?? { scenarios: [defaultScenario('Scenario 1')], result_path: null };
+    let state = initialPayload ?? { scenarios: [defaultScenario('NewScenario')], result_path: null };
     // Expose live in-memory state to shared cross-tab helpers (Topology/Flow/Preview).
     // Note: `let state = ...` does not create `window.state`, so helpers in other templates
     // cannot see it unless we explicitly attach it.
@@ -4876,7 +4876,7 @@
                 state.scenarios = fallbackScenarios;
                 try { logWarn(`[topology] Recovered scenarios from fallback snapshot (count=${fallbackScenarios.length}).`); } catch (e) { }
             } else {
-                state.scenarios = [defaultScenario('Scenario 1')];
+                state.scenarios = [defaultScenario('NewScenario')];
                 try { logWarn('[topology] No scenarios found; inserted default scenario.'); } catch (e) { }
             }
         }
@@ -5610,6 +5610,11 @@
                     showUnsavedChangesModal(href);
                     return;
                 }
+                try {
+                    if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+                        window.coretgAllowUnsavedNavOnce();
+                    }
+                } catch (e) { }
                 window.location.href = href;
             } catch (e) {
                 try { ev.preventDefault(); } catch (_e) { }
@@ -5627,12 +5632,22 @@
                     // Clear the post-save continue state so returning to Topology doesn't stay "Continue" forever.
                     try { sessionStorage.removeItem('coretg_topology_continue_after_save_v1'); } catch (e) { }
                     const url = '/scenarios/flag-sequencing' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                    try {
+                        if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+                            window.coretgAllowUnsavedNavOnce();
+                        }
+                    } catch (e) { }
                     window.location.href = url;
                     return;
                 }
                 if (action === 'continue-topology') {
                     const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
                     const url = '/scenarios' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                    try {
+                        if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+                            window.coretgAllowUnsavedNavOnce();
+                        }
+                    } catch (e) { }
                     window.location.href = url;
                     return;
                 }
@@ -7860,6 +7875,7 @@
     }
 
     function scheduleAutoSaveXml(snapshot, coreState, scenarios) {
+        return;
         if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
         if (!snapshot || !Array.isArray(scenarios) || scenarios.length === 0) return;
         if (autoSaveXmlSkipNext) {
@@ -7872,7 +7888,7 @@
             active_index: Number.isInteger(activeIdx) ? activeIdx : 0,
             project_key_hint: snapshot.project_key_hint || null,
             scenario_query: snapshot.scenario_query || null,
-            autosave: true,
+            autosave: false,
         };
         const signature = buildAutosaveSignature(payload);
         if (signature && autoSaveXmlLastSignature === signature) return;
@@ -8031,7 +8047,7 @@
             if (!scen || typeof scen !== 'object') continue;
 
             const seedVal = getDeterministicSeedForScenarioOnSave(scen, sidx) || 1;
-            const scenName = (scen.name ? String(scen.name) : '').trim() || `Scenario ${sidx + 1}`;
+            const scenName = (scen.name ? String(scen.name) : '').trim() || `NewScenario${sidx + 1}`;
             const sections = (scen.sections && typeof scen.sections === 'object') ? scen.sections : {};
 
             // These are the Topology-box cards where the UI allows Random selections.
@@ -8046,7 +8062,8 @@
                 // This replaces visible "Random" in the UI and avoids backend preview-plan failures.
                 if (sectionName === 'Vulnerabilities') {
                     const catalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
-                    // Only choose from vulnerabilities that are "Ready" (compose exists + images pulled).
+                    // Prefer "Ready" vulnerabilities when cache is already available, but do not
+                    // trigger save-time Docker/image checks.
                     const cache = (window.__coretg_vuln_status_by_key && typeof window.__coretg_vuln_status_by_key === 'object')
                         ? window.__coretg_vuln_status_by_key
                         : {};
@@ -8063,6 +8080,7 @@
                         }
                     };
                     const eligibleReady = catalogItems.filter(isReadyItem);
+                    const eligibleAny = eligibleReady.length ? eligibleReady : catalogItems;
                     for (let i = 0; i < items.length; i++) {
                         const it = items[i];
                         if (!it || typeof it !== 'object') continue;
@@ -8070,14 +8088,14 @@
                         const normalized = rawSelected.toLowerCase();
                         const isRandomSelected = (!rawSelected || normalized === 'random' || normalized === 'category' || normalized === 'type/vector');
                         if (!isRandomSelected) continue;
-                        if (!eligibleReady.length) {
-                            warnings.push('No Ready vulnerabilities available (download/pull at least one vuln pack item).');
-                            pushExample({ scenario: scenName, section: 'Vulnerabilities', row: i + 1, field: 'selected', from: rawSelected || 'Random', to: 'Left Random (no Ready items)' });
+                        if (!eligibleAny.length) {
+                            warnings.push('No vulnerabilities available in catalog.');
+                            pushExample({ scenario: scenName, section: 'Vulnerabilities', row: i + 1, field: 'selected', from: rawSelected || 'Random', to: 'Left Random (catalog empty)' });
                             continue;
                         }
 
                         const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|v_name|save-xml`);
-                        const pick = eligibleReady[Math.floor(rng() * eligibleReady.length) % eligibleReady.length];
+                        const pick = eligibleAny[Math.floor(rng() * eligibleAny.length) % eligibleAny.length];
                         const pickedName = pick && (pick.Name || pick.name) ? String(pick.Name || pick.name) : '';
                         if (!pickedName) continue;
 
@@ -8355,29 +8373,7 @@
     }
 
     async function concretizeRandomSelectionsForSaveAsync(scenarios) {
-        try {
-            const list = Array.isArray(scenarios) ? scenarios : [];
-            // Only do the potentially-expensive ready-status check if we have Vulnerability Random rows.
-            let needsVuln = false;
-            try {
-                for (const sc of list) {
-                    const items = sc?.sections?.['Vulnerabilities']?.items;
-                    if (!Array.isArray(items)) continue;
-                    if (items.some(it => {
-                        const sel = (it && it.selected !== undefined && it.selected !== null) ? String(it.selected).trim().toLowerCase() : '';
-                        return (!sel || sel === 'random' || sel === 'category' || sel === 'type/vector');
-                    })) {
-                        needsVuln = true;
-                        break;
-                    }
-                }
-            } catch (e) { needsVuln = false; }
-
-            if (needsVuln) {
-                const catalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
-                await ensureVulnReadyStatusCache(catalogItems);
-            }
-        } catch (e) { }
+        // Save XML should not perform Docker/image readiness checks.
         return concretizeRandomSelectionsForSave(scenarios);
     }
 
@@ -9151,7 +9147,7 @@
     }
 
     async function handleExternalIfxApply(options = {}) {
-        const { confirmUser = true, setBusy = true, autoSave = true } = options || {};
+        const { confirmUser = true, setBusy = true, autoSave = false } = options || {};
         const bridgeName = computeInternalBridgeName();
         logInfo(`External IFX apply initiated for bridge ${bridgeName}`);
         if (confirmUser) {
@@ -11617,7 +11613,7 @@
                     if (!name) {
                         // Ensure every scenario has a stable name so server-side deletion
                         // can match against snapshots and saved XML artifacts.
-                        name = `Scenario ${idx + 1}`;
+                        name = `NewScenario${idx + 1}`;
                         s.name = name;
                     }
                     deletedNames.push(name);
@@ -11781,7 +11777,7 @@
             a.className = 'list-group-item list-group-item-action py-1' + (idx === activeIdx ? ' active bg-primary text-white' : '');
             // Build inner HTML with checkbox
             const isChecked = selectedScenarioIds.has(sid);
-            const name = scen.name || `Scenario ${idx + 1}`;
+            const name = scen.name || `NewScenario${idx + 1}`;
             const safeName = escapeHtml(name);
             const checkboxHtml = IS_BUILDER_VIEW ? '' : `<input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked ? 'checked' : ''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />`;
 
@@ -12027,7 +12023,7 @@
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
         const safeScenarioName = escapeHtml(scen?.name || '');
-        const defaultScenarioName = escapeHtml(`Scenario ${activeIdx + 1}`);
+        const defaultScenarioName = escapeHtml(`NewScenario${activeIdx + 1}`);
 
         // Scenario-name card button enablement (Config HITL Clear).
         const metaHitlState = ensureHitlStateForScenario(scen);
@@ -13836,6 +13832,11 @@
                     if (result && result.ok && window._coreNavAwaitingValidation) {
                         const target = window._coreNavAwaitingValidation;
                         window._coreNavAwaitingValidation = null;
+                        try {
+                            if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+                                window.coretgAllowUnsavedNavOnce();
+                            }
+                        } catch (e) { }
                         window.location.href = target;
                     }
                     return result;
@@ -15112,7 +15113,7 @@
                         const raw = el.value ?? '';
                         if (ev?.type === 'change') {
                             const trimmed = raw.trim();
-                            const finalName = trimmed || `Scenario ${sidx + 1}`;
+                            const finalName = normalizeScenarioName(trimmed || `NewScenario${sidx + 1}`);
                             let uniqueName = finalName;
                             try {
                                 uniqueName = ensureUniqueScenarioName(finalName, state.scenarios, sidx);
@@ -17251,7 +17252,7 @@
                 generatorInjectsMissing ? `${generatorInjectsMissing} inject source(s) missing` : 'All inject sources present',
                 generatorInjectsDetailItems
             ));
-        } else {
+        } else if (expectedDockerNodes > 0) {
             executeSummaryListEl.appendChild(renderExecuteSummaryItem(
                 'Docker containers detected',
                 false,
