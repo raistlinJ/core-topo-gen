@@ -485,6 +485,9 @@ def _rewrite_compose_host_network(compose_path: Path) -> None:
         print(f"[compose] warning: failed to parse compose yaml for host network: {exc}")
         return
 
+    if isinstance(obj, dict):
+        obj.pop('version', None)
+
     services = obj.get('services') if isinstance(obj, dict) else None
     if not isinstance(services, dict):
         return
@@ -913,7 +916,10 @@ def main() -> int:
             try:
                 compose_src = (source_dir / compose_file).resolve()
                 if compose_src.exists():
-                    compose_out = (out_dir / 'docker-compose.hostnet.yml').resolve()
+                    compose_out = (
+                        compose_src.parent
+                        / f"docker-compose.hostnet.{os.getpid()}_{int(time.time() * 1000)}.yml"
+                    ).resolve()
                     compose_out.write_text(compose_src.read_text('utf-8', errors='ignore'), encoding='utf-8')
                     _rewrite_compose_host_network(compose_out)
                     compose_file = str(compose_out)

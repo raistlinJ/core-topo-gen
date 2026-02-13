@@ -17605,6 +17605,19 @@ def api_flow_prepare_preview_for_execute():
                 note = str(remote_err)
             else:
                 note = f'remote generator failed (rc={rc}): {tail[-800:] if tail else "(no output)"}'
+            try:
+                app.logger.error(
+                    '[flow.generator.remote] generator=%s ok=%s rc=%s note=%s manifest=%s stdout_tail=%s stderr_tail=%s',
+                    generator_id,
+                    bool(ok),
+                    rc,
+                    str(note or ''),
+                    str(manifest_path or ''),
+                    (stdout or '').strip()[-4000:],
+                    (stderr or '').strip()[-4000:],
+                )
+            except Exception:
+                pass
         elif not manifest_path:
             tail = (stderr or stdout).strip()
             if tail:
@@ -18324,6 +18337,22 @@ def api_flow_prepare_preview_for_execute():
                         except Exception:
                             pass
 
+                        if not ok_run:
+                            try:
+                                app.logger.error(
+                                    '[flow.generator.debug] node=%s generator=%s type=%s note=%s out_dir=%s manifest=%s stdout_tail=%s stderr_tail=%s',
+                                    cid,
+                                    generator_id,
+                                    assignment_type,
+                                    str(note or ''),
+                                    str(flow_out_dir or ''),
+                                    str(manifest_path or ''),
+                                    (run_stdout or '').strip()[-4000:] if isinstance(run_stdout, str) else '',
+                                    (run_stderr or '').strip()[-4000:] if isinstance(run_stderr, str) else '',
+                                )
+                            except Exception:
+                                pass
+
                         log_path = None
                         try:
                             logs_root = os.path.join(_outputs_dir(), 'logs', 'flow_generator_logs')
@@ -18348,6 +18377,12 @@ def api_flow_prepare_preview_for_execute():
                                     lf.write("\n")
                         except Exception:
                             log_path = None
+
+                        if not ok_run and log_path:
+                            try:
+                                app.logger.error('[flow.generator.debug] detailed log written to %s', str(log_path))
+                            except Exception:
+                                pass
 
                         try:
                             generator_runs.append({
@@ -33316,6 +33351,21 @@ def _looks_like_path(key, val) -> bool:
         return False
 
 
+def _skip_output_path_check(key, val) -> bool:
+    try:
+        k = str(key or '').strip().lower()
+        v = str(val or '').strip()
+        if k.startswith('directory('):
+            return True
+        if not v:
+            return False
+        if v in ('/exports', '/outputs', '/inputs'):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _find_latest_run_dir(scenario_tag, node_name):
     try:
         base = '/tmp/vulns/flag_node_generators_runs'
@@ -33347,9 +33397,24 @@ def _resolve_output_path(val: str, run_dir: str, artifacts_dir: str, scenario_ta
         found = _find_latest_run_dir(scenario_tag, node_name)
         if found:
             run_dir = found
+
+    def _map_container_mount_path(abs_path: str) -> str:
+        p = str(abs_path or '').strip()
+        if not p or not os.path.isabs(p):
+            return p
+        base = run_dir or artifacts_dir or ''
+        if not base:
+            return p
+        for mount_prefix in ('/outputs', '/exports'):
+            if p == mount_prefix:
+                return base
+            if p.startswith(mount_prefix + '/'):
+                suffix = p[len(mount_prefix):].lstrip('/')
+                return os.path.join(base, suffix) if suffix else base
+        return p
     
     if os.path.isabs(v):
-        return v
+        return _map_container_mount_path(v)
     if v.startswith('artifacts/') and artifacts_dir:
         return os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/'))
     if run_dir:
@@ -33453,6 +33518,8 @@ def main():
                 pass
 
             for k, v in outs.items():
+                if _skip_output_path_check(k, v):
+                    continue
                 if not _looks_like_path(k, v):
                     continue
                 p = _resolve_output_path(str(v), run_dir, artifacts_dir, scenario_tag=st, node_name=node_id)

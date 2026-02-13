@@ -8499,15 +8499,18 @@
       composeModalEnabled = true;
       showComposeDialog('Re-Validate', 'Connecting to CORE VM…');
       // Removed 'Sync Flow Plan' step to prevent re-generation.
-      setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 0);
+      const revalidateSteps = ['Connect to CORE VM', 'Verify files', 'Complete'];
+      setLoadingSteps(revalidateSteps, 0);
       appendLoadingLog('Starting re-validation…');
 
       // 2. Verify
       // showComposeDialog('Re-Validate', 'Connecting to CORE VM…'); 
       // setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 0); 
 
+      setLoadingSteps(revalidateSteps, 1);
       const data = await verifyFlowFiles(scenario, xmlPath);
       if (!data.ok) {
+        setLoadingSteps(revalidateSteps, revalidateSteps.length);
         setComposeError(data.error || 'Re-validate failed');
         setStatus('Re-validate failed.', true);
         if (typeof window.refreshDockLogs === 'function') window.refreshDockLogs();
@@ -8516,7 +8519,23 @@
       // UI already updated by helper.
 
       const missing = (data && Array.isArray(data.missing)) ? data.missing : [];
+      const present = (data && Array.isArray(data.present)) ? data.present : [];
+      const checkedFiles = Array.from(new Set([...
+        present.map(p => String(p || '').trim()).filter(Boolean),
+        missing.map(p => String(p || '').trim()).filter(Boolean),
+      ]));
       const esc = (s) => escapeHtml(String(s || ''));
+      const buildCheckedFilesDropdown = (files) => {
+        const arr = Array.isArray(files) ? files.map(f => String(f || '').trim()).filter(Boolean) : [];
+        const items = arr.slice(0, 200).map((f) => `<li>${esc(f)}</li>`).join('');
+        const more = arr.length > 200 ? `<li>... (${arr.length - 200} more)</li>` : '';
+        return `
+          <details class="mt-2">
+            <summary class="small fw-semibold" style="cursor:pointer;">Checked files (${arr.length})</summary>
+            <ul class="small mb-0 mt-2 ps-3">${items || '<li>(none)</li>'}${more}</ul>
+          </details>
+        `;
+      };
       const buildRevalidateHtml = (ok, title, subtitle, detailsHtml, logText) => {
         const alertClass = ok ? 'alert-success' : 'alert-danger';
         const icon = ok ? '✓' : '✕';
@@ -8536,14 +8555,16 @@
         `;
       };
       if (data && data.ok && missing.length === 0) {
+        setLoadingSteps(revalidateSteps, revalidateSteps.length);
         appendLoadingLog('All expected files found on CORE VM.');
 
         const snap = composeBodyEl ? (composeBodyEl.innerText || '') : '';
+        const detailsHtml = buildCheckedFilesDropdown(checkedFiles);
         const html = buildRevalidateHtml(
           true,
           'Re-Validate Succeeded',
           'All expected files found on CORE VM.',
-          '',
+          detailsHtml,
           snap
         );
         updateComposeDialog({ html });
@@ -8559,6 +8580,7 @@
         return;
       }
       if (data && data.ok && missing.length) {
+        setLoadingSteps(revalidateSteps, revalidateSteps.length);
         appendLoadingLog(`Missing files: ${missing.length}`);
         missing.slice(0, 8).forEach((m) => appendLoadingLog(`- ${m}`));
         if (missing.length > 8) appendLoadingLog(`- ... (${missing.length - 8} more)`);
@@ -8568,6 +8590,7 @@
         const detailsHtml = `
           <div class="small text-muted mb-2">Missing files</div>
           <ul class="small mb-3">${missingItems}${missingMore}</ul>
+          ${buildCheckedFilesDropdown(checkedFiles)}
         `;
         const html = buildRevalidateHtml(
           false,
@@ -8592,9 +8615,11 @@
         return;
       }
       const errMsg = (data && (data.error || data.message)) ? String(data.error || data.message) : 'Re-validate failed.';
+      setLoadingSteps(revalidateSteps, revalidateSteps.length);
       setComposeError(errMsg);
       setStatus(errMsg, true);
     } catch (err) {
+      setLoadingSteps(['Connect to CORE VM', 'Verify files', 'Complete'], 3);
       setComposeError(String(err && err.message || err));
       setStatus(String(err && err.message || err), true);
     }
