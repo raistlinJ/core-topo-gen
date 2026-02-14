@@ -1,4 +1,5 @@
 import os
+import re
 from types import SimpleNamespace
 
 from core_topo_gen.builders.topology import _apply_docker_compose_meta, NodeType
@@ -80,3 +81,107 @@ def test_apply_docker_compose_meta_pushes_options(tmp_path):
     assert getattr(node, "image") == ""
     assert getattr(options, "type") == ""
     assert getattr(options, "image") == ""
+
+
+def test_apply_docker_compose_meta_uses_real_service_name(tmp_path):
+    compose_path = tmp_path / "docker-compose-host-1.yml"
+    compose_path.write_text(
+            """
+services:
+    app:
+        image: nginx:latest
+""".strip()
+            + "\n",
+            encoding="utf-8",
+    )
+
+    record = {"Name": "standard-ubuntu-docker-core", "compose_path": str(compose_path)}
+    node = SimpleNamespace(id=6, name="host-1", options=None, type=NodeType.DOCKER, image="")
+    session = DummySession()
+
+    _apply_docker_compose_meta(node, record, session=session)
+
+    assert getattr(node, "compose_name") == "app"
+    assert session.calls, "session.edit_node should be called"
+    node_id, options, _ = session.calls[0]
+    assert node_id == node.id
+    assert getattr(options, "compose_name") == "app"
+
+
+def test_apply_docker_compose_meta_falls_back_when_service_invalid(tmp_path):
+    compose_path = tmp_path / "docker-compose-host-1.yml"
+    compose_path.write_text(
+            """
+services:
+    web:
+        image: nginx:latest
+""".strip()
+            + "\n",
+            encoding="utf-8",
+    )
+
+    record = {
+        "Name": "standard-ubuntu-docker-core",
+        "compose_path": str(compose_path),
+        "compose_service": "standard-ubuntu-docker-core",
+    }
+    node = SimpleNamespace(id=7, name="host-1", options=None, type=NodeType.DOCKER, image="")
+    session = DummySession()
+
+    _apply_docker_compose_meta(node, record, session=session)
+
+    assert getattr(node, "compose_name") == "web"
+    assert session.calls, "session.edit_node should be called"
+    node_id, options, _ = session.calls[0]
+    assert node_id == node.id
+    assert getattr(options, "compose_name") == "web"
+
+
+def test_apply_docker_compose_meta_unsets_invalid_service_when_unreadable_compose(tmp_path):
+    compose_path = tmp_path / "docker-compose-host-1.yml"
+    compose_path.write_text("services:\n  web: [\n", encoding="utf-8")
+
+    record = {
+        "Name": "standard-ubuntu-docker-core",
+        "compose_path": str(compose_path),
+        "compose_service": "standard-ubuntu-docker-core",
+    }
+    node = SimpleNamespace(id=8, name="host-1", options=None, type=NodeType.DOCKER, image="")
+    session = DummySession()
+
+    _apply_docker_compose_meta(node, record, session=session)
+
+    assert getattr(node, "compose_name", None) is None
+    assert session.calls, "session.edit_node should be called"
+    _node_id, options, _ = session.calls[0]
+    assert getattr(options, "compose_name", None) is None
+
+
+def test_prepare_compose_escapes_mako_shell_vars(tmp_path):
+        compose_src = tmp_path / "base-compose-airflow.yml"
+        compose_src.write_text(
+                """
+version: '3'
+services:
+    app:
+        image: apache/airflow:2.9.0
+        environment:
+            - AIRFLOW_UID=${AIRFLOW_UID:-50000}
+""".strip()
+                + "\n",
+                encoding="utf-8",
+        )
+
+        record = {"Type": "docker-compose", "Name": "Airflow", "Path": str(compose_src)}
+        name_to_vuln = {"docker-3": record}
+        created = prepare_compose_for_assignments(name_to_vuln, out_base=str(tmp_path))
+
+        out_path = os.path.join(str(tmp_path), "docker-compose-docker-3.yml")
+        assert out_path in created
+        text = open(out_path, encoding="utf-8").read()
+
+        assert '${"${AIRFLOW_UID:-50000}"}' in text
+        assert "\\${AIRFLOW_UID:-50000}" not in text
+        assert "$${AIRFLOW_UID:-50000}" not in text
+        assert re.search(r"(?<![\"'])\$\{AIRFLOW_UID:-50000\}(?![\"'])", text) is None
+        assert re.search(r"\$\{\s*[\"']\$\{AIRFLOW_UID:-50000\}[\"']\s*\}", text) is not None

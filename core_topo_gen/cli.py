@@ -606,7 +606,6 @@ def main():
             except Exception:
                 pass
         if args.preview or args.preview_full:
-            import json, sys
             summary = pool.summarize()
             # Provide r2s/r2r placeholders if not yet populated by builders so UI/report
             # can render consistent sections.
@@ -677,7 +676,6 @@ def main():
         else:
             if args.plan_output:
                 try:
-                    import json
                     with open(args.plan_output, 'w', encoding='utf-8') as wf:
                         json.dump({"plan": pool.summarize()}, wf, indent=2, sort_keys=True)
                 except Exception:
@@ -1432,7 +1430,12 @@ def main():
                 except subprocess.TimeoutExpired:
                     return False, 'generator timed out'
                 except Exception as exc:
-                    return False, f'generator exception: {exc}'
+                    try:
+                        import traceback
+                        tb = traceback.format_exc(limit=6)
+                        return False, f'generator exception: {exc}; traceback={tb[-1200:]}'
+                    except Exception:
+                        return False, f'generator exception: {exc}'
 
             if standard_nodes:
                 # If any flag-node-generators are enabled, use them to generate per-node docker-compose

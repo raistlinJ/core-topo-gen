@@ -452,15 +452,31 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
             if os.path.exists(out_path):
                 with open(out_path, 'r', encoding='utf-8', errors='ignore') as fh:
                     txt = fh.read()
-                # Escape only unescaped `${` occurrences.
                 import re as _re
-                # CORE writes rendered compose using a shell `printf "..."`.
-                # Backslash escapes like `\n` inside the content can be interpreted
-                # mid-line, which corrupts YAML indentation. Pre-escape each `\` to
-                # `\\\\` (i.e., 4 backslashes) so the written file keeps a literal `\`.
-                fixed = txt.replace('\\', '\\\\' * 2)
-                # Escape only unescaped `${` occurrences.
-                fixed = _re.sub(r'(?<!\$)\$\{', '$${', fixed)
+                # Convert `${...}` placeholders into a Mako-safe literal wrapper form.
+                fixed = txt
+                safe_re = _re.compile(r'\$\{\s*([\"\'])\$\{[^}]*\}\1\s*\}')
+                stash: dict[str, str] = {}
+
+                def _stash(m) -> str:
+                    key = f"__CORETG_SAFE_MAKO_EXPR_{len(stash)}__"
+                    stash[key] = str(m.group(0))
+                    return key
+
+                fixed = safe_re.sub(_stash, fixed)
+
+                def _wrap(m) -> str:
+                    expr = str(m.group(1) or '')
+                    if not expr:
+                        return str(m.group(0))
+                    return '${"${' + expr + '}"}'
+
+                fixed = _re.sub(r'\\+\$\{([^}]*)\}', _wrap, fixed)
+                fixed = _re.sub(r'\$\$\{([^}]*)\}', _wrap, fixed)
+                fixed = safe_re.sub(_stash, fixed)
+                fixed = _re.sub(r'(?<!\$)\$\{([^}]*)\}', _wrap, fixed)
+                for key, original in stash.items():
+                    fixed = fixed.replace(key, original)
                 # CORE writes rendered compose using a shell `printf "..."`, so unescaped
                 # percent signs are treated as format directives. Escape single `%` to `%%`.
                 fixed = _re.sub(r'(?<!%)%(?!%)', '%%', fixed)
@@ -924,9 +940,11 @@ def _apply_docker_compose_meta(node, rec, session=None):
         default_per_node = f"/tmp/vulns/docker-compose-{n}.yml"
 
         compose_path = None
+        source_compose_hint = None
         try:
             if rec and isinstance(rec, dict):
                 compose_path = rec.get('compose_path')
+                source_compose_hint = str(compose_path or '').strip() or None
                 logger.info(
                     "[vuln-node] metadata lookup node=%s compose_path=%s record_keys=%s",
                     n,
@@ -990,20 +1008,149 @@ def _apply_docker_compose_meta(node, rec, session=None):
                 n,
                 compose_path,
             )
+        def _first_compose_service_name(compose_file: str) -> str | None:
+            p = str(compose_file or '').strip()
+            if not p or not os.path.exists(p):
+                return None
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                return None
+            try:
+                with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+                    obj = yaml.safe_load(fh) or {}
+                services = obj.get('services') if isinstance(obj, dict) else None
+                if isinstance(services, dict):
+                    for key in services.keys():
+                        k = str(key or '').strip()
+                        if k:
+                            return k
+            except Exception:
+                return None
+            return None
+
+        def _compose_service_names(compose_file: str) -> set[str]:
+            p = str(compose_file or '').strip()
+            if not p or not os.path.exists(p):
+                return set()
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                return set()
+            try:
+                with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+                    text = fh.read()
+                obj = yaml.safe_load(text) or {}
+                services = obj.get('services') if isinstance(obj, dict) else None
+                if isinstance(services, dict):
+                    out: set[str] = set()
+                    for key in services.keys():
+                        k = str(key or '').strip()
+                        if k:
+                            out.add(k)
+                    if out:
+                        return out
+                # Fallback text parse for partially-invalid YAML: collect first-level keys
+                # under `services:` by indentation.
+                out_text: set[str] = set()
+                in_services = False
+                services_indent = None
+                for line in text.splitlines():
+                    if not in_services:
+                        m = re.match(r'^(\s*)services\s*:\s*$', line)
+                        if m:
+                            in_services = True
+                            services_indent = len(m.group(1) or '')
+                        continue
+                    if not line.strip() or line.lstrip().startswith('#'):
+                        continue
+                    indent = len(line) - len(line.lstrip(' '))
+                    if services_indent is not None and indent <= services_indent:
+                        break
+                    m = re.match(r'^\s*([A-Za-z0-9_.-]+)\s*:\s*(?:#.*)?$', line)
+                    if m and indent > (services_indent or 0):
+                        out_text.add(str(m.group(1) or '').strip())
+                return {name for name in out_text if name}
+            except Exception:
+                return set()
+            return set()
+
+        # Defensive final pass: ensure Mako-sensitive `${...}` does not leak into
+        # the compose file that CORE daemon will render.
+        try:
+            if compose_path and os.path.exists(compose_path):
+                with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                    _txt = fh.read()
+                import re as _re
+                safe_re = _re.compile(r'\$\{\s*([\"\'])\$\{[^}]*\}\1\s*\}')
+                stash: dict[str, str] = {}
+
+                def _stash(m) -> str:
+                    key = f"__CORETG_SAFE_MAKO_EXPR_{len(stash)}__"
+                    stash[key] = str(m.group(0))
+                    return key
+
+                _fixed = safe_re.sub(_stash, _txt)
+
+                def _wrap(m) -> str:
+                    expr = str(m.group(1) or '')
+                    if not expr:
+                        return str(m.group(0))
+                    return '${"${' + expr + '}"}'
+
+                _fixed = _re.sub(r'\\+\$\{([^}]*)\}', _wrap, _fixed)
+                _fixed = _re.sub(r'\$\$\{([^}]*)\}', _wrap, _fixed)
+                _fixed = safe_re.sub(_stash, _fixed)
+                _fixed = _re.sub(r'(?<!\$)\$\{([^}]*)\}', _wrap, _fixed)
+                for key, original in stash.items():
+                    _fixed = _fixed.replace(key, original)
+                if _fixed != _txt:
+                    with open(compose_path, 'w', encoding='utf-8') as fh:
+                        fh.write(_fixed)
+                    try:
+                        logger.info("[vuln-node] compose re-sanitized for mako vars node=%s path=%s", n, compose_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         vname = None
+        service_names = _compose_service_names(compose_path) or _compose_service_names(source_compose_hint or '')
         try:
             if rec:
                 # Prefer explicit compose service name when available.
                 vname = rec.get('compose_service') or rec.get('compose_service_name')
-                if not vname:
-                    vname = rec.get('Name') or rec.get('name') or rec.get('Title') or rec.get('title')
+                if vname is not None:
+                    vname = str(vname).strip() or None
+                if vname and not service_names:
+                    try:
+                        logger.warning(
+                            "[vuln-node] compose services unavailable node=%s requested=%s; omitting compose_name",
+                            n,
+                            vname,
+                        )
+                    except Exception:
+                        pass
+                    vname = None
+                if vname and service_names and vname not in service_names:
+                    try:
+                        logger.warning(
+                            "[vuln-node] compose service mismatch node=%s requested=%s available=%s; falling back",
+                            n,
+                            vname,
+                            sorted(service_names),
+                        )
+                    except Exception:
+                        pass
+                    vname = None
+                if not vname and service_names:
+                    vname = _first_compose_service_name(compose_path) or _first_compose_service_name(source_compose_hint or '')
         except Exception:
             vname = None
-        if not vname:
-            try:
-                vname = n
-            except Exception:
-                vname = None
+        if not vname and service_names:
+            vname = _first_compose_service_name(compose_path) or _first_compose_service_name(source_compose_hint or '')
+        if vname and service_names and vname not in service_names:
+            vname = None
         try:
             logger.debug("[vuln-node] node=%s existing compose attr=%s", n, getattr(node, 'compose', None))
         except Exception:

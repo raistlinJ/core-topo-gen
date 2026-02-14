@@ -559,3 +559,200 @@ def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
     assert resp.status_code == 202
     data = resp.get_json()
     assert isinstance(data.get('run_id'), str) and data.get('run_id')
+
+
+def test_ensure_remote_daemon_ready_uses_fallback_before_autostart(monkeypatch):
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [])
+
+    def _fake_exec(_client, command, *, timeout=120.0, cancel_check=None, check=False):
+        if 'systemctl show -p MainPID' in command:
+            return 0, '4242\n', ''
+        if 'pidof core-daemon' in command:
+            return 0, '4242\n', ''
+        if 'pgrep -fa core-daemon' in command:
+            return 0, '4242 /usr/sbin/core-daemon\n', ''
+        if 'systemctl is-active core-daemon' in command:
+            return 0, 'active\n', ''
+        if 'ss -ltn' in command:
+            return 0, 'LISTEN 0 128 0.0.0.0:50051 0.0.0.0:*\n', ''
+        raise AssertionError(f'unexpected command: {command}')
+
+    monkeypatch.setattr(backend, '_exec_ssh_command', _fake_exec)
+
+    def _fail_start(*_args, **_kwargs):
+        raise AssertionError('auto-start should not run when fallback detects an existing daemon')
+
+    monkeypatch.setattr(backend, '_start_remote_core_daemon', _fail_start)
+
+    pid = backend._ensure_remote_core_daemon_ready(
+        client=object(),
+        core_cfg={'ssh_password': 'pw'},
+        auto_start_allowed=True,
+        sudo_password='pw',
+        logger=backend.app.logger,
+    )
+    assert pid == 4242
+
+
+def test_ensure_remote_daemon_ready_refuses_autostart_when_active_pid_unknown(monkeypatch):
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [])
+
+    def _fake_exec(_client, command, *, timeout=120.0, cancel_check=None, check=False):
+        if 'systemctl show -p MainPID' in command:
+            return 0, '0\n', ''
+        if 'pidof core-daemon' in command:
+            return 0, '\n', ''
+        if 'pgrep -fa core-daemon' in command:
+            return 0, '\n', ''
+        if 'systemctl is-active core-daemon' in command:
+            return 0, 'active\n', ''
+        if 'ss -ltn' in command:
+            return 0, '\n', ''
+        raise AssertionError(f'unexpected command: {command}')
+
+    monkeypatch.setattr(backend, '_exec_ssh_command', _fake_exec)
+
+    def _fail_start(*_args, **_kwargs):
+        raise AssertionError('auto-start should not run when daemon appears active')
+
+    monkeypatch.setattr(backend, '_start_remote_core_daemon', _fail_start)
+
+    with pytest.raises(backend.CoreDaemonMissingError) as exc:
+        backend._ensure_remote_core_daemon_ready(
+            client=object(),
+            core_cfg={'ssh_password': 'pw'},
+            auto_start_allowed=True,
+            sudo_password='pw',
+            logger=backend.app.logger,
+        )
+    assert 'refusing auto-start to avoid duplicate daemons' in str(exc.value)
+
+
+def test_ensure_remote_daemon_ready_detects_manual_sudo_core_daemon(monkeypatch):
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [])
+
+    def _fake_exec(_client, command, *, timeout=120.0, cancel_check=None, check=False):
+        if 'systemctl show -p MainPID' in command:
+            return 0, '0\n', ''
+        if 'pidof core-daemon' in command:
+            return 0, '\n', ''
+        if 'pgrep -fa core-daemon' in command:
+            return 0, '9123 sudo core-daemon\n9124 core-daemon\n', ''
+        if 'systemctl is-active core-daemon' in command:
+            return 3, 'inactive\n', ''
+        if 'ss -ltn' in command:
+            return 0, 'LISTEN 0 128 0.0.0.0:50051 0.0.0.0:*\n', ''
+        raise AssertionError(f'unexpected command: {command}')
+
+    monkeypatch.setattr(backend, '_exec_ssh_command', _fake_exec)
+
+    def _fail_start(*_args, **_kwargs):
+        raise AssertionError('auto-start should not run when manual daemon is already running')
+
+    monkeypatch.setattr(backend, '_start_remote_core_daemon', _fail_start)
+
+    pid = backend._ensure_remote_core_daemon_ready(
+        client=object(),
+        core_cfg={'ssh_password': 'pw'},
+        auto_start_allowed=True,
+        sudo_password='pw',
+        logger=backend.app.logger,
+    )
+    assert pid == 9124
+
+
+def test_ensure_remote_daemon_ready_detects_sudo_wrapper_only(monkeypatch):
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [])
+
+    def _fake_exec(_client, command, *, timeout=120.0, cancel_check=None, check=False):
+        if 'systemctl show -p MainPID' in command:
+            return 0, '0\n', ''
+        if 'pidof core-daemon' in command:
+            return 0, '\n', ''
+        if 'pgrep -fa core-daemon' in command:
+            return 0, '9123 sudo core-daemon\n', ''
+        if 'systemctl is-active core-daemon' in command:
+            return 3, 'inactive\n', ''
+        if 'ss -ltn' in command:
+            return 0, '\n', ''
+        raise AssertionError(f'unexpected command: {command}')
+
+    monkeypatch.setattr(backend, '_exec_ssh_command', _fake_exec)
+
+    def _fail_start(*_args, **_kwargs):
+        raise AssertionError('auto-start should not run when manual sudo wrapper process is active')
+
+    monkeypatch.setattr(backend, '_start_remote_core_daemon', _fail_start)
+
+    pid = backend._ensure_remote_core_daemon_ready(
+        client=object(),
+        core_cfg={'ssh_password': 'pw'},
+        auto_start_allowed=True,
+        sudo_password='pw',
+        logger=backend.app.logger,
+    )
+    assert pid == 9123
+
+
+def test_ensure_remote_daemon_ready_auto_heals_duplicate_pids(monkeypatch):
+    pid_samples = [[1111, 2222], [2222]]
+
+    def _fake_collect(_client, **_kwargs):
+        if pid_samples:
+            return pid_samples.pop(0)
+        return [2222]
+
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', _fake_collect)
+
+    heal_calls = []
+
+    def _fake_heal(_client, *, sudo_password, pids, logger):
+        heal_calls.append({'sudo_password': sudo_password, 'pids': list(pids)})
+        return {
+            'status': 'attempted',
+            'main_pid': 2222,
+            'preserved_main_pid': True,
+            'kill_targets': [1111],
+        }
+
+    monkeypatch.setattr(backend, '_stop_remote_core_daemon_conflict', _fake_heal)
+
+    pid = backend._ensure_remote_core_daemon_ready(
+        client=object(),
+        core_cfg={'ssh_password': 'pw'},
+        auto_start_allowed=True,
+        sudo_password='pw',
+        logger=backend.app.logger,
+    )
+    assert pid == 2222
+    assert heal_calls == [{'sudo_password': 'pw', 'pids': [1111, 2222]}]
+
+
+def test_ensure_remote_daemon_ready_conflict_without_sudo_raises(monkeypatch):
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [1111, 2222])
+
+    def _unexpected_heal(*_args, **_kwargs):
+        raise AssertionError('auto-heal should not run without sudo password')
+
+    monkeypatch.setattr(backend, '_stop_remote_core_daemon_conflict', _unexpected_heal)
+
+    with pytest.raises(backend.CoreDaemonConflictError) as exc:
+        backend._ensure_remote_core_daemon_ready(
+            client=object(),
+            core_cfg={'ssh_password': ''},
+            auto_start_allowed=True,
+            sudo_password='',
+            logger=backend.app.logger,
+        )
+    assert 'Multiple core-daemon processes are running' in str(exc.value)
+
+
+def test_is_transient_remote_prepare_error_matches_network_signatures():
+    assert backend._is_transient_remote_prepare_error(RuntimeError('[Errno 65] No route to host')) is True
+    assert backend._is_transient_remote_prepare_error(RuntimeError('Connection reset by peer')) is True
+    assert backend._is_transient_remote_prepare_error(RuntimeError('socket timeout while connecting')) is True
+
+
+def test_is_transient_remote_prepare_error_ignores_non_network_errors():
+    assert backend._is_transient_remote_prepare_error(RuntimeError('invalid xml schema')) is False
+    assert backend._is_transient_remote_prepare_error(RuntimeError('permission denied writing file')) is False

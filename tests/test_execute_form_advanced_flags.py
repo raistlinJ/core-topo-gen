@@ -48,3 +48,18 @@ def test_execute_summary_includes_flow_live_paths() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing flow live-path execute summary wiring: " + "; ".join(missing)
+
+
+def test_scenario_name_input_sanitizes_to_alphanumeric() -> None:
+    text = TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "data-field=\"name\"",
+        "pattern=\"[A-Za-z0-9]+\"",
+        "const sanitized = normalizeScenarioName(raw);",
+        "if (sanitized !== raw)",
+        "state.scenarios[sidx].name = sanitized;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing scenario-name alphanumeric sanitization wiring: " + "; ".join(missing)

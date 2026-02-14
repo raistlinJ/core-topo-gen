@@ -248,3 +248,105 @@ def test_validate_flow_enabled_without_per_node_expectations_does_not_require_al
     )
 
     assert summary.get('injects_missing') == []
+
+
+def test_validate_created_container_is_startup_pending_not_not_running(monkeypatch):
+    monkeypatch.setattr(backend, '_expected_from_plan_preview', lambda *a, **k: {3: {'name': 'docker-3'}})
+    monkeypatch.setattr(backend, '_parse_session_xml_for_compare', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_specs_from_flow_state', lambda *a, **k: [])
+    monkeypatch.setattr(backend, '_extract_inject_expected_by_node', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_dirs_from_plan_xml', lambda *a, **k: ['/tmp'])
+    monkeypatch.setattr(backend, '_extract_inject_files_from_plan_xml', lambda *a, **k: ['/tmp/challenge.txt'])
+    monkeypatch.setattr(backend, '_extract_expected_docker_and_vuln_nodes_from_plan_xml', lambda *a, **k: (['docker-3'], []))
+    monkeypatch.setattr(backend, '_session_docker_nodes_from_xml', lambda *a, **k: ['docker-3'])
+    monkeypatch.setattr(backend, '_extract_inject_node_ids_from_flow_state', lambda *a, **k: set())
+    monkeypatch.setattr(backend, '_flow_state_from_xml_path', lambda *a, **k: {'flag_assignments': []})
+
+    def _fake_remote_json(_cfg, _script, logger=None, label='', timeout=0):
+        if label == 'docker.exec.injects_status':
+            return {
+                'items': [
+                    {
+                        'container': 'docker-3',
+                        'exists': True,
+                        'running': False,
+                        'state_status': 'created',
+                        'state_exit_code': 0,
+                        'state_error': '',
+                        'inject_count': 0,
+                        'inject_samples': [],
+                        'inject_dirs_found': [],
+                        'debug_logs': [],
+                    }
+                ]
+            }
+        if label == 'docker.compose.assignments':
+            return {'nodes': []}
+        if label == 'flow.artifacts.validate':
+            return {'items': []}
+        return {'items': []}
+
+    monkeypatch.setattr(backend, '_run_remote_python_json', _fake_remote_json)
+
+    summary = backend._validate_session_nodes_and_injects(
+        scenario_xml_path='/tmp/scenario.xml',
+        session_xml_path='/tmp/session.xml',
+        core_cfg={'ssh_enabled': True},
+        preview_plan_path=None,
+        scenario_label='NewScenario1',
+    )
+
+    assert summary.get('docker_not_running') == []
+    assert summary.get('docker_start_pending') == ['docker-3']
+
+
+def test_validate_inspect_no_such_container_is_startup_pending_not_missing(monkeypatch):
+    monkeypatch.setattr(backend, '_expected_from_plan_preview', lambda *a, **k: {3: {'name': 'docker-3'}})
+    monkeypatch.setattr(backend, '_parse_session_xml_for_compare', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_specs_from_flow_state', lambda *a, **k: [])
+    monkeypatch.setattr(backend, '_extract_inject_expected_by_node', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_dirs_from_plan_xml', lambda *a, **k: ['/tmp'])
+    monkeypatch.setattr(backend, '_extract_inject_files_from_plan_xml', lambda *a, **k: ['/tmp/challenge.txt'])
+    monkeypatch.setattr(backend, '_extract_expected_docker_and_vuln_nodes_from_plan_xml', lambda *a, **k: (['docker-3'], []))
+    monkeypatch.setattr(backend, '_session_docker_nodes_from_xml', lambda *a, **k: ['docker-3'])
+    monkeypatch.setattr(backend, '_extract_inject_node_ids_from_flow_state', lambda *a, **k: set())
+    monkeypatch.setattr(backend, '_flow_state_from_xml_path', lambda *a, **k: {'flag_assignments': []})
+
+    def _fake_remote_json(_cfg, _script, logger=None, label='', timeout=0):
+        if label == 'docker.exec.injects_status':
+            return {
+                'items': [
+                    {
+                        'container': 'docker-3',
+                        'exists': False,
+                        'running': False,
+                        'state_status': '',
+                        'state_exit_code': None,
+                        'state_error': '',
+                        'inspect_error': 'Error: No such container: docker-3',
+                        'inject_count': 0,
+                        'inject_samples': [],
+                        'inject_dirs_found': [],
+                        'debug_logs': [],
+                    }
+                ]
+            }
+        if label == 'docker.compose.assignments':
+            return {'nodes': []}
+        if label == 'flow.artifacts.validate':
+            return {'items': []}
+        return {'items': []}
+
+    monkeypatch.setattr(backend, '_run_remote_python_json', _fake_remote_json)
+
+    summary = backend._validate_session_nodes_and_injects(
+        scenario_xml_path='/tmp/scenario.xml',
+        session_xml_path='/tmp/session.xml',
+        core_cfg={'ssh_enabled': True},
+        preview_plan_path=None,
+        scenario_label='NewScenario1',
+    )
+
+    assert summary.get('docker_missing') == []
+    assert summary.get('docker_not_running') == []
+    assert summary.get('docker_start_pending') == ['docker-3']

@@ -20,3 +20,13 @@ How to use:
 6. Test with `python scripts/run_flag_generator.py ...`.
 
 See [docs/GENERATOR_AUTHORING.md](docs/GENERATOR_AUTHORING.md) for a full tutorial.
+
+## Parity checklist (Test vs Execute)
+
+When adapting templates, apply these defaults so UI Test and full Execute behave the same:
+
+- Keep imports (`json`, `sys`, etc.) at module scope.
+- Do not depend on live internet/package-manager success for core generator output.
+- Always write `outputs.json` with valid keys before exiting successfully.
+- Ensure `injects` entries map to real generated files.
+- Verify once as repo-local test and once as installed pack execute path.

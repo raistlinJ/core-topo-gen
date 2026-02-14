@@ -2,11 +2,17 @@
 
 These are small, local program stubs that demonstrate the Flag-Generator contract.
 
+> Note: the current production authoring path is manifest-based generator packs. See:
+> - [docs/GENERATOR_AUTHORING.md](../docs/GENERATOR_AUTHORING.md)
+> - [docs/AI_PROMPT_TEMPLATES.md](../docs/AI_PROMPT_TEMPLATES.md)
+
 ## Contract
 Each generator should:
 - Accept inputs via CLI args and/or environment variables.
 - Create artifacts under an output directory.
 - Emit a machine-readable manifest named `outputs.json`.
+- Keep shared imports (`json`, `sys`, etc.) at module scope when using nested helpers.
+- Be validated in both local Test and full Execute paths before release.
 
 Current stubs emit:
 

@@ -99,3 +99,15 @@ Destination directory (optional):
 - `manifest.yaml: injects: ["File(path)"]`
 
 The runner will stage only allowlisted items into `<out_dir>/injected/`.
+
+## Authoring guardrails for AI-generated generators
+
+To reduce Test-vs-Execute drift, enforce these constraints when generating code with AI:
+
+- Use **module-level imports** for shared modules (`json`, `sys`, etc.).
+- Avoid function-local imports in scopes that also define nested helper functions.
+- Treat package-manager/network setup as optional best-effort (do not make generator success depend on apt/apk availability).
+- Ensure `outputs.json` and any `injects`-referenced files are deterministic and present before success exit.
+- Validate both:
+	- generator Test endpoint run
+	- full Execute run (remote CORE path)

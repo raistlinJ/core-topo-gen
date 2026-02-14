@@ -2455,13 +2455,39 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		"""Escape Mako-sensitive `${...}` so they render literally in output.
 
 		Mako treats `${var}` as an expression and will raise NameError if undefined.
-		Escaping to `$${var}` renders a literal `${var}` in the final compose/bash.
-		This function preserves existing `$${...}` and only escapes raw `${...}`.
+		Use `${"${var}"}` so Mako renders a literal `${var}`.
+		This function also normalizes legacy `\\${...}` and `$${...}` forms.
 		"""
 		try:
 			import re as _re
-			# Replace occurrences of `${` not already escaped (i.e., not preceded by `$`).
-			return _re.sub(r'(?<!\$)\$\{', '$${', text)
+
+			safe_re = _re.compile(r'\$\{\s*([\"\'])\$\{[^}]*\}\1\s*\}')
+			stash: dict[str, str] = {}
+
+			def _stash(m) -> str:
+				idx = len(stash)
+				key = f"__CORETG_SAFE_MAKO_EXPR_{idx}__"
+				stash[key] = str(m.group(0))
+				return key
+
+			fixed = safe_re.sub(_stash, text)
+
+			def _wrap(m) -> str:
+				expr = str(m.group(1) or '')
+				if not expr:
+					return str(m.group(0))
+				return '${"${' + expr + '}"}'
+
+			# Normalize legacy escapes first, then convert remaining raw `${...}`.
+			fixed = _re.sub(r'\\+\$\{([^}]*)\}', _wrap, fixed)
+			fixed = _re.sub(r'\$\$\{([^}]*)\}', _wrap, fixed)
+			# Protect wrappers we just created so the next pass doesn't wrap them again.
+			fixed = safe_re.sub(_stash, fixed)
+			fixed = _re.sub(r'(?<!\$)\$\{([^}]*)\}', _wrap, fixed)
+
+			for key, original in stash.items():
+				fixed = fixed.replace(key, original)
+			return fixed
 		except Exception:
 			return text
 

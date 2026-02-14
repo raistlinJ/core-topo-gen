@@ -44,6 +44,7 @@ Tell the AI these are strict requirements:
 - Treat Flow-synthesized values as **inputs**, not artifacts:
   - Never put `seed`, `secret`, `node_name`, `flag_prefix` into artifact inputs (aka `requires`).
 - Input descriptors default to `required: true` when omitted. Set `required: false` for optional runtime inputs.
+- Keep shared imports (`json`, `sys`, etc.) at module scope; avoid function-local imports in enclosing scopes that define nested helpers.
 
 If the generator needs to deliver a file/binary to participants:
 
@@ -52,6 +53,14 @@ If the generator needs to deliver a file/binary to participants:
   - Manifest workflow: declare `injects` in `manifest.yaml`.
   - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `injects: ["File(path)"]`.
   - `injects` supports resolving output keys via `outputs.json` (e.g. `File(path)` -> `artifacts/my_binary`).
+
+Execution parity requirements (must include in generated code/README):
+
+- The generator must behave the same under UI **Test** and full **Execute** paths.
+- Do not rely on package-manager/internet availability for successful generator completion.
+- Include both verification commands in README:
+  1. local runner test (`scripts/run_flag_generator.py`)
+  2. installed-pack execute check (run through Flow/Execute and verify no generator warnings in run log)
 
 ---
 
@@ -98,6 +107,7 @@ Task:
 - Modify ONLY generator.py to implement this behavior: <describe behavior>.
 - Use only the Python standard library.
 - Keep error messages clear when required inputs are missing.
+- Keep imports at module scope; do not add function-local `import json`/`import sys` in scopes with nested helpers.
 
 Here is my current scaffolded generator.py:
 
@@ -148,6 +158,7 @@ Task:
 - Modify ONLY generator.py to implement this behavior: <describe behavior>.
 - The docker-compose.yml you write should define the node service(s) needed for the challenge.
 - Use only the Python standard library.
+- Keep imports at module scope; do not add function-local `import json`/`import sys` in scopes with nested helpers.
 
 Here is my current scaffolded generator.py:
 

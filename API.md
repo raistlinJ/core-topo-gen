@@ -371,6 +371,12 @@ Important behavior:
 }
 ```
 
+When a run completes and validation finds issues, `validation_summary.error_logs` includes downloadable `.log` artifacts (for example `docker_not_running.log`, `injects_missing.log`, and `run_output.log`) with `url` fields that point to `/download_report?path=...`.
+
+Parity note:
+- Generator Test endpoints and Execute should be treated as complementary checks.
+- Authors should validate both local Test and full Execute paths before considering a generator pack production-ready.
+
 `GET /stream/<run_id>`
 : Server-Sent Events (SSE) endpoint streaming live CLI log lines for async runs.
 

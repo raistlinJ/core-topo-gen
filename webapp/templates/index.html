@@ -113,6 +113,11 @@
         min-height: auto;
     }
 
+    #runProgressModal .modal-dialog {
+        --bs-modal-width: 2000px;
+        max-width: min(var(--bs-modal-width), 95vw);
+    }
+
     #executeProgressWrap .progress {
         height: 18px;
     }
@@ -12078,7 +12083,7 @@
                 <div class="d-flex flex-wrap justify-content-between align-items-end gap-3">
                     <div class="flex-grow-1" style="min-width: 240px;">
                         <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
-                        <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
+                        <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}" pattern="[A-Za-z0-9]+" title="Scenario names support letters and numbers only.">
                     </div>
                 </div>
             </div>`;
@@ -15134,7 +15139,11 @@
                             }
                             try { logInfo(`Scenario renamed to ${uniqueName}`); } catch (_) { }
                         } else {
-                            state.scenarios[sidx].name = raw;
+                            const sanitized = normalizeScenarioName(raw);
+                            if (sanitized !== raw) {
+                                el.value = sanitized;
+                            }
+                            state.scenarios[sidx].name = sanitized;
                         }
                     }
                     if (field === 'base-file') state.scenarios[sidx].base.filepath = el.value;
@@ -16654,6 +16663,7 @@
         done: false,
         cancelHandlers: [],
         validationSummary: null,
+        runStatus: null,
         summaryShown: false,
         validationLogSig: '',
     };
@@ -16760,6 +16770,13 @@
             const res = await fetch('/run_status/' + encodeURIComponent(String(id)));
             if (!res.ok) return;
             const data = await res.json();
+            executeProgressState.runStatus = {
+                done: !!data?.done,
+                returncode: Number.isFinite(Number(data?.returncode)) ? Number(data.returncode) : null,
+                error: (data?.error || '').toString().trim(),
+                error_detail: (data?.error_detail || '').toString().trim(),
+                error_code: (data?.error_code || '').toString().trim(),
+            };
             if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                 executeProgressState.validationSummary = data.validation_summary;
                 logExecuteValidationSummary(data.validation_summary);
@@ -17091,7 +17108,17 @@
         if (listItems.length) {
             listItems.forEach((item) => {
                 const liItem = document.createElement('li');
-                liItem.textContent = String(item);
+                if (item && typeof item === 'object' && item.url) {
+                    const text = (item.label || item.text || item.url || 'Download log').toString();
+                    const a = document.createElement('a');
+                    a.href = String(item.url);
+                    a.textContent = text;
+                    a.target = '_blank';
+                    a.rel = 'noopener noreferrer';
+                    liItem.appendChild(a);
+                } else {
+                    liItem.textContent = String(item);
+                }
                 ul.appendChild(liItem);
             });
         } else {
@@ -17132,6 +17159,18 @@
             ));
             return;
         }
+        const runStatus = (executeProgressState && executeProgressState.runStatus && typeof executeProgressState.runStatus === 'object')
+            ? executeProgressState.runStatus
+            : null;
+        const runReturnCode = Number.isFinite(Number(runStatus?.returncode)) ? Number(runStatus.returncode) : null;
+        const runFailed = (success === false) || (runReturnCode !== null && runReturnCode !== 0);
+        const runError = (runStatus?.error || summary.error || '').toString().trim();
+        const runErrorDetail = (runStatus?.error_detail || '').toString().trim();
+        const runFailureDetails = [];
+        if (runError) runFailureDetails.push(runError);
+        if (runErrorDetail && runErrorDetail !== runError) runFailureDetails.push(runErrorDetail);
+        if (runStatus?.error_code) runFailureDetails.push(`code: ${runStatus.error_code}`);
+        if (runReturnCode !== null) runFailureDetails.push(`return code: ${runReturnCode}`);
         if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.add('d-none');
         const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
         const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
@@ -17144,6 +17183,7 @@
         const actualVulnNodes = Array.isArray(summary.actual_vuln_nodes) ? summary.actual_vuln_nodes.length : 0;
         const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
         const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
+        const dockerStartPending = Array.isArray(summary.docker_start_pending) ? summary.docker_start_pending.length : 0;
         const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
         const generatorOutputsMissing = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing.length : 0;
         const generatorInjectsMissing = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing.length : 0;
@@ -17161,6 +17201,7 @@
         const generatorOutputsMissingList = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing : [];
         const generatorInjectsMissingList = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing : [];
         const generatorValidationDetail = Array.isArray(summary.generator_validation_detail) ? summary.generator_validation_detail : [];
+        const errorLogs = Array.isArray(summary.error_logs) ? summary.error_logs.filter((it) => it && typeof it === 'object' && it.url) : [];
         const generatorOutputsDetailItems = generatorValidationDetail.length
             ? generatorValidationDetail.map((it) => {
                 if (!it || typeof it !== 'object') return '';
@@ -17187,7 +17228,25 @@
                 return `${gtype} ${gname}: ${files.join(', ')}`;
             }).filter(Boolean)
             : generatorInjectsMissingList;
-        executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
+        executeSummaryStatusEl.textContent = runFailed
+            ? 'Run failed during initialization or execution.'
+            : (summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.');
+        if (runFailed) {
+            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                'Run initialization/execution status',
+                false,
+                runError || 'Run failed before completing startup.',
+                runFailureDetails
+            ));
+        }
+        if (errorLogs.length) {
+            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                'Error logs',
+                false,
+                `${errorLogs.length} log file(s) available for download`,
+                errorLogs
+            ));
+        }
         if (expectedDockerNodes > 0) {
             executeSummaryListEl.appendChild(renderExecuteSummaryItem(
                 'Expected docker nodes present',
@@ -17235,6 +17294,12 @@
                 dockerNotRunning === 0,
                 dockerNotRunning ? `${dockerNotRunning} not running` : 'All containers running',
                 dockerNotRunning ? (Array.isArray(summary.docker_not_running) ? summary.docker_not_running : []) : dockerRunningList
+            ));
+            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                'Docker startup pending (transient)',
+                true,
+                dockerStartPending ? `${dockerStartPending} container(s) still starting` : 'None',
+                dockerStartPending ? (Array.isArray(summary.docker_start_pending) ? summary.docker_start_pending : []) : []
             ));
             const expectedFilesText = expectedInjectFiles.length ? expectedInjectFiles.join(', ') : '';
             const injectsMissingList = Array.isArray(summary.injects_missing) ? summary.injects_missing : [];
@@ -17285,8 +17350,20 @@
 
     function buildExecuteSummaryText() {
         const summary = executeProgressState?.validationSummary;
+        const runStatus = (executeProgressState && executeProgressState.runStatus && typeof executeProgressState.runStatus === 'object')
+            ? executeProgressState.runStatus
+            : null;
+        const runReturnCode = Number.isFinite(Number(runStatus?.returncode)) ? Number(runStatus.returncode) : null;
+        const runFailed = runReturnCode !== null && runReturnCode !== 0;
         const lines = [];
         lines.push('CORE TopoGen Execute Summary');
+        if (runFailed) {
+            lines.push('Run status: FAILED during initialization/execution');
+            if (runStatus?.error) lines.push(`Run error: ${runStatus.error}`);
+            if (runStatus?.error_detail) lines.push(`Run detail: ${runStatus.error_detail}`);
+            if (runStatus?.error_code) lines.push(`Run code: ${runStatus.error_code}`);
+            lines.push(`Return code: ${runReturnCode}`);
+        }
         if (!summary || typeof summary !== 'object') {
             lines.push('Status: Validation summary unavailable.');
             return lines.join('\n');
@@ -17320,6 +17397,7 @@
         const actualVulnNodes = Array.isArray(summary.actual_vuln_nodes) ? summary.actual_vuln_nodes.length : 0;
         const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
         const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
+        const dockerStartPending = Array.isArray(summary.docker_start_pending) ? summary.docker_start_pending.length : 0;
         const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
         lines.push(`Expected nodes created: ${missingNodes === 0 ? 'OK' : `Missing ${missingNodes}`}`);
         lines.push(`Unexpected nodes: ${extraNodes === 0 ? 'None' : `Extra ${extraNodes}`}`);
@@ -17334,6 +17412,7 @@
         if (dockerNodes > 0) {
             lines.push(`Docker containers present: ${dockerMissing === 0 ? 'OK' : `Missing ${dockerMissing}`}`);
             lines.push(`Docker containers running: ${dockerNotRunning === 0 ? 'OK' : `Not running ${dockerNotRunning}`}`);
+            lines.push(`Docker startup pending (transient): ${dockerStartPending === 0 ? 'None' : dockerStartPending}`);
             lines.push(`Injected files present: ${injectsMissing === 0 ? 'OK' : `Missing injects/sources on ${injectsMissing}`}`);
         } else {
             lines.push('Docker containers detected: None');
@@ -18011,6 +18090,7 @@
         executeProgressState.cancelHandlers = [];
         executeProgressState.logLines = [];
         executeProgressState.validationSummary = null;
+        executeProgressState.runStatus = null;
         executeProgressState.validationLogSig = '';
         executeProgressState.summaryShown = false;
         if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.remove('d-none');
@@ -18058,6 +18138,7 @@
         executeProgressState.cancelHandlers = [];
         executeProgressState.logLines = [];
         executeProgressState.validationSummary = null;
+        executeProgressState.runStatus = null;
         if (executeProgressWrap) executeProgressWrap.classList.remove('d-none');
         if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
         if (executeProgressBarEl) executeProgressBarEl.classList.add('progress-bar-animated');
@@ -18165,8 +18246,9 @@
                 const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
                 const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
                 const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
+                const dockerStartPending = Array.isArray(summary.docker_start_pending) ? summary.docker_start_pending.length : 0;
                 const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
-                const msg = `Validation warnings: missing nodes=${missingNodes}, containers missing=${dockerMissing}, not running=${dockerNotRunning}, injects missing=${injectsMissing}`;
+                const msg = `Validation warnings: missing nodes=${missingNodes}, containers missing=${dockerMissing}, startup pending=${dockerStartPending}, not running=${dockerNotRunning}, injects missing=${injectsMissing}`;
                 updateExecuteConfirmAlert(msg, 'warning');
             }
         } catch (e) { }
@@ -18209,8 +18291,9 @@
                     const missingNodes = Array.isArray(payload.missing_nodes) ? payload.missing_nodes.length : 0;
                     const dockerMissing = Array.isArray(payload.docker_missing) ? payload.docker_missing.length : 0;
                     const dockerNotRunning = Array.isArray(payload.docker_not_running) ? payload.docker_not_running.length : 0;
+                    const dockerStartPending = Array.isArray(payload.docker_start_pending) ? payload.docker_start_pending.length : 0;
                     const injectsMissing = Array.isArray(payload.injects_missing) ? payload.injects_missing.length : 0;
-                    const msg = `Validation warnings: missing nodes=${missingNodes}, containers missing=${dockerMissing}, not running=${dockerNotRunning}, injects missing=${injectsMissing}`;
+                    const msg = `Validation warnings: missing nodes=${missingNodes}, containers missing=${dockerMissing}, startup pending=${dockerStartPending}, not running=${dockerNotRunning}, injects missing=${injectsMissing}`;
                     updateExecuteConfirmAlert(msg, 'warning');
                 }
             } catch (e) { }
@@ -21252,6 +21335,7 @@
         const showProgressModal = opts.showProgressModal !== false;
         const skipConfirm = opts.skipConfirm === true;
         const cleanupRetryAttempt = Number.isInteger(opts.cleanupRetryAttempt) ? opts.cleanupRetryAttempt : 0;
+        const daemonConflictRetryAttempt = Number.isInteger(opts.daemonConflictRetryAttempt) ? opts.daemonConflictRetryAttempt : 0;
         const activeScenarioCtx = getActiveScenarioContext();
         let scenarioIndexForRun = Number.isInteger(opts.scenarioIndex) ? opts.scenarioIndex : activeScenarioCtx.idx;
         let updateRemoteRepo = opts.updateRemoteRepo === true;
@@ -21633,7 +21717,8 @@
             }
         };
         // Validate saved XML (admin view). Builder view runs from current editor state.
-        let rp = state.result_path || '';
+        const forcedXmlPath = (opts && typeof opts.xmlPath === 'string') ? opts.xmlPath.trim() : '';
+        let rp = forcedXmlPath || state.result_path || '';
         if (IS_BUILDER_VIEW) {
             rp = '';
         } else if (!rp.endsWith('.xml')) {
@@ -21778,8 +21863,10 @@
                 return false;
             }
         }
-        let previewPlanPath = null;
-        let seedForRun = null;
+        let previewPlanPath = (opts && typeof opts.previewPlanPath === 'string' && opts.previewPlanPath.trim().toLowerCase().endsWith('.xml'))
+            ? opts.previewPlanPath.trim()
+            : null;
+        let seedForRun = (opts && opts.seed !== undefined && opts.seed !== null && opts.seed !== '') ? opts.seed : null;
         try {
             const activeScenario = getScenarioByIndex(scenarioIndexForRun);
             if (previewState && previewState.fullPreview && previewState.fullPreview.seed !== undefined) {
@@ -21790,7 +21877,7 @@
             const scenarioName = (activeScenario && typeof activeScenario.name === 'string')
                 ? activeScenario.name
                 : activeScenarioCtx.name;
-            if (!IS_BUILDER_VIEW && rp && rp.endsWith('.xml')) {
+            if (!IS_BUILDER_VIEW && rp && rp.endsWith('.xml') && !previewPlanPath) {
                 appendExecuteDialogLog('Syncing flow/preview plan with XML…');
                 const persisted = await ensurePersistedFlowPlanForRun({
                     xmlPath: rp,
@@ -22012,6 +22099,71 @@
                             try { opts.onTick?.(data); } catch (e) { }
                         }
                         if (!data.done) { setTimeout(poll, 1000); return; }
+                        if (data.returncode !== 0 && data.daemon_conflict && daemonConflictRetryAttempt < 1) {
+                            const pidList = Array.isArray(data.daemon_pids) ? data.daemon_pids.map((v) => String(v)).filter(Boolean) : [];
+                            const pidsText = pidList.length ? pidList.join(', ') : '';
+                            const baseMsg = (data.error || 'Multiple core-daemon processes are running on the CORE VM.').toString();
+                            appendExecuteDialogLog(`Run failed due to core-daemon conflict${pidsText ? ` (PIDs: ${pidsText})` : ''}.`);
+                            updateRunStatus('Run blocked by core-daemon conflict', 'Waiting for your decision to fix and retry…');
+                            if (data.can_stop_daemons === false) {
+                                appendExecuteDialogLog('Unable to auto-stop duplicate daemons because sudo credentials are unavailable.');
+                            } else {
+                                const proceed = await promptRunProgressConfirm(
+                                    `${baseMsg}${pidsText ? `\n\nPIDs: ${pidsText}` : ''}\n\nClose all core-daemon processes and start one fresh, then retry now?`,
+                                    {
+                                        title: 'core-daemon conflict detected',
+                                        confirmLabel: 'Close all & retry',
+                                        cancelLabel: 'Keep failed result',
+                                    }
+                                );
+                                if (proceed) {
+                                    try {
+                                        const fixRes = await fetch('/core/stop_duplicate_daemons_api', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ pids: Array.isArray(data.daemon_pids) ? data.daemon_pids : [] }),
+                                        });
+                                        const fixInfo = await parseResponseJson(fixRes);
+                                        if (!fixRes.ok || !fixInfo || fixInfo.ok === false) {
+                                            const errText = (fixInfo && (fixInfo.error || fixInfo.message)) ? String(fixInfo.error || fixInfo.message) : `HTTP ${fixRes.status}`;
+                                            appendExecuteDialogLog(`Failed to close duplicate core-daemon processes: ${errText}`);
+                                        } else {
+                                            appendExecuteDialogLog('Closed duplicate core-daemon processes; relaunching run.');
+                                            try {
+                                                if (runProgressEvtSrc) {
+                                                    runProgressEvtSrc.close();
+                                                }
+                                            } catch (e) { }
+                                            runProgressEvtSrc = null;
+                                            runProgressRunId = null;
+                                            try { localStorage.removeItem('coretg_active_run_id'); } catch (e) { }
+                                            try { executeProgressState.summaryShown = false; } catch (e) { }
+                                            const retryResult = await runSyncWithModal({
+                                                ...opts,
+                                                skipConfirm: true,
+                                                showProgressModal,
+                                                scenarioIndex: scenarioIndexForRun,
+                                                updateRemoteRepo,
+                                                confirmResult: {
+                                                    ...((confirmResult && typeof confirmResult === 'object') ? confirmResult : {}),
+                                                    confirmed: true,
+                                                    scenarioIndex: scenarioIndexForRun,
+                                                },
+                                                advanced: ((advancedFromOpts && typeof advancedFromOpts === 'object') ? advancedFromOpts : (confirmResult && confirmResult.advanced ? confirmResult.advanced : {})),
+                                                cleanupRetryAttempt,
+                                                daemonConflictRetryAttempt: daemonConflictRetryAttempt + 1,
+                                            });
+                                            resolve(retryResult);
+                                            return;
+                                        }
+                                    } catch (e) {
+                                        appendExecuteDialogLog('Failed to close duplicate core-daemon processes.');
+                                    }
+                                } else {
+                                    appendExecuteDialogLog('Daemon conflict retry declined by user; keeping failed result.');
+                                }
+                            }
+                        }
                         if (data.returncode !== 0 && cleanupRetryAttempt < 1) {
                             const blockingSessionsMessage = extractBlockingSessionsMessage(data);
                             if (blockingSessionsMessage) {
@@ -22041,6 +22193,12 @@
                                         ...opts,
                                         skipConfirm: true,
                                         showProgressModal,
+                                        xmlPath: rp,
+                                        previewPlanPath,
+                                        seed: seedForRun,
+                                        xmlPath: rp,
+                                        previewPlanPath,
+                                        seed: seedForRun,
                                         scenarioIndex: scenarioIndexForRun,
                                         updateRemoteRepo,
                                         confirmResult: {

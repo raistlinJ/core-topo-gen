@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import ast
 import base64
 import hashlib
 import sys
@@ -730,6 +731,25 @@ class CoreDaemonConflictError(CoreDaemonError):
         self.pids = list(pids or [])
 
 
+def _is_transient_remote_prepare_error(exc: Any) -> bool:
+    text = str(exc or '').strip().lower()
+    if not text:
+        return False
+    transient_tokens = (
+        'no route to host',
+        'timed out',
+        'timeout',
+        'connection reset',
+        'connection aborted',
+        'connection refused',
+        'network is unreachable',
+        'broken pipe',
+        'eof during negotiation',
+        'channel closed',
+    )
+    return any(token in text for token in transient_tokens)
+
+
 def _ensure_paramiko_available() -> None:
     if paramiko is None:  # pragma: no cover - dependency missing
         raise RuntimeError('SSH tunneling requires the paramiko package. Install paramiko and retry.')
@@ -947,7 +967,33 @@ def _strip_ansi(text: str) -> str:
         return text
 
 
-def _relay_remote_channel_to_log(channel: Any, log_handle: Any) -> None:
+def _redact_sensitive_text(text: str, redact_tokens: Optional[list[str]] = None) -> str:
+    try:
+        out = str(text or '')
+    except Exception:
+        return text
+    if not out:
+        return out
+    tokens = []
+    for tok in (redact_tokens or []):
+        try:
+            s = str(tok or '')
+        except Exception:
+            s = ''
+        if len(s) >= 3:
+            tokens.append(s)
+    if not tokens:
+        return out
+    # Replace longer tokens first to avoid partial masking artifacts.
+    for token in sorted(set(tokens), key=len, reverse=True):
+        try:
+            out = out.replace(token, '[REDACTED]')
+        except Exception:
+            continue
+    return out
+
+
+def _relay_remote_channel_to_log(channel: Any, log_handle: Any, *, redact_tokens: Optional[list[str]] = None) -> None:
     """Stream bytes from an SSH channel into the local log file."""
 
     try:
@@ -972,7 +1018,9 @@ def _relay_remote_channel_to_log(channel: Any, log_handle: Any) -> None:
                 text = chunk.decode('utf-8', 'replace')
             except Exception:
                 text = chunk.decode('latin-1', 'replace')
-            log_handle.write(_strip_ansi(text))
+            cleaned = _strip_ansi(text)
+            cleaned = _redact_sensitive_text(cleaned, redact_tokens=redact_tokens)
+            log_handle.write(cleaned)
     finally:
         try:
             log_handle.flush()
@@ -2617,6 +2665,57 @@ def _prepare_remote_cli_context(
 ) -> Dict[str, Any]:
     """Upload required artifacts before starting the remote CLI."""
 
+    def _sync_runtime_subset_to_remote_repo(repo_dir: str, sftp: Any, log_handle_local: Any) -> None:
+        repo_root = _get_repo_root()
+
+        def _put_file(rel_path: str) -> None:
+            rel = str(rel_path or '').strip().replace('\\', '/')
+            if not rel:
+                return
+            local_path = os.path.join(repo_root, rel)
+            if not os.path.isfile(local_path):
+                return
+            remote_path = _remote_path_join(repo_dir, rel)
+            remote_parent = posixpath.dirname(remote_path)
+            _remote_mkdirs(client, remote_parent)
+            sftp.put(local_path, remote_path)
+
+        def _put_tree(rel_dir: str) -> None:
+            rel = str(rel_dir or '').strip().replace('\\', '/')
+            if not rel:
+                return
+            local_dir = os.path.join(repo_root, rel)
+            if not os.path.isdir(local_dir):
+                return
+            allowed_names = {'.coretg_pack.json', 'Dockerfile', 'docker-compose.yml', 'manifest.yaml', 'manifest.yml', 'generator.py'}
+            allowed_ext = {'.py', '.yaml', '.yml', '.json'}
+            for root, _dirs, files in os.walk(local_dir):
+                for fn in files:
+                    if fn not in allowed_names and os.path.splitext(fn)[1].lower() not in allowed_ext:
+                        continue
+                    local_path = os.path.join(root, fn)
+                    rel_file = os.path.relpath(local_path, repo_root).replace('\\', '/')
+                    remote_path = _remote_path_join(repo_dir, rel_file)
+                    remote_parent = posixpath.dirname(remote_path)
+                    _remote_mkdirs(client, remote_parent)
+                    try:
+                        sftp.put(local_path, remote_path)
+                    except Exception:
+                        continue
+
+        # Keep Execute using the same runtime pieces as local Test.
+        _put_file('core_topo_gen/cli.py')
+        _put_file('core_topo_gen/generator_manifests.py')
+        _put_file('scripts/run_flag_generator.py')
+        _put_tree('outputs/installed_generators/flag_generators')
+        _put_tree('outputs/installed_generators/flag_node_generators')
+        _put_tree('flag_generators')
+        _put_tree('flag_node_generators')
+        try:
+            log_handle_local.write('[remote] synced runtime subset (cli/runner/generators)\n')
+        except Exception:
+            pass
+
     sftp = client.open_sftp()
     try:
         base_dir = _remote_base_dir(sftp)
@@ -2638,6 +2737,13 @@ def _prepare_remote_cli_context(
             log_handle.write(f"[remote] Using repo at {repo_dir}\n")
         except Exception:
             pass
+        try:
+            _sync_runtime_subset_to_remote_repo(repo_dir, sftp, log_handle)
+        except Exception as sync_exc:
+            try:
+                log_handle.write(f"[remote] runtime subset sync skipped/failed: {sync_exc}\n")
+            except Exception:
+                pass
         # Ensure reports/outputs/uploads directories exist for CLI outputs
         for subdir in ('reports', 'outputs', 'uploads'):
             _remote_mkdirs(client, _remote_path_join(repo_dir, subdir))
@@ -3988,12 +4094,10 @@ def _stop_remote_core_daemon_conflict(
 ) -> Dict[str, Any]:
     """Stop duplicate core-daemon processes.
 
-    Implementation strategy:
-    - Stop the systemd service (best-effort)
-    - Kill the discovered PIDs
-    - Start the service again
-
-    This intentionally errs on the side of producing a single clean daemon.
+    Preferred strategy:
+    - Discover systemd MainPID for core-daemon.
+    - If MainPID is among duplicates, keep it and terminate only extras.
+    - Otherwise fall back to a full stop/kill/start recovery.
     """
 
     if not pids:
@@ -4027,25 +4131,72 @@ def _stop_remote_core_daemon_conflict(
             except Exception:
                 pass
 
-    pid_args = ' '.join(str(int(pid)) for pid in pids if str(pid).strip().isdigit())
-    if not pid_args:
+    unique_pids = sorted({int(pid) for pid in pids if str(pid).strip().isdigit() and int(pid) > 0})
+    if not unique_pids:
         return {'status': 'noop', 'detail': 'no valid pids provided'}
 
+    main_pid: Optional[int] = None
+    code, out, err = _sudo('timeout 8s systemctl show -p MainPID --value core-daemon 2>/dev/null || true', timeout=15.0)
+    try:
+        for token in str(out or '').strip().split():
+            value = int(token)
+            if value > 0:
+                main_pid = value
+                break
+    except Exception:
+        main_pid = None
+
+    preserve_main_pid = bool(main_pid and main_pid in unique_pids and len(unique_pids) > 1)
+    if preserve_main_pid:
+        kill_targets = [pid for pid in unique_pids if pid != main_pid]
+    else:
+        kill_targets = list(unique_pids)
+
+    target_args = ' '.join(str(pid) for pid in kill_targets)
+    if not target_args:
+        return {
+            'status': 'noop',
+            'detail': 'no duplicate targets to stop',
+            'pids': unique_pids,
+            'main_pid': main_pid,
+            'preserved_main_pid': preserve_main_pid,
+        }
+
     steps: List[Dict[str, Any]] = []
-    for label, cmd in (
-        ('systemctl_stop', 'timeout 15s systemctl stop core-daemon || true'),
-        ('kill_term', f'kill -TERM {pid_args} 2>/dev/null || true'),
+    steps.append({
+        'step': 'systemctl_mainpid',
+        'command': 'timeout 8s systemctl show -p MainPID --value core-daemon 2>/dev/null || true',
+        'exit': code,
+        'stdout': (out or '').strip(),
+        'stderr': (err or '').strip(),
+    })
+
+    command_plan: List[tuple[str, str]] = []
+    if not preserve_main_pid:
+        command_plan.append(('systemctl_stop', 'timeout 15s systemctl stop core-daemon || true'))
+    command_plan.extend([
+        ('kill_term', f'kill -TERM {target_args} 2>/dev/null || true'),
         ('sleep', 'sleep 1'),
-        ('kill_kill', f'kill -KILL {pid_args} 2>/dev/null || true'),
-        ('systemctl_start', 'timeout 20s systemctl start core-daemon || true'),
-    ):
+        ('kill_kill', f'kill -KILL {target_args} 2>/dev/null || true'),
+    ])
+    if not preserve_main_pid:
+        command_plan.append(('systemctl_start', 'timeout 20s systemctl start core-daemon || true'))
+
+    for label, cmd in command_plan:
         code, out, err = _sudo(cmd, timeout=35.0)
         steps.append({'step': label, 'command': cmd, 'exit': code, 'stdout': (out or '').strip(), 'stderr': (err or '').strip()})
         try:
             logger.info('[core] stop duplicate daemons: %s exit=%s', label, code)
         except Exception:
             pass
-    return {'status': 'attempted', 'pids': pids, 'steps': steps}
+    return {
+        'status': 'attempted',
+        'pids': unique_pids,
+        'main_pid': main_pid,
+        'preserved_main_pid': preserve_main_pid,
+        'kill_targets': kill_targets,
+        'steps': steps,
+    }
 
 
 def _local_custom_services_dir() -> str:
@@ -4319,6 +4470,118 @@ def _ensure_remote_core_daemon_ready(
 ) -> int:
     """Verify that exactly one core-daemon process is running, auto-starting if permitted."""
 
+    def _parse_pid_tokens(text: str) -> List[int]:
+        pids: List[int] = []
+        for token in str(text or '').strip().split():
+            try:
+                value = int(token)
+            except Exception:
+                continue
+            if value > 0:
+                pids.append(value)
+        return pids
+
+    def _fallback_detect_existing_daemon() -> tuple[Optional[int], bool]:
+        observed: set[int] = set()
+        sudo_wrapper_pids: set[int] = set()
+        daemon_active = False
+        daemon_port_listening = False
+        port_value = core_cfg.get('port') or CORE_PORT
+        try:
+            grpc_port = int(str(port_value).strip())
+        except Exception:
+            grpc_port = int(CORE_PORT)
+
+        def _run_probe(label: str, command: str) -> tuple[int, str, str]:
+            code, out, err = _exec_ssh_command(client, command, timeout=15.0)
+            if log_handle:
+                try:
+                    log_handle.write(
+                        f"{log_prefix}{label}: {command} -> exit={code} stdout={(out or '').strip()} stderr={(err or '').strip()}\n"
+                    )
+                except Exception:
+                    pass
+            return code, out, err
+
+        try:
+            _code, out_mainpid, _err = _run_probe(
+                'fallback.systemctl.mainpid',
+                'sh -c "timeout 8s systemctl show -p MainPID --value core-daemon 2>/dev/null || true"',
+            )
+            observed.update(_parse_pid_tokens(out_mainpid))
+        except Exception:
+            pass
+
+        try:
+            _code, out_pidof, _err = _run_probe(
+                'fallback.pidof',
+                "sh -c 'timeout 5s pidof core-daemon 2>/dev/null || true'",
+            )
+            observed.update(_parse_pid_tokens(out_pidof))
+        except Exception:
+            pass
+
+        try:
+            _code, out_pgrep_full, _err = _run_probe(
+                'fallback.pgrep.full',
+                "sh -c 'timeout 5s pgrep -fa core-daemon 2>/dev/null || true'",
+            )
+            for line in str(out_pgrep_full or '').splitlines():
+                text = line.strip()
+                if not text:
+                    continue
+                parts = text.split(None, 1)
+                if not parts or not parts[0].isdigit():
+                    continue
+                lower = text.lower()
+                if 'pgrep -fa core-daemon' in lower:
+                    continue
+                cmd = parts[1].strip().lower() if len(parts) > 1 else ''
+                pid_value = int(parts[0])
+                if cmd.startswith('sudo ') or '/sudo ' in cmd:
+                    sudo_wrapper_pids.add(pid_value)
+                    continue
+                if re.search(r'(^|\s|/)core-daemon(\s|$)', cmd):
+                    observed.add(pid_value)
+        except Exception:
+            pass
+
+        try:
+            code_active, out_active, _err = _run_probe(
+                'fallback.systemctl.is-active',
+                'sh -c "timeout 8s systemctl is-active core-daemon 2>/dev/null || true"',
+            )
+            daemon_active = str(out_active or '').strip() == 'active'
+        except Exception:
+            pass
+
+        try:
+            _code, out_ss, _err = _run_probe(
+                'fallback.port.listen',
+                f"sh -c \"timeout 5s ss -ltn 2>/dev/null | awk '\\$4 ~ /:{grpc_port}$/ {{print}}' || true\"",
+            )
+            daemon_port_listening = bool(str(out_ss or '').strip())
+        except Exception:
+            pass
+
+        pids = sorted(observed)
+        wrapper_pids = sorted(sudo_wrapper_pids)
+        if len(pids) > 1:
+            raise CoreDaemonConflictError(
+                'Multiple core-daemon processes are running on the CORE VM.',
+                pids=pids,
+            )
+        if len(pids) == 0 and len(wrapper_pids) > 1:
+            raise CoreDaemonConflictError(
+                'Multiple core-daemon processes are running on the CORE VM.',
+                pids=wrapper_pids,
+            )
+        if len(pids) == 1:
+            return pids[0], (daemon_active or daemon_port_listening)
+        if len(wrapper_pids) == 1:
+            return wrapper_pids[0], True
+        return None, (daemon_active or daemon_port_listening)
+
     def _log_daemon_probe(stage: str, attempt_idx: int, pids: List[int]) -> None:
         if not log_handle:
             return
@@ -4341,6 +4604,74 @@ def _ensure_remote_core_daemon_ready(
             )
         except Exception:
             pass
+
+    def _attempt_conflict_auto_heal(conflict_pids: List[int], stage: str) -> Optional[int]:
+        unique = sorted({int(pid) for pid in conflict_pids if str(pid).strip().isdigit() and int(pid) > 0})
+        if len(unique) <= 1:
+            return unique[0] if unique else None
+        if not sudo_password:
+            raise CoreDaemonConflictError(
+                'Multiple core-daemon processes are running on the CORE VM.',
+                pids=unique,
+            )
+        if log_handle:
+            try:
+                log_handle.write(
+                    f"{log_prefix}{stage}: detected duplicate core-daemon PIDs ({', '.join(str(pid) for pid in unique)}); attempting automatic cleanup\n"
+                )
+            except Exception:
+                pass
+        try:
+            repair_result = _stop_remote_core_daemon_conflict(
+                client,
+                sudo_password=sudo_password,
+                pids=unique,
+                logger=logger,
+            )
+        except Exception as exc:
+            raise CoreDaemonConflictError(
+                f'Multiple core-daemon processes are running on the CORE VM, and automatic cleanup failed: {exc}',
+                pids=unique,
+            ) from exc
+        if log_handle:
+            try:
+                log_handle.write(
+                    f"{log_prefix}{stage}: automatic cleanup status={repair_result.get('status')} preserved_main_pid={repair_result.get('preserved_main_pid')} kill_targets={repair_result.get('kill_targets')}\n"
+                )
+            except Exception:
+                pass
+        try:
+            time.sleep(1.0)
+        except Exception:
+            pass
+        healed_pids = _collect_remote_core_daemon_pids(
+            client,
+            log_handle=log_handle,
+            log_prefix=log_prefix,
+            stage=f'{stage}.post-heal.pgrep',
+        )
+        _log_daemon_probe(f'{stage}.post-heal', 0, healed_pids)
+        if len(healed_pids) > 1:
+            raise CoreDaemonConflictError(
+                'Multiple core-daemon processes are still running on the CORE VM after automatic cleanup.',
+                pids=healed_pids,
+            )
+        if len(healed_pids) == 1:
+            if log_handle:
+                try:
+                    _write_sse_marker(
+                        log_handle,
+                        'phase',
+                        {
+                            'stage': 'core-daemon.ready',
+                            'pid': healed_pids[0],
+                            'source': f'{stage}.auto-heal',
+                        },
+                    )
+                except Exception:
+                    pass
+            return healed_pids[0]
+        return None
 
     def _poll_for_single_daemon(max_attempts: int, delay: float, stage: str) -> Optional[int]:
         last_pids: List[int] = []
@@ -4368,10 +4699,22 @@ def _ensure_remote_core_daemon_ready(
             _log_daemon_probe(stage, attempt, poll_pids)
             last_pids = poll_pids
             if len(poll_pids) > 1:
-                raise CoreDaemonConflictError(
-                    'Multiple core-daemon processes are running on the CORE VM.',
-                    pids=poll_pids,
+                healed = _attempt_conflict_auto_heal(poll_pids, stage)
+                if healed is not None:
+                    return healed
+                poll_pids = _collect_remote_core_daemon_pids(
+                    client,
+                    log_handle=log_handle,
+                    log_prefix=log_prefix,
+                    stage=f'{stage}.recheck.pgrep',
                 )
+                _log_daemon_probe(f'{stage}.recheck', attempt, poll_pids)
+                last_pids = poll_pids
+                if len(poll_pids) > 1:
+                    raise CoreDaemonConflictError(
+                        'Multiple core-daemon processes are running on the CORE VM.',
+                        pids=poll_pids,
+                    )
             if len(poll_pids) == 1:
                 if log_handle:
                     try:
@@ -4402,6 +4745,29 @@ def _ensure_remote_core_daemon_ready(
             except Exception:
                 pass
         return pid
+
+    try:
+        fallback_pid, daemon_active = _fallback_detect_existing_daemon()
+    except CoreDaemonConflictError as exc:
+        healed = _attempt_conflict_auto_heal(exc.pids, 'fallback')
+        if healed is not None:
+            return healed
+        fallback_pid, daemon_active = _fallback_detect_existing_daemon()
+    if fallback_pid is not None:
+        if log_handle:
+            try:
+                log_handle.write(f"{log_prefix}core-daemon detected via fallback probe (PID {fallback_pid})\n")
+            except Exception:
+                pass
+        return fallback_pid
+
+    if daemon_active:
+        raise CoreDaemonMissingError(
+            'core-daemon appears active on the CORE VM, but PID discovery was inconclusive; refusing auto-start to avoid duplicate daemons.',
+            can_auto_start=False,
+            start_command=CORE_DAEMON_START_COMMAND,
+        )
+
     if not auto_start_allowed:
         raise CoreDaemonMissingError(
             'core-daemon is not running on the CORE VM.',
@@ -17587,7 +17953,7 @@ def api_flow_prepare_preview_for_execute():
                 return False, 'runner script not found', None, None, None
 
             cmd = [
-                sys.executable or 'python',
+                _resolve_python_executable(),
                 runner_path,
                 '--kind',
                 str(kind or 'flag-generator'),
@@ -17600,13 +17966,14 @@ def api_flow_prepare_preview_for_execute():
                 '--repo-root',
                 repo_root,
             ]
-            env = None
+            env = dict(os.environ)
+            env.setdefault('CORETG_DOCKER_USE_SUDO', '1')
+            env.setdefault('CORETG_DOCKER_HOST_NETWORK', '1')
             try:
                 if isinstance(inject_files_override, list):
-                    env = dict(os.environ)
                     env['CORETG_INJECT_FILES_JSON'] = json.dumps(list(inject_files_override))
             except Exception:
-                env = None
+                pass
 
             p = subprocess.run(
                 cmd,
@@ -29079,6 +29446,103 @@ def _persist_execute_validation_artifacts(
         except Exception:
             pass
 
+
+def _build_execute_error_logs(
+    *,
+    run_id: str,
+    validation: Dict[str, Any],
+    main_log_path: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    if not isinstance(validation, dict):
+        return []
+    run_norm = str(run_id or '').strip() or 'unknown'
+    out_dir = os.path.join(_outputs_dir(), 'logs', 'execute-errors', run_norm)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        return []
+
+    categories: List[tuple[str, str, str]] = [
+        ('missing_nodes', 'Missing nodes', 'missing_nodes.log'),
+        ('extra_nodes', 'Unexpected nodes', 'extra_nodes.log'),
+        ('missing_docker_nodes', 'Missing docker nodes', 'missing_docker_nodes.log'),
+        ('extra_docker_nodes', 'Unexpected docker nodes', 'extra_docker_nodes.log'),
+        ('docker_missing', 'Missing docker containers', 'docker_missing.log'),
+        ('docker_not_running', 'Docker not running', 'docker_not_running.log'),
+        ('injects_missing', 'Missing injects/sources', 'injects_missing.log'),
+        ('generator_outputs_missing', 'Missing generator outputs', 'generator_outputs_missing.log'),
+        ('generator_injects_missing', 'Missing generator inject sources', 'generator_injects_missing.log'),
+    ]
+
+    logs: List[Dict[str, str]] = []
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    has_issue = not bool(validation.get('ok'))
+
+    for key, label, fname in categories:
+        items = validation.get(key)
+        if not isinstance(items, list) or not items:
+            continue
+        has_issue = True
+        path = os.path.join(out_dir, fname)
+        payload = {
+            'run_id': run_norm,
+            'generated_at': now,
+            'category': key,
+            'label': label,
+            'count': len(items),
+            'items': items,
+        }
+        if key == 'docker_not_running':
+            details = validation.get('docker_not_running_details')
+            if isinstance(details, list) and details:
+                payload['details'] = details
+        if key == 'injects_missing':
+            details = validation.get('injects_detail')
+            if isinstance(details, list) and details:
+                payload['details'] = details
+        if key in {'generator_outputs_missing', 'generator_injects_missing'}:
+            details = validation.get('generator_validation_detail')
+            if isinstance(details, list) and details:
+                payload['details'] = details
+        try:
+            with open(path, 'w', encoding='utf-8') as wf:
+                wf.write(json.dumps(payload, indent=2, sort_keys=True, default=str))
+                wf.write('\n')
+        except Exception:
+            continue
+        logs.append({'key': key, 'label': label, 'path': path})
+
+    val_error = str(validation.get('error') or '').strip()
+    if val_error:
+        has_issue = True
+        path = os.path.join(out_dir, 'validation_error.log')
+        payload = {
+            'run_id': run_norm,
+            'generated_at': now,
+            'label': 'Validation error',
+            'error': val_error,
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as wf:
+                wf.write(json.dumps(payload, indent=2, sort_keys=True, default=str))
+                wf.write('\n')
+            logs.append({'key': 'validation_error', 'label': 'Validation error', 'path': path})
+        except Exception:
+            pass
+
+    if has_issue and main_log_path and os.path.exists(main_log_path):
+        path = os.path.join(out_dir, 'run_output.log')
+        try:
+            with open(main_log_path, 'r', encoding='utf-8', errors='ignore') as rf:
+                content = rf.read()
+            with open(path, 'w', encoding='utf-8') as wf:
+                wf.write(content)
+            logs.append({'key': 'run_output', 'label': 'Full run output', 'path': path})
+        except Exception:
+            pass
+
+    return logs
+
     if summary_path and os.path.exists(summary_path):
         try:
             with open(summary_path, 'r', encoding='utf-8') as sf:
@@ -33739,7 +34203,7 @@ def _remote_docker_injects_status_script(
     inject_dirs_literal = json.dumps([str(d) for d in (inject_dirs or ['/flow_injects', '/flow_artifacts'])])
     return (
         r"""
-import json, subprocess
+import json, subprocess, time
 
 null = None
 true = True
@@ -33770,6 +34234,47 @@ def _run(cmd, timeout=30):
         return subprocess.CompletedProcess(cmd, 127, stdout=str(e))
 
 
+def _inspect_state(container_name, attempts=4, delay_s=1.0):
+    last_out = ''
+    for idx in range(max(1, int(attempts or 1))):
+        p = _run(['docker', 'inspect', '--format', '{{json .State}}', container_name], timeout=20)
+        out = str(p.stdout or '').strip()
+        if p.returncode == 0 and out:
+            try:
+                st = json.loads(out)
+            except Exception:
+                st = {}
+            if not isinstance(st, dict):
+                st = {}
+            status = str(st.get('Status') or '').strip()
+            running = bool(st.get('Running') is True or status.lower() == 'running')
+            exit_code = st.get('ExitCode')
+            state_error = str(st.get('Error') or '').strip()
+            return {
+                'exists': True,
+                'running': running,
+                'status': status,
+                'exit_code': exit_code,
+                'error': state_error,
+                'inspect_error': '',
+            }
+        if out:
+            last_out = out
+        if idx < max(1, int(attempts or 1)) - 1:
+            try:
+                time.sleep(float(delay_s or 1.0))
+            except Exception:
+                pass
+    return {
+        'exists': False,
+        'running': False,
+        'status': '',
+        'exit_code': None,
+        'error': '',
+        'inspect_error': last_out,
+    }
+
+
 def main():
     items = []
     for c in CONTAINERS:
@@ -33781,21 +34286,15 @@ def main():
         state_status = ''
         state_exit_code = None
         state_error = ''
+        inspect_error = ''
         try:
-            p = _run(['docker', 'inspect', '--format', '{{.State.Running}}', c], timeout=20)
-            if p.returncode == 0:
-                exists = True
-                running = (str(p.stdout or '').strip().lower() == 'true')
-                ps = _run(['docker', 'inspect', '--format', '{{json .State}}', c], timeout=20)
-                if ps.returncode == 0 and str(ps.stdout or '').strip():
-                    try:
-                        st = json.loads(str(ps.stdout or '').strip())
-                        if isinstance(st, dict):
-                            state_status = str(st.get('Status') or '').strip()
-                            state_exit_code = st.get('ExitCode')
-                            state_error = str(st.get('Error') or '').strip()
-                    except Exception:
-                        pass
+            st = _inspect_state(c, attempts=4, delay_s=1.0)
+            exists = bool(st.get('exists'))
+            running = bool(st.get('running'))
+            state_status = str(st.get('status') or '').strip()
+            state_exit_code = st.get('exit_code')
+            state_error = str(st.get('error') or '').strip()
+            inspect_error = str(st.get('inspect_error') or '').strip()
         except Exception:
             exists = False
             running = False
@@ -33844,6 +34343,7 @@ def main():
             'state_status': state_status,
             'state_exit_code': state_exit_code,
             'state_error': state_error,
+            'inspect_error': inspect_error,
             'inject_count': inject_count,
             'inject_samples': inject_samples,
             'inject_dirs_found': inject_dirs_found,
@@ -34210,6 +34710,7 @@ def _validate_session_nodes_and_injects(
         'docker_missing': [],
         'docker_not_running': [],
         'docker_not_running_details': [],
+        'docker_start_pending': [],
         'docker_running': [],
         'injects_missing': [],
         'injects_detail': [],
@@ -34554,6 +35055,18 @@ def _validate_session_nodes_and_injects(
         containers_for_injects = docker_nodes
         if inject_node_names:
             containers_for_injects = [n for n in docker_nodes if n in set(inject_node_names)]
+        def _is_transient_missing_inspect_error(text: Any) -> bool:
+            try:
+                s = str(text or '').strip().lower()
+            except Exception:
+                return False
+            if not s:
+                return False
+            return (
+                ('no such container' in s)
+                or ('no such object' in s)
+                or ('not found' in s and 'docker' in s)
+            )
         def _safe_inject_dir(path: str) -> str | None:
             p = str(path or '').strip()
             if not p or p == '/':
@@ -34596,31 +35109,52 @@ def _validate_session_nodes_and_injects(
                     if not name:
                         continue
                     if not it.get('exists'):
-                        summary['docker_missing'].append(name)
-                        summary['injects_detail'].append(f"{name}: missing")
+                        inspect_err = str(it.get('inspect_error') or '').strip()
+                        if _is_transient_missing_inspect_error(inspect_err):
+                            summary['docker_start_pending'].append(name)
+                            if inspect_err:
+                                summary['injects_detail'].append(f"{name}: startup pending (inspect transient: {inspect_err})")
+                            else:
+                                summary['injects_detail'].append(f"{name}: startup pending (inspect transient)")
+                        else:
+                            summary['docker_missing'].append(name)
+                            if inspect_err:
+                                summary['injects_detail'].append(f"{name}: missing ({inspect_err})")
+                            else:
+                                summary['injects_detail'].append(f"{name}: missing")
                         continue
                     if not it.get('running'):
-                        summary['docker_not_running'].append(name)
                         status_text = str(it.get('state_status') or '').strip()
                         exit_code = it.get('state_exit_code')
+                        try:
+                            exit_code_int = int(exit_code) if exit_code is not None and str(exit_code).strip() != '' else None
+                        except Exception:
+                            exit_code_int = None
                         err_text = str(it.get('state_error') or '').strip()
-                        nr_detail: Dict[str, Any] = {'container': name}
-                        if status_text:
-                            nr_detail['status'] = status_text
-                        if exit_code is not None:
-                            nr_detail['exit_code'] = exit_code
-                        if err_text:
-                            nr_detail['error'] = err_text
-                        summary['docker_not_running_details'].append(nr_detail)
-                        reason_bits: List[str] = []
-                        if status_text:
-                            reason_bits.append(status_text)
-                        if exit_code is not None:
-                            reason_bits.append(f"exit={exit_code}")
-                        if err_text:
-                            reason_bits.append(err_text)
-                        reason = f" ({'; '.join(reason_bits)})" if reason_bits else ''
-                        summary['injects_detail'].append(f"{name}: not running{reason}")
+                        status_norm = status_text.lower()
+                        startup_pending = bool(status_norm == 'created' and (exit_code_int in (None, 0)) and not err_text)
+                        if startup_pending:
+                            summary['docker_start_pending'].append(name)
+                            summary['injects_detail'].append(f"{name}: startup pending (created)")
+                        else:
+                            summary['docker_not_running'].append(name)
+                            nr_detail: Dict[str, Any] = {'container': name}
+                            if status_text:
+                                nr_detail['status'] = status_text
+                            if exit_code is not None:
+                                nr_detail['exit_code'] = exit_code
+                            if err_text:
+                                nr_detail['error'] = err_text
+                            summary['docker_not_running_details'].append(nr_detail)
+                            reason_bits: List[str] = []
+                            if status_text:
+                                reason_bits.append(status_text)
+                            if exit_code is not None:
+                                reason_bits.append(f"exit={exit_code}")
+                            if err_text:
+                                reason_bits.append(err_text)
+                            reason = f" ({'; '.join(reason_bits)})" if reason_bits else ''
+                            summary['injects_detail'].append(f"{name}: not running{reason}")
                     else:
                         summary['docker_running'].append(name)
                     try:
@@ -35341,7 +35875,12 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     app.logger.info("[async] Starting CLI background task; log: %s", log_path)
 
     # Helper function to signal failure and exit
-    def _fail_run(error_msg: str, detail: str = None, code: int = 1):
+    def _fail_run(
+        error_msg: str,
+        detail: str = None,
+        code: int = 1,
+        extra: Optional[Dict[str, Any]] = None,
+    ):
         try:
             log_f.write(f"[async error] {error_msg}\n")
             if detail:
@@ -35356,7 +35895,14 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         if meta:
             meta['done'] = True
             meta['returncode'] = code # Non-zero to indicate failure
-            # We could also add specific error fields to meta if run_status consumes them
+            meta['error'] = str(error_msg or '').strip()
+            if detail:
+                meta['error_detail'] = str(detail)
+            if isinstance(extra, dict) and extra:
+                try:
+                    meta.update(extra)
+                except Exception:
+                    pass
     
     try:
         payload_for_core = _parse_scenarios_xml(xml_path)
@@ -35480,6 +36026,17 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                 pass
             _fail_run(venv_error)
             return
+
+    try:
+        force_remote_sync = str(os.getenv('CORETG_FORCE_REMOTE_REPO_SYNC', '1')).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+    except Exception:
+        force_remote_sync = True
+    if force_remote_sync and bool(core_cfg.get('ssh_enabled')) and not bool(update_remote_repo):
+        update_remote_repo = True
+        try:
+            log_f.write("[remote] Repo upload was not requested; forcing upload to keep remote execute code up-to-date.\n")
+        except Exception:
+            pass
 
     if update_remote_repo:
         try:
@@ -35714,6 +36271,76 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                 pass
         _fail_run(f"Failed to open SSH session for CLI: {exc}", code=1)
         return
+
+    def _sanitize_remote_compose_templates() -> None:
+        script = textwrap.dedent(
+            r"""
+            python3 - <<'PY'
+            import glob, json, re
+
+            changed = []
+            for path in sorted(glob.glob('/tmp/vulns/docker-compose-*.yml')):
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        txt = f.read()
+                    safe_re = re.compile(r'\$\{\s*([\"\'])\$\{[^}]*\}\1\s*\}')
+                    stash = {}
+
+                    def _stash(m):
+                        key = f"__CORETG_SAFE_MAKO_EXPR_{len(stash)}__"
+                        stash[key] = m.group(0)
+                        return key
+
+                    fixed = safe_re.sub(_stash, txt)
+
+                    def _wrap(m):
+                        expr = (m.group(1) or '')
+                        if not expr:
+                            return m.group(0)
+                        return '${"${' + expr + '}"}'
+
+                    fixed = re.sub(r'\\+\$\{([^}]*)\}', _wrap, fixed)
+                    fixed = re.sub(r'\$\$\{([^}]*)\}', _wrap, fixed)
+                    fixed = safe_re.sub(_stash, fixed)
+                    fixed = re.sub(r'(?<!\$)\$\{([^}]*)\}', _wrap, fixed)
+                    for key, original in stash.items():
+                        fixed = fixed.replace(key, original)
+                    if fixed != txt:
+                        with open(path, 'w', encoding='utf-8') as f:
+                            f.write(fixed)
+                        changed.append(path)
+                except Exception:
+                    continue
+            print(json.dumps({'changed': changed, 'count': len(changed)}))
+            PY
+            """
+        ).strip()
+        try:
+            code, out_text, err_text = _exec_ssh_command(remote_client, script, timeout=45.0)
+        except Exception as exc:
+            try:
+                log_f.write(f"{log_prefix}WARN: pre-run remote compose sanitize failed: {exc}\n")
+            except Exception:
+                pass
+            return
+        if code != 0:
+            try:
+                log_f.write(
+                    f"{log_prefix}WARN: pre-run remote compose sanitize exited {code}; stderr={_summarize_for_log((err_text or '').strip())}\n"
+                )
+            except Exception:
+                pass
+            return
+        try:
+            payload = json.loads((out_text or '').strip() or '{}')
+        except Exception:
+            payload = {}
+        try:
+            log_f.write(
+                f"{log_prefix}pre-run remote compose sanitize changed={int(payload.get('count') or 0)}\n"
+            )
+        except Exception:
+            pass
     auto_start_allowed = _coerce_bool(core_cfg.get('auto_start_daemon')) or bool(adv_restart_core_daemon)
     try:
         log_f.write(f"{log_prefix}core-daemon auto-start allowed: {auto_start_allowed}\n")
@@ -35979,12 +36606,28 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         _ensure_remote_core_daemon_ready(
             client=remote_client,
             core_cfg=core_cfg,
-            auto_start_allowed=adv_start_core_daemon,
+            auto_start_allowed=auto_start_allowed,
             sudo_password=core_cfg.get('ssh_password'),
             logger=app.logger,
             log_handle=log_f,
             log_prefix=log_prefix
         )
+    except CoreDaemonConflictError as exc:
+        try:
+             log_f.write(f"{log_prefix}ERROR: Failed to ensure core-daemon is ready: {exc}\n")
+        except Exception:
+             pass
+        _fail_run(
+            f"Failed to ensure core-daemon is ready: {exc}",
+            code=1,
+            extra={
+                'daemon_conflict': True,
+                'daemon_pids': list(getattr(exc, 'pids', []) or []),
+                'can_stop_daemons': bool(core_cfg.get('ssh_password')),
+                'error_code': 'core_daemon_conflict',
+            },
+        )
+        return
     except Exception as exc:
         try:
              log_f.write(f"{log_prefix}ERROR: Failed to ensure core-daemon is ready: {exc}\n")
@@ -35992,6 +36635,8 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
              pass
         _fail_run(f"Failed to ensure core-daemon is ready: {exc}", code=1)
         return
+
+    _sanitize_remote_compose_templates()
 
     try:
         log_f.write(f"{log_prefix}Cleaning up active sessions...\n")
@@ -36033,14 +36678,36 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         except Exception:
             pass
 
-        remote_ctx = _prepare_remote_cli_context(
-             client=remote_client,
-             run_id=run_id_local,
-             xml_path=xml_path,
-             preview_plan_path=preview_plan_path,
-             log_handle=log_f,
-             upload_only_injected_artifacts=upload_only_injected_artifacts,
-        )
+        last_prepare_exc: Optional[Exception] = None
+        for prepare_attempt in range(2):
+            try:
+                remote_ctx = _prepare_remote_cli_context(
+                     client=remote_client,
+                     run_id=run_id_local,
+                     xml_path=xml_path,
+                     preview_plan_path=preview_plan_path,
+                     log_handle=log_f,
+                     upload_only_injected_artifacts=upload_only_injected_artifacts,
+                )
+                last_prepare_exc = None
+                break
+            except Exception as exc:
+                last_prepare_exc = exc
+                should_retry = prepare_attempt == 0 and _is_transient_remote_prepare_error(exc)
+                if not should_retry:
+                    raise
+                try:
+                    log_f.write(f"{log_prefix}Transient remote prep error ({exc}); reconnecting SSH and retrying once...\n")
+                except Exception:
+                    pass
+                try:
+                    if remote_client:
+                        remote_client.close()
+                except Exception:
+                    pass
+                remote_client = _open_ssh_client(core_cfg)
+        if last_prepare_exc is not None and remote_ctx is None:
+            raise last_prepare_exc
     except Exception as exc:
         if tmp_xml and os.path.exists(tmp_xml):
             try: os.remove(tmp_xml)
@@ -36159,7 +36826,11 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         
         stdin.close()
         
-        _relay_remote_channel_to_log(stdout.channel, log_f)
+        _relay_remote_channel_to_log(
+            stdout.channel,
+            log_f,
+            redact_tokens=[str(core_cfg.get('ssh_password') or '')],
+        )
         
         exit_code = stdout.channel.recv_exit_status()
         
@@ -37202,9 +37873,44 @@ def run_status(run_id: str):
                 }
         except Exception:
             pass
+    if meta.get('done') and isinstance(meta.get('validation_summary'), dict):
+        try:
+            val = meta.get('validation_summary') if isinstance(meta.get('validation_summary'), dict) else {}
+            links_cached = meta.get('validation_error_logs') if isinstance(meta.get('validation_error_logs'), list) else None
+            if links_cached is None:
+                raw_logs = _build_execute_error_logs(
+                    run_id=run_id,
+                    validation=val,
+                    main_log_path=meta.get('log_path'),
+                )
+                links: List[Dict[str, str]] = []
+                for entry in raw_logs:
+                    if not isinstance(entry, dict):
+                        continue
+                    p = str(entry.get('path') or '').strip()
+                    if not p:
+                        continue
+                    links.append({
+                        'key': str(entry.get('key') or '').strip(),
+                        'label': str(entry.get('label') or '').strip() or 'Download log',
+                        'path': p,
+                        'url': url_for('download_report', path=p),
+                    })
+                meta['validation_error_logs'] = links
+            if isinstance(meta.get('validation_error_logs'), list):
+                val['error_logs'] = meta.get('validation_error_logs')
+                meta['validation_summary'] = val
+        except Exception:
+            pass
     return jsonify({
         'done': bool(meta.get('done')),
         'returncode': meta.get('returncode'),
+        'error': meta.get('error'),
+        'error_detail': meta.get('error_detail'),
+        'error_code': meta.get('error_code'),
+        'daemon_conflict': bool(meta.get('daemon_conflict')),
+        'daemon_pids': meta.get('daemon_pids') if isinstance(meta.get('daemon_pids'), list) else [],
+        'can_stop_daemons': False if meta.get('can_stop_daemons') is False else True,
         'docker_conflicts': docker_conflicts,
         'validation_summary': meta.get('validation_summary'),
         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
@@ -42571,6 +43277,250 @@ def vuln_catalog_items_delete():
     return jsonify({'ok': True})
 
 
+def _core_like_compose_template_preflight(path: str) -> tuple[bool, str | None, dict[str, Any]]:
+    """Best-effort emulate CORE's compose template parsing behavior.
+
+    CORE treats compose files as templates (Mako). This preflight catches template
+    expression errors early for the vuln catalog Test button flow.
+    """
+    meta: dict[str, Any] = {}
+    try:
+        text = Path(path).read_text(encoding='utf-8', errors='ignore')
+    except Exception as exc:
+        return False, f'Unable to read prepared docker-compose file: {exc}', meta
+
+    # Ignore already-safe wrappers like `${"${VAR:-x}"}` while scanning.
+    scan_text = re.sub(
+        r'\$\{\s*([\"\'])\$\{[^}]*\}\1\s*\}',
+        lambda m: ' ' * len(m.group(0)),
+        text,
+    )
+
+    raw_exprs: list[tuple[str, int]] = []
+    for m in re.finditer(r'(?<!\\)\$\{([^}]*)\}', scan_text):
+        expr = (m.group(1) or '').strip()
+        line_no = text.count('\n', 0, m.start()) + 1
+        raw_exprs.append((expr, line_no))
+    if raw_exprs:
+        meta['raw_template_expr_count'] = len(raw_exprs)
+
+    syntax_errors: list[str] = []
+    for expr, line_no in raw_exprs[:8]:
+        try:
+            ast.parse(expr, mode='eval')
+        except SyntaxError:
+            syntax_errors.append(f'line {line_no}: ${{{expr}}}')
+        except Exception:
+            # Non-syntax parse failures are still suspicious but less deterministic.
+            syntax_errors.append(f'line {line_no}: ${{{expr}}}')
+    if syntax_errors:
+        return (
+            False,
+            'Compose template contains unescaped `${...}` expression(s) that fail CORE-style parsing: '
+            + '; '.join(syntax_errors[:3]),
+            meta,
+        )
+
+    try:
+        from mako.template import Template as _MakoTemplate  # type: ignore
+        from mako import exceptions as _mako_exceptions  # type: ignore
+
+        meta['template_engine'] = 'mako'
+        try:
+            _MakoTemplate(text).render()
+        except Exception as exc:
+            detail = ''
+            try:
+                detail = str(_mako_exceptions.text_error_template().render()).strip()
+            except Exception:
+                detail = str(exc)
+            detail = detail.replace('\n', ' | ')
+            if len(detail) > 700:
+                detail = detail[:700] + '...'
+            return False, f'CORE-like template render check failed: {detail}', meta
+    except Exception:
+        meta['template_engine'] = 'ast-fallback'
+
+    return True, None, meta
+
+
+def _core_vm_compose_template_preflight(ssh_client: Any, remote_compose_path: str) -> tuple[bool, str | None, dict[str, Any]]:
+    """Run a CORE-like compose template preflight on the CORE VM itself."""
+    meta: dict[str, Any] = {}
+    remote_path = str(remote_compose_path or '').strip()
+    if not remote_path:
+        return False, 'Missing remote compose path for CORE VM preflight', meta
+
+    path_q = shlex.quote(remote_path)
+    script = textwrap.dedent(
+        r"""
+        python3 - <<'PY' __CORETG_PATH__
+import ast, json, re, sys
+
+meta = {}
+path = sys.argv[1] if len(sys.argv) > 1 else ''
+if not path:
+    print(json.dumps({'ok': False, 'error': 'missing compose path', 'meta': meta}))
+    raise SystemExit(0)
+try:
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+except Exception as exc:
+    print(json.dumps({'ok': False, 'error': f'unable to read compose: {exc}', 'meta': meta}))
+    raise SystemExit(0)
+
+scan_text = re.sub(r'\$\{\s*([\"\'])\$\{[^}]*\}\1\s*\}', lambda m: ' ' * len(m.group(0)), text)
+raw_exprs = []
+for m in re.finditer(r'(?<!\\)\$\{([^}]*)\}', scan_text):
+    expr = (m.group(1) or '').strip()
+    line_no = text.count('\n', 0, m.start()) + 1
+    raw_exprs.append((expr, line_no))
+if raw_exprs:
+    meta['raw_template_expr_count'] = len(raw_exprs)
+
+syntax_errors = []
+for expr, line_no in raw_exprs[:8]:
+    try:
+        ast.parse(expr, mode='eval')
+    except Exception:
+        syntax_errors.append(f'line {line_no}: ${{{expr}}}')
+if syntax_errors:
+    print(json.dumps({'ok': False, 'error': 'Compose template contains unescaped `${...}` expression(s): ' + '; '.join(syntax_errors[:3]), 'meta': meta}))
+    raise SystemExit(0)
+
+try:
+    from mako.template import Template as _MakoTemplate  # type: ignore
+    meta['template_engine'] = 'mako'
+    _MakoTemplate(text).render()
+except ImportError:
+    meta['template_engine'] = 'ast-fallback'
+except Exception as exc:
+    detail = str(exc).replace('\n', ' | ')
+    if len(detail) > 700:
+        detail = detail[:700] + '...'
+    print(json.dumps({'ok': False, 'error': 'CORE-VM template render check failed: ' + detail, 'meta': meta}))
+    raise SystemExit(0)
+
+print(json.dumps({'ok': True, 'meta': meta}))
+PY
+    """
+    ).replace('__CORETG_PATH__', path_q).strip()
+
+    cmd = f"bash -lc {shlex.quote(script)}"
+    try:
+        rc, out, err = _exec_ssh_command(ssh_client, cmd, timeout=30.0)
+    except Exception as exc:
+        return False, f'CORE VM template preflight transport failed: {exc}', meta
+    if rc != 0:
+        detail = str(err or out or '').strip() or f'command exited {rc}'
+        return False, f'CORE VM template preflight command failed: {detail}', meta
+
+    payload: dict[str, Any] = {}
+    out_text = str(out or '').strip()
+    if out_text:
+        try:
+            payload = json.loads(out_text)
+        except Exception:
+            return False, f'CORE VM template preflight returned non-JSON output: {out_text[:300]}', meta
+    if not isinstance(payload, dict):
+        payload = {}
+    pm = payload.get('meta')
+    if isinstance(pm, dict):
+        meta.update(pm)
+    if payload.get('ok') is False:
+        return False, str(payload.get('error') or 'CORE VM compose template preflight failed'), meta
+    return True, None, meta
+
+
+def _core_vm_render_compose_template(ssh_client: Any, remote_compose_path: str) -> tuple[bool, str | None, str | None, dict[str, Any]]:
+    """Render compose template on CORE VM and return a runtime compose path.
+
+    Returns: (ok, rendered_path, error, meta)
+    """
+    meta: dict[str, Any] = {}
+    remote_path = str(remote_compose_path or '').strip()
+    if not remote_path:
+        return False, None, 'Missing remote compose path for CORE VM render', meta
+
+    path_q = shlex.quote(remote_path)
+    script = textwrap.dedent(
+        r"""
+        python3 - <<'PY' __CORETG_PATH__
+import json, os, re, sys
+
+src = sys.argv[1] if len(sys.argv) > 1 else ''
+if not src:
+    print(json.dumps({'ok': False, 'error': 'missing source path'}))
+    raise SystemExit(0)
+
+try:
+    with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+except Exception as exc:
+    print(json.dumps({'ok': False, 'error': f'unable to read source compose: {exc}'}))
+    raise SystemExit(0)
+
+engine = 'wrapper-fallback'
+rendered = text
+try:
+    from mako.template import Template as _MakoTemplate  # type: ignore
+    rendered = _MakoTemplate(text).render()
+    engine = 'mako'
+except ImportError:
+    # Fallback: collapse `${"${...}"}` wrappers emitted by sanitizer.
+    prev = None
+    cur = rendered
+    pat = re.compile(r'\$\{\s*[\"\']\s*(\$\{[^}]*\})\s*[\"\']\s*\}')
+    while prev != cur:
+        prev = cur
+        cur = pat.sub(r'\1', cur)
+    rendered = cur
+except Exception as exc:
+    print(json.dumps({'ok': False, 'error': f'mako render failed: {exc}'}))
+    raise SystemExit(0)
+
+out_path = src + '.runtime.yml'
+try:
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(rendered)
+except Exception as exc:
+    print(json.dumps({'ok': False, 'error': f'unable to write rendered compose: {exc}'}))
+    raise SystemExit(0)
+
+print(json.dumps({'ok': True, 'path': out_path, 'meta': {'engine': engine}}))
+PY
+        """
+    ).replace('__CORETG_PATH__', path_q).strip()
+
+    cmd = f"bash -lc {shlex.quote(script)}"
+    try:
+        rc, out, err = _exec_ssh_command(ssh_client, cmd, timeout=30.0)
+    except Exception as exc:
+        return False, None, f'CORE VM compose render transport failed: {exc}', meta
+    if rc != 0:
+        detail = str(err or out or '').strip() or f'command exited {rc}'
+        return False, None, f'CORE VM compose render command failed: {detail}', meta
+
+    payload: dict[str, Any] = {}
+    out_text = str(out or '').strip()
+    if out_text:
+        try:
+            payload = json.loads(out_text)
+        except Exception:
+            return False, None, f'CORE VM compose render returned non-JSON output: {out_text[:300]}', meta
+    if not isinstance(payload, dict):
+        payload = {}
+    pm = payload.get('meta')
+    if isinstance(pm, dict):
+        meta.update(pm)
+    if payload.get('ok') is False:
+        return False, None, str(payload.get('error') or 'CORE VM compose render failed'), meta
+    out_path = str(payload.get('path') or '').strip()
+    if not out_path:
+        return False, None, 'CORE VM compose render did not return output path', meta
+    return True, out_path, None, meta
+
+
 @app.route('/vuln_catalog_items/test/start', methods=['POST'])
 def vuln_catalog_items_test_start():
     _require_builder_or_admin()
@@ -42757,6 +43707,15 @@ def vuln_catalog_items_test_start():
 
     if prepared_compose_path != compose_path:
         _rewrite_compose_paths_for_remote(prepared_compose_path, run_dir, remote_run_dir)
+
+    preflight_ok, preflight_error, preflight_meta = _core_like_compose_template_preflight(prepared_compose_path)
+    if not preflight_ok:
+        return jsonify({
+            'ok': False,
+            'error': preflight_error or 'Prepared docker-compose failed template preflight',
+            'compose_path': prepared_compose_path,
+            'preflight': preflight_meta,
+        }), 422
 
     def _compose_images_and_containers(path: str) -> tuple[list[str], list[str]]:
         images: list[str] = []
@@ -42972,6 +43931,56 @@ def vuln_catalog_items_test_start():
         rel_compose = os.path.relpath(prepared_compose_path, run_dir)
         remote_compose_path = _remote_path_join(remote_run_dir, rel_compose)
         log_f.write(f"[remote] compose: {remote_compose_path}\n")
+
+        remote_preflight_ok, remote_preflight_error, remote_preflight_meta = _core_vm_compose_template_preflight(
+            ssh_client,
+            remote_compose_path,
+        )
+        if remote_preflight_ok:
+            try:
+                log_f.write(
+                    f"[remote] compose preflight ok (engine={str((remote_preflight_meta or {}).get('template_engine') or 'unknown')})\n"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                log_f.write(f"[remote] compose preflight failed: {remote_preflight_error}\n")
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': remote_preflight_error or 'CORE VM compose template preflight failed',
+                'compose_path': prepared_compose_path,
+                'remote_compose_path': remote_compose_path,
+                'preflight_remote': remote_preflight_meta,
+            }), 422
+
+        remote_render_ok, remote_runtime_compose_path, remote_render_error, remote_render_meta = _core_vm_render_compose_template(
+            ssh_client,
+            remote_compose_path,
+        )
+        if not remote_render_ok or not remote_runtime_compose_path:
+            try:
+                log_f.write(f"[remote] compose render failed: {remote_render_error}\n")
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': remote_render_error or 'CORE VM compose render failed',
+                'compose_path': prepared_compose_path,
+                'remote_compose_path': remote_compose_path,
+                'preflight_remote': remote_preflight_meta,
+                'render_remote': remote_render_meta,
+            }), 422
+        try:
+            log_f.write(
+                f"[remote] compose render ok (engine={str((remote_render_meta or {}).get('engine') or 'unknown')}) path={remote_runtime_compose_path}\n"
+            )
+        except Exception:
+            pass
+
+        remote_compose_runtime_path = remote_runtime_compose_path
         log_f.write(f"[remote] docker compose up (project={project_name})\n")
 
         pw = ''
@@ -42982,7 +43991,7 @@ def vuln_catalog_items_test_start():
         inner_cmd = (
             f"cd {shlex.quote(remote_run_dir)} && "
             f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} sudo -S -p '' -k "
-            f"docker compose -f {shlex.quote(remote_compose_path)} up --remove-orphans"
+            f"docker compose -f {shlex.quote(remote_compose_runtime_path)} up --remove-orphans"
         )
         cmd = f"bash -lc {shlex.quote(inner_cmd)}"
         channel = ssh_client.get_transport().open_session() if ssh_client.get_transport() else None
@@ -43002,6 +44011,7 @@ def vuln_catalog_items_test_start():
         relay_thread = threading.Thread(
             target=_relay_remote_channel_to_log,
             args=(channel, log_f),
+            kwargs={'redact_tokens': [pw]},
             daemon=True,
         )
         relay_thread.start()
@@ -43040,7 +44050,8 @@ def vuln_catalog_items_test_start():
         'catalog_id': cid,
         'item_id': item_id,
         'remote_run_dir': remote_run_dir,
-        'remote_compose_path': remote_compose_path,
+        'remote_compose_path': remote_compose_runtime_path,
+        'remote_compose_template_path': remote_compose_path,
         'core_cfg': core_cfg,
         'ssh_client': ssh_client,
         'ssh_channel': channel,
@@ -43173,7 +44184,7 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
                     pass
                 try:
                     with open(log_path, 'a', encoding='utf-8') as log_f:
-                        _relay_remote_channel_to_log(channel, log_f)
+                        _relay_remote_channel_to_log(channel, log_f, redact_tokens=[pw])
                 except Exception:
                     pass
         except Exception:
@@ -44554,7 +45565,7 @@ def flag_generators_test_run():
     repo_root = _get_repo_root()
     runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
     cmd = [
-        sys.executable or 'python',
+        _resolve_python_executable(),
         runner_path,
         '--kind',
         'flag-generator',
@@ -44577,12 +45588,16 @@ def flag_generators_test_run():
 
     try:
         log_handle = open(log_path, 'a', encoding='utf-8')
+        env = dict(os.environ)
+        env.setdefault('CORETG_DOCKER_USE_SUDO', '1')
+        env.setdefault('CORETG_DOCKER_HOST_NETWORK', '1')
         proc = subprocess.Popen(
             cmd,
             cwd=repo_root,
             stdout=log_handle,
             stderr=log_handle,
             text=True,
+            env=env,
         )
     except Exception as exc:
         try:
@@ -44735,7 +45750,7 @@ def flag_node_generators_test_run():
     repo_root = _get_repo_root()
     runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
     cmd = [
-        sys.executable or 'python',
+        _resolve_python_executable(),
         runner_path,
         '--kind',
         'flag-node-generator',
@@ -44758,12 +45773,16 @@ def flag_node_generators_test_run():
 
     try:
         log_handle = open(log_path, 'a', encoding='utf-8')
+        env = dict(os.environ)
+        env.setdefault('CORETG_DOCKER_USE_SUDO', '1')
+        env.setdefault('CORETG_DOCKER_HOST_NETWORK', '1')
         proc = subprocess.Popen(
             cmd,
             cwd=repo_root,
             stdout=log_handle,
             stderr=log_handle,
             text=True,
+            env=env,
         )
     except Exception as exc:
         try:

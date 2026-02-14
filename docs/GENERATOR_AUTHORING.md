@@ -233,6 +233,43 @@ cat /tmp/nodegen_test/docker-compose.yml
 cat /tmp/nodegen_test/outputs.json
 ```
 
+### Test/Execute parity checklist (important)
+
+When a generator passes in the UI **Test** button but fails during **Execute**, it is usually a runtime-parity issue.
+
+Use this checklist before shipping a generator pack:
+
+1. **Run from installed source, not only repo-local**
+  - Install the pack via the Web UI and re-test from installed generators.
+  - Execute uses installed generators as source-of-truth in normal workflows.
+
+2. **Avoid function-local imports in code that defines nested helpers**
+  - In Python, `import json` / `import sys` inside a function can create closure shadowing issues for nested functions.
+  - Prefer module-level imports for `json`, `sys`, and other shared modules.
+
+3. **Do not rely on internet/package-manager availability at runtime**
+  - Keep runtime resilient if `apt/apk/dnf/yum` is unavailable.
+  - Treat package installation as best-effort, not a hard dependency for basic generator output.
+
+4. **Keep runtime paths deterministic**
+  - Write outputs under `/outputs` and reference artifacts relative to `outputs.json`.
+  - For injectables, emit stable artifact paths and use manifest `injects` keys that resolve to real files.
+
+5. **Validate both execution modes when possible**
+  - UI Test run (local web process)
+  - Full Execute run (remote CORE path)
+  - Compare logs if behavior diverges.
+
+6. **Require explicit failure signals**
+  - Non-zero exit on true failure.
+  - Populate `outputs.json` only when outputs are valid.
+
+### AI scaffolding prompt addendum
+
+If you use AI to scaffold a generator, include this in your prompt:
+
+> Generate a manifest-based generator that is parity-safe between local Test and remote Execute. Use module-level imports only (no function-local `import json/sys` in enclosing scopes with nested helpers), avoid hard dependency on internet/package-manager availability, write deterministic `/outputs/outputs.json`, and ensure `injects` paths resolve to real files. Include a quick local run command and an installed-pack verification checklist.
+
 ---
 
 ## 7) Packaging a Generator Pack (ZIP)
