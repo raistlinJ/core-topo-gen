@@ -17161,11 +17161,6 @@
         const generatorOutputsMissingList = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing : [];
         const generatorInjectsMissingList = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing : [];
         const generatorValidationDetail = Array.isArray(summary.generator_validation_detail) ? summary.generator_validation_detail : [];
-        const flowLivePathsMissing = Array.isArray(summary.flow_live_paths_missing) ? summary.flow_live_paths_missing : [];
-        const flowLivePathsChecked = Number.isFinite(Number(summary.flow_live_paths_checked)) ? Number(summary.flow_live_paths_checked) : 0;
-        const flowLivePathsMissingCount = Number.isFinite(Number(summary.flow_live_paths_missing_count))
-            ? Number(summary.flow_live_paths_missing_count)
-            : flowLivePathsMissing.length;
         const generatorOutputsDetailItems = generatorValidationDetail.length
             ? generatorValidationDetail.map((it) => {
                 if (!it || typeof it !== 'object') return '';
@@ -17185,11 +17180,11 @@
                 const node = (it.node_id || '').toString();
                 const gname = (it.generator_name || it.generator_id || node || 'generator').toString();
                 const gtype = (it.generator_type || 'generator').toString();
-                const files = Array.isArray(it.inject_checked) && it.inject_checked.length
-                    ? it.inject_checked
-                    : (Array.isArray(it.inject_missing) ? it.inject_missing : []);
-                const fileText = files.length ? files.join(', ') : 'no inject files';
-                return `${gtype} ${gname}: ${fileText}`;
+                const checkedFiles = Array.isArray(it.inject_checked) ? it.inject_checked.filter(Boolean) : [];
+                const missingFiles = Array.isArray(it.inject_missing) ? it.inject_missing.filter(Boolean) : [];
+                const files = generatorInjectsMissing > 0 ? (missingFiles.length ? missingFiles : checkedFiles) : checkedFiles;
+                if (!files.length) return '';
+                return `${gtype} ${gname}: ${files.join(', ')}`;
             }).filter(Boolean)
             : generatorInjectsMissingList;
         executeSummaryStatusEl.textContent = summary.ok ? 'All validation checks passed.' : 'Validation checks found issues.';
@@ -17228,16 +17223,6 @@
             extraNodes ? `${extraNodes} unexpected` : 'No extras detected',
             extraNodes ? (Array.isArray(summary.extra_nodes) ? summary.extra_nodes : []) : actualNodesList
         ));
-        if (flowLivePathsChecked > 0 || flowLivePathsMissing.length > 0) {
-            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
-                'Flow live paths present',
-                flowLivePathsMissingCount === 0,
-                flowLivePathsMissingCount > 0
-                    ? `${flowLivePathsMissingCount} missing local path(s)`
-                    : `${flowLivePathsChecked} path(s) checked`,
-                flowLivePathsMissing
-            ));
-        }
         if (dockerNodes > 0) {
             executeSummaryListEl.appendChild(renderExecuteSummaryItem(
                 'Docker containers present',
@@ -17336,22 +17321,8 @@
         const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
         const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
         const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
-        const flowLivePathsChecked = Number.isFinite(Number(summary.flow_live_paths_checked)) ? Number(summary.flow_live_paths_checked) : 0;
-        const flowLivePathsMissingCount = Number.isFinite(Number(summary.flow_live_paths_missing_count))
-            ? Number(summary.flow_live_paths_missing_count)
-            : (Array.isArray(summary.flow_live_paths_missing) ? summary.flow_live_paths_missing.length : 0);
         lines.push(`Expected nodes created: ${missingNodes === 0 ? 'OK' : `Missing ${missingNodes}`}`);
         lines.push(`Unexpected nodes: ${extraNodes === 0 ? 'None' : `Extra ${extraNodes}`}`);
-        if (flowLivePathsChecked > 0 || flowLivePathsMissingCount > 0) {
-            lines.push(`Flow live paths present: ${flowLivePathsMissingCount === 0 ? `OK (${flowLivePathsChecked} checked)` : `Missing ${flowLivePathsMissingCount}`}`);
-            const missingItems = Array.isArray(summary.flow_live_paths_missing) ? summary.flow_live_paths_missing : [];
-            missingItems.slice(0, 10).forEach((item) => {
-                lines.push(`- ${String(item)}`);
-            });
-            if (missingItems.length > 10) {
-                lines.push(`- (+${missingItems.length - 10} more)`);
-            }
-        }
         if (expectedDockerNodes > 0) {
             lines.push(`Expected docker nodes: ${missingDockerNodes === 0 ? 'OK' : `Missing ${missingDockerNodes}`}`);
             lines.push(`Unexpected docker nodes: ${extraDockerNodes === 0 ? 'None' : `Extra ${extraDockerNodes}`}`);

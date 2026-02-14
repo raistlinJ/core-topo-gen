@@ -34574,7 +34574,7 @@ def _validate_session_nodes_and_injects(
         if inject_expected_by_node:
             inject_dirs = sorted({d for paths in inject_expected_by_node.values() for p in paths if p.startswith('/') for d in (_safe_inject_dir(p),) if d})
         else:
-            inject_dirs = expected_inject_dirs if expected_inject_dirs else None
+            inject_dirs = expected_inject_dirs if (expected_inject_dirs and not flow_enabled) else None
         try:
             payload = _run_remote_python_json(
                 core_cfg,
