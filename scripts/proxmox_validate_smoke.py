@@ -145,7 +145,7 @@ def main() -> int:
     probe_url = _join_url(base_url, "/api/proxmox/credentials/get")
     probe = sess.post(
         probe_url,
-        json={},
+        data={},
         allow_redirects=False,
         timeout=15,
         verify=verify_base_tls,
@@ -177,7 +177,7 @@ def main() -> int:
 
     resp = sess.post(
         validate_url,
-        json=payload,
+        data=payload,
         timeout=30,
         verify=verify_base_tls,
     )

@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 
 import pytest
 
@@ -85,7 +86,7 @@ def test_run_cli_async_adv_auto_kill_sessions_invokes_delete(tmp_path, monkeypat
     fake_core_cfg = {
         'host': '127.0.0.1',
         'port': 50051,
-        'ssh_enabled': True,
+        'ssh_enabled': False,
         'ssh_host': '127.0.0.1',
         'ssh_port': 22,
         'ssh_username': 'core',
@@ -152,7 +153,7 @@ def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, mo
     fake_core_cfg = {
         'host': '127.0.0.1',
         'port': 50051,
-        'ssh_enabled': True,
+        'ssh_enabled': False,
         'ssh_host': '127.0.0.1',
         'ssh_port': 22,
         'ssh_username': 'core',
@@ -184,3 +185,284 @@ def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, mo
     assert resp.status_code == 202
     payload = resp.get_json() or {}
     assert isinstance(payload.get('run_id'), str) and payload.get('run_id')
+
+
+def test_run_cli_async_blocks_when_flow_artifact_paths_missing(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text(
+        '<Scenarios><Scenario name="NewScenario1"><ScenarioEditor /></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    fake_core_cfg = {
+        'host': '127.0.0.1',
+        'port': 50051,
+        'ssh_enabled': False,
+        'ssh_host': '127.0.0.1',
+        'ssh_port': 22,
+        'ssh_username': 'core',
+        'ssh_password': 'pw',
+        'auto_start_daemon': False,
+        'venv_bin': '',
+    }
+
+    monkeypatch.setattr(backend, '_merge_core_configs', lambda *a, **k: dict(fake_core_cfg))
+    monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(
+        backend,
+        '_select_core_config_for_page',
+        lambda *a, **k: dict(fake_core_cfg),
+    )
+
+    missing_artifacts = str(tmp_path / 'missing' / 'artifacts')
+    missing_mount = str(tmp_path / 'missing' / 'mount')
+    missing_inject = str(tmp_path / 'missing' / 'inject' / 'exports')
+
+    def _fake_preview_payload(_path, _scenario):
+        return {
+            'metadata': {
+                'flow': {
+                    'flag_assignments': [
+                        {
+                            'node_id': '7',
+                            'id': 'nfs_sensitive_file',
+                            'artifacts_dir': missing_artifacts,
+                            'mount_dir': missing_mount,
+                            'inject_files': [missing_inject],
+                            'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                        }
+                    ]
+                }
+            },
+            'full_preview': {'role_counts': {'Docker': 1}},
+        }
+
+    monkeypatch.setattr(backend, '_load_preview_payload_from_path', _fake_preview_payload)
+
+    client = app.test_client()
+    _login(client)
+
+    resp = client.post(
+        '/run_cli_async',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': 'NewScenario1',
+            'preview_plan': str(xml_path),
+            'flow_enabled': '1',
+        },
+    )
+
+    assert resp.status_code == 422
+    payload = resp.get_json() or {}
+    assert 'Execute requires pre-generated Flow values' in str(payload.get('error') or '')
+    details = payload.get('details') if isinstance(payload.get('details'), list) else []
+    assert any(isinstance(d, dict) and d.get('reason') == 'missing artifacts_dir' for d in details)
+    assert any(isinstance(d, dict) and d.get('reason') == 'missing mount_dir' for d in details)
+    assert any(isinstance(d, dict) and d.get('reason') == 'missing inject_source' for d in details)
+
+
+def test_run_cli_async_remote_allows_missing_local_flow_paths(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text(
+        '<Scenarios><Scenario name="NewScenario1"><ScenarioEditor /></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    remote_core_cfg = {
+        'host': '127.0.0.1',
+        'port': 50051,
+        'ssh_enabled': True,
+        'ssh_host': '127.0.0.1',
+        'ssh_port': 22,
+        'ssh_username': 'core',
+        'ssh_password': 'pw',
+        'auto_start_daemon': False,
+        'venv_bin': '',
+    }
+
+    monkeypatch.setattr(backend, '_merge_core_configs', lambda *a, **k: dict(remote_core_cfg))
+    monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(
+        backend,
+        '_select_core_config_for_page',
+        lambda *a, **k: dict(remote_core_cfg),
+    )
+    monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
+
+    missing_artifacts = str(tmp_path / 'missing' / 'artifacts')
+    missing_mount = str(tmp_path / 'missing' / 'mount')
+    missing_inject = str(tmp_path / 'missing' / 'inject' / 'exports.txt')
+
+    def _fake_preview_payload(_path, _scenario):
+        return {
+            'metadata': {
+                'flow': {
+                    'flag_assignments': [
+                        {
+                            'node_id': '7',
+                            'id': 'nfs_sensitive_file',
+                            'artifacts_dir': missing_artifacts,
+                            'mount_dir': missing_mount,
+                            'inject_files': [f'{missing_inject} -> /tmp/seed'],
+                            'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                        }
+                    ]
+                }
+            },
+            'full_preview': {'role_counts': {'Docker': 1}},
+        }
+
+    monkeypatch.setattr(backend, '_load_preview_payload_from_path', _fake_preview_payload)
+
+    client = app.test_client()
+    _login(client)
+
+    resp = client.post(
+        '/run_cli_async',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': 'NewScenario1',
+            'preview_plan': str(xml_path),
+            'flow_enabled': '1',
+        },
+    )
+
+    assert resp.status_code == 202
+    payload = resp.get_json() or {}
+    assert isinstance(payload.get('run_id'), str) and payload.get('run_id')
+
+
+def test_run_cli_async_accepts_inject_spec_with_dest_when_source_exists(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text(
+        '<Scenarios><Scenario name="NewScenario1"><ScenarioEditor /></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    fake_core_cfg = {
+        'host': '127.0.0.1',
+        'port': 50051,
+        'ssh_enabled': True,
+        'ssh_host': '127.0.0.1',
+        'ssh_port': 22,
+        'ssh_username': 'core',
+        'ssh_password': 'pw',
+        'auto_start_daemon': False,
+        'venv_bin': '',
+    }
+
+    monkeypatch.setattr(backend, '_merge_core_configs', lambda *a, **k: dict(fake_core_cfg))
+    monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(
+        backend,
+        '_select_core_config_for_page',
+        lambda *a, **k: dict(fake_core_cfg),
+    )
+
+    artifacts_dir = tmp_path / 'ok' / 'artifacts'
+    mount_dir = tmp_path / 'ok' / 'mount'
+    inject_source = tmp_path / 'ok' / 'inject' / 'exports.txt'
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    inject_source.parent.mkdir(parents=True, exist_ok=True)
+    inject_source.write_text('ok', encoding='utf-8')
+
+    def _fake_preview_payload(_path, _scenario):
+        return {
+            'metadata': {
+                'flow': {
+                    'flag_assignments': [
+                        {
+                            'node_id': '7',
+                            'id': 'nfs_sensitive_file',
+                            'artifacts_dir': str(artifacts_dir),
+                            'mount_dir': str(mount_dir),
+                            'inject_files': [f'{inject_source} -> /tmp/seed'],
+                            'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                        }
+                    ]
+                }
+            },
+            'full_preview': {'role_counts': {'Docker': 1}},
+        }
+
+    monkeypatch.setattr(backend, '_load_preview_payload_from_path', _fake_preview_payload)
+    monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
+
+    client = app.test_client()
+    _login(client)
+
+    resp = client.post(
+        '/run_cli_async',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': 'NewScenario1',
+            'preview_plan': str(xml_path),
+            'flow_enabled': '1',
+        },
+    )
+
+    assert resp.status_code == 202
+    payload = resp.get_json() or {}
+    assert isinstance(payload.get('run_id'), str) and payload.get('run_id')
+
+
+def test_run_status_includes_flow_live_path_fields(tmp_path):
+    from webapp import app_backend as backend
+
+    run_id = f"test-run-{uuid.uuid4().hex}"
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text('<Scenarios></Scenarios>', encoding='utf-8')
+
+    backend.RUNS[run_id] = {
+        'done': True,
+        'returncode': 0,
+        'xml_path': str(xml_path),
+        'log_path': str(tmp_path / 'cli.log'),
+        'history_added': True,
+        'validation_summary': {
+            'ok': False,
+            'flow_live_paths_checked': 3,
+            'flow_live_paths_missing_count': 1,
+            'flow_live_paths_missing': ['7 artifacts_dir: /tmp/vulns/missing-artifacts'],
+            'flow_live_paths_detail': [
+                {
+                    'node_id': '7',
+                    'generator_id': 'nfs_sensitive_file',
+                    'path_type': 'artifacts_dir',
+                    'path': '/tmp/vulns/missing-artifacts',
+                    'exists_local': False,
+                    'is_remote': False,
+                    'missing_local': True,
+                }
+            ],
+        },
+    }
+
+    client = app.test_client()
+    _login(client)
+
+    try:
+        resp = client.get(f'/run_status/{run_id}')
+        assert resp.status_code == 200
+        payload = resp.get_json() or {}
+        summary = payload.get('validation_summary') if isinstance(payload.get('validation_summary'), dict) else {}
+
+        assert summary.get('flow_live_paths_checked') == 3
+        assert summary.get('flow_live_paths_missing_count') == 1
+        missing = summary.get('flow_live_paths_missing') if isinstance(summary.get('flow_live_paths_missing'), list) else []
+        assert any('missing-artifacts' in str(item) for item in missing)
+        detail = summary.get('flow_live_paths_detail') if isinstance(summary.get('flow_live_paths_detail'), list) else []
+        assert detail and isinstance(detail[0], dict)
+        assert detail[0].get('path_type') == 'artifacts_dir'
+    finally:
+        backend.RUNS.pop(run_id, None)

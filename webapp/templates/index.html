@@ -5630,7 +5630,7 @@
                 if (action === 'continue') {
                     const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
                     // Clear the post-save continue state so returning to Topology doesn't stay "Continue" forever.
-                    try { sessionStorage.removeItem('coretg_topology_continue_after_save_v1'); } catch (e) { }
+                    try { sessionStorage.removeItem('coretg_topology_continue_after_save_v3'); } catch (e) { }
                     const url = '/scenarios/flag-sequencing' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
                     try {
                         if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
@@ -5642,7 +5642,7 @@
                 }
                 if (action === 'continue-topology') {
                     const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
-                    const url = '/scenarios' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                    const url = '/' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
                     try {
                         if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
                             window.coretgAllowUnsavedNavOnce();
@@ -9687,6 +9687,7 @@
             const advRunCoreCleanup = !!(core.adv_run_core_cleanup);
             const advCheckCoreVersion = !!(core.adv_check_core_version);
             const advRestartCoreDaemon = !!(core.adv_restart_core_daemon);
+            const advStartCoreDaemon = !!(core.adv_start_core_daemon);
             const advAutoKillSessions = !!(core.adv_auto_kill_sessions);
             const enabledFlags = [];
             if (autoStartDaemon) enabledFlags.push('Auto-start core-daemon');
@@ -9695,6 +9696,7 @@
             if (advRunCoreCleanup) enabledFlags.push('Advanced: Run core-cleanup');
             if (advCheckCoreVersion) enabledFlags.push('Advanced: Check CORE version');
             if (advRestartCoreDaemon) enabledFlags.push('Advanced: Restart core-daemon');
+            if (advStartCoreDaemon) enabledFlags.push('Advanced: Start core-daemon');
             if (advAutoKillSessions) enabledFlags.push('Advanced: Auto-kill sessions');
             verifyLog(`Calling /test_core for ${coreHost}:${corePort}`);
             verifyLog(`Using last dialog options: ${enabledFlags.length ? enabledFlags.join(' | ') : 'none'}`);
@@ -9712,6 +9714,7 @@
                 advRunCoreCleanup,
                 advCheckCoreVersion,
                 advRestartCoreDaemon,
+                advStartCoreDaemon,
                 advAutoKillSessions,
             });
 
@@ -9776,6 +9779,7 @@
                         { key: 'adv_fix_docker_daemon', label: 'Fix Docker daemon' },
                         { key: 'adv_run_core_cleanup', label: 'Run core-cleanup' },
                         { key: 'adv_restart_core_daemon', label: 'Restart core-daemon' },
+                        { key: 'adv_start_core_daemon', label: 'Start core-daemon if inactive' },
                         { key: 'adv_auto_kill_sessions', label: 'Auto-kill running sessions' },
                     ];
                     const out = [];
@@ -10626,6 +10630,7 @@
             advRunCoreCleanup = false,
             advCheckCoreVersion = false,
             advRestartCoreDaemon = false,
+            advStartCoreDaemon = false,
             advAutoKillSessions = true,
             _daemonConflictPrompted = false,
             showSummaryOnSuccess = false,
@@ -10759,6 +10764,7 @@
                 adv_run_core_cleanup: advRunCoreCleanup,
                 adv_check_core_version: advCheckCoreVersion,
                 adv_restart_core_daemon: advRestartCoreDaemon,
+                adv_start_core_daemon: advStartCoreDaemon,
                 adv_auto_kill_sessions: advAutoKillSessions,
             },
         };
@@ -10816,6 +10822,7 @@
                     { key: 'adv_fix_docker_daemon', label: 'Fix Docker daemon' },
                     { key: 'adv_run_core_cleanup', label: 'Run core-cleanup' },
                     { key: 'adv_restart_core_daemon', label: 'Restart core-daemon' },
+                    { key: 'adv_start_core_daemon', label: 'Start core-daemon if inactive' },
                     { key: 'adv_auto_kill_sessions', label: 'Auto-kill running sessions' },
                 ];
                 const out = [];
@@ -17111,6 +17118,20 @@
             executeSummaryListEl.appendChild(renderExecuteSummaryItem('Validation summary available', false, 'No summary data received'));
             return;
         }
+        if (summary.validation_unavailable) {
+            const unavailableItems = Array.isArray(summary.validation_unavailable_details)
+                ? summary.validation_unavailable_details.filter(Boolean)
+                : [];
+            if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.add('d-none');
+            executeSummaryStatusEl.textContent = 'Validation unavailable for this run.';
+            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                'Session validation unavailable',
+                false,
+                (summary.error || 'Post-run session XML could not be exported.'),
+                unavailableItems
+            ));
+            return;
+        }
         if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.add('d-none');
         const missingNodes = Array.isArray(summary.missing_nodes) ? summary.missing_nodes.length : 0;
         const extraNodes = Array.isArray(summary.extra_nodes) ? summary.extra_nodes.length : 0;
@@ -17140,6 +17161,11 @@
         const generatorOutputsMissingList = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing : [];
         const generatorInjectsMissingList = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing : [];
         const generatorValidationDetail = Array.isArray(summary.generator_validation_detail) ? summary.generator_validation_detail : [];
+        const flowLivePathsMissing = Array.isArray(summary.flow_live_paths_missing) ? summary.flow_live_paths_missing : [];
+        const flowLivePathsChecked = Number.isFinite(Number(summary.flow_live_paths_checked)) ? Number(summary.flow_live_paths_checked) : 0;
+        const flowLivePathsMissingCount = Number.isFinite(Number(summary.flow_live_paths_missing_count))
+            ? Number(summary.flow_live_paths_missing_count)
+            : flowLivePathsMissing.length;
         const generatorOutputsDetailItems = generatorValidationDetail.length
             ? generatorValidationDetail.map((it) => {
                 if (!it || typeof it !== 'object') return '';
@@ -17202,6 +17228,16 @@
             extraNodes ? `${extraNodes} unexpected` : 'No extras detected',
             extraNodes ? (Array.isArray(summary.extra_nodes) ? summary.extra_nodes : []) : actualNodesList
         ));
+        if (flowLivePathsChecked > 0 || flowLivePathsMissing.length > 0) {
+            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                'Flow live paths present',
+                flowLivePathsMissingCount === 0,
+                flowLivePathsMissingCount > 0
+                    ? `${flowLivePathsMissingCount} missing local path(s)`
+                    : `${flowLivePathsChecked} path(s) checked`,
+                flowLivePathsMissing
+            ));
+        }
         if (dockerNodes > 0) {
             executeSummaryListEl.appendChild(renderExecuteSummaryItem(
                 'Docker containers present',
@@ -17234,7 +17270,7 @@
                 'Injected files present',
                 injectsMissing === 0 && (expectedInjectDirs === 0 || injectsDetailList.length > 0),
                 injectsMissing
-                    ? `${injectsMissing} containers missing injects`
+                    ? `${injectsMissing} containers missing injects/sources`
                     : (expectedInjectDirs > 0 && injectsDetailList.length === 0)
                         ? 'No injects detected'
                         : 'Injects detected',
@@ -17270,6 +17306,17 @@
             lines.push('Status: Validation summary unavailable.');
             return lines.join('\n');
         }
+        if (summary.validation_unavailable) {
+            lines.push('Status: Validation unavailable.');
+            lines.push(`Reason: ${summary.error || 'Post-run session XML could not be exported.'}`);
+            const unavailableItems = Array.isArray(summary.validation_unavailable_details)
+                ? summary.validation_unavailable_details.filter(Boolean)
+                : [];
+            unavailableItems.forEach((item) => {
+                lines.push(`- ${String(item)}`);
+            });
+            return lines.join('\n');
+        }
         lines.push(`Status: ${summary.ok ? 'OK' : 'Issues detected'}`);
         try {
             const genOutMissing = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing.length : 0;
@@ -17289,8 +17336,22 @@
         const dockerMissing = Array.isArray(summary.docker_missing) ? summary.docker_missing.length : 0;
         const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
         const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+        const flowLivePathsChecked = Number.isFinite(Number(summary.flow_live_paths_checked)) ? Number(summary.flow_live_paths_checked) : 0;
+        const flowLivePathsMissingCount = Number.isFinite(Number(summary.flow_live_paths_missing_count))
+            ? Number(summary.flow_live_paths_missing_count)
+            : (Array.isArray(summary.flow_live_paths_missing) ? summary.flow_live_paths_missing.length : 0);
         lines.push(`Expected nodes created: ${missingNodes === 0 ? 'OK' : `Missing ${missingNodes}`}`);
         lines.push(`Unexpected nodes: ${extraNodes === 0 ? 'None' : `Extra ${extraNodes}`}`);
+        if (flowLivePathsChecked > 0 || flowLivePathsMissingCount > 0) {
+            lines.push(`Flow live paths present: ${flowLivePathsMissingCount === 0 ? `OK (${flowLivePathsChecked} checked)` : `Missing ${flowLivePathsMissingCount}`}`);
+            const missingItems = Array.isArray(summary.flow_live_paths_missing) ? summary.flow_live_paths_missing : [];
+            missingItems.slice(0, 10).forEach((item) => {
+                lines.push(`- ${String(item)}`);
+            });
+            if (missingItems.length > 10) {
+                lines.push(`- (+${missingItems.length - 10} more)`);
+            }
+        }
         if (expectedDockerNodes > 0) {
             lines.push(`Expected docker nodes: ${missingDockerNodes === 0 ? 'OK' : `Missing ${missingDockerNodes}`}`);
             lines.push(`Unexpected docker nodes: ${extraDockerNodes === 0 ? 'None' : `Extra ${extraDockerNodes}`}`);
@@ -17302,7 +17363,7 @@
         if (dockerNodes > 0) {
             lines.push(`Docker containers present: ${dockerMissing === 0 ? 'OK' : `Missing ${dockerMissing}`}`);
             lines.push(`Docker containers running: ${dockerNotRunning === 0 ? 'OK' : `Not running ${dockerNotRunning}`}`);
-            lines.push(`Injected files present: ${injectsMissing === 0 ? 'OK' : `Missing injects on ${injectsMissing}`}`);
+            lines.push(`Injected files present: ${injectsMissing === 0 ? 'OK' : `Missing injects/sources on ${injectsMissing}`}`);
         } else {
             lines.push('Docker containers detected: None');
         }
@@ -17822,6 +17883,7 @@
             if (adv.runCoreCleanup) enabled.push('run core cleanup');
             if (adv.checkCoreVersion) enabled.push('check CORE version');
             if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
+            if (adv.startCoreDaemon) enabled.push('start core-daemon if inactive');
             if (adv.autoKillSessions) enabled.push('auto-kill sessions');
             if (!enabled.length) return '';
             return ` (Advanced: ${enabled.join(', ')})`;
@@ -17851,6 +17913,7 @@
                         if (adv.runCoreCleanup) enabled.push('run core cleanup');
                         if (adv.checkCoreVersion) enabled.push('check CORE version');
                         if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
+                        if (adv.startCoreDaemon) enabled.push('start core-daemon if inactive');
                         if (adv.autoKillSessions) enabled.push('auto-kill sessions');
                         if (enabled.length) {
                             lines.push(`[ui] Advanced pre-flight: ${enabled.join(', ')}`);
@@ -19801,6 +19864,7 @@
             if (adv && adv.dockerNukeAll) form.append('docker_remove_all_containers', '1');
             if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');
             if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
+            if (adv && adv.startCoreDaemon) form.append('adv_start_core_daemon', '1');
             if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
             if (adv && adv.uploadOnlyInjectedArtifacts) form.append('upload_only_injected_artifacts', '1');
         } catch (err) { /* ignore */ }
@@ -21216,6 +21280,7 @@
         }
         const showProgressModal = opts.showProgressModal !== false;
         const skipConfirm = opts.skipConfirm === true;
+        const cleanupRetryAttempt = Number.isInteger(opts.cleanupRetryAttempt) ? opts.cleanupRetryAttempt : 0;
         const activeScenarioCtx = getActiveScenarioContext();
         let scenarioIndexForRun = Number.isInteger(opts.scenarioIndex) ? opts.scenarioIndex : activeScenarioCtx.idx;
         let updateRemoteRepo = opts.updateRemoteRepo === true;
@@ -21260,6 +21325,32 @@
             if (showProgressModal) {
                 runProgressLogLine(line);
             }
+        };
+        const extractBlockingSessionsMessage = (payload) => {
+            try {
+                const summaryErr = payload && payload.validation_summary && payload.validation_summary.error
+                    ? String(payload.validation_summary.error)
+                    : '';
+                const directErr = payload && payload.error ? String(payload.error) : '';
+                const directMsg = payload && payload.message ? String(payload.message) : '';
+                const candidates = [summaryErr, directErr, directMsg].filter(Boolean);
+                for (const text of candidates) {
+                    if (/blocking\s+sessions\s+active/i.test(text)) {
+                        return text;
+                    }
+                }
+            } catch (e) { }
+            return '';
+        };
+        const buildCleanupRetryAdvanced = () => {
+            const sourceAdvanced = (confirmResult && typeof confirmResult === 'object' && confirmResult.advanced && typeof confirmResult.advanced === 'object')
+                ? confirmResult.advanced
+                : ((advancedFromOpts && typeof advancedFromOpts === 'object') ? advancedFromOpts : {});
+            return {
+                ...sourceAdvanced,
+                autoKillSessions: true,
+                runCoreCleanup: true,
+            };
         };
         appendExecuteDialogLog('runSyncWithModal() entered.');
         const stopUploadHeartbeat = () => {
@@ -21950,6 +22041,52 @@
                             try { opts.onTick?.(data); } catch (e) { }
                         }
                         if (!data.done) { setTimeout(poll, 1000); return; }
+                        if (data.returncode !== 0 && cleanupRetryAttempt < 1) {
+                            const blockingSessionsMessage = extractBlockingSessionsMessage(data);
+                            if (blockingSessionsMessage) {
+                                appendExecuteDialogLog(`Run failed due to active sessions: ${blockingSessionsMessage}`);
+                                updateRunStatus('Run blocked by active sessions', 'Waiting for your decision to retry with cleanup…');
+                                const shouldRetryWithCleanup = await promptRunProgressConfirm(
+                                    `${blockingSessionsMessage}\n\nRetry now with cleanup enabled?\n- Auto-kill active CORE sessions\n- Run core-cleanup before launch`,
+                                    {
+                                        title: 'Active CORE session(s) blocked this run',
+                                        confirmLabel: 'Retry with cleanup',
+                                        cancelLabel: 'Keep failed result',
+                                    }
+                                );
+                                if (shouldRetryWithCleanup) {
+                                    const cleanupAdvanced = buildCleanupRetryAdvanced();
+                                    appendExecuteDialogLog('Retry confirmed by user; relaunching with auto-kill sessions + core-cleanup.');
+                                    try {
+                                        if (runProgressEvtSrc) {
+                                            runProgressEvtSrc.close();
+                                        }
+                                    } catch (e) { }
+                                    runProgressEvtSrc = null;
+                                    runProgressRunId = null;
+                                    try { localStorage.removeItem('coretg_active_run_id'); } catch (e) { }
+                                    try { executeProgressState.summaryShown = false; } catch (e) { }
+                                    const retryResult = await runSyncWithModal({
+                                        ...opts,
+                                        skipConfirm: true,
+                                        showProgressModal,
+                                        scenarioIndex: scenarioIndexForRun,
+                                        updateRemoteRepo,
+                                        confirmResult: {
+                                            ...((confirmResult && typeof confirmResult === 'object') ? confirmResult : {}),
+                                            confirmed: true,
+                                            scenarioIndex: scenarioIndexForRun,
+                                            advanced: cleanupAdvanced,
+                                        },
+                                        advanced: cleanupAdvanced,
+                                        cleanupRetryAttempt: cleanupRetryAttempt + 1,
+                                    });
+                                    resolve(retryResult);
+                                    return;
+                                }
+                                appendExecuteDialogLog('Cleanup retry declined by user; keeping failed result.');
+                            }
+                        }
                         if (showProgressModal) {
                             document.getElementById('runProgressStatus').textContent = (data.returncode === 0) ? 'Scenario started' : 'Finished with errors';
                             document.getElementById('runProgressBar').classList.remove('progress-bar-animated');

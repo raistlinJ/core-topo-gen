@@ -808,6 +808,7 @@
         'inject_files_detail',
         'artifacts_dir',
         'mount_dir',
+        'resolved_paths',
         'run_dir',
         'outputs_manifest',
         'input_fields',
@@ -841,6 +842,11 @@
         const rawList = Array.isArray(injects) ? injects.map(x => String(x || '').trim()).filter(Boolean) : [];
         if (!rawList.length) return rawList;
         const ro = (resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)) ? resolvedOutputs : null;
+        const _isSymbolicInjectToken = (value) => {
+          const text = String(value || '').trim();
+          if (!text || text.includes('/')) return false;
+          return /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(text);
+        };
         const lowerMap = new Map();
         if (ro) {
           Object.keys(ro).forEach((k) => {
@@ -858,6 +864,7 @@
             if (typeof val === 'string' && val.trim()) return val.trim();
           }
           if (!text.includes('/')) {
+            if (_isSymbolicInjectToken(text)) return text;
             const lowered = text.toLowerCase();
             try {
               for (const [k, v] of Object.entries(ro)) {
@@ -926,6 +933,11 @@
         const rawList = Array.isArray(injects) ? injects.map(x => String(x || '').trim()).filter(Boolean) : [];
         if (!rawList.length) return [];
         const ro = (resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)) ? resolvedOutputs : null;
+        const _isSymbolicInjectToken = (value) => {
+          const text = String(value || '').trim();
+          if (!text || text.includes('/')) return false;
+          return /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(text);
+        };
         const lowerMap = new Map();
         if (ro) {
           Object.keys(ro).forEach((k) => {
@@ -943,6 +955,7 @@
             if (typeof val === 'string' && val.trim()) return val.trim();
           }
           if (!text.includes('/')) {
+            if (_isSymbolicInjectToken(text)) return text;
             const lowered = text.toLowerCase();
             try {
               for (const [k, v] of Object.entries(ro)) {
@@ -1069,11 +1082,15 @@
       const outputsManifest = (curA && typeof curA.outputs_manifest === 'string' && curA.outputs_manifest.trim())
         ? String(curA.outputs_manifest).trim()
         : undefined;
+      const resolvedPaths = (curA && typeof curA.resolved_paths === 'object' && curA.resolved_paths && !Array.isArray(curA.resolved_paths))
+        ? curA.resolved_paths
+        : undefined;
 
       if (artifactsDir) out.artifacts_dir = artifactsDir;
       if (mountDir) out.mount_dir = mountDir;
       if (runDir) out.run_dir = runDir;
       if (outputsManifest) out.outputs_manifest = outputsManifest;
+      if (resolvedPaths) out.resolved_paths = resolvedPaths;
 
       const typeVal = (curA && typeof curA.type === 'string' && curA.type.trim()) ? String(curA.type).trim() : undefined;
       const genLabel = (curA && typeof curA.flag_generator === 'string' && curA.flag_generator.trim()) ? String(curA.flag_generator).trim() : undefined;
@@ -1096,6 +1113,7 @@
       if (mountDir !== undefined) out.mount_dir = mountDir;
       if (runDir !== undefined) out.run_dir = runDir;
       if (outputsManifest !== undefined) out.outputs_manifest = outputsManifest;
+      if (resolvedPaths !== undefined) out.resolved_paths = resolvedPaths;
       if (inputDetails.length) out.resolved_inputs_detail = inputDetails;
       if (outputDetails.length) out.resolved_outputs_detail = outputDetails;
       if (hintOvr !== undefined) out.hint_overrides = hintOvr;
@@ -3894,14 +3912,64 @@
           const tbl = document.createElement('table');
           tbl.className = 'table table-sm mb-0';
           const thead = document.createElement('thead');
-          thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th>Path</th></tr>';
+          thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved path</th></tr>';
           tbl.appendChild(thead);
           const tbody2 = document.createElement('tbody');
           const rows = Array.isArray(files) ? files : [];
+          const resolvedInjectSources = (fa && fa.resolved_paths && Array.isArray(fa.resolved_paths.inject_sources))
+            ? fa.resolved_paths.inject_sources.filter(x => x && typeof x === 'object')
+            : [];
+
+          function _basenameOnly(p) {
+            const s = String(p || '').replace('\\', '/');
+            const parts = s.split('/').filter(Boolean);
+            return parts.length ? parts[parts.length - 1] : s;
+          }
+
+          function _isSymbolicInjectToken(value) {
+            const text = String(value || '').trim();
+            if (!text || text.includes('/')) return false;
+            return /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(text);
+          }
+
+          function _isHostLocalSyntheticPath(value) {
+            const text = String(value || '').trim();
+            if (!text.startsWith('/Users/')) return false;
+            const base = _basenameOnly(text);
+            return _isSymbolicInjectToken(base);
+          }
+
+          function resolvedPathsForCandidate(srcValue, resolvedValue) {
+            const src = String(srcValue || '').trim();
+            const resolvedRaw = String(resolvedValue || '').trim();
+            const candidates = new Set();
+            if (src) candidates.add(src);
+            if (resolvedRaw) candidates.add(resolvedRaw);
+            const srcBase = _basenameOnly(src);
+            const resolvedBase = _basenameOnly(resolvedRaw);
+            if (srcBase) candidates.add(srcBase);
+            if (resolvedBase) candidates.add(resolvedBase);
+            const out = [];
+            resolvedInjectSources.forEach((entry) => {
+              const lp = String((entry && entry.path) || '').trim();
+              if (!lp) return;
+              if (_isHostLocalSyntheticPath(lp)) return;
+              const lpBase = _basenameOnly(lp);
+              const matched = Array.from(candidates).some((c) => {
+                const cc = String(c || '').trim();
+                if (!cc) return false;
+                return lp === cc || lp.endsWith('/' + cc) || lpBase === cc;
+              });
+              if (matched) out.push(entry);
+            });
+            return out;
+          }
+
+
           if (!rows.length) {
             const tr = document.createElement('tr');
             const td = document.createElement('td');
-            td.colSpan = 3;
+            td.colSpan = 2;
             td.className = 'text-muted small';
             td.textContent = 'No inject files.';
             tr.appendChild(td);
@@ -3968,8 +4036,12 @@
 
             rows.forEach((entry) => {
               const parsed = parseInjectSpec(entry);
-              const srcRaw = String(parsed.src || '');
+              let srcRaw = String(parsed.src || '');
               const dest = parsed.dest || '';
+
+              if (_isHostLocalSyntheticPath(srcRaw)) {
+                srcRaw = _basenameOnly(srcRaw);
+              }
 
               let displaySrc = srcRaw;
               let resolvedTargets = [];
@@ -4000,21 +4072,27 @@
 
                 const tdResolved = document.createElement('td');
                 tdResolved.className = 'small text-muted';
-                tdResolved.textContent = resolvedVal ? resolvedVal : (resolvedTargets.length ? '-' : (likelySymbolicToken ? '<unresolved>' : ''));
-
-                const tdPath = document.createElement('td');
-                tdPath.className = 'small text-muted';
                 const resolvedBase = basenameFrom(resolvedVal ? resolvedVal : displaySrc);
                 const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
-                if (!resolvedVal && (tokenLike || likelySymbolicToken)) {
-                  tdPath.textContent = '<unresolved>';
+                const resolvedMatches = resolvedPathsForCandidate(displaySrc, resolvedVal);
+                if (resolvedMatches.length) {
+                  const values = resolvedMatches
+                    .map((entry) => String((entry && entry.path) || '').trim())
+                    .filter(Boolean)
+                    .filter((value) => !_isHostLocalSyntheticPath(value));
+                  tdResolved.textContent = values.join('; ') || '-';
                 } else {
-                  tdPath.textContent = destPath || '-';
+                  if (!resolvedVal && (tokenLike || likelySymbolicToken)) {
+                    tdResolved.textContent = '<unresolved>';
+                  } else if (resolvedVal && resolvedVal.startsWith('/') && !_isHostLocalSyntheticPath(resolvedVal)) {
+                    tdResolved.textContent = resolvedVal;
+                  } else {
+                    tdResolved.textContent = destPath || '-';
+                  }
                 }
 
                 tr.appendChild(tdName);
                 tr.appendChild(tdResolved);
-                tr.appendChild(tdPath);
                 tbody2.appendChild(tr);
               });
             });
@@ -5210,6 +5288,55 @@
 
           const stack = document.createElement('div');
           stack.className = 'd-flex flex-column gap-2';
+          const resolvedInjectSources = (fa && fa.resolved_paths && Array.isArray(fa.resolved_paths.inject_sources))
+            ? fa.resolved_paths.inject_sources.filter(x => x && typeof x === 'object')
+            : [];
+
+          function normalizeDestDir(d) {
+            const s = String(d || '').trim();
+            if (!s || !s.startsWith('/')) return '/tmp';
+            return s.replace(/\/+$/g, '') || '/tmp';
+          }
+
+          function resolvedPathsForCandidate(srcValue, resolvedValue) {
+            const src = String(srcValue || '').trim();
+            const resolvedRaw = String(resolvedValue || '').trim();
+            const candidates = new Set();
+            if (src) candidates.add(src);
+            if (resolvedRaw) candidates.add(resolvedRaw);
+            const srcBase = basenameFromPath(src);
+            const resolvedBase = basenameFromPath(resolvedRaw);
+            if (srcBase) candidates.add(srcBase);
+            if (resolvedBase) candidates.add(resolvedBase);
+            const out = [];
+            resolvedInjectSources.forEach((entry) => {
+              const lp = String((entry && entry.path) || '').trim();
+              if (!lp) return;
+              if (_isHostLocalSyntheticPath(lp)) return;
+              const lpBase = basenameFromPath(lp);
+              const matched = Array.from(candidates).some((c) => {
+                const cc = String(c || '').trim();
+                if (!cc) return false;
+                return lp === cc || lp.endsWith('/' + cc) || lpBase === cc;
+              });
+              if (matched) out.push(entry);
+            });
+            return out;
+          }
+
+
+          function _isSymbolicInjectToken(value) {
+            const text = String(value || '').trim();
+            if (!text || text.includes('/')) return false;
+            return /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(text);
+          }
+
+          function _isHostLocalSyntheticPath(value) {
+            const text = String(value || '').trim();
+            if (!text.startsWith('/Users/')) return false;
+            const base = basenameFromPath(text);
+            return _isSymbolicInjectToken(base);
+          }
 
           const header = document.createElement('div');
           header.className = 'd-grid gap-2 align-items-center small text-muted';
@@ -5217,7 +5344,7 @@
           const h1 = document.createElement('div');
           h1.textContent = 'Variable';
           const h2 = document.createElement('div');
-          h2.textContent = 'Resolved';
+          h2.textContent = 'Resolved path';
           const h3 = document.createElement('div');
           h3.textContent = 'Destination dir';
           const h4 = document.createElement('div');
@@ -5268,9 +5395,17 @@
             if (!key) return [];
             const v = resolvedOutputs[key];
             if (Array.isArray(v)) {
-              return v.map(x => String(x ?? '')).filter(x => x.trim());
+              return v
+                .map(x => String(x ?? '').trim())
+                .filter(x => x)
+                .filter(x => !(_isSymbolicInjectToken(raw) && _isHostLocalSyntheticPath(x)));
             }
-            if (typeof v === 'string') return [v.trim()].filter(Boolean);
+            if (typeof v === 'string') {
+              const sv = String(v || '').trim();
+              if (!sv) return [];
+              if (_isSymbolicInjectToken(raw) && _isHostLocalSyntheticPath(sv)) return [];
+              return [sv];
+            }
             return [];
           }
 
@@ -5312,7 +5447,10 @@
             srcInp.className = 'form-control form-control-sm font-monospace';
             srcInp.placeholder = 'e.g., hint.txt or File(path)';
             {
-              const rawSrc = String(parsed.src ?? '');
+              let rawSrc = String(parsed.src ?? '');
+              if (_isHostLocalSyntheticPath(rawSrc)) {
+                rawSrc = basenameFromPath(rawSrc);
+              }
               if (rawSrc.startsWith('upload:')) {
                 const base = basenameFromPath(rawSrc.slice('upload:'.length));
                 srcInp.dataset.uploadToken = rawSrc;
@@ -5321,29 +5459,14 @@
                 srcInp.value = rawSrc;
               }
             }
-            srcInp.addEventListener('input', () => {
-              injectsTouched = true;
-              try { delete srcInp.dataset.uploadToken; } catch (e) { }
-              try { refreshResolvedHint(); } catch (e) { }
-            });
 
             const destInp = document.createElement('input');
             destInp.type = 'text';
             destInp.className = 'form-control form-control-sm font-monospace';
             destInp.placeholder = '/tmp (default)';
             destInp.value = String(parsed.dest ?? '');
-            destInp.addEventListener('input', () => { injectsTouched = true; });
 
             const picker = buildVarPicker();
-            picker.addEventListener('change', () => {
-              const v = String(picker.value || '').trim();
-              if (!v) return;
-              srcInp.value = v;
-              injectsTouched = true;
-              try { delete srcInp.dataset.uploadToken; } catch (e) { }
-              try { picker.value = ''; } catch (e) { }
-              try { refreshResolvedHint(); } catch (e) { }
-            });
 
             const uploadBtn = document.createElement('button');
             uploadBtn.type = 'button';
@@ -5379,7 +5502,7 @@
                 const base = basenameFromPath(String(data.stored_filename || ''));
                 srcInp.value = base ? `artifacts/${base}` : String(data.stored_filename || data.original_filename || '') || 'artifacts/upload';
                 injectsTouched = true;
-                try { refreshResolvedHint(); } catch (e) { }
+                try { refreshPathHints(); } catch (e) { }
               } catch (err) {
                 alert(String((err && err.message) || err || 'Upload failed'));
               } finally {
@@ -5412,26 +5535,52 @@
             resolvedHint.className = 'small text-muted';
             resolvedHint.textContent = '-';
 
-            function refreshResolvedHint() {
+            function refreshPathHints() {
               let key = String((srcInp && srcInp.value) ?? '').trim();
               try {
                 if (srcInp && srcInp.dataset && srcInp.dataset.uploadToken) {
                   key = String(srcInp.dataset.uploadToken || '').trim() || key;
                 }
               } catch (e) { }
+              const displaySrc = key.startsWith('upload:')
+                ? ((() => {
+                  const base = basenameFromPath(key.slice('upload:'.length));
+                  return base ? `artifacts/${base}` : key;
+                })())
+                : key;
               const targets = resolvedTargetsFor(key);
+              const tokenLike = !displaySrc.includes('/') && /^[A-Za-z_][A-Za-z0-9_]*\(.+\)$/.test(displaySrc);
+              const likelySymbolicToken = !displaySrc.includes('/')
+                && !displaySrc.startsWith('artifacts/')
+                && !/\.[A-Za-z0-9]{1,16}$/.test(displaySrc);
+              const destDir = normalizeDestDir(destInp.value);
+
               if (!targets.length) {
-                resolvedHint.textContent = '-';
+                if (!displaySrc) {
+                  resolvedHint.textContent = '-';
+                  resolvedHint.classList.add('text-muted');
+                } else {
+                  const resolvedBase = basenameFromPath(displaySrc);
+                  const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
+                  resolvedHint.textContent = (tokenLike || likelySymbolicToken) ? '<unresolved>' : (destPath || '-');
+                  resolvedHint.classList.add('text-muted');
+                }
+              } else {
+                const matchedResolvedPaths = resolvedPathsForCandidate(displaySrc, targets[0] || '');
+                const anticipated = matchedResolvedPaths.length
+                  ? matchedResolvedPaths.map((entry) => String((entry && entry.path) || '').trim()).filter(Boolean)
+                  : targets
+                    .filter((value) => !_isHostLocalSyntheticPath(value))
+                    .map((value) => String(value || '').trim())
+                    .filter(Boolean);
+                const head = anticipated.slice(0, 3);
+                const more = anticipated.length > head.length ? ` (+${anticipated.length - head.length})` : '';
+                resolvedHint.textContent = `${head.join(', ')}${more}`;
                 resolvedHint.classList.add('text-muted');
-                return;
               }
-              const head = targets.slice(0, 3);
-              const more = targets.length > head.length ? ` (+${targets.length - head.length})` : '';
-              resolvedHint.textContent = `${head.join(', ')}${more}`;
-              resolvedHint.classList.remove('text-muted');
             }
 
-            try { refreshResolvedHint(); } catch (e) { }
+            try { refreshPathHints(); } catch (e) { }
 
             row.appendChild(srcInp);
             row.appendChild(resolvedHint);
@@ -5439,6 +5588,25 @@
             row.appendChild(pickWrap);
             row.appendChild(del);
             stack.appendChild(row);
+
+            srcInp.addEventListener('input', () => {
+              injectsTouched = true;
+              try { delete srcInp.dataset.uploadToken; } catch (e) { }
+              try { refreshPathHints(); } catch (e) { }
+            });
+            destInp.addEventListener('input', () => {
+              injectsTouched = true;
+              try { refreshPathHints(); } catch (e) { }
+            });
+            picker.addEventListener('change', () => {
+              const v = String(picker.value || '').trim();
+              if (!v) return;
+              srcInp.value = v;
+              injectsTouched = true;
+              try { delete srcInp.dataset.uploadToken; } catch (e) { }
+              try { picker.value = ''; } catch (e) { }
+              try { refreshPathHints(); } catch (e) { }
+            });
           }
 
           (Array.isArray(files) ? files : []).forEach(addRow);

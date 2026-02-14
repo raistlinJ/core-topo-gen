@@ -6,6 +6,8 @@ import logging
 import random
 import uuid
 import os
+import subprocess
+import sys
 from xml.etree import ElementTree as ET
 from typing import Any, Dict, Tuple
 
@@ -1694,7 +1696,6 @@ def main():
                         except Exception:
                             conflicts = {'containers': [], 'images': []}
                     try:
-                        import subprocess
                         import shutil as _sh
                         if _sh.which('docker'):
                             existing_named: list[str] = []

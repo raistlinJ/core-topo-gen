@@ -10,6 +10,7 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 	- [Install dependencies](#install-dependencies)
 	- [Launch the Web UI](#launch-the-web-ui)
 	- [Run the CLI](#run-the-cli)
+	- [VS Code smoke tasks](#vs-code-smoke-tasks)
 - [Full Preview workflow](#full-preview-workflow)
 - [Feature deep dive](#feature-deep-dive)
 	- [Planning semantics](#planning-semantics)
@@ -72,6 +73,21 @@ Popular options:
 - `--layout-density {compact|normal|spacious}` adjust map spacing
 - `--seg-include-hosts`, `--seg-allow-docker-ports`, `--nat-mode`, `--dnat-prob` fine-tune segmentation
 - `--traffic-pattern`, `--traffic-rate`, `--traffic-content` override traffic defaults
+
+### VS Code smoke tasks
+For Execute retry-prompt validation, use these tasks from **Terminal → Run Task**:
+
+- `Smoke UI Execute Retry Prompt`  
+	Runs `scripts/ui_execute_retry_smoke.py` against the currently running Web UI.
+- `Restart + Smoke UI Execute Retry Prompt`  
+	Restarts Web UI on port 9090, waits for `/healthz`, then runs the same smoke.
+
+Expected success output includes:
+
+- `prompt_seen=True`
+- `retry_click=ok`
+- `retry_run_id_before=<id>`
+- `retry_run_id_after=<different-id>`
 
 ## Full Preview workflow
 1. **Save XML** – The editor auto-saves, but hitting “Save XML” ensures consistent previews.

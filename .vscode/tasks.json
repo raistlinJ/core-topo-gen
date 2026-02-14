@@ -258,6 +258,32 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 &",
 			"isBackground": false
+		},
+		{
+			"label": "Smoke UI Execute Retry Prompt",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py > /tmp/ui_execute_retry_smoke.txt 2>&1; code=$?; echo EXIT_CODE=$code; cat /tmp/ui_execute_retry_smoke.txt; exit $code",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Restart + Smoke UI Execute Retry Prompt",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && lsof -ti:9090 | xargs kill -9 2>/dev/null; sleep 0.5; mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & sleep 1; curl -fsS http://127.0.0.1:9090/healthz >/dev/null && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py > /tmp/ui_execute_retry_smoke.txt 2>&1; code=$?; echo EXIT_CODE=$code; cat /tmp/ui_execute_retry_smoke.txt; exit $code",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Check 9090 listener",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && lsof -nP -iTCP:9090 -sTCP:LISTEN",
+			"isBackground": false
+		},
+		{
+			"label": "Run execute retry smoke",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py",
+			"isBackground": false
 		}
 	]
 }
