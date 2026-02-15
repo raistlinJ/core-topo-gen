@@ -22080,6 +22080,11 @@ def _select_python_interpreter(preferred_venv_bin: Optional[str] = None) -> str:
 
     return sys.executable or 'python'
 
+
+def _resolve_python_executable(preferred_venv_bin: Optional[str] = None) -> str:
+    """Backward-compatible alias for selecting the local Python interpreter."""
+    return _select_python_interpreter(preferred_venv_bin)
+
 def _get_cli_script_path() -> str:
     """Return absolute path to config2scen_core_grpc.py script."""
     return os.path.join(_get_repo_root(), 'config2scen_core_grpc.py')
@@ -45444,7 +45449,7 @@ def flag_generators_test_run():
     except Exception:
         pass
 
-    run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_id = datetime.datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
     run_dir = os.path.join(_flag_generators_runs_dir(), run_id)
     inputs_dir = os.path.join(run_dir, 'inputs')
     os.makedirs(inputs_dir, exist_ok=True)
@@ -45689,7 +45694,7 @@ def flag_node_generators_test_run():
     except Exception:
         pass
 
-    run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_id = datetime.datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
     run_dir = os.path.join(_flag_node_generators_runs_dir(), run_id)
     inputs_dir = os.path.join(run_dir, 'inputs')
     os.makedirs(inputs_dir, exist_ok=True)
