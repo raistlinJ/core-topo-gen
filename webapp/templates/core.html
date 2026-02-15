@@ -503,8 +503,7 @@ current_user.is_authenticated) else '' %}
     let tabVisible = true;
     let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
     const coreDataBaseUrl = "{{ url_for('core_data') }}";
-    const isBuilderView = {{ 'true' if is_builder_view else 'false' }
-  };
+    const isBuilderView = {{ 'true' if is_builder_view else 'false' }};
   let scenarioNamesCache = {{ (scenarios or[])| tojson }};
   const initialScenarioFilter = {{ (active_scenario or '')| tojson }};
   let scenarioFilter = initialScenarioFilter || null;
