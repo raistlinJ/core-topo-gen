@@ -89,7 +89,7 @@ fi
 if [ ! -f /opt/app/bin/healthcheck.sh ]; then
   cat > /opt/app/bin/healthcheck.sh <<'EOF'
 #!/usr/bin/env sh
-date -u +"%Y-%m-%dT%H:%M:%SZ" && echo "OK"
+date +"%m/%d/%y/%H/%M/%S" && echo "OK"
 EOF
   chmod +x /opt/app/bin/healthcheck.sh 2>/dev/null || true
 fi
@@ -140,7 +140,7 @@ EOF
   fi
 
   if [ ! -f "/home/${u}/.ssh/known_hosts" ]; then
-    printf "# known_hosts seeded %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)" > "/home/${u}/.ssh/known_hosts" || true
+    printf "# known_hosts seeded %s\n" "$(date +"%m/%d/%y/%H/%M/%S" 2>/dev/null || true)" > "/home/${u}/.ssh/known_hosts" || true
   fi
 
   # Best-effort ownership (works even without a user existing in NSS if numeric)
@@ -238,7 +238,7 @@ fi
 # Background: write a line to a log file and create a tmp file occasionally.
 (
   while true; do
-    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")"
+    ts="$(date +"%m/%d/%y/%H/%M/%S" 2>/dev/null || echo "unknown")"
     # Choose a small set of plausible actions.
     act="login"
     case "$(choose_mod 5)" in

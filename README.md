@@ -118,6 +118,10 @@ Expected success output includes:
 
 ### Reports & artifacts
 - Markdown reports (`./reports/scenario_report_<timestamp>.md`) enumerate topology stats, planning metadata, segmentation results, and runtime artefacts. Each run also emits a JSON summary alongside the Markdown file (`scenario_report_<timestamp>.json`) plus per-run connectivity CSVs when router degree data is available.
+- Timestamp conventions:
+	- Display/readable fields use local time `MM/DD/YY/HH/MM/SS`.
+	- Filename/ID-safe values use local time `MM-DD-YY-HH-MM-SS`.
+	- Report filenames append microseconds for collision safety: `scenario_report_MM-DD-YY-HH-MM-SS-ffffff.{md,json}`.
 - Run history is persisted in `outputs/run_history.json` for the Reports page.
 - Safe deletion keeps reports while purging associated outputs under `outputs/` when scenarios are removed via the GUI.
 

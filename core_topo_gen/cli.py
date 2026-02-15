@@ -252,7 +252,7 @@ def _run_offline_report(
     from datetime import datetime as _dt
     report_dir = os.path.join(repo_root, "reports")
     os.makedirs(report_dir, exist_ok=True)
-    report_path = os.path.join(report_dir, f"scenario_report_{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}.md")
+    report_path = os.path.join(report_dir, f"scenario_report_{_dt.now().strftime('%m-%d-%y-%H-%M-%S-%f')}.md")
 
     report_path, summary_path = write_report(
         report_path,
@@ -1178,7 +1178,7 @@ def main():
         os.makedirs(report_dir, exist_ok=True)
         traffic_summary_path = os.path.join(traffic_out_dir, "traffic_summary.json")
         # Use a high-resolution timestamp to avoid same-second filename collisions across runs
-        _ts = _dt.now().strftime("%Y%m%d-%H%M%S-%f")
+        _ts = _dt.now().strftime("%m-%d-%y-%H-%M-%S-%f")
         report_path = os.path.join(report_dir, f"scenario_report_{_ts}.md")
         routing_cfg = {
             "density": routing_density,

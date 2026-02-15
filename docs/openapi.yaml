@@ -2411,7 +2411,8 @@ components:
           additionalProperties: true
         fetched_at:
           type: string
-          format: date-time
+          description: Local timestamp string in `MM/DD/YY/HH/MM/SS` format.
+          example: "02/15/26/09/47/31"
           nullable: true
       required:
         - interfaces
@@ -2567,7 +2568,8 @@ components:
       properties:
         timestamp:
           type: string
-          format: date-time
+          description: Local timestamp string in `MM/DD/YY/HH/MM/SS` format.
+          example: "02/15/26/09/47/31"
         mode:
           type: string
           description: Execution mode (`sync` or `async`).
@@ -2688,6 +2690,8 @@ components:
             $ref: '#/components/schemas/DockerStatusItem'
         timestamp:
           type: integer
+          description: Unix epoch seconds when docker status was collected.
+          example: 1771148851
       required:
         - items
         - timestamp

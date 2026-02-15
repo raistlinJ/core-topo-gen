@@ -7089,7 +7089,7 @@ def _save_proxmox_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
         'username': username,
         'password': encrypted_password,
         'verify_ssl': verify_ssl,
-        'stored_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'stored_at': _local_timestamp_display(),
     }
     path = _proxmox_secret_path(identifier)
     tmp_path = path + '.tmp'
@@ -7277,7 +7277,7 @@ def _save_core_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
     'vmid': vmid if vmid else None,
         'proxmox_secret_id': prox_secret_id,
         'proxmox_target': prox_target,
-        'stored_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'stored_at': _local_timestamp_display(),
     }
     path = os.path.join(_core_secret_dir(), f"{identifier}.json")
     tmp_path = path + '.tmp'
@@ -7563,7 +7563,7 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
                 'interfaces': interfaces,
             })
     return {
-        'fetched_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'fetched_at': _local_timestamp_display(),
         'url': record.get('url'),
         'username': record.get('username'),
         'verify_ssl': record.get('verify_ssl', True),
@@ -7707,7 +7707,7 @@ def _save_base_upload_state(meta: Dict[str, Any]) -> None:
     if not clean:
         return
     clean = dict(clean)
-    clean['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    clean['updated_at'] = _local_timestamp_display()
     try:
         with open(_base_upload_state_path(), 'w', encoding='utf-8') as f:
             json.dump(clean, f, indent=2)
@@ -7897,12 +7897,18 @@ def _parse_iso_datetime(raw: Any) -> Optional[datetime.datetime]:
     if not text:
         return None
     try:
-        # Accept trailing Z
+        dt = datetime.datetime.strptime(text, '%m/%d/%y/%H/%M/%S')
+        local_tz = datetime.datetime.now().astimezone().tzinfo
+        return dt.replace(tzinfo=local_tz)
+    except Exception:
+        pass
+    try:
         if text.endswith('Z'):
             text = text[:-1] + '+00:00'
         dt = datetime.datetime.fromisoformat(text)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+            local_tz = datetime.datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
         return dt
     except Exception:
         return None
@@ -9672,7 +9678,7 @@ def participant_ui_record_open_api():
     if not href:
         # Do not record meaningless events.
         return jsonify({'ok': False, 'error': 'missing href'}), 400
-    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    now = _local_timestamp_display()
     stats = _load_participant_ui_stats()
     totals = stats.get('totals') if isinstance(stats.get('totals'), dict) else {}
     totals['open_count'] = int(totals.get('open_count') or 0) + 1
@@ -9750,10 +9756,21 @@ ATTACK_FLOW_SCHEMA_VERSION = "2.0.0"
 
 def _iso_now() -> str:
     try:
-        # Attack Flow / STIX 2.1 common properties require timestamps with at least millisecond precision.
-        return datetime.datetime.now(datetime.UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        return datetime.datetime.now().strftime('%m/%d/%y/%H/%M/%S')
     except Exception:
-        return "1970-01-01T00:00:00Z"
+        return "01/01/70/00/00/00"
+    
+def _local_timestamp_display() -> str:
+    try:
+        return datetime.datetime.now().strftime('%m/%d/%y/%H/%M/%S')
+    except Exception:
+        return "01/01/70/00/00/00"
+
+def _local_timestamp_safe() -> str:
+    try:
+        return datetime.datetime.now().strftime('%m-%d-%y-%H-%M-%S')
+    except Exception:
+        return "01-01-70-00-00-00"
 
 
 def _new_stix_id(stix_type: str) -> str:
@@ -18619,7 +18636,7 @@ def api_flow_prepare_preview_for_execute():
                         except Exception:
                             pass
 
-                        flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+                        flow_run_id = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:10]
                         # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
                         # these artifacts to the CORE host (where docker-compose paths resolve).
                         subdir = 'flag_node_generators_runs' if assignment_type == 'flag-node-generator' else 'flag_generators_runs'
@@ -20628,7 +20645,7 @@ def api_flow_upload_flow_input_file():
 
     original_filename = str(getattr(f, 'filename', '') or '')
     safe_filename = secure_filename(original_filename) or 'upload'
-    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    unique = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:8]
     base_dir = os.path.join(_flow_uploads_dir(), scenario_norm, unique)
     os.makedirs(base_dir, exist_ok=True)
 
@@ -20695,7 +20712,7 @@ def api_flow_upload_flow_inject_file():
 
     original_filename = str(getattr(f, 'filename', '') or '')
     safe_filename = secure_filename(original_filename) or 'upload'
-    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    unique = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:8]
     base_dir = os.path.join(_flow_inject_uploads_dir(), scenario_norm, unique)
     os.makedirs(base_dir, exist_ok=True)
 
@@ -22667,7 +22684,7 @@ def _persist_scenario_catalog(
         payload = {
             'names': ordered,
             'sources': sources_out,
-            'updated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+            'updated_at': _local_timestamp_display(),
         }
         if participant_by_norm:
             payload['participant_urls'] = participant_by_norm
@@ -22754,12 +22771,12 @@ def _remove_scenarios_from_catalog(names_to_remove: Iterable[Any]) -> Dict[str, 
 
         if not kept_names:
             payload['force_empty'] = True
-            payload['force_empty_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+            payload['force_empty_at'] = _local_timestamp_display()
         else:
             payload.pop('force_empty', None)
             payload.pop('force_empty_at', None)
 
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -23059,7 +23076,7 @@ def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, An
         merged.update(normalized_updates)
 
         payload['participant_urls'] = merged
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -23197,7 +23214,7 @@ def _merge_hitl_validation_into_scenario_catalog(
             current_entry['core'] = core_clean
         merged[scenario_norm] = current_entry
         payload['hitl_validation'] = merged
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -23249,7 +23266,7 @@ def _clear_hitl_validation_in_scenario_catalog(scenario_name: str, *, proxmox: b
         else:
             merged.pop(scenario_norm, None)
         payload['hitl_validation'] = merged
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -23352,7 +23369,7 @@ def _clear_hitl_config_in_scenario_catalog(
 
         payload['hitl_config'] = hc
         payload['hitl_validation'] = hv
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -23421,7 +23438,7 @@ def _scrub_hitl_validation_usernames_in_scenario_catalog() -> bool:
         if not changed:
             return False
         payload['hitl_validation'] = cleaned
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -23728,7 +23745,7 @@ def _scrub_unverified_hitl_config_in_scenario_catalog() -> bool:
             return False
 
         payload['hitl_config'] = cleaned
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
             json.dump(payload, fh, indent=2)
@@ -23789,7 +23806,7 @@ def _merge_hitl_config_map_into_scenario_catalog(hitl_configs: Dict[str, Dict[st
         clean = _sanitize_hitl_config_hint(hitl)
         if clean:
             # Stamp a write time so "latest" can be selected later.
-            stored_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+            stored_at = _local_timestamp_display()
             if isinstance(clean.get('core'), dict) and 'stored_at' not in clean['core']:
                 clean['core']['stored_at'] = stored_at
             if isinstance(clean.get('proxmox'), dict) and 'stored_at' not in clean['proxmox']:
@@ -23816,7 +23833,7 @@ def _merge_hitl_config_map_into_scenario_catalog(hitl_configs: Dict[str, Dict[st
             entry.update(clean)
             merged[norm] = entry
         payload['hitl_config'] = merged
-        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        payload['updated_at'] = _local_timestamp_display()
 
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as fh:
@@ -25926,7 +25943,7 @@ def _scenario_timestamped_filename(scenario_name: str | None, ts_epoch: float | 
         except Exception:
             epoch = 0.0
     try:
-        ts = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).strftime('-%Y%m%d-%H%M%S')
+        ts = datetime.datetime.fromtimestamp(epoch).strftime('-%m-%d-%y-%H-%M-%S')
     except Exception:
         ts = '-unknown'
     return f"{stem}{ts}.xml"
@@ -26151,7 +26168,7 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
     """
     try:
         os.makedirs(out_dir, exist_ok=True)
-        stem = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+        stem = _local_timestamp_safe()
         if run_id:
             stem = f"{stem}-{run_id[:8]}"
         zip_path = os.path.join(out_dir, f"full_scenario_{stem}.zip")
@@ -26922,7 +26939,7 @@ def api_host_interfaces():
                 'source': 'proxmox_inventory_fallback',
                 'interfaces': synthesized,
                 'metadata': meta,
-                'fetched_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                'fetched_at': _local_timestamp_display(),
                 'note': 'Using Proxmox inventory as a fallback; CORE VM SSH enumeration unavailable.'
             }
 
@@ -26998,7 +27015,7 @@ def api_host_interfaces():
             'source': 'core_vm',
             'interfaces': interfaces,
             'metadata': {k: v for k, v in vm_context.items() if v not in (None, '')},
-            'fetched_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+            'fetched_at': _local_timestamp_display(),
         }
         return jsonify(response_data)
     try:
@@ -27180,7 +27197,7 @@ def api_proxmox_validate():
                     'verify_ssl': summary.get('verify_ssl'),
                     'secret_id': secret_identifier if remember_credentials else None,
                     'validated': bool(secret_identifier) if remember_credentials else False,
-                    'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                    'last_validated_at': _local_timestamp_display(),
                     'stored_at': summary.get('stored_at'),
                     'last_message': message,
                 },
@@ -29480,7 +29497,7 @@ def _build_execute_error_logs(
     ]
 
     logs: List[Dict[str, str]] = []
-    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    now = _local_timestamp_display()
     has_issue = not bool(validation.get('ok'))
 
     for key, label, fname in categories:
@@ -31531,7 +31548,7 @@ def save_xml():
         except Exception:
             pass
         scenarios_list = data.get('scenarios') if isinstance(data.get('scenarios'), list) else []
-        ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        ts = _local_timestamp_safe()
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
         try:
@@ -31691,7 +31708,7 @@ def save_xml_api():
         except Exception:
             pass
         autosave = False
-        ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        ts = _local_timestamp_safe()
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
         try:
@@ -32307,7 +32324,7 @@ def run_cli():
             core_public = dict(core_cfg)
             core_public.pop('ssh_password', None)
             _append_run_history({
-                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                'timestamp': _local_timestamp_display(),
                 'mode': 'sync',
                 'xml_path': xml_path,
                 'post_xml_path': session_xml_path,
@@ -32412,7 +32429,7 @@ def api_plan_preview_full():
                 try:
                     normalized_core = _normalize_core_config(core_inline, include_password=True) if isinstance(core_inline, dict) else None
                     tree = _build_scenarios_xml({ 'scenarios': scenarios_inline, 'core': normalized_core })
-                    ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                    ts = _local_timestamp_safe()
                     tag = str(uuid.uuid4())[:8]
                     out_dir = os.path.join(_outputs_dir(), f'tmp-preview-{ts}-{tag}')
                     os.makedirs(out_dir, exist_ok=True)
@@ -32602,7 +32619,7 @@ def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int
         flow_meta = existing_meta.get('flow') if isinstance(existing_meta.get('flow'), dict) else {}
     created_at = existing_meta.get('created_at') if isinstance(existing_meta, dict) else None
     if not isinstance(created_at, str) or not created_at.strip():
-        created_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+        created_at = _local_timestamp_display()
     plan_payload = {
         'full_preview': full_prev,
         'metadata': {
@@ -32612,7 +32629,7 @@ def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int
             'origin': 'planner',
             'flow': flow_meta or {},
             'created_at': created_at,
-            'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+            'updated_at': _local_timestamp_display(),
         },
     }
     try:
@@ -37023,7 +37040,7 @@ def run_cli_async():
                 if scenario_pick is None:
                     return jsonify({"error": "No valid scenario supplied for execution."}), 400
                 tree = _build_scenarios_xml({ 'scenarios': [scenario_pick], 'core': normalized_core })
-                ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                ts = _local_timestamp_safe()
                 run_tag = str(uuid.uuid4())[:8]
                 out_dir = os.path.join(_outputs_dir(), f'tmp-exec-{ts}-{run_tag}')
                 os.makedirs(out_dir, exist_ok=True)
@@ -37800,7 +37817,7 @@ def run_status(run_id: str):
                         meta['full_scenario_path'] = full_bundle
                     session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                     history_ok = _append_run_history({
-                        'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                        'timestamp': _local_timestamp_display(),
                         'mode': 'async',
                         'xml_path': xml_path_local,
                         'post_xml_path': session_xml_path,
@@ -37941,7 +37958,7 @@ def upload_base():
     filename = secure_filename(f.filename)
     base_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'base')
     os.makedirs(base_dir, exist_ok=True)
-    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    unique = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:8]
     saved_path = os.path.join(base_dir, f"{unique}-{filename}")
     f.save(saved_path)
     ok, errs = _validate_core_xml(saved_path)
@@ -38066,12 +38083,9 @@ def _session_store_entry_updated_at_epoch(value: Any) -> Optional[float]:
     if not text:
         return None
     try:
-        # Accept both explicit Z and +00:00 offsets.
-        if text.endswith('Z'):
-            text = text[:-1] + '+00:00'
-        dt = datetime.datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = _parse_iso_datetime(text)
+        if dt is None:
+            return None
         return dt.timestamp()
     except Exception:
         return None
@@ -38169,10 +38183,7 @@ def _migrate_core_sessions_store_with_core_targets(store: dict, history: list[di
             mt = _safe_path_mtime_epoch(path)
             if mt is not None:
                 try:
-                    value['updated_at'] = datetime.datetime.fromtimestamp(
-                        mt,
-                        tz=datetime.timezone.utc,
-                    ).isoformat().replace('+00:00', 'Z')
+                    value['updated_at'] = datetime.datetime.fromtimestamp(mt).strftime('%m/%d/%y/%H/%M/%S')
                     dirty = True
                 except Exception:
                     pass
@@ -38225,7 +38236,7 @@ def _update_xml_session_mapping(
             scenario_label = (scenario_name or '').strip()
             entry: dict[str, Any] = {'session_id': int(session_id)}
             try:
-                entry['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+                entry['updated_at'] = _local_timestamp_display()
             except Exception:
                 pass
             scenario_norm = _normalize_scenario_label(scenario_label)
@@ -39315,7 +39326,7 @@ def core_upload():
         return _redirect_core_page_with_scenario()
     dest_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'core')
     os.makedirs(dest_dir, exist_ok=True)
-    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+    unique = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:6]
     path = os.path.join(dest_dir, f"{unique}-{filename}")
     f.save(path)
     ok, errs = _validate_core_xml(path)
@@ -40730,7 +40741,7 @@ def test_core():
                     core={
                         'core_secret_id': stored_meta.get('identifier'),
                         'validated': bool(stored_meta.get('identifier')),
-                        'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                        'last_validated_at': _local_timestamp_display(),
                         'grpc_host': stored_meta.get('grpc_host') or stored_meta.get('host'),
                         'grpc_port': stored_meta.get('grpc_port') or stored_meta.get('port'),
                         'ssh_host': stored_meta.get('ssh_host'),
@@ -42422,7 +42433,7 @@ def _pick_vuln_csv_from_zip(zf: zipfile.ZipFile) -> str | None:
 
 def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str) -> dict:
     os.makedirs(_installed_vuln_catalogs_root(), exist_ok=True)
-    catalog_id = time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3)
+    catalog_id = _local_timestamp_safe() + '-' + secrets.token_hex(3)
     pack_dir = _vuln_catalog_pack_dir(catalog_id)
     os.makedirs(pack_dir, exist_ok=True)
 
@@ -42512,7 +42523,7 @@ def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str
         'label': str(label or '').strip() or catalog_id,
         'from_source': str(label or '').strip() or catalog_id,
         'origin': str(origin or '').strip(),
-        'installed_at': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'installed_at': _local_timestamp_display(),
         'csv_paths': csv_rel_paths,
         'content_dir': os.path.relpath(_vuln_catalog_pack_content_dir(catalog_id), _get_repo_root()).replace('\\', '/'),
         'compose_items': compose_items,
@@ -44234,7 +44245,7 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
                     else:
                         it['validated_incomplete'] = False
                         it['validated_ok'] = bool(user_ok)
-                    it['validated_at'] = datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+                    it['validated_at'] = _local_timestamp_display()
                     updated = True
                     break
             if updated:
@@ -44708,7 +44719,7 @@ def _install_generator_pack_payload(
                     'pack_id': pack_id,
                     'pack_label': safe_label,
                     'origin': pack_origin,
-                    'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                    'installed_at': _local_timestamp_display(),
                     'generator_id': assigned_gid,
                     'kind': kind,
                     'source_generator_id': source_gid,
@@ -44736,7 +44747,7 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
             repo_root = os.getcwd()
 
         safe_label = secure_filename(pack_label or 'pack') or 'pack'
-        pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+        pack_id = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:6]
         next_numeric = _compute_next_numeric_generator_id(repo_root=repo_root)
 
         ok, note, installed, _next, warnings = _install_generator_pack_payload(
@@ -44757,7 +44768,7 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
             'origin': pack_origin,
             'note': note,
             'warnings': warnings,
-            'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+            'installed_at': _local_timestamp_display(),
             'installed': installed,
         })
         _save_installed_generator_packs_state(state)
@@ -44801,7 +44812,7 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
             if (not has_manifest) and nested:
                 # Bundle import: install all nested pack ZIPs under a single pack label/state row.
                 safe_label = secure_filename(pack_label or 'bundle') or 'bundle'
-                pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+                pack_id = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:6]
                 try:
                     repo_root = _get_repo_root()
                 except Exception:
@@ -44856,7 +44867,7 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                         'origin': pack_origin,
                         'note': f'Imported {successes} pack(s) from bundle' + (f'; {failures[0]}' if failures else ''),
                         'warnings': warnings_all,
-                        'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                        'installed_at': _local_timestamp_display(),
                         'installed': installed_all,
                     })
                     _save_installed_generator_packs_state(state)
@@ -45449,7 +45460,7 @@ def flag_generators_test_run():
     except Exception:
         pass
 
-    run_id = datetime.datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_id = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:10]
     run_dir = os.path.join(_flag_generators_runs_dir(), run_id)
     inputs_dir = os.path.join(run_dir, 'inputs')
     os.makedirs(inputs_dir, exist_ok=True)
@@ -45594,7 +45605,7 @@ def flag_generators_test_run():
     try:
         log_handle = open(log_path, 'a', encoding='utf-8')
         env = dict(os.environ)
-        env.setdefault('CORETG_DOCKER_USE_SUDO', '1')
+        env.setdefault('CORETG_DOCKER_USE_SUDO', '0')
         env.setdefault('CORETG_DOCKER_HOST_NETWORK', '1')
         proc = subprocess.Popen(
             cmd,
@@ -45694,7 +45705,7 @@ def flag_node_generators_test_run():
     except Exception:
         pass
 
-    run_id = datetime.datetime.now(datetime.UTC).strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_id = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:10]
     run_dir = os.path.join(_flag_node_generators_runs_dir(), run_id)
     inputs_dir = os.path.join(run_dir, 'inputs')
     os.makedirs(inputs_dir, exist_ok=True)
@@ -45779,7 +45790,7 @@ def flag_node_generators_test_run():
     try:
         log_handle = open(log_path, 'a', encoding='utf-8')
         env = dict(os.environ)
-        env.setdefault('CORETG_DOCKER_USE_SUDO', '1')
+        env.setdefault('CORETG_DOCKER_USE_SUDO', '0')
         env.setdefault('CORETG_DOCKER_HOST_NETWORK', '1')
         proc = subprocess.Popen(
             cmd,
