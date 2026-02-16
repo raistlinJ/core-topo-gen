@@ -2197,9 +2197,12 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 	lines = [
 		f"FROM {base_image}",
 		"",
-		"RUN set -eux; \\",
+		# Avoid `set -x` to reduce giant build logs; keep `-e` and `-u`.
+		"RUN set -eu; \\",
 		"\tif command -v apt-get >/dev/null 2>&1; then \\",
-		"\t\tif ! apt-get update; then \\",
+		# Use conservative timeouts/retries so builds don't hang on offline CORE VMs.
+		"\t\tAPT_OPTS='-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15'; \\",
+		"\t\tif ! apt-get $APT_OPTS update; then \\",
 		"\t\t\trm -f /etc/apt/sources.list; \\",
 		"\t\t\trm -f /etc/apt/sources.list.d/*.list || true; \\",
 		"\t\t\tprintf '%s\\n' \\",
@@ -2208,7 +2211,7 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian stretch main\" \\",
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian stretch-updates main\" \\",
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main\" > /etc/apt/sources.list; \\",
-		"\t\t\tapt-get -o Acquire::Check-Valid-Until=false update || true; \\",
+		"\t\t\tapt-get $APT_OPTS -o Acquire::Check-Valid-Until=false update || true; \\",
 		"\t\tfi; \\",
 		"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true; \\",
 		"\t\trm -rf /var/lib/apt/lists/*; \\",
@@ -2436,6 +2439,54 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			if not isinstance(svc, dict):
 				return compose_obj
 			svc['container_name'] = str(node_name)
+			return compose_obj
+		except Exception:
+			return compose_obj
+
+	def _ensure_service_named_as_node(compose_obj: dict, node_name: str, prefer_service: Optional[str] = None) -> dict:
+		"""Ensure compose has a service key exactly matching the CORE node name.
+
+		CORE docker nodes typically run: `docker compose up -d <node_name>`.
+		If the compose YAML only defines a generic service name (e.g. `generator`),
+		core-daemon fails with: `no such service: <node_name>`.
+
+		Strategy (best-effort):
+		- If `services[node_name]` exists: keep as-is.
+		- Else pick a source service (prefer_service, otherwise first/selected)
+		  and alias it under `node_name` (do not delete the original).
+		"""
+		try:
+			if not isinstance(compose_obj, dict):
+				return compose_obj
+			services = compose_obj.get('services')
+			if not isinstance(services, dict) or not services:
+				return compose_obj
+			node_key = str(node_name or '').strip()
+			if not node_key:
+				return compose_obj
+			if node_key in services:
+				return compose_obj
+
+			src_key = None
+			if prefer_service:
+				ps = str(prefer_service).strip()
+				if ps and ps in services:
+					src_key = ps
+			if not src_key:
+				try:
+					src_key = _select_service_key(compose_obj, prefer_service=prefer_service)
+				except Exception:
+					src_key = None
+			if not src_key and len(services) == 1:
+				try:
+					src_key = next(iter(services.keys()))
+				except Exception:
+					src_key = None
+			if not src_key or src_key not in services:
+				return compose_obj
+
+			import copy as _copy
+			services[node_key] = _copy.deepcopy(services.get(src_key) or {})
 			return compose_obj
 		except Exception:
 			return compose_obj
@@ -2733,18 +2784,23 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				pass
 			# Avoid name collisions: ensure no hard-coded container_name remains in any service.
 			obj = _remove_container_names_all_services(obj)
+			# NOTE: do NOT force all injections to target the node-name service.
+			# Many callers/tests expect the original selected service (often the first
+			# service, e.g. `app`) to be modified in-place.
+			# We create/refresh the node-name alias AFTER modifications, just before dump.
 			# Optional: set container_name for the selected service.
 			# Default OFF because it can interfere with CORE's service execution on docker nodes.
 			if _compose_set_container_name_enabled():
 				obj = _set_container_name_for_selected_service(obj, node_name, prefer_service=prefer)
-			# Record which service was selected (useful when a compose has multiple services).
+			# Track which service we modified (used later to alias it under node_name).
+			modified_service_key: Optional[str] = None
 			try:
-				svc_key_selected = _select_service_key(obj, prefer_service=prefer)
-				if svc_key_selected:
-					rec['compose_service'] = str(svc_key_selected)
-					logger.info("[vuln] compose selected service node=%s service=%s", node_name, svc_key_selected)
+				modified_service_key = _select_service_key(obj, prefer_service=prefer)
+				if modified_service_key:
+					rec['compose_service_selected'] = str(modified_service_key)
+					logger.info("[vuln] compose selected service node=%s service=%s", node_name, modified_service_key)
 			except Exception:
-				pass
+				modified_service_key = None
 			# Remove obsolete top-level 'version' key to suppress warnings.
 			try:
 				obj.pop('version', None)
@@ -2914,6 +2970,19 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			try:
 				# Dump YAML to string first, then escape sequences that CORE's host-side printf
 				# would otherwise interpret.
+				# Ensure CORE can start this docker node by service name: docker compose up -d <node_name>.
+				# Do this late so the alias includes all wrapper/mount/port-pruning modifications.
+				try:
+					alias_src = None
+					try:
+						alias_src = str(rec.get('compose_service_selected') or '').strip() or None
+					except Exception:
+						alias_src = None
+					obj = _ensure_service_named_as_node(obj, node_name, prefer_service=alias_src or prefer)
+					# CORE should start the node-name service.
+					rec['compose_service'] = str(node_name)
+				except Exception:
+					pass
 				text = _yaml_dump_literal_multiline(obj)
 				text = _escape_core_printf_backslashes(text)
 				text = _escape_mako_dollars(text)

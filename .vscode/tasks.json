@@ -320,6 +320,42 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full.txt 2>&1; code=$?; tail -n 60 /tmp/pytest_full.txt; echo EXIT_CODE=$code; exit $code",
 			"isBackground": false
+		},
+		{
+			"label": "pytest: new compose alias regression",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_compose_service_name_alias.py",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: compose alias regression (captured)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_compose_service_name_alias.py > /tmp/pytest_alias.txt 2>&1; code=$?; tail -n 40 /tmp/pytest_alias.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite after compose alias",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full2.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full2.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: failing docker_compose_metadata regression",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_docker_compose_metadata.py::test_prepare_compose_for_assignments_records_compose_path > /tmp/pytest_dcmeta.txt 2>&1; code=$?; tail -n 60 /tmp/pytest_dcmeta.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (post compose alias fix)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full3.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full3.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (wrapper timeout tweak)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full4.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full4.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
 		}
 	]
 }
