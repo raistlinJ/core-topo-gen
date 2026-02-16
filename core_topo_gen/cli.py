@@ -8,6 +8,8 @@ import uuid
 import os
 import subprocess
 import sys
+import time
+import shutil
 from xml.etree import ElementTree as ET
 from typing import Any, Dict, Tuple
 
@@ -41,6 +43,169 @@ from .utils.vuln_process import (
     detect_docker_conflicts_for_compose_files,
     remove_docker_conflicts,
 )
+
+
+def _core_session_id(session: Any) -> int | None:
+    try:
+        sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)
+        return int(sid) if sid is not None else None
+    except Exception:
+        return None
+
+
+def _core_state_str(value: Any) -> str:
+    if value is None:
+        return ''
+    try:
+        # CORE sometimes uses IntEnum-like objects
+        name = getattr(value, 'name', None)
+        if isinstance(name, str) and name:
+            return name.strip().lower()
+    except Exception:
+        pass
+    try:
+        text = str(value).strip()
+    except Exception:
+        text = ''
+    if not text:
+        return ''
+
+    # Common string forms: 'SessionState.RUNTIME'
+    try:
+        if '.' in text:
+            tail = text.split('.')[-1].strip()
+            if tail:
+                text = tail
+    except Exception:
+        pass
+
+    # Numeric states: try mapping via core_pb2 if available.
+    if text.isdigit():
+        try:
+            from core.api.grpc import core_pb2  # type: ignore
+
+            return str(core_pb2.SessionState.Name(int(text))).strip().lower()
+        except Exception:
+            pass
+    return text.lower()
+
+
+def _docker_container_state(name: str) -> dict[str, Any]:
+    """Best-effort docker inspect state for a container name."""
+    name = str(name or '').strip()
+    if not name:
+        return {'name': name, 'exists': False, 'running': False, 'status': '', 'exit_code': None, 'error': 'empty name'}
+    if not shutil.which('docker'):
+        return {'name': name, 'exists': None, 'running': None, 'status': '', 'exit_code': None, 'error': 'docker not found'}
+    try:
+        p = subprocess.run(
+            ['docker', 'inspect', '--format', '{{json .State}}', name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+    except Exception as exc:
+        return {'name': name, 'exists': False, 'running': False, 'status': '', 'exit_code': None, 'error': f'{exc.__class__.__name__}: {exc}'}
+    if p.returncode != 0:
+        return {
+            'name': name,
+            'exists': False,
+            'running': False,
+            'status': '',
+            'exit_code': None,
+            'error': (p.stdout or '').strip() or f'docker inspect failed rc={p.returncode}',
+        }
+    raw = (p.stdout or '').strip()
+    try:
+        st = json.loads(raw) if raw else {}
+    except Exception:
+        st = {}
+    running = None
+    status = ''
+    exit_code = None
+    try:
+        if isinstance(st, dict):
+            running = st.get('Running')
+            status = str(st.get('Status') or '').strip()
+            exit_code = st.get('ExitCode')
+    except Exception:
+        pass
+    return {
+        'name': name,
+        'exists': True,
+        'running': bool(running) if running is not None else None,
+        'status': status,
+        'exit_code': exit_code,
+        'error': None,
+    }
+
+
+def _wait_for_docker_running(
+    names: list[str],
+    *,
+    timeout_s: float = 30.0,
+    poll_s: float = 0.5,
+) -> dict[str, Any]:
+    names = [str(n).strip() for n in (names or []) if str(n).strip()]
+    names = sorted(set(names))
+    if not names:
+        return {'total': 0, 'running': [], 'not_running': [], 'items': []}
+    deadline = time.time() + max(0.1, float(timeout_s))
+    last_items: list[dict[str, Any]] = []
+    while time.time() < deadline:
+        items = [_docker_container_state(nm) for nm in names]
+        last_items = items
+        not_running = []
+        running = []
+        for it in items:
+            if it.get('running') is True:
+                running.append(it.get('name'))
+            else:
+                not_running.append(it.get('name'))
+        if not not_running:
+            return {'total': len(names), 'running': running, 'not_running': [], 'items': items}
+        time.sleep(max(0.05, float(poll_s)))
+    # timeout
+    not_running2 = []
+    running2 = []
+    for it in last_items:
+        if it.get('running') is True:
+            running2.append(it.get('name'))
+        else:
+            not_running2.append(it.get('name'))
+    return {'total': len(names), 'running': running2, 'not_running': not_running2, 'items': last_items}
+
+
+def _get_core_session_state(core: Any, session_id: int) -> str:
+    try:
+        sessions = core.get_sessions() or []
+    except Exception:
+        sessions = []
+    for sess in sessions:
+        sid = _core_session_id(sess)
+        if sid is None or int(sid) != int(session_id):
+            continue
+        try:
+            return _core_state_str(getattr(sess, 'state', None))
+        except Exception:
+            return ''
+    return ''
+
+
+def _wait_for_core_runtime(core: Any, session_id: int, *, timeout_s: float = 30.0, poll_s: float = 0.5) -> tuple[bool, str]:
+    deadline = time.time() + max(0.1, float(timeout_s))
+    last_state = ''
+    while time.time() < deadline:
+        state = _get_core_session_state(core, session_id)
+        if state:
+            last_state = state
+        if state in {'runtime'}:
+            return True, state
+        if state in {'shutdown'}:
+            return False, state
+        time.sleep(max(0.05, float(poll_s)))
+    return False, last_state
 
 
 def _flow_state_from_xml(xml_path: str, scenario_name: str | None) -> dict[str, Any] | None:
@@ -1668,7 +1833,12 @@ def main():
     except Exception as e:
         logging.exception("Failed to write scenario report: %s", e)
 
-    # Start the CORE session only after all services (including Traffic) are applied
+    # Start the CORE session only after all services (including Traffic) are applied.
+    start_ok = True
+    session_id: int | None = None
+    session_state = ''
+    docker_runtime: dict[str, Any] | None = None
+    start_error: str | None = None
     try:
         logging.info("PHASE: Start CORE session")
         # Preflight: check for conflicting Docker containers/images for any compose-based Docker nodes.
@@ -1699,8 +1869,7 @@ def main():
                         except Exception:
                             conflicts = {'containers': [], 'images': []}
                     try:
-                        import shutil as _sh
-                        if _sh.which('docker'):
+                        if shutil.which('docker'):
                             existing_named: list[str] = []
                             for nm in docker_names:
                                 try:
@@ -1725,8 +1894,7 @@ def main():
                     try:
                         import re as _re
                         import subprocess as _sp
-                        import shutil as _sh
-                        if _sh.which('docker'):
+                        if shutil.which('docker'):
                             p = _sp.run(['docker', 'ps', '-a', '--format', '{{.Names}}'], stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True)
                             if p.returncode == 0:
                                 names = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
@@ -1784,30 +1952,113 @@ def main():
                                         len(rr.get('removed_images') or []),
                                     )
                                 else:
-                                    logging.error("Aborting: Docker conflicts not removed")
-                                    return 1
+                                    start_ok = False
+                                    start_error = 'Docker conflicts not removed'
                             else:
-                                logging.error(
-                                    "Aborting: Docker conflicts detected but cannot prompt (non-interactive). Rerun with --docker-remove-conflicts or clean up Docker resources.",
+                                start_ok = False
+                                start_error = (
+                                    'Docker conflicts detected but cannot prompt (non-interactive). '
+                                    'Rerun with --docker-remove-conflicts or clean up Docker resources.'
                                 )
-                                return 1
         except Exception as _dock_exc:
             logging.debug("Docker conflict preflight skipped/failed: %s", _dock_exc)
 
-        # Emit session id in a parseable form for webapp backend to capture
-        try:
-            sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)
-            if sid is not None:
-                logging.info("CORE_SESSION_ID: %s", sid)
-        except Exception:
-            pass
-        # CORE client expects the session object (uses session.to_proto()).
-        core.start_session(session)
-        logging.info("CORE session started")
+        session_id = _core_session_id(session)
+        if session_id is not None:
+            logging.info("CORE_SESSION_ID: %s", session_id)
+
+        if start_ok:
+            # CORE client expects the session object (uses session.to_proto()).
+            core.start_session(session)
+            logging.info("CORE session start requested")
+
+        # Validate that CORE reaches runtime.
+        if start_ok and session_id is not None:
+            ok_runtime, st = _wait_for_core_runtime(core, int(session_id), timeout_s=30.0, poll_s=0.5)
+            session_state = st
+            if not ok_runtime:
+                start_ok = False
+                start_error = f"CORE session did not reach runtime (state={st or 'unknown'})"
+
+        # Validate docker-compose nodes are actually running (not merely created in config).
+        if start_ok:
+            docker_names2: list[str] = []
+            try:
+                if isinstance(docker_by_name, dict):
+                    for nm, rec in docker_by_name.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        if (rec.get('Type') or '').strip().lower() != 'docker-compose':
+                            continue
+                        docker_names2.append(str(nm))
+            except Exception:
+                docker_names2 = []
+            docker_names2 = sorted(set([n for n in docker_names2 if n]))
+            if docker_names2:
+                docker_runtime = _wait_for_docker_running(docker_names2, timeout_s=30.0, poll_s=0.5)
+                if docker_runtime.get('not_running'):
+                    start_ok = False
+                    start_error = f"Docker node(s) not running: {', '.join(docker_runtime.get('not_running') or [])}"
     except Exception as e:
-        logging.exception("Failed to start CORE session: %s", e)
+        start_ok = False
+        start_error = f"{e.__class__.__name__}: {e}"
+        logging.exception("Failed to start/validate CORE session: %s", e)
+
+    # Record runtime status into the report metadata so the UI doesn't claim success when CORE stayed in config.
+    try:
+        if isinstance(generation_meta, dict):
+            generation_meta.setdefault('errors', [])
+            if (not start_ok) and start_error:
+                try:
+                    if isinstance(generation_meta.get('errors'), list):
+                        generation_meta['errors'].append(str(start_error))
+                except Exception:
+                    pass
+            generation_meta['core_session'] = {
+                'id': session_id,
+                'state': session_state,
+                'runtime_ok': bool(start_ok) and bool(session_state in {'runtime'}),
+            }
+            if docker_runtime is not None:
+                generation_meta['docker_nodes_runtime'] = docker_runtime
+    except Exception:
+        pass
+
+    # Rewrite report+summary to include the post-start runtime validation data.
+    try:
+        if 'report_path' in locals() and report_path:
+            _routers = routers if ('routers' in locals() and isinstance(routers, list)) else []
+            _router_protocols = router_protocols if ('router_protocols' in locals() and isinstance(router_protocols, dict)) else {}
+            _switches = [] if _routers else (switches if ('switches' in locals() and isinstance(switches, list)) else [])
+            _hosts = hosts if ('hosts' in locals() and isinstance(hosts, list)) else []
+            _service_assignments = service_assignments if ('service_assignments' in locals() and isinstance(service_assignments, dict)) else {}
+            report_path, summary_path = write_report(
+                report_path,
+                scenario_name,
+                routers=_routers,
+                router_protocols=_router_protocols,
+                switches=_switches,
+                hosts=_hosts,
+                service_assignments=_service_assignments,
+                traffic_summary_path=traffic_summary_path if ('traffic_summary_path' in locals() and traffic_summary_path and os.path.exists(traffic_summary_path)) else None,
+                segmentation_summary_path=seg_summary_path if ('seg_summary_path' in locals() and seg_summary_path and os.path.exists(seg_summary_path)) else None,
+                metadata=generation_meta,
+                routing_cfg=routing_cfg if 'routing_cfg' in locals() else None,
+                traffic_cfg=traffic_cfg if 'traffic_cfg' in locals() else None,
+                services_cfg=services_cfg if 'services_cfg' in locals() else None,
+                segmentation_cfg=segmentation_cfg if 'segmentation_cfg' in locals() else None,
+                vulnerabilities_cfg=vulnerabilities_cfg if 'vulnerabilities_cfg' in locals() else None,
+            )
+    except Exception:
+        # Keep exit code semantics even if report rewrite fails.
+        logging.exception("Failed to rewrite scenario report with runtime status")
+
+    if not start_ok:
+        if start_error:
+            logging.error("Start validation failed: %s", start_error)
         return 1
 
+    logging.info("CORE session started and validated")
     return 0
 
 

@@ -177,12 +177,54 @@ def write_report(
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
     lines.append(f"- Segmentation rules: {len(seg_rules)}")
+    # CORE runtime status (if provided by CLI)
+    try:
+        if metadata and isinstance(metadata.get('core_session'), dict):
+            cs = metadata.get('core_session') or {}
+            sid = cs.get('id')
+            st = str(cs.get('state') or '').strip().lower()
+            ok = _boolish(cs.get('runtime_ok'))
+            lines.append(f"- CORE session: id={sid if sid is not None else 'n/a'} state={st or 'unknown'} runtime_ok={ok}")
+    except Exception:
+        pass
+    # Docker node runtime status (if provided by CLI)
+    try:
+        if metadata and isinstance(metadata.get('docker_nodes_runtime'), dict):
+            dr = metadata.get('docker_nodes_runtime') or {}
+            total = dr.get('total')
+            running = dr.get('running') or []
+            not_running = dr.get('not_running') or []
+            try:
+                running_n = len(running) if isinstance(running, list) else 0
+            except Exception:
+                running_n = 0
+            if total is None:
+                total = running_n + (len(not_running) if isinstance(not_running, list) else 0)
+            lines.append(f"- Docker nodes running: {running_n}/{total if total is not None else 'n/a'}")
+            if isinstance(not_running, list) and not_running:
+                lines.append(f"- Docker nodes not running: {', '.join(str(x) for x in not_running)}")
+    except Exception:
+        pass
     if allow_verify:
         bc = allow_verify.get('blocked_count') or 0
         lines.append(f"- Flow verification blocked: {bc} (see allow_verification.json)")
     try:
         if metadata and metadata.get('segmentation_preview_rules') and not seg_rules:
             lines.append(f"- Segmentation (preview injected): {len(metadata.get('segmentation_preview_rules') or [])}")
+    except Exception:
+        pass
+
+    # Errors emitted by the generator (if any)
+    try:
+        errs = metadata.get('errors') if metadata else None
+        if isinstance(errs, list) and errs:
+            lines.append('')
+            lines.append('## Errors')
+            for e in errs:
+                txt = str(e).strip()
+                if txt:
+                    lines.append(f"- {txt}")
+            lines.append('')
     except Exception:
         pass
     # Planned vs Actual reconciliation (counts) leveraging plan_summary if present

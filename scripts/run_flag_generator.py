@@ -37,7 +37,9 @@ def _wrap_docker_cmd(cmd: list[str]) -> tuple[list[str], str | None]:
     pw = _docker_sudo_password()
     if pw is None:
         return ['sudo', '-E'] + cmd, None
-    return ['sudo', '-E', '-S'] + cmd, (pw + '\n')
+    # Use a blank prompt to avoid emitting "[sudo] password for ..." into logs.
+    # Use -k to force a password read (so we can supply via stdin reliably).
+    return ['sudo', '-E', '-S', '-p', '', '-k'] + cmd, (pw + '\n')
 
 
 def _fix_output_permissions(out_dir: Path) -> None:

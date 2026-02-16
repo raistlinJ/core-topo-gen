@@ -17185,6 +17185,14 @@
         const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
         const dockerStartPending = Array.isArray(summary.docker_start_pending) ? summary.docker_start_pending.length : 0;
         const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+        const flowLivePathsMissing = Array.isArray(summary.flow_live_paths_missing);
+        const flowLivePathsChecked = Number.isFinite(Number(summary.flow_live_paths_checked))
+            ? Number(summary.flow_live_paths_checked)
+            : null;
+        const flowLivePathsMissingList = flowLivePathsMissing ? summary.flow_live_paths_missing.filter(Boolean) : [];
+        const flowLivePathsMissingCount = Number.isFinite(Number(summary.flow_live_paths_missing_count))
+            ? Number(summary.flow_live_paths_missing_count)
+            : flowLivePathsMissingList.length;
         const generatorOutputsMissing = Array.isArray(summary.generator_outputs_missing) ? summary.generator_outputs_missing.length : 0;
         const generatorInjectsMissing = Array.isArray(summary.generator_injects_missing) ? summary.generator_injects_missing.length : 0;
         const expectedInjectDirs = Array.isArray(summary.inject_dirs_expected) ? summary.inject_dirs_expected.length : 0;
@@ -17338,6 +17346,13 @@
                 generatorInjectsMissing ? `${generatorInjectsMissing} inject source(s) missing` : 'All inject sources present',
                 generatorInjectsDetailItems
             ));
+            const flowLivePathsDetail = (flowLivePathsMissingCount > 0) ? flowLivePathsMissingList : [];
+            executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                'Flow live paths present',
+                flowLivePathsMissingCount === 0,
+                flowLivePathsMissingCount ? `${flowLivePathsMissingCount} missing` : 'All live paths present',
+                flowLivePathsDetail
+            ));
         } else if (expectedDockerNodes > 0) {
             executeSummaryListEl.appendChild(renderExecuteSummaryItem(
                 'Docker containers detected',
@@ -17399,6 +17414,13 @@
         const dockerNotRunning = Array.isArray(summary.docker_not_running) ? summary.docker_not_running.length : 0;
         const dockerStartPending = Array.isArray(summary.docker_start_pending) ? summary.docker_start_pending.length : 0;
         const injectsMissing = Array.isArray(summary.injects_missing) ? summary.injects_missing.length : 0;
+        const flowLivePathsMissing = Array.isArray(summary.flow_live_paths_missing);
+        const flowLivePathsChecked = Number.isFinite(Number(summary.flow_live_paths_checked))
+            ? Number(summary.flow_live_paths_checked)
+            : null;
+        const flowLivePathsMissingCount = Number.isFinite(Number(summary.flow_live_paths_missing_count))
+            ? Number(summary.flow_live_paths_missing_count)
+            : (flowLivePathsMissing ? summary.flow_live_paths_missing.filter(Boolean).length : 0);
         lines.push(`Expected nodes created: ${missingNodes === 0 ? 'OK' : `Missing ${missingNodes}`}`);
         lines.push(`Unexpected nodes: ${extraNodes === 0 ? 'None' : `Extra ${extraNodes}`}`);
         if (expectedDockerNodes > 0) {
@@ -17416,6 +17438,9 @@
             lines.push(`Injected files present: ${injectsMissing === 0 ? 'OK' : `Missing injects/sources on ${injectsMissing}`}`);
         } else {
             lines.push('Docker containers detected: None');
+        }
+        if (flowLivePathsMissingCount > 0 || flowLivePathsChecked !== null) {
+            lines.push(`Flow live paths present: ${flowLivePathsMissingCount === 0 ? 'OK' : `Missing ${flowLivePathsMissingCount}`}`);
         }
         return lines.join('\n');
     }

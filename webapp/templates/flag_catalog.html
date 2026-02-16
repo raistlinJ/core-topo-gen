@@ -242,6 +242,44 @@
   </div>
 </div>
 
+<!-- Generator Test SSH Credentials Modal -->
+<div class="modal fade" id="genTestCredsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">CORE VM Credentials</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">SSH Host</label>
+          <input class="form-control" id="genTestCredsHost" placeholder="core-vm.example" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Port</label>
+          <input class="form-control" id="genTestCredsPort" type="number" value="22" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Username</label>
+          <input class="form-control" id="genTestCredsUser" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Password</label>
+          <input class="form-control" id="genTestCredsPass" type="password" />
+        </div>
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" id="genTestCredsSave" checked>
+          <label class="form-check-label" for="genTestCredsSave">Save Credentials</label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="genTestCredsContinue">Continue</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Generator Pack Upload Progress Modal -->
 <div class="modal fade" id="packUploadProgressModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
   <div class="modal-dialog modal-dialog-centered">
@@ -308,6 +346,7 @@
     testBase: '/flag_generators_test',
     eventSource: null,
     runId: null,
+    testCoreCfg: null,
     savedUploads: {},
     outputsPollTimer: null,
     outputsLastSig: null,
@@ -1302,6 +1341,9 @@
 
     const form = document.getElementById('genTestForm');
     const fd = new FormData(form);
+    if (genTestState.testCoreCfg && typeof genTestState.testCoreCfg === 'object') {
+      fd.append('core', JSON.stringify(genTestState.testCoreCfg));
+    }
     const base = genTestState.testBase || '/flag_generators_test';
     setTestLogLine(`[ui] POST ${base}/run …`);
     const data = await fetchJson(`${base}/run`, { method: 'POST', body: fd });
@@ -1368,6 +1410,66 @@
       startOutputsPolling(runId);
       btn.disabled = false;
     };
+  }
+
+  function _loadSavedGenTestCreds() {
+    try {
+      const raw = localStorage.getItem('coretg_flag_test_ssh');
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function _saveGenTestCreds(creds) {
+    try {
+      localStorage.setItem('coretg_flag_test_ssh', JSON.stringify(creds || {}));
+    } catch (e) {}
+  }
+
+  async function promptGenTestCreds() {
+    return new Promise((resolve) => {
+      const modalEl = document.getElementById('genTestCredsModal');
+      const hostEl = document.getElementById('genTestCredsHost');
+      const portEl = document.getElementById('genTestCredsPort');
+      const userEl = document.getElementById('genTestCredsUser');
+      const passEl = document.getElementById('genTestCredsPass');
+      const saveEl = document.getElementById('genTestCredsSave');
+      const contBtn = document.getElementById('genTestCredsContinue');
+      if (!modalEl) return resolve(null);
+
+      const saved = _loadSavedGenTestCreds() || {};
+      if (hostEl) hostEl.value = saved.ssh_host || '';
+      if (portEl) portEl.value = saved.ssh_port || 22;
+      if (userEl) userEl.value = saved.ssh_username || '';
+      if (passEl) passEl.value = saved.ssh_password || '';
+      if (saveEl) saveEl.checked = saved.save !== false;
+
+      const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl)) : null;
+      const onHidden = () => {
+        try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+        resolve(null);
+      };
+      try { modalEl.addEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+
+      if (contBtn) {
+        contBtn.onclick = () => {
+          try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+          const creds = {
+            ssh_host: (hostEl && hostEl.value || '').trim(),
+            ssh_port: parseInt((portEl && portEl.value) || '22', 10) || 22,
+            ssh_username: (userEl && userEl.value || '').trim(),
+            ssh_password: (passEl && passEl.value || '').toString(),
+          };
+          const shouldSave = !!(saveEl && saveEl.checked);
+          if (shouldSave) _saveGenTestCreds({ ...creds, save: true });
+          resolve(creds);
+          try { modalObj?.hide(); } catch (e) {}
+        };
+      }
+
+      try { modalObj?.show(); } catch (e) {}
+    });
   }
 
   function escapeHtml(str) {
@@ -1496,6 +1598,9 @@
   });
 
   document.getElementById('genTestRunBtn').addEventListener('click', async () => {
+    const creds = await promptGenTestCreds();
+    if (!creds) return;
+    genTestState.testCoreCfg = creds;
     await runCurrentGenTest();
   });
 

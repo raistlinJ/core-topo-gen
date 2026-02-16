@@ -284,6 +284,42 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py",
 			"isBackground": false
+		},
+		{
+			"label": "pytest: flow copy test",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_flow_generate_validate_execute_copy.py::test_generate_validate_execute_flow_copy_for_both_generator_kinds",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: flow copy test (after indent fix)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_flow_generate_validate_execute_copy.py::test_generate_validate_execute_flow_copy_for_both_generator_kinds",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: flow copy test (fallback inject abs)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_flow_generate_validate_execute_copy.py::test_generate_validate_execute_flow_copy_for_both_generator_kinds",
+			"isBackground": false
+		},
+		{
+			"label": "run tmp flow repro",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python scripts/_tmp_flow_copy_repro.py",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (venv312)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (captured)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full.txt 2>&1; code=$?; tail -n 60 /tmp/pytest_full.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
 		}
 	]
 }

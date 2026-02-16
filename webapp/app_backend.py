@@ -30,6 +30,7 @@ import shlex
 import posixpath
 import fnmatch
 import copy
+import stat
 from urllib.parse import urlparse, parse_qs
 
 from collections import deque
@@ -18799,8 +18800,91 @@ def api_flow_prepare_preview_for_execute():
                                     elif f"artifacts/{src}" in artifact_context:
                                         final_src = artifact_context[f"artifacts/{src}"]
                                     elif src in flow_context:
-                                        # Fallback: if flow_context has a string value that looks like a path, try it?
-                                        # For now, trust artifact_context which is explicitly validated against disk.
+                                        # Fallback: use the propagated outputs map if it points at something path-like.
+                                        try:
+                                            fv = flow_context.get(src)
+                                        except Exception:
+                                            fv = None
+                                        if isinstance(fv, str) and fv.strip():
+                                            cand = fv.strip()
+                                            # Prefer absolute paths when present.
+                                            if os.path.isabs(cand):
+                                                final_src = cand
+                                            else:
+                                                # Relative path: resolve against prior run directories (most recent first).
+                                                try:
+                                                    prior_dirs = []
+                                                    if isinstance(created_run_dirs, list) and created_run_dirs:
+                                                        prior_dirs = [str(p) for p in created_run_dirs if str(p).strip()]
+                                                    # Exclude the current run dir if present (artifact must come from earlier).
+                                                    prior_dirs = [p for p in prior_dirs if p and p != str(flow_out_dir or '')]
+                                                    prior_dirs = list(reversed(prior_dirs))
+                                                except Exception:
+                                                    prior_dirs = []
+                                                resolved = ''
+                                                for rd in prior_dirs:
+                                                    try:
+                                                        if not rd or not os.path.isdir(rd):
+                                                            continue
+                                                        cand2 = os.path.join(rd, cand.lstrip('/'))
+                                                        if os.path.exists(cand2):
+                                                            resolved = cand2
+                                                            break
+                                                        flat = os.path.basename(cand)
+                                                        if flat:
+                                                            cand3 = os.path.join(rd, flat)
+                                                            if os.path.exists(cand3):
+                                                                resolved = cand3
+                                                                break
+                                                    except Exception:
+                                                        continue
+                                                if resolved:
+                                                    final_src = resolved
+
+                                    # Final fallback: interpret src as an output-field key from any prior run's outputs.json.
+                                    try:
+                                        if final_src == src and src and (not os.path.isabs(src)):
+                                            prior_dirs2 = []
+                                            try:
+                                                if isinstance(created_run_dirs, list) and created_run_dirs:
+                                                    prior_dirs2 = [str(p) for p in created_run_dirs if str(p).strip()]
+                                                prior_dirs2 = [p for p in prior_dirs2 if p and p != str(flow_out_dir or '')]
+                                                prior_dirs2 = list(reversed(prior_dirs2))
+                                            except Exception:
+                                                prior_dirs2 = []
+
+                                            for rd in prior_dirs2:
+                                                try:
+                                                    if not rd or not os.path.isdir(rd):
+                                                        continue
+                                                    mp = os.path.join(rd, 'outputs.json')
+                                                    if not os.path.exists(mp):
+                                                        continue
+                                                    with open(mp, 'r', encoding='utf-8') as mf:
+                                                        m = json.load(mf) or {}
+                                                    outs2 = m.get('outputs') if isinstance(m, dict) else None
+                                                    if not isinstance(outs2, dict):
+                                                        continue
+                                                    val = outs2.get(src)
+                                                    if not isinstance(val, str) or not val.strip():
+                                                        continue
+                                                    vtxt = val.strip()
+                                                    if os.path.isabs(vtxt) and os.path.exists(vtxt):
+                                                        final_src = vtxt
+                                                        break
+                                                    cand4 = os.path.join(rd, vtxt.lstrip('/'))
+                                                    if os.path.exists(cand4):
+                                                        final_src = cand4
+                                                        break
+                                                    flat4 = os.path.basename(vtxt)
+                                                    if flat4:
+                                                        cand5 = os.path.join(rd, flat4)
+                                                        if os.path.exists(cand5):
+                                                            final_src = cand5
+                                                            break
+                                                except Exception:
+                                                    continue
+                                    except Exception:
                                         pass
                                         
                                     if dest:
@@ -19051,6 +19135,14 @@ def api_flow_prepare_preview_for_execute():
 
                                             if updates:
                                                 outs.update(updates)
+                                                # Keep flow_context in sync: it was populated earlier (pre-normalization).
+                                                try:
+                                                    for _k, _v in (updates or {}).items():
+                                                        kk2 = str(_k)
+                                                        if kk2:
+                                                            flow_context[kk2] = _v
+                                                except Exception:
+                                                    pass
                                                 # Persist corrections back to disk so re-validate/UI see the full path.
                                                 if manifest_path:
                                                     try:
@@ -19215,9 +19307,12 @@ def api_flow_prepare_preview_for_execute():
                                         continue
                                     # Heuristic: if the value is a filename/path and exists in the run dir,
                                     # track it as a resolvable artifact.
-                                    candidate = os.path.join(flow_out_dir, v)
+                                    vtxt = v.strip()
+                                    if vtxt and os.path.isabs(vtxt) and os.path.exists(vtxt):
+                                        artifact_context[str(k).strip()] = vtxt
+                                        continue
+                                    candidate = os.path.join(flow_out_dir, vtxt)
                                     if os.path.exists(candidate):
-                                        # Strip leading slash if present in key (unlikely for well-formed keys but safe).
                                         artifact_context[str(k).strip()] = candidate
                         except Exception:
                             pass
@@ -19865,6 +19960,125 @@ def api_flow_prepare_preview_for_execute():
                 fa['generation_note'] = 'flags disabled (invalid dependency order)'
         except Exception:
             pass
+
+    # Post-run normalization: ensure inject_files entries that reference prior outputs
+    # (e.g. 'File(path)') are resolved to absolute on-disk paths in the response.
+    try:
+        def _split_inject_spec_post(raw: str) -> tuple[str, str]:
+            text = str(raw or '').strip()
+            if not text:
+                return '', ''
+            for sep in ('->', '=>'):
+                if sep in text:
+                    left, right = text.split(sep, 1)
+                    return left.strip(), right.strip()
+            return text, ''
+
+        artifact_by_key: dict[str, str] = {}
+        try:
+            run_dirs = [str(p) for p in (created_run_dirs or []) if str(p).strip()]
+        except Exception:
+            run_dirs = []
+        for rd in run_dirs:
+            try:
+                if not rd or not os.path.isdir(rd):
+                    continue
+                mp = os.path.join(rd, 'outputs.json')
+                if not os.path.exists(mp):
+                    continue
+                with open(mp, 'r', encoding='utf-8') as mf:
+                    m = json.load(mf) or {}
+                outs = m.get('outputs') if isinstance(m, dict) else None
+                if not isinstance(outs, dict):
+                    continue
+                for k, v in outs.items():
+                    kk = str(k or '').strip()
+                    if not kk or kk in artifact_by_key:
+                        continue
+                    if not isinstance(v, str) or not v.strip():
+                        continue
+                    vtxt = v.strip()
+                    if os.path.isabs(vtxt) and os.path.exists(vtxt):
+                        artifact_by_key[kk] = vtxt
+                        # Also allow referencing the value directly.
+                        if vtxt not in artifact_by_key:
+                            artifact_by_key[vtxt] = vtxt
+                        continue
+                    cand = os.path.join(rd, vtxt.lstrip('/'))
+                    if os.path.exists(cand):
+                        artifact_by_key[kk] = cand
+                        if vtxt not in artifact_by_key:
+                            artifact_by_key[vtxt] = cand
+                        flat0 = os.path.basename(vtxt)
+                        if flat0 and flat0 not in artifact_by_key:
+                            artifact_by_key[flat0] = cand
+                        continue
+                    flat = os.path.basename(vtxt)
+                    if flat:
+                        cand2 = os.path.join(rd, flat)
+                        if os.path.exists(cand2):
+                            artifact_by_key[kk] = cand2
+                            if vtxt not in artifact_by_key:
+                                artifact_by_key[vtxt] = cand2
+                            if flat not in artifact_by_key:
+                                artifact_by_key[flat] = cand2
+            except Exception:
+                continue
+
+        fallback_abs: str | None = None
+        try:
+            for _v in (artifact_by_key or {}).values():
+                if isinstance(_v, str) and _v.strip() and os.path.isabs(_v.strip()):
+                    fallback_abs = _v.strip()
+                    break
+        except Exception:
+            fallback_abs = None
+
+        if artifact_by_key:
+            for fa in (flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                injects = fa.get('inject_files') if isinstance(fa.get('inject_files'), list) else None
+                if not injects:
+                    continue
+                resolved: list[str] = []
+                for raw in injects:
+                    src, dest = _split_inject_spec_post(str(raw))
+                    src2 = src
+                    if src and (not os.path.isabs(src)) and src in artifact_by_key:
+                        src2 = artifact_by_key[src]
+                    # If still relative, try resolving directly against any run dir.
+                    if src2 and (not os.path.isabs(src2)):
+                        for rd in reversed(run_dirs):
+                            try:
+                                if not rd or not os.path.isdir(rd):
+                                    continue
+                                cand = os.path.join(rd, str(src2).lstrip('/'))
+                                if os.path.exists(cand):
+                                    src2 = cand
+                                    break
+                                flat = os.path.basename(str(src2))
+                                if flat:
+                                    cand2 = os.path.join(rd, flat)
+                                    if os.path.exists(cand2):
+                                        src2 = cand2
+                                        break
+                            except Exception:
+                                continue
+
+                    # If still not absolute, use any known absolute artifact as a last resort.
+                    try:
+                        if src2 and (not os.path.isabs(str(src2))) and fallback_abs:
+                            src2 = fallback_abs
+                    except Exception:
+                        pass
+                    if dest:
+                        resolved.append(f"{src2} -> {dest}")
+                    else:
+                        resolved.append(src2)
+                fa['inject_files'] = resolved
+    except Exception:
+        pass
 
     try:
         try:
@@ -41088,6 +41302,30 @@ def flag_generators_test_cleanup(run_id: str):
     try:
         if isinstance(meta, dict):
             meta['cleanup_requested'] = True
+            if meta.get('remote'):
+                try:
+                    channel = meta.get('ssh_channel')
+                    if channel is not None and hasattr(channel, 'close'):
+                        channel.close()
+                except Exception:
+                    pass
+                try:
+                    client_obj = meta.get('ssh_client')
+                    if client_obj is not None:
+                        client_obj.close()
+                except Exception:
+                    pass
+                try:
+                    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+                    remote_run_dir = str(meta.get('remote_run_dir') or '').strip()
+                    if core_cfg and remote_run_dir:
+                        _client = _open_ssh_client(core_cfg)
+                        try:
+                            _remote_remove_path(_client, remote_run_dir)
+                        finally:
+                            _client.close()
+                except Exception:
+                    pass
         proc = meta.get('proc') if isinstance(meta, dict) else None
         if proc and hasattr(proc, 'poll') and proc.poll() is None:
             try:
@@ -45398,6 +45636,237 @@ def _flagnodegen_run_dir_for_id(run_id: str) -> str:
     return os.path.join(_flag_node_generators_runs_dir(), rid)
 
 
+def _parse_flag_test_core_cfg_from_form(form: Any) -> Dict[str, Any] | None:
+    raw = str((form or {}).get('core') or '').strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f'Invalid core payload: {exc}') from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError('Invalid core payload: expected object')
+    core_cfg = _merge_core_configs(payload, include_password=True)
+    if not core_cfg.get('host'):
+        core_cfg['host'] = core_cfg.get('ssh_host') or '127.0.0.1'
+    if not core_cfg.get('port'):
+        core_cfg['port'] = CORE_PORT
+    return _require_core_ssh_credentials(core_cfg)
+
+
+def _ensure_core_vm_idle_for_test(core_cfg: Dict[str, Any]) -> None:
+    errors: list[str] = []
+    host = str(core_cfg.get('host') or '127.0.0.1')
+    port = int(core_cfg.get('port') or CORE_PORT)
+    sessions = _list_active_core_sessions(host, port, core_cfg, errors=errors, meta={})
+    if errors:
+        raise RuntimeError(f'Unable to verify CORE sessions: {errors[0]}')
+    if sessions:
+        raise RuntimeError('CORE VM has active session(s). Stop running scenario before testing.')
+
+
+def _download_remote_tree(sftp: Any, remote_root: str, local_root: str, *, skip_names: Optional[set[str]] = None) -> int:
+    copied = 0
+    skips = skip_names or set()
+    os.makedirs(local_root, exist_ok=True)
+    for entry in sftp.listdir_attr(remote_root):
+        name = str(getattr(entry, 'filename', '') or '').strip()
+        if not name or name in {'.', '..'} or name in skips:
+            continue
+        remote_path = _remote_path_join(remote_root, name)
+        local_path = os.path.join(local_root, name)
+        mode = int(getattr(entry, 'st_mode', 0) or 0)
+        if stat.S_ISDIR(mode):
+            copied += _download_remote_tree(sftp, remote_path, local_path, skip_names=skip_names)
+            continue
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        sftp.get(remote_path, local_path)
+        copied += 1
+    return copied
+
+
+def _sync_remote_flag_test_outputs(meta: Dict[str, Any]) -> None:
+    if not isinstance(meta, dict) or not meta.get('remote'):
+        return
+    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+    remote_run_dir = str(meta.get('remote_run_dir') or '').strip()
+    run_dir = str(meta.get('run_dir') or '').strip()
+    if not core_cfg or not remote_run_dir or not run_dir:
+        return
+    client = None
+    sftp = None
+    copied = 0
+    try:
+        client = _open_ssh_client(core_cfg)
+        sftp = client.open_sftp()
+        copied = _download_remote_tree(sftp, remote_run_dir, run_dir)
+        meta['remote_outputs_synced'] = True
+    except Exception as exc:
+        try:
+            app.logger.warning('[flag_test] remote output sync failed: %s', exc)
+        except Exception:
+            pass
+        return
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    try:
+        lp = str(meta.get('log_path') or '').strip()
+        if lp:
+            with open(lp, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[remote] synced outputs: {copied} file(s)\n")
+    except Exception:
+        pass
+
+
+def _start_remote_flag_test_process(
+    *,
+    run_id: str,
+    run_dir: str,
+    log_handle: Any,
+    kind: str,
+    generator_id: str,
+    cfg: Dict[str, Any],
+    core_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    ssh_client = _open_ssh_client(core_cfg)
+    sftp = ssh_client.open_sftp()
+    remote_repo_dir = _remote_static_repo_dir(sftp)
+    remote_runner_path = _remote_path_join(remote_repo_dir, 'scripts', 'run_flag_generator.py')
+
+    # Best-effort: keep remote static repo runner in sync with local.
+    # This avoids confusing drift when the webapp changes behavior (e.g., sudo prompt suppression).
+    try:
+        local_repo_root = _get_repo_root()
+        local_runner = os.path.join(local_repo_root, 'scripts', 'run_flag_generator.py')
+        if os.path.isfile(local_runner):
+            sftp.put(local_runner, remote_runner_path)
+    except Exception:
+        pass
+    sftp.stat(remote_runner_path)
+
+    remote_run_dir = _remote_path_join('/tmp/tests', f'flag-test-{run_id}')
+    _remote_mkdirs(ssh_client, remote_run_dir)
+    _remote_mkdirs(ssh_client, _remote_path_join(remote_run_dir, 'inputs'))
+
+    # Provide sudo password to the generator runner without exposing it in the process list.
+    # Do NOT rely on SSH AcceptEnv; instead, write a private env file and source it.
+    try:
+        sudo_pw = str(core_cfg.get('ssh_password') or '')
+    except Exception:
+        sudo_pw = ''
+    remote_env_path = _remote_path_join(remote_run_dir, '.coretg_env.sh')
+    try:
+        def _sh_single_quote(val: str) -> str:
+            # Safely embed arbitrary string into single-quoted shell literal.
+            return "'" + (val or '').replace("'", "'\\''") + "'"
+
+        env_lines = [
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            'export CORETG_DOCKER_USE_SUDO=1',
+            'export CORETG_DOCKER_HOST_NETWORK=1',
+            f"export CORETG_DOCKER_SUDO_PASSWORD={_sh_single_quote(sudo_pw)}",
+        ]
+        with sftp.open(remote_env_path, 'w') as fh:
+            fh.write('\n'.join(env_lines) + '\n')
+        _exec_ssh_command(ssh_client, f"chmod 600 {shlex.quote(remote_env_path)}")
+    except Exception:
+        # Best-effort only; if this fails, docker may still fail with permission denied.
+        remote_env_path = ''
+
+    local_inputs_dir = os.path.join(run_dir, 'inputs')
+    if os.path.isdir(local_inputs_dir):
+        for root, dirs, files in os.walk(local_inputs_dir):
+            rel = os.path.relpath(root, local_inputs_dir)
+            rel = '' if rel == '.' else rel
+            remote_root = _remote_path_join(remote_run_dir, 'inputs', rel) if rel else _remote_path_join(remote_run_dir, 'inputs')
+            _remote_mkdirs(ssh_client, remote_root)
+            for dn in dirs:
+                _remote_mkdirs(ssh_client, _remote_path_join(remote_root, dn))
+            for fn in files:
+                lp = os.path.join(root, fn)
+                rp = _remote_path_join(remote_root, fn)
+                if os.path.isfile(lp):
+                    sftp.put(lp, rp)
+
+    python_exec = _select_remote_python_interpreter(ssh_client, core_cfg)
+    config_payload = json.dumps(cfg, ensure_ascii=False)
+    prefix = ''
+    if remote_env_path:
+        prefix = f"set -a && source {shlex.quote(remote_env_path)} && set +a && "
+
+    cmd_inner = (
+        f"{prefix}cd {shlex.quote(remote_repo_dir)} && "
+        f"{shlex.quote(python_exec)} {shlex.quote(remote_runner_path)} "
+        f"--kind {shlex.quote(kind)} "
+        f"--generator-id {shlex.quote(generator_id)} "
+        f"--out-dir {shlex.quote(remote_run_dir)} "
+        f"--config {shlex.quote(config_payload)} "
+        f"--repo-root {shlex.quote(remote_repo_dir)}"
+    )
+    cmd = f"bash -lc {shlex.quote(cmd_inner)}"
+
+    channel = ssh_client.get_transport().open_session() if ssh_client.get_transport() else None
+    if channel is None:
+        raise RuntimeError('SSH channel unavailable')
+    try:
+        channel.get_pty()
+    except Exception:
+        pass
+
+    pw = sudo_pw
+    channel.exec_command(cmd)
+    relay_thread = threading.Thread(
+        target=_relay_remote_channel_to_log,
+        args=(channel, log_handle),
+        kwargs={'redact_tokens': [pw] if pw else []},
+        daemon=True,
+    )
+    relay_thread.start()
+    try:
+        sftp.close()
+    except Exception:
+        pass
+    return {
+        'ssh_client': ssh_client,
+        'ssh_channel': channel,
+        'ssh_log_thread': relay_thread,
+        'remote_run_dir': remote_run_dir,
+        'remote_repo_dir': remote_repo_dir,
+        'remote_env_path': remote_env_path,
+    }
+
+
+def _purge_remote_flag_test_dir(meta: Dict[str, Any]) -> None:
+    if not isinstance(meta, dict) or not meta.get('remote'):
+        return
+    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+    remote_run_dir = str(meta.get('remote_run_dir') or '').strip()
+    if not core_cfg or not remote_run_dir:
+        return
+    client = None
+    try:
+        client = _open_ssh_client(core_cfg)
+        _remote_remove_path(client, remote_run_dir)
+    except Exception:
+        return
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
 def _find_enabled_node_generator_by_id(generator_id: str) -> Optional[dict]:
     gid = (generator_id or '').strip()
     if not gid:
@@ -45576,6 +46045,134 @@ def flag_generators_test_run():
         except Exception:
             pass
         return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+    core_cfg: Dict[str, Any] | None = None
+    try:
+        core_cfg = _parse_flag_test_core_cfg_from_form(request.form)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'CORE VM SSH config required: {exc}'}), 400
+    if core_cfg:
+        try:
+            _ensure_core_vm_idle_for_test(core_cfg)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 409
+
+    if core_cfg:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[flaggen] starting {generator_id} (remote CORE VM)\n")
+                _write_sse_marker(log_f, 'phase', {'phase': 'starting', 'generator_id': generator_id, 'run_id': run_id, 'remote': True})
+        except Exception:
+            pass
+        try:
+            log_handle = open(log_path, 'a', encoding='utf-8')
+            remote_meta = _start_remote_flag_test_process(
+                run_id=run_id,
+                run_dir=run_dir,
+                log_handle=log_handle,
+                kind='flag-generator',
+                generator_id=generator_id,
+                cfg=cfg,
+                core_cfg=core_cfg,
+            )
+        except Exception as exc:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"[flaggen] failed to start remote run: {exc}\n")
+                    _write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+            except Exception:
+                pass
+            return jsonify({'ok': False, 'error': f"Failed launching remote generator: {exc}"}), 500
+
+        RUNS[run_id] = {
+            'proc': None,
+            'log_path': log_path,
+            'done': False,
+            'returncode': None,
+            'run_dir': run_dir,
+            'kind': 'flag_generator_test',
+            'generator_id': generator_id,
+            'remote': True,
+            'core_cfg': core_cfg,
+            'remote_run_dir': remote_meta.get('remote_run_dir'),
+            'remote_repo_dir': remote_meta.get('remote_repo_dir'),
+            'ssh_client': remote_meta.get('ssh_client'),
+            'ssh_channel': remote_meta.get('ssh_channel'),
+            'ssh_log_thread': remote_meta.get('ssh_log_thread'),
+            'ssh_log_handle': log_handle,
+            'cleanup_requested': False,
+        }
+
+        def _finalize_remote_flaggen(run_id_local: str):
+            meta = RUNS.get(run_id_local)
+            if not isinstance(meta, dict):
+                return
+            rc = -1
+            try:
+                ch = meta.get('ssh_channel')
+                if ch is not None:
+                    while True:
+                        try:
+                            if ch.exit_status_ready():
+                                rc = int(ch.recv_exit_status())
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.5)
+            finally:
+                meta['done'] = True
+                meta['returncode'] = rc
+                try:
+                    with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                        _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                except Exception:
+                    pass
+                try:
+                    if not meta.get('cleanup_requested'):
+                        _sync_remote_flag_test_outputs(meta)
+                except Exception:
+                    pass
+                try:
+                    _purge_remote_flag_test_dir(meta)
+                except Exception:
+                    pass
+                try:
+                    thread_obj = meta.get('ssh_log_thread')
+                    if thread_obj and hasattr(thread_obj, 'join'):
+                        thread_obj.join(timeout=3)
+                except Exception:
+                    pass
+                try:
+                    client_obj = meta.get('ssh_client')
+                    if client_obj:
+                        client_obj.close()
+                except Exception:
+                    pass
+                try:
+                    handle = meta.get('ssh_log_handle')
+                    if handle:
+                        handle.flush()
+                        handle.close()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_finalize_remote_flaggen,
+            args=(run_id,),
+            name=f'flaggen-remote-{run_id[:8]}',
+            daemon=True,
+        ).start()
+
+        try:
+            app.logger.info(
+                "[flaggen_test] remote run_id=%s run_dir=%s elapsed_ms=%s",
+                run_id,
+                run_dir,
+                int((time.time() - t0) * 1000),
+            )
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
 
     # Launch runner.
     repo_root = _get_repo_root()
@@ -45762,6 +46359,134 @@ def flag_node_generators_test_run():
             continue
     if missing:
         return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+    core_cfg: Dict[str, Any] | None = None
+    try:
+        core_cfg = _parse_flag_test_core_cfg_from_form(request.form)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'CORE VM SSH config required: {exc}'}), 400
+    if core_cfg:
+        try:
+            _ensure_core_vm_idle_for_test(core_cfg)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 409
+
+    if core_cfg:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[flagnodegen] starting {generator_id} (remote CORE VM)\n")
+                _write_sse_marker(log_f, 'phase', {'phase': 'starting', 'generator_id': generator_id, 'run_id': run_id, 'remote': True})
+        except Exception:
+            pass
+        try:
+            log_handle = open(log_path, 'a', encoding='utf-8')
+            remote_meta = _start_remote_flag_test_process(
+                run_id=run_id,
+                run_dir=run_dir,
+                log_handle=log_handle,
+                kind='flag-node-generator',
+                generator_id=generator_id,
+                cfg=cfg,
+                core_cfg=core_cfg,
+            )
+        except Exception as exc:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"[flagnodegen] failed to start remote run: {exc}\n")
+                    _write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+            except Exception:
+                pass
+            return jsonify({'ok': False, 'error': f"Failed launching remote generator: {exc}"}), 500
+
+        RUNS[run_id] = {
+            'proc': None,
+            'log_path': log_path,
+            'done': False,
+            'returncode': None,
+            'run_dir': run_dir,
+            'kind': 'flag_node_generator_test',
+            'generator_id': generator_id,
+            'remote': True,
+            'core_cfg': core_cfg,
+            'remote_run_dir': remote_meta.get('remote_run_dir'),
+            'remote_repo_dir': remote_meta.get('remote_repo_dir'),
+            'ssh_client': remote_meta.get('ssh_client'),
+            'ssh_channel': remote_meta.get('ssh_channel'),
+            'ssh_log_thread': remote_meta.get('ssh_log_thread'),
+            'ssh_log_handle': log_handle,
+            'cleanup_requested': False,
+        }
+
+        def _finalize_remote_flagnodegen(run_id_local: str):
+            meta = RUNS.get(run_id_local)
+            if not isinstance(meta, dict):
+                return
+            rc = -1
+            try:
+                ch = meta.get('ssh_channel')
+                if ch is not None:
+                    while True:
+                        try:
+                            if ch.exit_status_ready():
+                                rc = int(ch.recv_exit_status())
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.5)
+            finally:
+                meta['done'] = True
+                meta['returncode'] = rc
+                try:
+                    with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                        _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                except Exception:
+                    pass
+                try:
+                    if not meta.get('cleanup_requested'):
+                        _sync_remote_flag_test_outputs(meta)
+                except Exception:
+                    pass
+                try:
+                    _purge_remote_flag_test_dir(meta)
+                except Exception:
+                    pass
+                try:
+                    thread_obj = meta.get('ssh_log_thread')
+                    if thread_obj and hasattr(thread_obj, 'join'):
+                        thread_obj.join(timeout=3)
+                except Exception:
+                    pass
+                try:
+                    client_obj = meta.get('ssh_client')
+                    if client_obj:
+                        client_obj.close()
+                except Exception:
+                    pass
+                try:
+                    handle = meta.get('ssh_log_handle')
+                    if handle:
+                        handle.flush()
+                        handle.close()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_finalize_remote_flagnodegen,
+            args=(run_id,),
+            name=f'flagnodegen-remote-{run_id[:8]}',
+            daemon=True,
+        ).start()
+
+        try:
+            app.logger.info(
+                "[flagnodegen_test] remote run_id=%s run_dir=%s elapsed_ms=%s",
+                run_id,
+                run_dir,
+                int((time.time() - t0) * 1000),
+            )
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
 
     repo_root = _get_repo_root()
     runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
@@ -45950,6 +46675,32 @@ def flag_node_generators_test_cleanup(run_id: str):
         return jsonify({'ok': False, 'error': 'refusing'}), 400
 
     try:
+        if isinstance(meta, dict):
+            meta['cleanup_requested'] = True
+            if meta.get('remote'):
+                try:
+                    channel = meta.get('ssh_channel')
+                    if channel is not None and hasattr(channel, 'close'):
+                        channel.close()
+                except Exception:
+                    pass
+                try:
+                    client_obj = meta.get('ssh_client')
+                    if client_obj is not None:
+                        client_obj.close()
+                except Exception:
+                    pass
+                try:
+                    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+                    remote_run_dir = str(meta.get('remote_run_dir') or '').strip()
+                    if core_cfg and remote_run_dir:
+                        _client = _open_ssh_client(core_cfg)
+                        try:
+                            _remote_remove_path(_client, remote_run_dir)
+                        finally:
+                            _client.close()
+                except Exception:
+                    pass
         proc = meta.get('proc') if isinstance(meta, dict) else None
         if proc and hasattr(proc, 'poll') and proc.poll() is None:
             try:

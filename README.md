@@ -89,6 +89,15 @@ Expected success output includes:
 - `retry_run_id_before=<id>`
 - `retry_run_id_after=<different-id>`
 
+Live CORE credential parity smoke for flag tests:
+
+- Script: `python scripts/flag_test_core_e2e_check.py`
+	- Logs into Web UI, reads a CORE secret from `outputs/secrets/core`, runs both `/flag_generators_test/run` and `/flag_node_generators_test/run` with `core` credentials payload, polls outputs, and performs cleanup.
+	- Useful env vars: `CORETG_WEB_BASE`, `CORETG_WEB_USER`, `CORETG_WEB_PASS`, `CORETG_CORE_SECRET_ID`, `CORETG_SMOKE_POLL_SECONDS`.
+- Pytest gate for CI/live infra:
+	- `CORETG_RUN_LIVE_FLAG_CORE_SMOKE=1 pytest -q tests/test_flag_test_core_e2e_smoke.py`
+	- Skipped by default unless `CORETG_RUN_LIVE_FLAG_CORE_SMOKE=1` is set.
+
 ## Full Preview workflow
 1. **Save XML** – The editor auto-saves, but hitting “Save XML” ensures consistent previews.
 2. **(Optional) Set seed** – Enter an integer seed to get deterministic topology output.
