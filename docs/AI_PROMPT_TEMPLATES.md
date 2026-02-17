@@ -62,6 +62,13 @@ Execution parity requirements (must include in generated code/README):
   1. local runner test (`scripts/run_flag_generator.py`)
   2. installed-pack execute check (run through Flow/Execute and verify no generator warnings in run log)
 
+Compose + CORE docker-node constraints (important for `flag-node-generator` outputs):
+
+- Compose files attached to CORE docker nodes are treated as templates by CORE (Mako). Avoid docker-compose env interpolation like `${VAR}` / `${VAR:-default}` in the compose you ship unless you know it will be resolved before CORE consumes it.
+- Assume containers may run with `network_mode: none` enforced and may have no outbound internet.
+- Do not rely on `ports:` for connectivity between CORE nodes. Clients should connect to the server using the server node’s CORE IP.
+- Prefer single-port protocols (one TCP port) to reduce segmentation/firewall complexity.
+
 ---
 
 ## Prompt Template: flag-generator
@@ -145,6 +152,11 @@ Hard requirements (do not violate):
   - Do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
 - Deterministic outputs: same (seed, node_name, flag_prefix) => same outputs and compose.
 - Inputs (NOT artifacts): seed (required), node_name (required), flag_prefix (optional).
+
+CORE docker-node constraints:
+- Avoid `${...}` patterns in the emitted docker-compose.yml (CORE treats compose as a template and `${...}` can be interpreted as Mako).
+- Do not rely on `ports:` for in-CORE reachability; clients in CORE should connect to the node’s CORE IP.
+- Assume `network_mode: none` may be enforced; do not assume default Docker networking or internet access.
 
 Catalog intent:
 - inputs artifacts: <list artifacts or '(none)'>

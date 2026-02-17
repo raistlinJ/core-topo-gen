@@ -7,3 +7,9 @@ It will create an x64 binary file (named filename). If no filename is provided a
 The output of this generator is the binary file (maybe we need to add file as a type/reserved if it's not there).
 
 Please auto generate description, hints, etc. for this generator.
+
+CORE docker-node / compose restrictions to keep in mind (do not violate):
+- Avoid `${...}` in emitted docker-compose.yml (CORE treats compose as a template and `${...}` can be interpreted by Mako).
+- Do not rely on `ports:` mappings for in-CORE connectivity; other CORE nodes connect via the node’s CORE IP.
+- Assume docker-node services may run with `network_mode: none` and no outbound internet.
+- If implementing a network file service (e.g., NFS), prefer a userspace server and NFSv4-only (single TCP/2049) rather than kernel `nfsd` / NFSv3 (rpcbind/mountd).

@@ -756,7 +756,13 @@
             return null;
         }
     }
+ </script>
+
+<script>
+    // Injected by backend to help debug stale cached tabs.
+    window.__CORETG_UI_BUILD_ID = {{ (ui_build_id or '')|tojson }};
 </script>
+
 
 <!-- Graph libraries for Full Preview Modal -->
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
@@ -856,29 +862,12 @@
                                 Connection</button>
                         </div>
                     </div>
-                    <div class="form-check form-switch mt-3 d-none" id="executePushUpdateToggleWrap">
-                        <input class="form-check-input" type="checkbox" role="switch"
-                            id="executeConfirmPushUpdateToggle">
-                        <label class="form-check-label fw-semibold" for="executeConfirmPushUpdateToggle">Push updated
-                            backend (may take several minutes)</label>
-                        <div class="form-text" id="executeConfirmPushUpdateHelp">Sync the current repository snapshot to
-                            your CORE VM before execution.</div>
-                    </div>
                 </div>
 
                 <details class="border rounded-3 p-3 bg-body-tertiary mb-3 d-none" id="executeAdvancedWrap">
                     <summary class="fw-semibold">Advanced</summary>
                     <div class="small text-muted mt-2">Applies to remote execution only.</div>
                     <div class="mt-3 d-grid gap-2">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="executeAdvUploadOnlyInjectedArtifacts"
-                                checked>
-                            <label class="form-check-label" for="executeAdvUploadOnlyInjectedArtifacts">Upload only
-                                required files (instead of full artifacts)</label>
-                            <div class="form-text">Uploads only the plan's <span class="font-monospace">mount_dir</span>
-                                (typically <span class="font-monospace">.../injected</span>) instead of the full <span
-                                    class="font-monospace">artifacts_dir</span>.</div>
-                        </div>
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvFixDockerDaemon">
                             <label class="form-check-label" for="executeAdvFixDockerDaemon">Fix Docker daemon for CORE
@@ -16777,6 +16766,7 @@
                 error_detail: (data?.error_detail || '').toString().trim(),
                 error_code: (data?.error_code || '').toString().trim(),
             };
+            refreshExecuteSummaryIfVisible();
             if (data?.validation_summary && shouldUpdateValidationSummary(executeProgressState.validationSummary, data.validation_summary)) {
                 executeProgressState.validationSummary = data.validation_summary;
                 logExecuteValidationSummary(data.validation_summary);
@@ -17138,8 +17128,23 @@
         ensureExecuteSummaryElements();
         if (!executeSummaryListEl || !executeSummaryStatusEl) return;
         executeSummaryListEl.innerHTML = '';
+        const runStatus = (executeProgressState && executeProgressState.runStatus && typeof executeProgressState.runStatus === 'object')
+            ? executeProgressState.runStatus
+            : null;
         const summary = executeProgressState?.validationSummary;
         if (!summary || typeof summary !== 'object') {
+            const runDone = !!(runStatus && runStatus.done);
+            if (runStatus && !runDone) {
+                executeSummaryStatusEl.textContent = 'Waiting on CORE session result…';
+                if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.remove('d-none');
+                executeSummaryListEl.appendChild(renderExecuteSummaryItem(
+                    'CORE session result pending',
+                    false,
+                    'Waiting on CORE session result…',
+                    []
+                ));
+                return;
+            }
             executeSummaryStatusEl.textContent = 'Summarizing, please wait…';
             if (executeSummarySpinnerEl) executeSummarySpinnerEl.classList.remove('d-none');
             executeSummaryListEl.appendChild(renderExecuteSummaryItem('Validation summary available', false, 'No summary data received'));
@@ -17159,9 +17164,6 @@
             ));
             return;
         }
-        const runStatus = (executeProgressState && executeProgressState.runStatus && typeof executeProgressState.runStatus === 'object')
-            ? executeProgressState.runStatus
-            : null;
         const runReturnCode = Number.isFinite(Number(runStatus?.returncode)) ? Number(runStatus.returncode) : null;
         const runFailed = (success === false) || (runReturnCode !== null && runReturnCode !== 0);
         const runError = (runStatus?.error || summary.error || '').toString().trim();
@@ -17973,13 +17975,10 @@
             const info = detectLocalEmulation();
             const remoteSelected = isRemoteExecutionSelected();
             const selections = (typeof getExecuteConfirmSelections === 'function') ? getExecuteConfirmSelections() : null;
-            const pushPref = selections && typeof selections.pushPreference !== 'undefined'
-                ? !!selections.pushPreference
-                : (typeof getExecuteConfirmUpdateRemotePref === 'function' ? !!getExecuteConfirmUpdateRemotePref() : false);
             const remoteMode = remoteSelected ? 'REMOTE' : 'LOCAL';
             lines.push(`[ui] Mode: ${remoteMode}${remoteSelected ? (info.verified ? ' (verified)' : ' (not verified)') : ''}`);
             if (remoteSelected) {
-                lines.push(`[ui] Push updated backend: ${pushPref ? 'enabled' : 'disabled'}`);
+                lines.push('[ui] Repo sync: enabled');
                 try {
                     const adv = selections && selections.advanced && typeof selections.advanced === 'object' ? selections.advanced : null;
                     if (adv) {
@@ -19932,9 +19931,7 @@
         } catch (err) {
             form.append('core_json', '{}');
         }
-        if (options && options.updateRemoteRepo) {
-            form.append('update_remote_repo', '1');
-        }
+        // Repo sync behavior is enforced by backend for remote execution.
         try {
             const adv = options && typeof options.advanced === 'object' ? options.advanced : null;
             if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');
@@ -19945,7 +19942,6 @@
             if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
             if (adv && adv.startCoreDaemon) form.append('adv_start_core_daemon', '1');
             if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
-            if (adv && adv.uploadOnlyInjectedArtifacts) form.append('upload_only_injected_artifacts', '1');
         } catch (err) { /* ignore */ }
         try {
             const previewPlanPath = options && typeof options.previewPlanPath === 'string' ? options.previewPlanPath.trim() : '';
@@ -20294,6 +20290,8 @@
         const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
         const pollInterval = Math.max(500, options.intervalMs || 1500);
         let consecutiveUnknown = 0;
+        let everSawTracker = false;
+        let unknownSinceMs = null;
         let lastProgressKey = '';
         const statusUrl = buildRepoFinalizeStatusUrl(progressId);
         if (!statusUrl) {
@@ -20318,12 +20316,18 @@
             if (response.status === 200) {
                 const info = (await parseResponseJson(response)) || {};
                 consecutiveUnknown = 0;
+                everSawTracker = true;
+                unknownSinceMs = null;
                 try {
                     const key = JSON.stringify({
                         status: info?.status || null,
                         stage: info?.stage || null,
                         detail: info?.detail || null,
                         percent: (info?.percent !== undefined && info?.percent !== null) ? Number(info.percent) : null,
+                        done_bytes: (info?.done_bytes !== undefined && info?.done_bytes !== null) ? Number(info.done_bytes) : null,
+                        total_bytes: (info?.total_bytes !== undefined && info?.total_bytes !== null) ? Number(info.total_bytes) : null,
+                        done_files: (info?.done_files !== undefined && info?.done_files !== null) ? Number(info.done_files) : null,
+                        total_files: (info?.total_files !== undefined && info?.total_files !== null) ? Number(info.total_files) : null,
                     });
                     if (key != lastProgressKey) {
                         lastProgressKey = key;
@@ -20343,6 +20347,9 @@
                 }
             } else if (response.status === 404) {
                 consecutiveUnknown += 1;
+                if (unknownSinceMs === null) {
+                    unknownSinceMs = Date.now();
+                }
                 // Avoid spamming the same waiting message every poll.
                 if (consecutiveUnknown === 1) {
                     onProgress?.({ status: 'pending', stage: 'waiting', detail: 'Waiting for remote finalize tracker…' });
@@ -20350,6 +20357,15 @@
                 if (consecutiveUnknown === 5) {
                     onProgress?.({ status: 'pending', stage: 'waiting', detail: 'Remote finalize tracker unavailable; still waiting…' });
                 }
+                // If we previously saw the tracker but it vanished, treat this as an error
+                // (likely a web UI restart clearing in-memory progress) instead of waiting forever.
+                try {
+                    const ageMs = unknownSinceMs ? (Date.now() - unknownSinceMs) : 0;
+                    if (everSawTracker && ageMs >= 15000) {
+                        onProgress?.({ status: 'error', stage: 'waiting', detail: 'Remote finalize tracker disappeared (web UI likely restarted). Retry Execute to sync again.' });
+                        return false;
+                    }
+                } catch (e) { }
             } else {
                 const detail = await extractResponseDetail(response);
                 onProgress?.({ status: 'error', detail: detail || `Finalize status failed (HTTP ${response.status})` });
@@ -21433,6 +21449,11 @@
             };
         };
         appendExecuteDialogLog('runSyncWithModal() entered.');
+        try {
+            if (window.__CORETG_UI_BUILD_ID) {
+                appendExecuteDialogLog(`[ui] build=${String(window.__CORETG_UI_BUILD_ID)}`);
+            }
+        } catch (e) { }
         const stopUploadHeartbeat = () => {
             if (uploadHeartbeatTimer) {
                 clearInterval(uploadHeartbeatTimer);
@@ -21489,11 +21510,37 @@
                         try {
                             const stage = lastFinalizeInfo && lastFinalizeInfo.stage ? String(lastFinalizeInfo.stage) : '';
                             const status = lastFinalizeInfo && lastFinalizeInfo.status ? String(lastFinalizeInfo.status) : '';
-                            const detail = lastFinalizeInfo && lastFinalizeInfo.detail ? String(lastFinalizeInfo.detail) : '';
+                            const method = lastFinalizeInfo && lastFinalizeInfo.method ? String(lastFinalizeInfo.method) : '';
                             const parts = [];
                             if (status) parts.push(`status=${status}`);
                             if (stage) parts.push(`stage=${stage}`);
-                            if (detail && detail !== lastFinalizeDetail) parts.push(`detail=${detail}`);
+                            if (method) parts.push(`method=${method}`);
+
+                            // Prefer server-side transfer counters (repo sync), not the browser POST body size.
+                            const doneBytesRaw = (lastFinalizeInfo && lastFinalizeInfo.done_bytes !== undefined && lastFinalizeInfo.done_bytes !== null)
+                                ? Number(lastFinalizeInfo.done_bytes)
+                                : null;
+                            const totalBytesRaw = (lastFinalizeInfo && lastFinalizeInfo.total_bytes !== undefined && lastFinalizeInfo.total_bytes !== null)
+                                ? Number(lastFinalizeInfo.total_bytes)
+                                : null;
+                            const doneFilesRaw = (lastFinalizeInfo && lastFinalizeInfo.done_files !== undefined && lastFinalizeInfo.done_files !== null)
+                                ? Number(lastFinalizeInfo.done_files)
+                                : null;
+                            const totalFilesRaw = (lastFinalizeInfo && lastFinalizeInfo.total_files !== undefined && lastFinalizeInfo.total_files !== null)
+                                ? Number(lastFinalizeInfo.total_files)
+                                : null;
+                            const doneBytes = (typeof doneBytesRaw === 'number' && !Number.isNaN(doneBytesRaw) && doneBytesRaw >= 0) ? doneBytesRaw : null;
+                            const totalBytes = (typeof totalBytesRaw === 'number' && !Number.isNaN(totalBytesRaw) && totalBytesRaw > 0) ? totalBytesRaw : null;
+                            const doneFiles = (typeof doneFilesRaw === 'number' && !Number.isNaN(doneFilesRaw) && doneFilesRaw >= 0) ? doneFilesRaw : null;
+                            const totalFiles = (typeof totalFilesRaw === 'number' && !Number.isNaN(totalFilesRaw) && totalFilesRaw > 0) ? totalFilesRaw : null;
+                            if (totalBytes) {
+                                const portion = `${formatBytes(doneBytes || 0)} / ${formatBytes(totalBytes)}`;
+                                if (totalFiles) parts.push(`repo=${portion} (${doneFiles || 0} / ${totalFiles} files)`);
+                                else parts.push(`repo=${portion}`);
+                            } else if (totalFiles) {
+                                parts.push(`files=${doneFiles || 0} / ${totalFiles}`);
+                            }
+
                             if (parts.length) finalizeStageSuffix = ` [${parts.join(' | ')}]`;
                         } catch (e) { }
                         let staleSuffix = '';
@@ -21504,50 +21551,13 @@
                                 staleSuffix = ` [last update: ${ageSec}s ago]`;
                             }
                         } catch (e) { }
-                        let extraSuffix = '';
-                        try {
-                            const parts = [];
-                            if (lastFinalizeInfo) {
-                                if (lastFinalizeInfo.status) parts.push(`status=${lastFinalizeInfo.status}`);
-                                if (lastFinalizeInfo.stage) parts.push(`stage=${lastFinalizeInfo.stage}`);
-                                if (lastFinalizeInfo.detail && lastFinalizeInfo.detail !== lastFinalizeDetail) {
-                                    parts.push(`detail=${lastFinalizeInfo.detail}`);
-                                }
-                            }
-                            if (lastUploadStats) {
-                                const loaded = lastUploadStats.loaded || 0;
-                                const total = lastUploadStats.total || null;
-                                if (total) parts.push(`upload=${formatBytes(loaded)} / ${formatBytes(total)}`);
-                                else if (loaded) parts.push(`upload=${formatBytes(loaded)}`);
-                            }
-                            if (lastResponseStats) {
-                                const loaded = lastResponseStats.loaded || 0;
-                                const total = lastResponseStats.total || null;
-                                if (total) parts.push(`response=${formatBytes(loaded)} / ${formatBytes(total)}`);
-                                else if (loaded) parts.push(`response=${formatBytes(loaded)}`);
-                            }
-                            if (parts.length) {
-                                extraSuffix = ` [${parts.join(' | ')}]`;
-                            }
-                        } catch (e) { }
-                        appendExecuteDialogLog(`Finalizing on CORE host (${finalizeElapsed}s)${suffix}${finalizeStageSuffix}${staleSuffix}${extraSuffix}.`);
+                        appendExecuteDialogLog(`Finalizing on CORE host (${finalizeElapsed}s)${suffix}${finalizeStageSuffix}${staleSuffix}.`);
                     }
                     // Keep the status/meta line accurate while waiting.
                     try {
                         const parts = [];
                         if (lastFinalizeDetail) parts.push(lastFinalizeDetail);
-                        if (lastUploadStats) {
-                            const loaded = lastUploadStats.loaded || 0;
-                            const total = lastUploadStats.total || null;
-                            if (total) parts.push(`upload: ${formatBytes(loaded)} / ${formatBytes(total)}`);
-                            else if (loaded) parts.push(`upload: ${formatBytes(loaded)} transferred`);
-                        }
-                        if (lastResponseStats) {
-                            const loaded = lastResponseStats.loaded || 0;
-                            const total = lastResponseStats.total || null;
-                            if (total) parts.push(`response: ${formatBytes(loaded)} / ${formatBytes(total)}`);
-                            else if (loaded) parts.push(`response: ${formatBytes(loaded)} received`);
-                        }
+                        // Do not show browser POST transfer stats here; they’re unrelated to repo sync.
                         updateRunStatus('Finishing repository sync… (this may take a few minutes)', parts.length ? parts.join(' | ') : 'Remote finalize in progress…');
                     } catch (e) { }
                     return;
@@ -21700,10 +21710,33 @@
             const status = info.status || 'pending';
             const stage = info.stage || '';
             const detail = info.detail || stage || 'Remote finalize in progress…';
+
+            let transferMeta = '';
+            try {
+                const doneBytesRaw = (info.done_bytes !== undefined && info.done_bytes !== null) ? Number(info.done_bytes) : null;
+                const totalBytesRaw = (info.total_bytes !== undefined && info.total_bytes !== null) ? Number(info.total_bytes) : null;
+                const doneFilesRaw = (info.done_files !== undefined && info.done_files !== null) ? Number(info.done_files) : null;
+                const totalFilesRaw = (info.total_files !== undefined && info.total_files !== null) ? Number(info.total_files) : null;
+                const doneBytes = (typeof doneBytesRaw === 'number' && !Number.isNaN(doneBytesRaw) && doneBytesRaw >= 0) ? doneBytesRaw : null;
+                const totalBytes = (typeof totalBytesRaw === 'number' && !Number.isNaN(totalBytesRaw) && totalBytesRaw > 0) ? totalBytesRaw : null;
+                const doneFiles = (typeof doneFilesRaw === 'number' && !Number.isNaN(doneFilesRaw) && doneFilesRaw >= 0) ? doneFilesRaw : null;
+                const totalFiles = (typeof totalFilesRaw === 'number' && !Number.isNaN(totalFilesRaw) && totalFilesRaw > 0) ? totalFilesRaw : null;
+
+                if (totalBytes) {
+                    const portion = `${formatBytes(doneBytes || 0)} / ${formatBytes(totalBytes)}`;
+                    transferMeta = totalFiles ? `${portion} (${doneFiles || 0} / ${totalFiles} files)` : portion;
+                } else if (doneBytes) {
+                    transferMeta = `${formatBytes(doneBytes)} transferred`;
+                }
+            } catch (e) { }
+
             if (!finalizeAnnounced) {
                 finalizeAnnounced = true;
                 let uploadDetail = '';
-                if (lastUploadStats) {
+                // Prefer server-side transfer counters (rsync/SFTP delta) over the browser POST size.
+                if (transferMeta) {
+                    uploadDetail = transferMeta;
+                } else if (lastUploadStats) {
                     const loaded = lastUploadStats.loaded || 0;
                     const total = lastUploadStats.total || null;
                     if (total) uploadDetail = `${formatBytes(loaded)} / ${formatBytes(total)}`;
@@ -21732,7 +21765,8 @@
                 appendExecuteDialogLog(`Remote finalize step: ${stage}${detail ? ` — ${detail}` : ''}`);
             }
             if (detail) {
-                updateRunStatus('Finishing repository sync… (this may take a few minutes)', detail);
+                const merged = transferMeta ? `${detail} (${transferMeta})` : detail;
+                updateRunStatus('Finishing repository sync… (this may take a few minutes)', merged);
             }
             if (status === 'error') {
                 logError('Remote finalize reported an error; check server logs for details.');
@@ -21964,10 +21998,7 @@
             } else if (advancedFromOpts && typeof advancedFromOpts === 'object') {
                 formOptions.advanced = advancedFromOpts;
             }
-            try {
-                const injectedOnly = !!formOptions?.advanced?.uploadOnlyInjectedArtifacts;
-                appendExecuteDialogLog(`Remote upload mode: ${injectedOnly ? 'injected-only (mount_dir)' : 'full artifacts_dir'}`);
-            } catch (e) { }
+            try { appendExecuteDialogLog('Remote upload mode: full artifacts_dir'); } catch (e) { }
             const autoKillSessions = !!formOptions?.advanced?.autoKillSessions;
             const res = await submitRunCliRequest(
                 () => {
@@ -21976,9 +22007,6 @@
                             scenarios: state.scenarios,
                             core: getRunCoreConfig(true, scenarioIndexForRun),
                         }, { scenarioIndex: scenarioIndexForRun });
-                        if (updateRemoteRepo) {
-                            payload.update_remote_repo = true;
-                        }
                         try {
                             const adv = formOptions && typeof formOptions.advanced === 'object' ? formOptions.advanced : null;
                             if (adv && adv.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
@@ -21987,7 +22015,6 @@
                             if (adv && adv.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                             if (adv && adv.startCoreDaemon) payload.adv_start_core_daemon = true;
                             if (adv && adv.autoKillSessions) payload.adv_auto_kill_sessions = true;
-                            if (adv && adv.uploadOnlyInjectedArtifacts) payload.upload_only_injected_artifacts = true;
                         } catch (e) { }
                         return {
                             body: JSON.stringify(payload),
@@ -22404,19 +22431,13 @@
             // Show dock logs
             try { const showBtn = document.getElementById('dockShowBtn'); if (showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch (e) { }
             runProgressLogLine('[ui] Requesting remote CLI run…');
-            try {
-                const injectedOnly = !!advancedSelections?.uploadOnlyInjectedArtifacts;
-                runProgressLogLine(`[ui] Remote upload mode: ${injectedOnly ? 'injected-only (mount_dir)' : 'full artifacts_dir'}`);
-            } catch (e) { }
+            try { runProgressLogLine('[ui] Remote upload mode: full artifacts_dir'); } catch (e) { }
             const seededStatusEl = document.getElementById('runProgressStatus');
             if (seededStatusEl) seededStatusEl.textContent = 'Preparing remote workspace…';
             const statusMetaEl = document.getElementById('runProgressMeta');
             if (statusMetaEl) statusMetaEl.textContent = 'Submitting run request to CORE host…';
             const buildRequest = () => {
                 const payload = enrichPayloadWithScenarioContext({ xml_path: rp, seed: seedVal, core: getRunCoreConfig(true, scenarioIdx) });
-                if (sendUpdateRemoteFlag) {
-                    payload.update_remote_repo = true;
-                }
                 try {
                     if (advancedSelections && typeof advancedSelections === 'object') {
                         if (advancedSelections.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
@@ -22425,7 +22446,6 @@
                         if (advancedSelections.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                         if (advancedSelections.startCoreDaemon) payload.adv_start_core_daemon = true;
                         if (advancedSelections.autoKillSessions) payload.adv_auto_kill_sessions = true;
-                        if (advancedSelections.uploadOnlyInjectedArtifacts) payload.upload_only_injected_artifacts = true;
                     }
                 } catch (e) { }
                 return {

@@ -17,9 +17,10 @@ services:
         # to install it. (On offline CORE docker nodes this may still fail; prefer
         # wrapper-build + host-side preflight where possible.)
         if ! command -v ip >/dev/null 2>&1; then
-          apt-get update -y
-          apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3
-          rm -rf /var/lib/apt/lists/*
+          echo "[coretg] warning: iproute2 missing; attempting apt-get (may fail offline)" >&2
+          apt-get update -y || true
+          apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true
+          rm -rf /var/lib/apt/lists/* || true
         fi
 
         sleep infinity

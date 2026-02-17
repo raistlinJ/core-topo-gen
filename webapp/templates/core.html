@@ -873,7 +873,25 @@ current_user.is_authenticated) else '' %}
     bar.textContent = pct + '%';
     document.getElementById('progressStatusText').textContent = `${done} of ${total}`;
     if (msg) {
-      const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+      const fmt = (typeof window.coretgFormatLogTs === 'function')
+        ? window.coretgFormatLogTs
+        : ((d) => {
+            try {
+              const pad2 = (n) => String(n).padStart(2, '0');
+              const pad3 = (n) => String(n).padStart(3, '0');
+              const yyyy = d.getFullYear();
+              const mm = pad2(d.getMonth() + 1);
+              const dd = pad2(d.getDate());
+              const hh = pad2(d.getHours());
+              const mi = pad2(d.getMinutes());
+              const ss = pad2(d.getSeconds());
+              const ms = pad3(d.getMilliseconds());
+              return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss},${ms}`;
+            } catch (e) {
+              return '';
+            }
+          });
+      const line = `[${fmt(new Date())}] ${msg}\n`;
       document.getElementById('progressLog').textContent += line;
       try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: 'INFO', message: msg } })); } catch (e) { }
     }

@@ -11,6 +11,27 @@ from pathlib import Path
 from typing import Any
 
 
+def _docker_executable() -> str:
+    """Return a docker executable path.
+
+    In remote SSH runs (non-interactive shells), PATH may be minimal and
+    `shutil.which('docker')` can fail even when docker exists at /usr/bin/docker.
+    """
+    try:
+        exe = shutil.which('docker')
+        if exe:
+            return exe
+    except Exception:
+        pass
+    for cand in ('/usr/bin/docker', '/usr/local/bin/docker', '/bin/docker', '/snap/bin/docker'):
+        try:
+            if os.path.exists(cand) and os.access(cand, os.X_OK):
+                return cand
+        except Exception:
+            continue
+    return 'docker'
+
+
 def repo_root_from_here() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -29,14 +50,20 @@ def _docker_sudo_password() -> str | None:
 
 
 def _wrap_docker_cmd(cmd: list[str]) -> tuple[list[str], str | None]:
-    if not cmd or cmd[0] != 'docker':
+    if not cmd:
+        return cmd, None
+    try:
+        is_docker = os.path.basename(str(cmd[0])) == 'docker'
+    except Exception:
+        is_docker = False
+    if not is_docker:
         return cmd, None
     use_sudo = _docker_use_sudo() or (_docker_sudo_password() is not None)
     if not use_sudo:
         return cmd, None
     pw = _docker_sudo_password()
     if pw is None:
-        return ['sudo', '-E'] + cmd, None
+        return ['sudo', '-n', '-E'] + cmd, None
     # Use a blank prompt to avoid emitting "[sudo] password for ..." into logs.
     # Use -k to force a password read (so we can supply via stdin reliably).
     return ['sudo', '-E', '-S', '-p', '', '-k'] + cmd, (pw + '\n')
@@ -709,16 +736,27 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
 
 
 def run_cmd(cmd: list[str], workdir: Path, env: dict[str, str]) -> None:
+    try:
+        docker_timeout = float(os.getenv('CORETG_RUN_FLAG_GENERATOR_DOCKER_TIMEOUT', '180') or 180)
+    except Exception:
+        docker_timeout = 180
     wrapped_cmd, stdin_data = _wrap_docker_cmd(cmd)
-    p = subprocess.run(
-        wrapped_cmd,
-        cwd=str(workdir),
-        env={**os.environ, **env},
-        check=False,
-        text=True,
-        capture_output=True,
-        input=stdin_data,
-    )
+    try:
+        p = subprocess.run(
+            wrapped_cmd,
+            cwd=str(workdir),
+            env={**os.environ, **env},
+            check=False,
+            text=True,
+            capture_output=True,
+            input=stdin_data,
+            timeout=docker_timeout if docker_timeout > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(
+            f"docker command timed out after {docker_timeout:.0f}s: {' '.join(wrapped_cmd)}\n"
+            f"Hint: set CORETG_RUN_FLAG_GENERATOR_DOCKER_TIMEOUT to a higher value (seconds)."
+        ) from exc
     out = (p.stdout or '').strip()
     err = (p.stderr or '').strip()
     if out:
@@ -734,6 +772,10 @@ def run_cmd(cmd: list[str], workdir: Path, env: dict[str, str]) -> None:
 
 
 def run_cmd_capture(cmd: list[str], workdir: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    try:
+        docker_timeout = float(os.getenv('CORETG_RUN_FLAG_GENERATOR_DOCKER_TIMEOUT', '180') or 180)
+    except Exception:
+        docker_timeout = 180
     wrapped_cmd, stdin_data = _wrap_docker_cmd(cmd)
     return subprocess.run(
         wrapped_cmd,
@@ -743,6 +785,7 @@ def run_cmd_capture(cmd: list[str], workdir: Path, env: dict[str, str]) -> subpr
         capture_output=True,
         text=True,
         input=stdin_data,
+        timeout=docker_timeout if docker_timeout > 0 else None,
     )
 
 
@@ -779,7 +822,7 @@ def run_compose(
     }
 
     cmd = [
-        "docker",
+        _docker_executable(),
         "compose",
         "-f",
         str(compose_path),
@@ -800,7 +843,7 @@ def run_compose(
         # Since each run uses a fresh project name, we must tear down explicitly
         # to avoid exhausting Docker's default address pools.
         down_cmd = [
-            "docker",
+            _docker_executable(),
             "compose",
             "-f",
             str(compose_path),

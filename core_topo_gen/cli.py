@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import shutil
+import select
 from xml.etree import ElementTree as ET
 from typing import Any, Dict, Tuple
 
@@ -87,7 +88,29 @@ def _core_state_str(value: Any) -> str:
             return str(core_pb2.SessionState.Name(int(text))).strip().lower()
         except Exception:
             pass
-    return text.lower()
+    try:
+        low = text.lower()
+        # Normalize common CORE variants like RUNTIME_STATE -> runtime_state
+        low = low.replace('-', '_').replace(' ', '_')
+        while '__' in low:
+            low = low.replace('__', '_')
+        return low
+    except Exception:
+        return text.lower()
+
+
+def _is_runtime_state(state: str) -> bool:
+    s = str(state or '').strip().lower().replace('-', '_').replace(' ', '_')
+    while '__' in s:
+        s = s.replace('__', '_')
+    return s in {'runtime', 'runtime_state'}
+
+
+def _is_shutdown_state(state: str) -> bool:
+    s = str(state or '').strip().lower().replace('-', '_').replace(' ', '_')
+    while '__' in s:
+        s = s.replace('__', '_')
+    return s in {'shutdown', 'shutdown_state'}
 
 
 def _docker_container_state(name: str) -> dict[str, Any]:
@@ -141,6 +164,152 @@ def _docker_container_state(name: str) -> dict[str, Any]:
     }
 
 
+def _docker_container_config(name: str) -> dict[str, Any]:
+    """Best-effort docker inspect config for a container name."""
+    name = str(name or '').strip()
+    if not name:
+        return {'name': name, 'exists': False, 'image': None, 'cmd': None, 'entrypoint': None, 'error': 'empty name'}
+    if not shutil.which('docker'):
+        return {'name': name, 'exists': None, 'image': None, 'cmd': None, 'entrypoint': None, 'error': 'docker not found'}
+    try:
+        p = subprocess.run(
+            ['docker', 'inspect', '--format', '{{json .Config}}', name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+    except Exception as exc:
+        return {'name': name, 'exists': False, 'image': None, 'cmd': None, 'entrypoint': None, 'error': f'{exc.__class__.__name__}: {exc}'}
+    if p.returncode != 0:
+        return {
+            'name': name,
+            'exists': False,
+            'image': None,
+            'cmd': None,
+            'entrypoint': None,
+            'error': (p.stdout or '').strip() or f'docker inspect failed rc={p.returncode}',
+        }
+    raw = (p.stdout or '').strip()
+    try:
+        cfg = json.loads(raw) if raw else {}
+    except Exception:
+        cfg = {}
+    image = None
+    cmd = None
+    entrypoint = None
+    try:
+        if isinstance(cfg, dict):
+            image = cfg.get('Image')
+            cmd = cfg.get('Cmd')
+            entrypoint = cfg.get('Entrypoint')
+    except Exception:
+        pass
+    return {
+        'name': name,
+        'exists': True,
+        'image': str(image) if image is not None else None,
+        'cmd': cmd,
+        'entrypoint': entrypoint,
+        'error': None,
+    }
+
+
+def _expected_container_config_from_compose(compose_path: str, service: str) -> dict[str, Any] | None:
+    """Best-effort parse of expected image/cmd/entrypoint from a compose YAML."""
+    p = str(compose_path or '').strip()
+    svc = str(service or '').strip()
+    if not p or not svc or not os.path.exists(p):
+        return None
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+            obj = yaml.safe_load(fh) or {}
+    except Exception:
+        return None
+    services = obj.get('services') if isinstance(obj, dict) else None
+    if not isinstance(services, dict):
+        return None
+    body = services.get(svc)
+    if not isinstance(body, dict):
+        return None
+    out: dict[str, Any] = {'service': svc, 'compose_path': p}
+    try:
+        if isinstance(body.get('image'), str):
+            out['image'] = body.get('image')
+    except Exception:
+        pass
+    try:
+        if body.get('command') is not None:
+            out['command'] = body.get('command')
+    except Exception:
+        pass
+    try:
+        if body.get('entrypoint') is not None:
+            out['entrypoint'] = body.get('entrypoint')
+    except Exception:
+        pass
+    return out
+
+
+def _maybe_seed_docker_sudo_password_from_stdin() -> None:
+    """Best-effort read a sudo password from stdin into CORETG_DOCKER_SUDO_PASSWORD.
+
+    The Web UI's remote runner can supply the SSH password on stdin (so it isn't placed
+    on the command line). CORE topo-gen also spawns subprocesses (e.g.
+    `scripts/run_flag_generator.py`) that only read the password from the environment.
+
+    This function bridges that gap for remote SSH runs.
+    """
+    try:
+        if str(os.getenv('CORETG_DOCKER_SUDO_PASSWORD') or '').strip():
+            return
+        flag = str(os.getenv('CORETG_DOCKER_SUDO_PASSWORD_STDIN') or '').strip().lower()
+        if flag not in ('1', 'true', 'yes', 'y', 'on'):
+            return
+        if sys.stdin is None:
+            return
+        # Avoid blocking if stdin isn't a pipe/pty with data.
+        r, _w, _x = select.select([sys.stdin], [], [], 0.2)
+        if not r:
+            return
+        line = sys.stdin.readline()
+        pw = (line or '').rstrip('\n')
+        if pw.strip():
+            os.environ['CORETG_DOCKER_SUDO_PASSWORD'] = pw
+    except Exception:
+        return
+
+
+def _docker_compose_restart_service(compose_path: str, service: str, *, timeout_s: float = 120.0) -> dict[str, Any]:
+    """Best-effort restart a single service from a compose file.
+
+    Intended as a recovery path when CORE starts a Docker node before our compose
+    override has taken effect (leading to "vanilla" containers).
+    """
+    p = str(compose_path or '').strip()
+    svc = str(service or '').strip()
+    if not p or not svc:
+        return {'ok': False, 'error': 'empty compose/service', 'compose_path': p, 'service': svc}
+    if not os.path.exists(p):
+        return {'ok': False, 'error': 'compose missing', 'compose_path': p, 'service': svc}
+    if not shutil.which('docker'):
+        return {'ok': False, 'error': 'docker not found', 'compose_path': p, 'service': svc}
+
+    cmd = ['docker', 'compose', '-f', p, 'up', '-d', svc]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=float(timeout_s or 120))
+    except Exception as exc:
+        return {'ok': False, 'error': f'{exc.__class__.__name__}: {exc}', 'compose_path': p, 'service': svc, 'cmd': cmd}
+    out = (proc.stdout or '').strip()
+    if proc.returncode != 0:
+        return {'ok': False, 'error': f'docker compose up rc={proc.returncode}', 'compose_path': p, 'service': svc, 'cmd': cmd, 'output': out[-2400:]}
+    return {'ok': True, 'compose_path': p, 'service': svc, 'cmd': cmd, 'output': out[-2400:]}
+
+
 def _wait_for_docker_running(
     names: list[str],
     *,
@@ -177,6 +346,48 @@ def _wait_for_docker_running(
     return {'total': len(names), 'running': running2, 'not_running': not_running2, 'items': last_items}
 
 
+def _tail_core_daemon_journal(*, lines: int = 200, since_seconds: int = 300) -> str | None:
+    """Best-effort capture of recent core-daemon logs when running on the CORE VM.
+
+    This is a diagnostic fallback only. gRPC session state is still the primary signal.
+    """
+    try:
+        if sys.platform != 'linux':
+            return None
+        if not shutil.which('journalctl'):
+            return None
+    except Exception:
+        return None
+
+    try:
+        n = int(lines)
+    except Exception:
+        n = 200
+    n = max(50, min(n, 2000))
+    try:
+        since_s = int(since_seconds)
+    except Exception:
+        since_s = 300
+    since_s = max(30, min(since_s, 3600))
+
+    cmd = [
+        'journalctl',
+        '--no-pager',
+        '-u',
+        'core-daemon',
+        '-n',
+        str(n),
+        '--since',
+        f"-{since_s} seconds",
+    ]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+    except Exception:
+        return None
+    out = (p.stdout or '').strip()
+    return out or None
+
+
 def _get_core_session_state(core: Any, session_id: int) -> str:
     try:
         sessions = core.get_sessions() or []
@@ -200,11 +411,26 @@ def _wait_for_core_runtime(core: Any, session_id: int, *, timeout_s: float = 30.
         state = _get_core_session_state(core, session_id)
         if state:
             last_state = state
-        if state in {'runtime'}:
+        if _is_runtime_state(state):
             return True, state
-        if state in {'shutdown'}:
+        if _is_shutdown_state(state):
             return False, state
         time.sleep(max(0.05, float(poll_s)))
+
+    # Fallback (CORE VM): gRPC state readback can be flaky; trust core-daemon state transition log.
+    try:
+        tail = _tail_core_daemon_journal(lines=200, since_seconds=int(max(30.0, float(timeout_s))) + 120)
+        if tail:
+            needle = f"changing session({int(session_id)}) to state runtime_state"
+            for line in tail.splitlines():
+                ln = line.strip().lower().replace('-', '_').replace(' ', '_')
+                if needle in ln:
+                    return True, 'runtime_state'
+                # Accept uppercase original too (without normalization artifacts)
+                if f"changing session({int(session_id)}) to state runtime" in ln:
+                    return True, 'runtime'
+    except Exception:
+        pass
     return False, last_state
 
 
@@ -471,6 +697,18 @@ def main():
     )
     ap.add_argument("--max-nodes", type=int, default=None, help="Optional cap on hosts to create")
     ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    ap.add_argument(
+        "--start-timeout-s",
+        type=float,
+        default=None,
+        help="Max seconds to wait for CORE session to reach RUNTIME (default: 120; env: CORETG_CORE_START_TIMEOUT_S)",
+    )
+    ap.add_argument(
+        "--docker-wait-s",
+        type=float,
+        default=None,
+        help="Max seconds to wait for Docker containers to become running (default: 180; env: CORETG_DOCKER_WAIT_RUNNING_S)",
+    )
     ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible topology randomness")
     ap.add_argument("--preview", action="store_true", help="Parse and plan only; output plan summary JSON and exit 0")
     ap.add_argument("--preview-full", action="store_true", help="Generate a full dry-run plan (routers, hosts, IPs, services, vulnerabilities, segmentation) without contacting CORE; implies --preview style output")
@@ -551,6 +789,10 @@ def main():
         help="Automatically remove conflicting Docker containers/images instead of prompting",
     )
     args = ap.parse_args()
+
+    # Remote SSH runner may provide sudo password on stdin; make it available to
+    # docker-invoking subprocesses (e.g. flag-node-generators) via env.
+    _maybe_seed_docker_sudo_password_from_stdin()
 
     preview_payload: Dict[str, Any] | None = None
     preview_full: Dict[str, Any] | None = None
@@ -1563,6 +1805,14 @@ def main():
                     except Exception:
                         docker_ok = False
                     if not docker_ok:
+                        for cand in ('/usr/bin/docker', '/usr/local/bin/docker', '/bin/docker', '/snap/bin/docker'):
+                            try:
+                                if os.path.exists(cand) and os.access(cand, os.X_OK):
+                                    docker_ok = True
+                                    break
+                            except Exception:
+                                continue
+                    if not docker_ok:
                         return False, 'docker not found'
                     cmd = [
                         sys.executable or 'python',
@@ -1603,63 +1853,74 @@ def main():
                         return False, f'generator exception: {exc}'
 
             if standard_nodes:
-                # If any flag-node-generators are enabled, use them to generate per-node docker-compose
-                # for the explicit Docker role nodes (these are DOCKER-type nodes, not vulnerability nodes).
-                node_gens = _load_enabled_flag_node_generators(repo_root)
-                usable = [g for g in (node_gens or []) if isinstance(g.get('compose'), dict)]
+                # Optional: auto-run flag-node-generators for explicit Docker role nodes.
+                # Default OFF because it overrides per-node plan intent (e.g., Flow chains where only
+                # a single node should get a node-generator compose).
+                try:
+                    auto_nodegen = str(os.getenv('CORETG_CLI_AUTO_FLAG_NODEGEN', '0') or '0').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                except Exception:
+                    auto_nodegen = False
 
-                if usable:
-                    # Round-robin generator assignment across standard docker nodes.
-                    usable.sort(key=lambda g: str(g.get('id') or ''))
-                    try:
-                        base_seed = int(getattr(args, 'seed', 0) or 0)
-                    except Exception:
-                        base_seed = 0
-                    scenario_tag = str(os.getenv('CORETG_SCENARIO_TAG') or '').strip()
-                    if not scenario_tag:
-                        scenario_tag = str(getattr(args, 'scenario', '') or 'scenario').strip() or 'scenario'
-                    scenario_tag = ''.join([c for c in scenario_tag if c.isalnum() or c in ('-', '_')])[:40] or 'scenario'
+                if auto_nodegen:
+                    # If any flag-node-generators are enabled, use them to generate per-node docker-compose
+                    # for the explicit Docker role nodes (these are DOCKER-type nodes, not vulnerability nodes).
+                    node_gens = _load_enabled_flag_node_generators(repo_root)
+                    usable = [g for g in (node_gens or []) if isinstance(g.get('compose'), dict)]
 
-                    updated = {}
-                    for idx, (nm, _rec) in enumerate(sorted(standard_nodes.items(), key=lambda x: str(x[0]))):
-                        gen = usable[idx % max(1, len(usable))]
-                        gen_id = str(gen.get('id') or '').strip()
-                        if not gen_id:
-                            continue
-                        out_dir = os.path.join('/tmp/vulns', 'flag_node_generators_runs', f"cli-{scenario_tag}-{nm}")
+                    if usable:
+                        # Round-robin generator assignment across standard docker nodes.
+                        usable.sort(key=lambda g: str(g.get('id') or ''))
                         try:
-                            if os.path.exists(out_dir):
-                                import shutil
-                                shutil.rmtree(out_dir)
-                            os.makedirs(out_dir, exist_ok=True)
+                            base_seed = int(getattr(args, 'seed', 0) or 0)
                         except Exception:
-                            pass
-                        cfg = {
-                            'seed': f"{base_seed}:{scenario_tag}:{nm}:{gen_id}",
-                            'node_name': nm,
-                        }
-                        ok_run, note = _run_flag_node_generator(gen_id, out_dir=out_dir, config=cfg)
-                        compose_src = os.path.join(out_dir, 'docker-compose.yml')
-                        if ok_run and os.path.exists(compose_src):
-                            updated[nm] = {
-                                'Type': 'docker-compose',
-                                'Name': str(gen.get('name') or gen_id),
-                                'Path': compose_src,
-                                'Vector': 'flag-nodegen',
-                                'ScenarioTag': scenario_tag,
-                            }
-                        else:
-                            logging.warning("Flag-node-generator failed for node=%s gen=%s: %s", nm, gen_id, note)
+                            base_seed = 0
+                        scenario_tag = str(os.getenv('CORETG_SCENARIO_TAG') or '').strip()
+                        if not scenario_tag:
+                            scenario_tag = str(getattr(args, 'scenario', '') or 'scenario').strip() or 'scenario'
+                        scenario_tag = ''.join([c for c in scenario_tag if c.isalnum() or c in ('-', '_')])[:40] or 'scenario'
 
-                    if updated:
-                        # Replace the standard compose records for those nodes so compose prep uses the generated templates.
-                        for nm, rec in updated.items():
-                            standard_nodes[nm] = rec
+                        updated = {}
+                        for idx, (nm, _rec) in enumerate(sorted(standard_nodes.items(), key=lambda x: str(x[0]))):
+                            gen = usable[idx % max(1, len(usable))]
+                            gen_id = str(gen.get('id') or '').strip()
+                            if not gen_id:
+                                continue
+                            out_dir = os.path.join('/tmp/vulns', 'flag_node_generators_runs', f"cli-{scenario_tag}-{nm}")
                             try:
-                                if 'docker_by_name' in locals() and isinstance(docker_by_name, dict):
-                                    docker_by_name[nm] = rec
+                                if os.path.exists(out_dir):
+                                    import shutil
+                                    shutil.rmtree(out_dir)
+                                os.makedirs(out_dir, exist_ok=True)
                             except Exception:
                                 pass
+                            cfg = {
+                                'seed': f"{base_seed}:{scenario_tag}:{nm}:{gen_id}",
+                                'node_name': nm,
+                            }
+                            ok_run, note = _run_flag_node_generator(gen_id, out_dir=out_dir, config=cfg)
+                            compose_src = os.path.join(out_dir, 'docker-compose.yml')
+                            if ok_run and os.path.exists(compose_src):
+                                updated[nm] = {
+                                    'Type': 'docker-compose',
+                                    'Name': str(gen.get('name') or gen_id),
+                                    'Path': compose_src,
+                                    'Vector': 'flag-nodegen',
+                                    'ScenarioTag': scenario_tag,
+                                }
+                            else:
+                                logging.warning("Flag-node-generator failed for node=%s gen=%s: %s", nm, gen_id, note)
+
+                        if updated:
+                            # Replace the standard compose records for those nodes so compose prep uses the generated templates.
+                            for nm, rec in updated.items():
+                                standard_nodes[nm] = rec
+                                try:
+                                    if 'docker_by_name' in locals() and isinstance(docker_by_name, dict):
+                                        docker_by_name[nm] = rec
+                                except Exception:
+                                    pass
+                else:
+                    logging.info('Auto flag-node-generator assignment disabled (set CORETG_CLI_AUTO_FLAG_NODEGEN=1 to enable)')
 
                 # Ensure ScenarioTag is present so wrapper images are scoped.
                 try:
@@ -1839,6 +2100,26 @@ def main():
     session_state = ''
     docker_runtime: dict[str, Any] | None = None
     start_error: str | None = None
+
+    # Timeouts: allow overrides for slow CORE startups / slow docker pulls.
+    try:
+        core_start_timeout_s = float(
+            args.start_timeout_s
+            if getattr(args, 'start_timeout_s', None) is not None
+            else (os.getenv('CORETG_CORE_START_TIMEOUT_S') or 120.0)
+        )
+    except Exception:
+        core_start_timeout_s = 120.0
+    try:
+        docker_wait_s = float(
+            args.docker_wait_s
+            if getattr(args, 'docker_wait_s', None) is not None
+            else (os.getenv('CORETG_DOCKER_WAIT_RUNNING_S') or 180.0)
+        )
+    except Exception:
+        docker_wait_s = 180.0
+    core_start_timeout_s = max(5.0, min(core_start_timeout_s, 600.0))
+    docker_wait_s = max(5.0, min(docker_wait_s, 600.0))
     try:
         logging.info("PHASE: Start CORE session")
         # Preflight: check for conflicting Docker containers/images for any compose-based Docker nodes.
@@ -1974,7 +2255,7 @@ def main():
 
         # Validate that CORE reaches runtime.
         if start_ok and session_id is not None:
-            ok_runtime, st = _wait_for_core_runtime(core, int(session_id), timeout_s=30.0, poll_s=0.5)
+            ok_runtime, st = _wait_for_core_runtime(core, int(session_id), timeout_s=core_start_timeout_s, poll_s=0.5)
             session_state = st
             if not ok_runtime:
                 start_ok = False
@@ -1995,10 +2276,137 @@ def main():
                 docker_names2 = []
             docker_names2 = sorted(set([n for n in docker_names2 if n]))
             if docker_names2:
-                docker_runtime = _wait_for_docker_running(docker_names2, timeout_s=30.0, poll_s=0.5)
+                docker_runtime = _wait_for_docker_running(docker_names2, timeout_s=docker_wait_s, poll_s=0.5)
                 if docker_runtime.get('not_running'):
                     start_ok = False
                     start_error = f"Docker node(s) not running: {', '.join(docker_runtime.get('not_running') or [])}"
+
+            # Strict: ensure flag-node-generator derived docker nodes are running the intended compose service.
+            # This prevents intermittent outcomes where CORE starts the default "sleep" container before we swap
+            # in the generated compose metadata.
+            if start_ok and docker_names2:
+                try:
+                    strict_vecs = {'flag-nodegen', 'flag', 'flag-node-generator'}
+                    mismatches: list[dict[str, Any]] = []
+                    for nm in docker_names2:
+                        rec = docker_by_name.get(nm) if isinstance(docker_by_name, dict) else None
+                        vec = str((rec or {}).get('Vector') or '').strip().lower() if isinstance(rec, dict) else ''
+                        if vec and vec not in strict_vecs:
+                            continue
+                        # Generated per-node compose path (CORE host path).
+                        compose_path = f"/tmp/vulns/docker-compose-{nm}.yml"
+                        expected = _expected_container_config_from_compose(compose_path, service=str(nm))
+                        actual = _docker_container_config(nm)
+                        if expected is None:
+                            # If we can't read compose locally, don't block (best-effort).
+                            continue
+                        exp_img = str(expected.get('image') or '').strip()
+                        act_img = str(actual.get('image') or '').strip()
+                        if exp_img and act_img and exp_img != act_img:
+                            mismatches.append({'name': nm, 'expected': expected, 'actual': actual})
+                            continue
+                        # If compose sets an explicit command/entrypoint, ensure it matches.
+                        if 'command' in expected and expected.get('command') is not None:
+                            if actual.get('cmd') is not None and expected.get('command') != actual.get('cmd'):
+                                mismatches.append({'name': nm, 'expected': expected, 'actual': actual})
+                                continue
+                        if 'entrypoint' in expected and expected.get('entrypoint') is not None:
+                            if actual.get('entrypoint') is not None and expected.get('entrypoint') != actual.get('entrypoint'):
+                                mismatches.append({'name': nm, 'expected': expected, 'actual': actual})
+                                continue
+                    if mismatches:
+                        # Best-effort recovery: re-run docker compose up for the affected services.
+                        # This helps CORE versions that auto-start docker nodes during add_node()
+                        # (and do not support start=False).
+                        try:
+                            val = os.getenv('CORETG_DOCKER_RESTART_ON_COMPOSE_MISMATCH')
+                            restart_enabled = True if val is None else (str(val).strip().lower() not in ('0', 'false', 'no', 'off', ''))
+                        except Exception:
+                            restart_enabled = True
+
+                        restart_results: list[dict[str, Any]] = []
+                        if restart_enabled and shutil.which('docker'):
+                            for m in mismatches:
+                                nm = str(m.get('name') or '').strip()
+                                if not nm:
+                                    continue
+                                compose_path = f"/tmp/vulns/docker-compose-{nm}.yml"
+                                rr = _docker_compose_restart_service(compose_path, nm, timeout_s=float(os.getenv('CORETG_DOCKER_RESTART_TIMEOUT_S') or 120))
+                                rr['node'] = nm
+                                restart_results.append(rr)
+                                try:
+                                    if rr.get('ok'):
+                                        logging.info("Restarted docker compose node=%s via %s", nm, compose_path)
+                                    else:
+                                        logging.warning("Failed restarting docker compose node=%s via %s: %s", nm, compose_path, rr.get('error'))
+                                except Exception:
+                                    pass
+
+                        # Re-check after restarts.
+                        if restart_results and any(bool(r.get('ok')) for r in restart_results):
+                            try:
+                                time.sleep(1.0)
+                            except Exception:
+                                pass
+                            fixed: list[dict[str, Any]] = []
+                            still_bad: list[dict[str, Any]] = []
+                            for m in mismatches:
+                                nm = str(m.get('name') or '').strip()
+                                if not nm:
+                                    continue
+                                compose_path = f"/tmp/vulns/docker-compose-{nm}.yml"
+                                expected2 = _expected_container_config_from_compose(compose_path, service=str(nm))
+                                actual2 = _docker_container_config(nm)
+                                if expected2 is None:
+                                    # Can't validate, treat as fixed (best-effort).
+                                    fixed.append({'name': nm, 'expected': None, 'actual': actual2})
+                                    continue
+                                exp_img2 = str(expected2.get('image') or '').strip()
+                                act_img2 = str(actual2.get('image') or '').strip()
+                                ok2 = True
+                                if exp_img2 and act_img2 and exp_img2 != act_img2:
+                                    ok2 = False
+                                if ok2 and 'command' in expected2 and expected2.get('command') is not None:
+                                    if actual2.get('cmd') is not None and expected2.get('command') != actual2.get('cmd'):
+                                        ok2 = False
+                                if ok2 and 'entrypoint' in expected2 and expected2.get('entrypoint') is not None:
+                                    if actual2.get('entrypoint') is not None and expected2.get('entrypoint') != actual2.get('entrypoint'):
+                                        ok2 = False
+                                if ok2:
+                                    fixed.append({'name': nm, 'expected': expected2, 'actual': actual2})
+                                else:
+                                    still_bad.append({'name': nm, 'expected': expected2, 'actual': actual2})
+
+                            if still_bad:
+                                # Persist diagnostics and fail.
+                                start_ok = False
+                                generation_meta.setdefault('docker_nodes_config_mismatch', still_bad)  # type: ignore[arg-type]
+                                generation_meta.setdefault('docker_nodes_restart_attempts', restart_results)  # type: ignore[arg-type]
+                                bad = ', '.join([m.get('name') for m in still_bad if m.get('name')])
+                                start_error = (
+                                    'Docker node(s) running unexpected config (likely started before compose override was applied): '
+                                    + bad
+                                )
+                            else:
+                                # Recovery succeeded: keep going.
+                                generation_meta.setdefault('docker_nodes_restart_attempts', restart_results)  # type: ignore[arg-type]
+                                try:
+                                    logging.info("Recovered docker-compose node config mismatch via restart: %s", ', '.join([f.get('name') for f in fixed if f.get('name')]))
+                                except Exception:
+                                    pass
+                        else:
+                            # No successful restarts: fail as before.
+                            start_ok = False
+                            generation_meta.setdefault('docker_nodes_config_mismatch', mismatches)  # type: ignore[arg-type]
+                            if restart_results:
+                                generation_meta.setdefault('docker_nodes_restart_attempts', restart_results)  # type: ignore[arg-type]
+                            bad = ', '.join([m.get('name') for m in mismatches if m.get('name')])
+                            start_error = (
+                                'Docker node(s) running unexpected config (likely started before compose override was applied): '
+                                + bad
+                            )
+                except Exception:
+                    pass
     except Exception as e:
         start_ok = False
         start_error = f"{e.__class__.__name__}: {e}"
@@ -2017,10 +2425,23 @@ def main():
             generation_meta['core_session'] = {
                 'id': session_id,
                 'state': session_state,
-                'runtime_ok': bool(start_ok) and bool(session_state in {'runtime'}),
+                'runtime_ok': bool(_is_runtime_state(session_state)),
+                'validation_ok': bool(start_ok),
+                'validation_error': str(start_error) if ((not start_ok) and start_error) else None,
+                'runtime_timeout_s': core_start_timeout_s,
             }
             if docker_runtime is not None:
                 generation_meta['docker_nodes_runtime'] = docker_runtime
+            generation_meta['docker_nodes_runtime_timeout_s'] = docker_wait_s
+
+            # Diagnostics: if we timed out waiting for runtime, include recent core-daemon logs when available.
+            try:
+                if (not start_ok) and isinstance(start_error, str) and 'did not reach runtime' in start_error.lower():
+                    tail = _tail_core_daemon_journal(lines=200, since_seconds=int(core_start_timeout_s) + 60)
+                    if tail:
+                        generation_meta['core_daemon_journal_tail'] = tail
+            except Exception:
+                pass
     except Exception:
         pass
 

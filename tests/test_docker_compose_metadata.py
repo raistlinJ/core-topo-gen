@@ -51,6 +51,8 @@ services:
         assert svc.get("network_mode") == "none"
         # With network_mode none we should not be publishing ports at all.
         assert "ports" not in svc
+        # Preserve container-side port intent for reporting/metadata.
+        assert "expose" in svc and "80" in [str(x) for x in (svc.get("expose") or [])]
         # CORE services may chmod/create files using relative paths; ensure root workdir.
         assert svc.get("working_dir") == "/"
         assert "build" in svc
@@ -185,3 +187,91 @@ services:
         assert "$${AIRFLOW_UID:-50000}" not in text
         assert re.search(r"(?<![\"'])\$\{AIRFLOW_UID:-50000\}(?![\"'])", text) is None
         assert re.search(r"\$\{\s*[\"']\$\{AIRFLOW_UID:-50000\}[\"']\s*\}", text) is not None
+
+
+def test_prepare_compose_local_template_dot_bind_isolation(tmp_path):
+    """Regression: isolating local templates must not recurse copying base_dir into base_dir/node-*.
+
+    This pattern happens with node-generator outputs like:
+      volumes:
+        - .:/exports
+    """
+    # Create a local compose that references '.' so it will be absolutized and then isolated.
+    src_dir = tmp_path / "local"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "payload.txt").write_text("hello\n", encoding="utf-8")
+    compose_src = src_dir / "docker-compose.yml"
+    compose_src.write_text(
+        (
+            "services:\n"
+            "  node:\n"
+            "    image: alpine:3.19\n"
+            "    command: ['sh','-lc','sleep 2']\n"
+            "    volumes:\n"
+            "      - .:/exports\n"
+        ),
+        encoding="utf-8",
+    )
+
+    record = {"Type": "docker-compose", "Name": "LocalDot", "Path": str(compose_src)}
+    out_base = tmp_path / "out"
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(out_base))
+    out_path = out_base / "docker-compose-docker-1.yml"
+    assert str(out_path) in created
+    assert out_path.exists()
+
+    # Ensure the rewritten compose refers to a bind source under the isolated node dir.
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+    if yaml is None:
+        return
+
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    svc = (obj.get("services") or {}).get("docker-1") or (obj.get("services") or {}).get("node")
+    assert isinstance(svc, dict)
+    vols = svc.get("volumes")
+    assert isinstance(vols, list)
+    # Should be absolute path bind, not '.'
+    vol0 = str(vols[0])
+    assert vol0.split(":", 1)[0].startswith(str(out_base)), vol0
+
+
+def test_prepare_compose_prefers_local_path_over_cached(tmp_path):
+    # Two different local compose sources but same Name (so same safe base_dir).
+    src1 = tmp_path / "run1"
+    src1.mkdir(parents=True, exist_ok=True)
+    (src1 / "docker-compose.yml").write_text(
+        "services:\n  app:\n    image: alpine:3.19\n    command: ['sh','-lc','echo one; sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    src2 = tmp_path / "run2"
+    src2.mkdir(parents=True, exist_ok=True)
+    (src2 / "docker-compose.yml").write_text(
+        "services:\n  app:\n    image: alpine:3.19\n    command: ['sh','-lc','echo two; sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    out_base = tmp_path / "out"
+    rec1 = {"Type": "docker-compose", "Name": "SameName", "Path": str((src1 / 'docker-compose.yml'))}
+    rec2 = {"Type": "docker-compose", "Name": "SameName", "Path": str((src2 / 'docker-compose.yml'))}
+
+    # First run creates base_dir cached compose.
+    prepare_compose_for_assignments({"n1": rec1}, out_base=str(out_base))
+
+    # Corrupt/overwrite the cached compose to something else to ensure we don't reuse it.
+    safe_dir = out_base / "samename"
+    safe_dir.mkdir(parents=True, exist_ok=True)
+    (safe_dir / "docker-compose.yml").write_text(
+        "services:\n  app:\n    image: alpine:3.19\n    command: ['sh','-lc','echo STALE; sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    created = prepare_compose_for_assignments({"n2": rec2}, out_base=str(out_base))
+    out_path = out_base / "docker-compose-n2.yml"
+    assert str(out_path) in created
+    txt = out_path.read_text("utf-8", errors="ignore")
+    assert "echo two" in txt
+    assert "echo STALE" not in txt

@@ -481,6 +481,7 @@ REMOTE_STATIC_REPO_ENV = os.environ.get('CORE_REMOTE_STATIC_REPO', '/tmp/core-to
 REMOTE_RUNS_SUBDIR = 'runs'
 REMOTE_LOG_CHUNK_SIZE = 8192
 REPO_PUSH_SKIP_IF_UNCHANGED = os.environ.get('CORETG_REPO_SKIP_IF_UNCHANGED', '1')
+REPO_PUSH_METHOD = os.environ.get('CORETG_REPO_PUSH_METHOD', 'auto')
 
 REPO_PUSH_EXCLUDE_DIRS = {
     '.git',
@@ -582,6 +583,13 @@ def _init_repo_push_progress(
         'stage': stage,
         'detail': detail,
         'percent': percent,
+        # Optional counters for long-running server-side pushes (rsync/SFTP delta).
+        # These are populated best-effort depending on the method.
+        'done_bytes': None,
+        'total_bytes': None,
+        'done_files': None,
+        'total_files': None,
+        'method': None,
         'created_at': now,
         'updated_at': now,
     }
@@ -1324,12 +1332,12 @@ def _flow_required_generator_repo_paths(
         return sorted(required)
 
     try:
-        gens, _ = _flag_generators_from_enabled_sources()
+        gens, _plugins_by_id, _errors = _flag_generators_from_manifests(kind='flag-generator')
     except Exception as exc:
         app.logger.error('[flow.generator] failed to load flag_generators: %s', exc)
         gens = []
     try:
-        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        node_gens, _plugins_by_id2, _errors2 = _flag_generators_from_manifests(kind='flag-node-generator')
     except Exception as exc:
         app.logger.error('[flow.generator] failed to load flag_node_generators: %s', exc)
         node_gens = []
@@ -1347,6 +1355,68 @@ def _flow_required_generator_repo_paths(
         gid = str(g.get('id') or '').strip()
         if gid:
             gen_by_key[('flag_node_generators', gid)] = g
+
+    # Some IDs exist both as repo samples and as installed packs. The manifest loader
+    # intentionally prefers installed packs when IDs collide, which can cause remote
+    # sync to omit the repo copy. For remote execution we include both when present.
+    _repo_manifest_cache: dict[tuple[str, str], list[str]] = {}
+
+    def _repo_manifest_dirs_for(cat: str, gid: str) -> list[str]:
+        key = (cat, gid)
+        if key in _repo_manifest_cache:
+            return _repo_manifest_cache[key]
+
+        out: list[str] = []
+        try:
+            from pathlib import Path
+        except Exception:
+            _repo_manifest_cache[key] = out
+            return out
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            yaml = None  # type: ignore
+
+        if yaml is None:
+            _repo_manifest_cache[key] = out
+            return out
+
+        base_rel = 'flag_generators' if cat == 'flag_generators' else 'flag_node_generators'
+        expected_kind = 'flag-generator' if cat == 'flag_generators' else 'flag-node-generator'
+        base = Path(repo_root_abs) / base_rel
+        if not base.exists() or not base.is_dir():
+            _repo_manifest_cache[key] = out
+            return out
+
+        # Scan only repo sources (not outputs/installed_generators). Keep it small.
+        try:
+            candidates = list(base.rglob('manifest.yaml')) + list(base.rglob('manifest.yml'))
+        except Exception:
+            candidates = []
+        for mp in candidates:
+            try:
+                doc = yaml.safe_load(mp.read_text('utf-8', errors='ignore'))
+            except Exception:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            mid = str(doc.get('id') or '').strip()
+            if mid != gid:
+                continue
+            declared_kind = str(doc.get('kind') or expected_kind).strip().lower().replace('_', '-').replace(' ', '-')
+            if declared_kind != expected_kind:
+                continue
+            try:
+                rel_dir = os.path.relpath(str(mp.parent), repo_root_abs).replace('\\', '/').lstrip('/')
+            except Exception:
+                continue
+            if rel_dir:
+                out.append(rel_dir)
+
+        # Deterministic output.
+        out = sorted(set(out))
+        _repo_manifest_cache[key] = out
+        return out
 
     # Track lookup failures for diagnostics
     lookup_failures: list[str] = []
@@ -1371,6 +1441,9 @@ def _flow_required_generator_repo_paths(
         gen = gen_by_key.get((cat, gid))
         if not isinstance(gen, dict):
             lookup_failures.append(f'{cat}/{gid}')
+            # Still try to include a repo copy by scanning manifests.
+            for rel_dir in _repo_manifest_dirs_for(cat, gid):
+                required.add(rel_dir)
             continue
         src_path = str(gen.get('_source_path') or gen.get('source', {}).get('path') or '').strip()
         if not src_path:
@@ -1392,6 +1465,10 @@ def _flow_required_generator_repo_paths(
             rel = posixpath.dirname(rel)
         if rel:
             required.add(rel)
+
+        # Include repo copy if present (even when installed pack is preferred).
+        for rel_dir in _repo_manifest_dirs_for(cat, gid):
+            required.add(rel_dir)
 
     # Log diagnostic information about failures
     if lookup_failures:
@@ -1420,23 +1497,57 @@ def _should_exclude_repo_member(rel_path: str, *, allowed_outputs: Optional[List
         return False
     # Allow required subsets of outputs/ to be pushed to the remote host.
     # Keep repo sync lean while ensuring execute has the needed artifacts.
+    # IMPORTANT: even when outputs/ is allowlisted, we still apply the rest of
+    # the exclude rules (e.g. nested .git dirs) to avoid syncing huge git objects.
+    outputs_allowed = False
     try:
         rel_norm = rel_path.replace('\\', '/').lstrip('/')
         if rel_norm.startswith('outputs'):
             if rel_norm == 'outputs':
-                return False
-            if not allowed_outputs:
-                allowed_outputs = _resolve_repo_push_allowed_outputs(False)
-            if any(
-                rel_norm == p
-                or rel_norm.startswith(p + '/')
-                for p in allowed_outputs
-            ):
-                return False
-            return True
+                outputs_allowed = True
+            else:
+                if not allowed_outputs:
+                    allowed_outputs = _resolve_repo_push_allowed_outputs(False)
+                if any(
+                    rel_norm == p
+                    or rel_norm.startswith(p + '/')
+                    # Prefix allowlist entries can end with '-' (e.g. outputs/scenarios-)
+                    or (str(p).endswith('-') and rel_norm.startswith(str(p)))
+                    for p in allowed_outputs
+                ):
+                    outputs_allowed = True
+                else:
+                    return True
+    except Exception:
+        outputs_allowed = False
+
+    # Large pack artifacts are not required at runtime on the CORE VM.
+    # The extracted catalog content + CSVs are what the CLI uses.
+    try:
+        rel_norm2 = rel_path.replace('\\', '/').lstrip('/')
+        if rel_norm2.startswith('outputs/installed_vuln_catalogs/'):
+            leaf = rel_norm2.rsplit('/', 1)[-1]
+            if leaf == 'catalog.zip':
+                return True
     except Exception:
         pass
     for part in parts:
+        # If outputs is allowlisted, don't treat the literal "outputs" path
+        # segment as excluded (we still exclude nested ".git", venvs, etc.).
+        if outputs_allowed and part == 'outputs':
+            continue
+        # Exclude Python virtualenv directories beyond literal ".venv".
+        # Example: ".venv312" is common in this repo and should never be synced to remote CORE VMs.
+        try:
+            p = str(part or '')
+        except Exception:
+            p = ''
+        if p.startswith('.venv') and p != '.venv':
+            return True
+        if p.startswith('venv') and p != 'venv':
+            # Keep conservative: exclude venv* folders (e.g. venv312).
+            # This avoids uploading local environments by accident.
+            return True
         if part in REPO_PUSH_EXCLUDE_DIRS:
             return True
     leaf = parts[-1]
@@ -1465,6 +1576,1331 @@ def _create_local_repo_archive(src_dir: str, dest_basename: str, *, allowed_outp
     with tarfile.open(tmp_path, 'w:gz') as tar:
         tar.add(src_dir, arcname=base_name, filter=_filter)
     return tmp_path
+
+
+def _normalize_repo_push_method(core_cfg: Dict[str, Any]) -> str:
+    """Select repo push method.
+
+    Methods:
+    - auto: prefer rsync when SSH password is not provided (key-based), else prefer SFTP delta sync.
+    - rsync: force rsync (requires local rsync and remote rsync; will fail for password-only SSH).
+    - sftp: force SFTP delta sync.
+    - tar: force legacy tar.gz snapshot upload.
+    """
+    try:
+        method = str(REPO_PUSH_METHOD or 'auto').strip().lower()
+    except Exception:
+        method = 'auto'
+    if method in {'auto', 'rsync', 'sftp', 'tar'}:
+        pass
+    else:
+        method = 'auto'
+    if method != 'auto':
+        return method
+    try:
+        pw = core_cfg.get('ssh_password') if isinstance(core_cfg, dict) else None
+        pw_ok = bool(str(pw).strip()) if pw not in (None, '') else False
+    except Exception:
+        pw_ok = False
+    # If we have a password, rsync would typically require sshpass (not assumed). Use SFTP.
+    return 'sftp' if pw_ok else 'rsync'
+
+
+def _rsync_available() -> bool:
+    try:
+        import shutil
+
+        return bool(shutil.which('rsync'))
+    except Exception:
+        return False
+
+
+def _safe_posix_relpath(rel_path: str) -> str:
+    rel = str(rel_path or '').replace('\\', '/').lstrip('/').strip()
+    # Avoid "./" prefixes in remote joins.
+    if rel == '.':
+        rel = ''
+    return rel
+
+
+def _repo_rsync_filters(*, allowed_outputs: Optional[List[str]]) -> list[str]:
+    """Return rsync filter rules that match _should_exclude_repo_member() semantics."""
+    # We use rsync --filter rules so we can express "exclude outputs/** except allowlist".
+    rules: list[str] = []
+
+    # Exclude patterns (leaf-based)
+    for pat in REPO_PUSH_EXCLUDE_PATTERNS:
+        rules.append(f"- {pat}")
+
+    # Exclude common virtualenv directory patterns.
+    rules.append('- .venv*/')
+    rules.append('- **/.venv*/')
+    rules.append('- venv*/')
+    rules.append('- **/venv*/')
+
+    # Exclude directories anywhere in path.
+    for d in sorted(REPO_PUSH_EXCLUDE_DIRS):
+        # outputs handled separately below
+        if d == 'outputs':
+            continue
+        rules.append(f"- {d}/")
+        rules.append(f"- **/{d}/")
+
+    # outputs/ special-case allowlist
+    allowed_outputs = list(allowed_outputs or [])
+    if allowed_outputs:
+        # Ensure the directory itself is visitable.
+        rules.append('+ outputs/')
+        for raw in allowed_outputs:
+            item = _safe_posix_relpath(raw)
+            if not item:
+                continue
+            # Prefix entries in current code end with '-' (e.g. outputs/scenarios-)
+            if item.endswith('-'):
+                prefix = item
+                # allow directories like outputs/scenarios-*/...
+                rules.append(f"+ {prefix}*/")
+                rules.append(f"+ {prefix}*/***")
+            else:
+                # Allow both the directory and all descendants.
+                rules.append(f"+ {item}/")
+                rules.append(f"+ {item}/***")
+                rules.append(f"+ {item}")
+        # Exclude everything else under outputs.
+        rules.append('- outputs/**')
+    else:
+        rules.append('- outputs/**')
+
+    # Default include is everything else.
+    return rules
+
+
+def _push_repo_to_remote_via_rsync(
+    core_cfg: Dict[str, Any],
+    *,
+    remote_repo: str,
+    allowed_outputs: Optional[List[str]],
+    include_repo_paths: Optional[List[str]],
+    logger: logging.Logger,
+    progress_id: Optional[str],
+    log_handle: Any | None = None,
+) -> None:
+    """Incremental sync using rsync over ssh.
+
+    Requires key-based SSH (no password prompt). If it fails, callers should fall back.
+    """
+    import subprocess
+    import shutil
+
+    if not _rsync_available():
+        raise RuntimeError('rsync not available locally')
+
+    cfg = _require_core_ssh_credentials(core_cfg)
+    ssh_host = str(cfg.get('ssh_host') or cfg.get('host') or 'localhost').strip() or 'localhost'
+    ssh_user = str(cfg.get('ssh_username') or '').strip()
+    ssh_port = int(cfg.get('ssh_port') or 22)
+    if not ssh_user:
+        raise RuntimeError('ssh_username required for rsync')
+
+    # rsync cannot use the password in core_cfg without external helpers (sshpass).
+    pw = cfg.get('ssh_password')
+    if pw not in (None, '') and str(pw).strip():
+        raise RuntimeError('rsync method requires key-based SSH (ssh_password is set)')
+
+    repo_root = _get_repo_root()
+
+    # If include_repo_paths is used, build a temporary staging directory containing only those paths.
+    # This keeps the behavior similar to _create_local_repo_archive_from_paths().
+    staging_dir = None
+    src_root = repo_root
+    try:
+        if include_repo_paths:
+            import tempfile
+            import shutil as _shutil
+
+            staging_dir = tempfile.mkdtemp(prefix='coretg_rsync_include_')
+            for raw in include_repo_paths:
+                rel = _safe_posix_relpath(raw)
+                if not rel:
+                    continue
+                src = os.path.join(repo_root, rel)
+                if not os.path.exists(src):
+                    continue
+                dst = os.path.join(staging_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.isdir(src):
+                    _shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    _shutil.copy2(src, dst)
+            src_root = staging_dir
+
+        filters = _repo_rsync_filters(allowed_outputs=allowed_outputs)
+
+        ssh_cmd = [
+            'ssh',
+            '-p',
+            str(ssh_port),
+            '-o',
+            'StrictHostKeyChecking=no',
+            '-o',
+            'UserKnownHostsFile=/dev/null',
+        ]
+
+        # Sync directory contents into remote_repo.
+        # We intentionally do not "rm -rf" the repo; --delete makes it match.
+        remote_target = f"{ssh_user}@{ssh_host}:{remote_repo.rstrip('/')}/"
+        cmd: list[str] = [
+            'rsync',
+            '-az',
+            '--delete',
+            '--delete-excluded',
+            '--itemize-changes',
+            '-e',
+            ' '.join(ssh_cmd),
+        ]
+        for rule in filters:
+            cmd.extend(['--filter', rule])
+        cmd.extend([
+            src_root.rstrip('/') + '/',
+            remote_target,
+        ])
+
+        try:
+            if log_handle:
+                log_handle.write(f"[remote] Repo upload: rsync to {remote_target}\n")
+                log_handle.write(f"[remote] Repo upload: rsync filters={filters}\n")
+                log_handle.flush()
+        except Exception:
+            pass
+
+        _update_repo_push_progress(progress_id, status='uploading', stage='syncing', percent=20.0, method='rsync', detail='Syncing repository via rsync…')
+        proc = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"rsync failed (exit={proc.returncode}): {(proc.stderr or proc.stdout or '').strip()}")
+        # Keep logs compact.
+        try:
+            if log_handle:
+                preview = (proc.stdout or '').strip().splitlines()[-30:]
+                if preview:
+                    log_handle.write('[remote] rsync summary (tail)\n' + '\n'.join(preview) + '\n')
+                log_handle.flush()
+        except Exception:
+            pass
+        _update_repo_push_progress(progress_id, status='finalizing', stage='hash', percent=95.0, method='rsync', detail='Updating remote hash…')
+    finally:
+        try:
+            if staging_dir and os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _push_repo_to_remote_via_sftp_delta(
+    client: Any,
+    sftp: Any,
+    *,
+    repo_root: str,
+    remote_repo: str,
+    allowed_outputs: Optional[List[str]],
+    include_repo_paths: Optional[List[str]],
+    logger: logging.Logger,
+    progress_id: Optional[str],
+    log_handle: Any | None = None,
+) -> None:
+    """Incremental sync using SFTP (uploads only changed files by size+mtime).
+
+    This does not do block-level deltas like rsync, but avoids re-uploading the whole repo.
+    """
+
+    root = os.path.abspath(repo_root)
+
+    # Ensure remote root exists via SSH first (fast, avoids SFTP mkdir/stat hangs).
+    try:
+        _exec_ssh_command(
+            client,
+            f"mkdir -p {shlex.quote(str(remote_repo))}",
+            timeout=float(os.getenv('CORETG_REMOTE_REPO_MKDIR_TIMEOUT_S', '10') or 10.0),
+            cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
+            check=False,
+        )
+    except Exception:
+        pass
+
+    # Normalize include paths if present.
+    include_repo_paths = [
+        _safe_posix_relpath(p)
+        for p in (include_repo_paths or [])
+        if isinstance(p, str) and str(p).strip()
+    ]
+
+    def _iter_local_files() -> tuple[set[str], set[str]]:
+        files: set[str] = set()
+        dirs: set[str] = set()
+
+        scanned_dirs = 0
+        scanned_files = 0
+        last_scan_update_ts = time.time()
+
+        def _scan_heartbeat(force: bool = False) -> None:
+            nonlocal last_scan_update_ts
+            if not progress_id:
+                return
+            now = time.time()
+            if not force and (now - last_scan_update_ts) < 1.0:
+                return
+            last_scan_update_ts = now
+            try:
+                _update_repo_push_progress(
+                    progress_id,
+                    status='uploading',
+                    stage='planning',
+                    percent=4.5,
+                    method='sftp',
+                    detail=f'Scanning local repo… (dirs={scanned_dirs}, files={scanned_files})',
+                )
+            except Exception:
+                pass
+
+        def _walk_dir(base_rel: str) -> None:
+            nonlocal scanned_dirs, scanned_files
+            base_rel_norm = _safe_posix_relpath(base_rel)
+            base_abs = os.path.join(root, base_rel_norm) if base_rel_norm else root
+            for dirpath, dirnames, filenames in os.walk(base_abs):
+                scanned_dirs += 1
+                rel_dir = os.path.relpath(dirpath, root)
+                if rel_dir == '.':
+                    rel_dir = ''
+                rel_dir = rel_dir.replace('\\', '/').lstrip('/')
+                # In full-repo mode, apply the same exclude logic used for tar.
+                if not include_repo_paths:
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if not _should_exclude_repo_member(os.path.join(rel_dir, d) if rel_dir else d, allowed_outputs=allowed_outputs)
+                    ]
+                else:
+                    # For include-only mode, still skip dot dirs for sanity.
+                    dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+
+                # Record directory so we can keep it during delete.
+                if rel_dir:
+                    dirs.add(rel_dir)
+                for fname in filenames:
+                    scanned_files += 1
+                    rel_path = os.path.join(rel_dir, fname) if rel_dir else fname
+                    rel_path = rel_path.replace('\\', '/').lstrip('/')
+                    if not rel_path:
+                        continue
+                    if not include_repo_paths and _should_exclude_repo_member(rel_path, allowed_outputs=allowed_outputs):
+                        continue
+                    files.add(rel_path)
+
+                _scan_heartbeat()
+
+        if include_repo_paths:
+            for rel in include_repo_paths:
+                if not rel:
+                    continue
+                full = os.path.join(root, rel)
+                if os.path.isdir(full):
+                    _walk_dir(rel)
+                elif os.path.exists(full):
+                    files.add(rel)
+                    parent = os.path.dirname(rel)
+                    if parent:
+                        dirs.add(parent)
+        else:
+            _walk_dir('')
+
+        _scan_heartbeat(force=True)
+
+        # Always preserve remote hash file if present.
+        files.add('.coretg_repo_hash')
+        return files, dirs
+
+    desired_files, desired_dirs = _iter_local_files()
+
+    # Ensure remote root exists (SFTP best-effort; SSH already attempted above).
+    try:
+        _sftp_ensure_dir(sftp, remote_repo)
+    except Exception:
+        pass
+
+    manifest_name = '.coretg_repo_manifest.json'
+    manifest_remote_path = _remote_path_join(remote_repo, manifest_name)
+
+    def _load_remote_manifest() -> dict[str, dict[str, int]]:
+        # Prefer SSH cat with timeout (SFTP reads can wedge indefinitely).
+        try:
+            if client is not None:
+                rc, out, _err = _exec_ssh_command(
+                    client,
+                    f"bash -lc {shlex.quote('cat ' + shlex.quote(manifest_remote_path) + ' 2>/dev/null || true')}",
+                    timeout=float(os.getenv('CORETG_REMOTE_MANIFEST_READ_TIMEOUT_S', '10') or 10.0),
+                    cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
+                    check=False,
+                )
+                _ = rc
+                text = (out or '').strip()
+                if text:
+                    obj = json.loads(text)
+                else:
+                    obj = {}
+                # fall through to normalization
+                if not isinstance(obj, dict):
+                    obj = {}
+                out2: dict[str, dict[str, int]] = {}
+                for k, v in obj.items():
+                    try:
+                        kk = str(k or '').strip().lstrip('/').replace('\\', '/')
+                    except Exception:
+                        continue
+                    if not kk or kk in {manifest_name}:
+                        continue
+                    if not isinstance(v, dict):
+                        continue
+                    try:
+                        size = int(v.get('size', -1))
+                        mtime = int(v.get('mtime', -1))
+                    except Exception:
+                        continue
+                    if size < 0 or mtime < 0:
+                        continue
+                    out2[kk] = {'size': size, 'mtime': mtime}
+                return out2
+        except Exception:
+            pass
+
+        try:
+            f = sftp.open(manifest_remote_path, 'r')
+        except Exception:
+            return {}
+        try:
+            raw = f.read()
+        except Exception:
+            try:
+                f.close()
+            except Exception:
+                pass
+            return {}
+        try:
+            f.close()
+        except Exception:
+            pass
+        try:
+            if isinstance(raw, bytes):
+                text = raw.decode('utf-8', errors='ignore')
+            else:
+                text = str(raw)
+            obj = json.loads(text) if text.strip() else {}
+        except Exception:
+            obj = {}
+        if not isinstance(obj, dict):
+            return {}
+        out: dict[str, dict[str, int]] = {}
+        for k, v in obj.items():
+            try:
+                kk = str(k or '').strip().lstrip('/').replace('\\', '/')
+            except Exception:
+                continue
+            if not kk or kk in {manifest_name}:
+                continue
+            if not isinstance(v, dict):
+                continue
+            try:
+                size = int(v.get('size', -1))
+                mtime = int(v.get('mtime', -1))
+            except Exception:
+                continue
+            if size < 0 or mtime < 0:
+                continue
+            out[kk] = {'size': size, 'mtime': mtime}
+        return out
+
+    remote_manifest = _load_remote_manifest()
+
+    def _remote_python_candidates() -> list[str]:
+        return ['python3', 'python']
+
+    def _ensure_remote_manifest_via_ssh() -> None:
+        """Best-effort create/update the remote manifest using a single SSH command.
+
+        This avoids thousands of SFTP round-trips (stat per file) which can appear to hang.
+        """
+        nonlocal remote_manifest
+        try:
+            if not client or not hasattr(client, 'exec_command'):
+                return
+        except Exception:
+            return
+
+        try:
+            _update_repo_push_progress(progress_id, status='uploading', stage='planning', percent=5.0, method='sftp', detail='Planning SFTP delta sync… (building remote manifest…)')
+        except Exception:
+            pass
+
+        try:
+            manifest_timeout_s = float(os.getenv('CORETG_REMOTE_MANIFEST_BUILD_TIMEOUT_S', '45') or 45)
+        except Exception:
+            manifest_timeout_s = 45.0
+        manifest_timeout_s = max(10.0, min(manifest_timeout_s, 240.0))
+
+        # Build a compact python script.
+        script = (
+            "import os, json, stat\n"
+            f"root={json.dumps(str(remote_repo))}\n"
+            f"out={json.dumps(str(manifest_remote_path))}\n"
+            "tmp=out+'.tmp'\n"
+            "m={}\n"
+            "for dp, dns, fns in os.walk(root):\n"
+            "  for fn in fns:\n"
+            "    if fn in ('.coretg_repo_hash', '.coretg_repo_manifest.json'): continue\n"
+            "    p=os.path.join(dp, fn)\n"
+            "    try:\n"
+            "      st=os.lstat(p)\n"
+            "    except Exception:\n"
+            "      continue\n"
+            "    try:\n"
+            "      if stat.S_ISLNK(st.st_mode):\n"
+            "        continue\n"
+            "    except Exception:\n"
+            "      pass\n"
+            "    rel=os.path.relpath(p, root).replace('\\\\','/').lstrip('/')\n"
+            "    if not rel: continue\n"
+            "    m[rel]={'size': int(getattr(st,'st_size',0) or 0), 'mtime': int(getattr(st,'st_mtime',0) or 0)}\n"
+            "try:\n"
+            "  with open(tmp, 'w', encoding='utf-8') as f: json.dump(m, f, ensure_ascii=False, separators=(',',':'))\n"
+            "  os.replace(tmp, out)\n"
+            "except Exception:\n"
+            "  pass\n"
+            "print(len(m))\n"
+        )
+        quoted = shlex.quote(script)
+        for py in _remote_python_candidates():
+            cmd = f"{py} -c {quoted}"
+            try:
+                rc, out, err = _exec_ssh_command(
+                    client,
+                    cmd,
+                    timeout=manifest_timeout_s,
+                    cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
+                    check=False,
+                )
+            except TimeoutError as exc:
+                try:
+                    if log_handle:
+                        log_handle.write(f"[remote] manifest build timeout after {manifest_timeout_s:.0f}s ({py}): {exc}\n")
+                        log_handle.flush()
+                except Exception:
+                    pass
+                continue
+            except Exception as exc:
+                try:
+                    if log_handle:
+                        log_handle.write(f"[remote] manifest build failed ({py}): {exc}\n")
+                        log_handle.flush()
+                except Exception:
+                    pass
+                continue
+            out = (out or '').strip()
+            err = (err or '').strip()
+            if err and rc != 0:
+                try:
+                    if log_handle:
+                        log_handle.write(f"[remote] manifest build stderr (rc={rc}, {py}): {err[:500]}\n")
+                        log_handle.flush()
+                except Exception:
+                    pass
+            # Reload manifest regardless; if build failed it will remain empty.
+            try:
+                remote_manifest = _load_remote_manifest()
+            except Exception:
+                remote_manifest = {}
+            if remote_manifest:
+                try:
+                    _update_repo_push_progress(progress_id, status='uploading', stage='planning', percent=5.0, method='sftp', detail=f'Planning SFTP delta sync… (remote manifest ok: {len(remote_manifest)} files)')
+                except Exception:
+                    pass
+                return
+            # If the command printed a number but we still can't load it, continue to next interpreter.
+            try:
+                _ = int(out) if out else None
+            except Exception:
+                pass
+
+    # If manifest missing/empty, try to build it once via SSH.
+    try:
+        if not remote_manifest:
+            _ensure_remote_manifest_via_ssh()
+    except Exception:
+        # Non-fatal; we'll fall back to upload-all planning.
+        pass
+
+    # Plan which files actually need to be uploaded so we can report total bytes.
+    uploaded = 0
+    skipped_unchanged = 0
+    skipped_symlink = 0
+    checked = 0
+
+    upload_plan: list[tuple[str, str, int, int, int]] = []
+    total_bytes = 0
+
+    _update_repo_push_progress(
+        progress_id,
+        status='uploading',
+        stage='planning',
+        percent=5.0,
+        method='sftp',
+        detail='Planning SFTP delta sync…',
+        done_bytes=0,
+        total_bytes=0,
+        done_files=0,
+        total_files=0,
+    )
+
+    planning_total_files = max(0, len(desired_files) - (1 if '.coretg_repo_hash' in desired_files else 0))
+    last_plan_update_ts = time.time()
+
+    assume_upload_all = not bool(remote_manifest)
+
+    for rel in sorted(desired_files):
+        if rel == '.coretg_repo_hash':
+            continue
+        local_path = os.path.join(root, rel)
+        if not os.path.exists(local_path):
+            continue
+        # Avoid uploading symlinks (common in venvs; can be broken/machine-specific).
+        try:
+            if os.path.islink(local_path):
+                skipped_symlink += 1
+                continue
+        except Exception:
+            pass
+        checked += 1
+        try:
+            st_local = os.stat(local_path)
+        except Exception:
+            continue
+
+        needs_upload = True
+        if not assume_upload_all:
+            # Compare against cached remote manifest.
+            try:
+                rec = remote_manifest.get(rel)
+                if rec:
+                    same_size = int(rec.get('size', -1)) == int(st_local.st_size)
+                    same_mtime = int(rec.get('mtime', -1)) == int(st_local.st_mtime)
+                    if same_size and same_mtime:
+                        needs_upload = False
+            except Exception:
+                needs_upload = True
+
+        if not needs_upload:
+            skipped_unchanged += 1
+            continue
+
+        try:
+            size = int(st_local.st_size)
+        except Exception:
+            size = 0
+        total_bytes += max(0, size)
+        upload_plan.append((rel, local_path, max(0, size), int(getattr(st_local, 'st_atime', 0)), int(getattr(st_local, 'st_mtime', 0))))
+
+        if progress_id:
+            now = time.time()
+            if (now - last_plan_update_ts) >= 1.0:
+                last_plan_update_ts = now
+                try:
+                    frac = (float(checked) / float(planning_total_files)) if planning_total_files else 0.0
+                    frac = max(0.0, min(1.0, frac))
+                    pct = 5.0 + (9.5 * frac)
+                    _update_repo_push_progress(
+                        progress_id,
+                        status='uploading',
+                        stage='planning',
+                        percent=pct,
+                        method='sftp',
+                        done_files=checked,
+                        total_files=planning_total_files,
+                        detail=(
+                            f'Planning SFTP delta sync… (scanned={checked}/{planning_total_files}, '
+                            f'changed={len(upload_plan)}, unchanged={skipped_unchanged})'
+                        ),
+                    )
+                except Exception:
+                    pass
+
+    total_files = len(upload_plan)
+    done_bytes = 0
+    done_files = 0
+
+    # Upload phase progress spans 15% -> 55%.
+    _update_repo_push_progress(
+        progress_id,
+        status='uploading',
+        stage='syncing',
+        percent=15.0,
+        method='sftp',
+        done_bytes=0,
+        total_bytes=total_bytes,
+        done_files=0,
+        total_files=total_files,
+        detail=(
+            'SFTP delta sync: nothing to upload; proceeding to cleanup…'
+            if total_files == 0
+            else f'Syncing repository via SFTP delta… (0 / {total_files} files)'
+        ),
+    )
+
+    last_update_ts = time.time()
+    def _should_bundle_upload() -> bool:
+        try:
+            if not client or not hasattr(client, 'exec_command'):
+                return False
+        except Exception:
+            return False
+        # Bundling avoids massive per-file SFTP overhead; only do it when it matters.
+        try:
+            if total_files >= 250:
+                return True
+        except Exception:
+            pass
+        try:
+            if total_bytes >= (50 * 1024 * 1024):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _exec_remote_python(script: str, *args: str, timeout_s: float = 180.0) -> None:
+        last_err = None
+        for py in ('python3', 'python'):
+            try:
+                cmd = f"{py} -c {shlex.quote(script)}" + (" " + " ".join(shlex.quote(a) for a in args) if args else "")
+                _exec_ssh_command(
+                    client,
+                    cmd,
+                    timeout=timeout_s,
+                    cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
+                    check=True,
+                )
+                return
+            except Exception as exc:
+                last_err = exc
+                continue
+        raise RuntimeError(f"Remote python execution failed: {last_err}")
+
+    if _should_bundle_upload() and total_files > 0:
+        # Bundle files into tar.gz chunks and extract remotely to avoid thousands of SFTP ops.
+        try:
+            _update_repo_push_progress(
+                progress_id,
+                status='uploading',
+                stage='syncing',
+                percent=15.0,
+                method='sftp',
+                done_bytes=done_bytes,
+                total_bytes=total_bytes,
+                done_files=done_files,
+                total_files=total_files,
+                detail='SFTP delta sync: bundling uploads…',
+            )
+        except Exception:
+            pass
+
+        tmp_dir_rel = '__coretg_tmp'
+        remote_tmp_dir = _remote_path_join(remote_repo, tmp_dir_rel)
+        try:
+            _sftp_ensure_dir(sftp, remote_tmp_dir)
+        except Exception:
+            pass
+
+        # Chunk limits: tuned to reduce overhead without producing huge temp archives.
+        max_chunk_files = 800
+        max_chunk_bytes = 80 * 1024 * 1024
+
+        chunk: list[tuple[str, str, int]] = []
+        chunk_bytes = 0
+        chunk_index = 0
+
+        def _flush_chunk(final: bool = False) -> None:
+            nonlocal done_bytes, done_files, uploaded, chunk, chunk_bytes, chunk_index, last_update_ts
+            if not chunk:
+                return
+            chunk_index += 1
+            chunk_id = uuid.uuid4().hex
+            local_tmp = None
+            remote_tmp = _remote_path_join(remote_tmp_dir, f"bundle_{chunk_id}.tar.gz")
+            try:
+                try:
+                    if progress_id and _is_repo_push_cancel_requested(progress_id):
+                        raise TimeoutError('cancelled')
+                except Exception:
+                    pass
+
+                # Build tar.gz locally.
+                with tempfile.NamedTemporaryFile(prefix='coretg_sftp_bundle_', suffix='.tar.gz', delete=False) as tf:
+                    local_tmp = tf.name
+                with tarfile.open(local_tmp, 'w:gz') as tar:
+                    built_files = 0
+                    built_bytes = 0
+                    for rel0, local_path0, _sz0 in chunk:
+                        # Ensure stable POSIX paths inside archive.
+                        arcname = str(rel0).replace('\\', '/').lstrip('/')
+                        if not arcname:
+                            continue
+                        tar.add(local_path0, arcname=arcname, recursive=False)
+                        built_files += 1
+                        built_bytes += int(_sz0 or 0)
+                        now = time.time()
+                        if progress_id and (now - last_update_ts >= 0.75):
+                            last_update_ts = now
+                            # While building, report a "virtual" progress so UI stays alive.
+                            try:
+                                v_done_files = int(done_files) + int(built_files)
+                                v_done_bytes = int(done_bytes) + int(built_bytes)
+                                frac = (float(v_done_bytes) / float(total_bytes)) if total_bytes else 1.0
+                            except Exception:
+                                frac = 0.0
+                            frac = max(0.0, min(1.0, frac))
+                            pct = 15.0 + (40.0 * frac)
+                            try:
+                                _update_repo_push_progress(
+                                    progress_id,
+                                    status='uploading',
+                                    stage='syncing',
+                                    percent=pct,
+                                    method='sftp',
+                                    done_bytes=v_done_bytes,
+                                    total_bytes=total_bytes,
+                                    done_files=v_done_files,
+                                    total_files=total_files,
+                                    detail=(
+                                        f"SFTP delta sync: bundling uploads… (chunk {chunk_index}, building {built_files}/{len(chunk)} files)"
+                                    ),
+                                )
+                            except Exception:
+                                pass
+
+                        try:
+                            if progress_id and _is_repo_push_cancel_requested(progress_id):
+                                raise TimeoutError('cancelled')
+                        except Exception:
+                            pass
+
+                # Upload and extract.
+                def _cb(transferred: int, total: int) -> None:
+                    nonlocal last_update_ts
+                    try:
+                        if not progress_id:
+                            return
+                        now = time.time()
+                        if (now - last_update_ts) < 0.75 and transferred < (total or 0):
+                            return
+                        last_update_ts = now
+                        frac_chunk = (float(transferred) / float(total)) if total else 0.0
+                        frac_chunk = max(0.0, min(1.0, frac_chunk))
+                        # Approximate file-bytes progress using chunk_bytes.
+                        v_done_bytes = int(done_bytes) + int(chunk_bytes * frac_chunk)
+                        v_done_files = int(done_files)  # files count updates on extract completion
+                        frac = (float(v_done_bytes) / float(total_bytes)) if total_bytes else 1.0
+                        frac = max(0.0, min(1.0, frac))
+                        pct = 15.0 + (40.0 * frac)
+                        _update_repo_push_progress(
+                            progress_id,
+                            status='uploading',
+                            stage='syncing',
+                            percent=pct,
+                            method='sftp',
+                            done_bytes=v_done_bytes,
+                            total_bytes=total_bytes,
+                            done_files=v_done_files,
+                            total_files=total_files,
+                            detail=(
+                                f"SFTP delta sync: uploading bundle… (chunk {chunk_index}, {int(frac_chunk * 100)}%)"
+                            ),
+                        )
+                    except Exception:
+                        pass
+
+                sftp.put(local_tmp, remote_tmp, callback=_cb)
+                extract_script = (
+                    "import os,sys,tarfile\n"
+                    "repo=sys.argv[1].rstrip('/')\n"
+                    "archive=sys.argv[2]\n"
+                    "os.makedirs(repo, exist_ok=True)\n"
+                    "with tarfile.open(archive, 'r:gz') as t: t.extractall(path=repo)\n"
+                    "try: os.remove(archive)\n"
+                    "except Exception: pass\n"
+                )
+                _exec_remote_python(extract_script, remote_repo, remote_tmp, timeout_s=240.0)
+
+                # Mark chunk complete.
+                uploaded += len(chunk)
+                done_files += len(chunk)
+                done_bytes += int(chunk_bytes or 0)
+
+            except Exception as exc:
+                raise RuntimeError(f"SFTP bundle upload failed (chunk={chunk_index}, files={len(chunk)}): {exc}") from exc
+            finally:
+                try:
+                    if local_tmp and os.path.exists(local_tmp):
+                        os.remove(local_tmp)
+                except Exception:
+                    pass
+
+            # Progress update
+            now = time.time()
+            if progress_id and (now - last_update_ts >= 0.5 or final):
+                last_update_ts = now
+                try:
+                    frac = (float(done_bytes) / float(total_bytes)) if total_bytes else 1.0
+                except Exception:
+                    frac = 0.0
+                frac = max(0.0, min(1.0, frac))
+                pct = 15.0 + (40.0 * frac)
+                try:
+                    _update_repo_push_progress(
+                        progress_id,
+                        status='uploading',
+                        stage='syncing',
+                        percent=pct,
+                        method='sftp',
+                        done_bytes=done_bytes,
+                        total_bytes=total_bytes,
+                        done_files=done_files,
+                        total_files=total_files,
+                        detail=(
+                            f"SFTP delta sync in progress… ({done_files} / {total_files} files)"
+                            + f" (bundled: {chunk_index} chunk{'s' if chunk_index != 1 else ''})"
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            # Reset
+            chunk = []
+            chunk_bytes = 0
+
+        for (rel, local_path, size, _atime, _mtime) in upload_plan:
+            if not os.path.exists(local_path):
+                continue
+            chunk.append((rel, local_path, int(size or 0)))
+            chunk_bytes += int(size or 0)
+            if len(chunk) >= max_chunk_files or chunk_bytes >= max_chunk_bytes:
+                _flush_chunk()
+        _flush_chunk(final=True)
+    else:
+        # Fallback: upload file-by-file.
+        for idx, (rel, local_path, size, atime, mtime) in enumerate(upload_plan, start=1):
+            if not os.path.exists(local_path):
+                continue
+            remote_path = _remote_path_join(remote_repo, rel)
+
+            # Ensure parent dir
+            try:
+                parent = posixpath.dirname(remote_path)
+                _sftp_ensure_dir(sftp, parent)
+            except Exception:
+                pass
+            try:
+                sftp.put(local_path, remote_path)
+                try:
+                    sftp.utime(remote_path, (int(atime), int(mtime)))
+                except Exception:
+                    pass
+                uploaded += 1
+                done_files += 1
+                done_bytes += int(size or 0)
+            except Exception as exc:
+                raise RuntimeError(f"SFTP put failed for {rel}: {exc}") from exc
+
+            now = time.time()
+            if progress_id and (now - last_update_ts >= 0.5 or idx == total_files):
+                last_update_ts = now
+                try:
+                    frac = (float(done_bytes) / float(total_bytes)) if total_bytes else 1.0
+                except Exception:
+                    frac = 0.0
+                frac = max(0.0, min(1.0, frac))
+                pct = 15.0 + (40.0 * frac)
+                try:
+                    _update_repo_push_progress(
+                        progress_id,
+                        status='uploading',
+                        stage='syncing',
+                        percent=pct,
+                        method='sftp',
+                        done_bytes=done_bytes,
+                        total_bytes=total_bytes,
+                        done_files=done_files,
+                        total_files=total_files,
+                        detail=f'SFTP delta sync in progress… ({done_files} / {total_files} files)',
+                    )
+                except Exception:
+                    pass
+
+    # Best-effort delete: remove remote members not present locally.
+    _update_repo_push_progress(
+        progress_id,
+        status='finalizing',
+        stage='deleting',
+        percent=60.0,
+        method='sftp',
+        done_bytes=done_bytes,
+        total_bytes=total_bytes,
+        done_files=done_files,
+        total_files=total_files,
+        detail='Removing stale remote files…',
+    )
+
+    # Fast delete when a manifest is available: delete stale files recorded by the previous sync.
+    # This avoids a full remote tree walk (which can be very slow over SFTP).
+    try:
+        if remote_manifest:
+            desired_set = set(desired_files)
+            desired_set.add('.coretg_repo_hash')
+            desired_set.add(manifest_name)
+            stale = sorted(set(remote_manifest.keys()) - desired_set)
+            removed_files = 0
+
+            try:
+                batch_timeout_s = float(os.getenv('CORETG_REMOTE_STALE_DELETE_BATCH_TIMEOUT_S', '20') or 20)
+            except Exception:
+                batch_timeout_s = 20.0
+            batch_timeout_s = max(5.0, min(batch_timeout_s, 180.0))
+            try:
+                max_delete_s = float(os.getenv('CORETG_REMOTE_STALE_DELETE_MAX_S', '75') or 75)
+            except Exception:
+                max_delete_s = 75.0
+            max_delete_s = max(10.0, min(max_delete_s, 600.0))
+            delete_start_ts = time.time()
+
+            def _remote_exec_delete_batch(batch: list[str]) -> tuple[int, int]:
+                """Delete a batch of relative paths on the remote host.
+
+                Returns (removed, failed).
+                """
+                if not batch:
+                    return 0, 0
+                try:
+                    if not client or not hasattr(client, 'exec_command'):
+                        return 0, len(batch)
+                except Exception:
+                    return 0, len(batch)
+
+                payload = {'root': remote_repo, 'paths': batch}
+                payload_text = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+                quoted = shlex.quote(payload_text)
+                script = (
+                    "import os,sys,json,stat\n"
+                    "p=json.loads(sys.argv[1])\n"
+                    "root=str(p.get('root') or '').rstrip('/')\n"
+                    "paths=p.get('paths') if isinstance(p.get('paths'), list) else []\n"
+                    "removed=0\nfailed=0\n"
+                    "for rel in paths:\n"
+                    "  try:\n"
+                    "    r=str(rel or '').lstrip('/').replace('\\\\','/')\n"
+                    "    if not r: continue\n"
+                    "    ap=os.path.join(root, r)\n"
+                    "    try:\n"
+                    "      st=os.lstat(ap)\n"
+                    "    except Exception:\n"
+                    "      continue\n"
+                    "    try:\n"
+                    "      if stat.S_ISDIR(st.st_mode):\n"
+                    "        continue\n"
+                    "    except Exception:\n"
+                    "      pass\n"
+                    "    os.remove(ap)\n"
+                    "    removed += 1\n"
+                    "  except Exception:\n"
+                    "    failed += 1\n"
+                    "print(json.dumps({'removed':removed,'failed':failed},separators=(',',':')))\n"
+                )
+                cmd = f"python3 -c {shlex.quote(script)} {quoted}"
+                try:
+                    rc, out, err = _exec_ssh_command(
+                        client,
+                        cmd,
+                        timeout=batch_timeout_s,
+                        cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)),
+                        check=False,
+                    )
+                except TimeoutError as exc:
+                    try:
+                        if log_handle:
+                            log_handle.write(f"[remote] delete batch timeout after {batch_timeout_s:.0f}s: {exc}\n")
+                            log_handle.flush()
+                    except Exception:
+                        pass
+                    return 0, len(batch)
+                except Exception as exc:
+                    try:
+                        if log_handle:
+                            log_handle.write(f"[remote] delete batch failed: {exc}\n")
+                            log_handle.flush()
+                    except Exception:
+                        pass
+                    return 0, len(batch)
+                out = (out or '').strip()
+                err = (err or '').strip()
+                if err and rc != 0:
+                    try:
+                        if log_handle:
+                            log_handle.write(f"[remote] delete batch stderr (rc={rc}): {err[:500]}\n")
+                            log_handle.flush()
+                    except Exception:
+                        pass
+                try:
+                    obj = json.loads(out) if out else {}
+                except Exception:
+                    obj = {}
+                try:
+                    return int(obj.get('removed') or 0), int(obj.get('failed') or 0)
+                except Exception:
+                    return 0, len(batch)
+
+            def _sftp_delete_batch(batch: list[str]) -> tuple[int, int]:
+                removed = 0
+                failed = 0
+                for rel in batch:
+                    try:
+                        sftp.remove(_remote_path_join(remote_repo, rel))
+                        removed += 1
+                    except Exception:
+                        failed += 1
+                return removed, failed
+
+            total_stale = len(stale)
+            if total_stale:
+                try:
+                    _update_repo_push_progress(
+                        progress_id,
+                        status='finalizing',
+                        stage='deleting',
+                        percent=65.0,
+                        method='sftp',
+                        detail=f'Removing stale remote files… (removed=0/{total_stale})',
+                    )
+                except Exception:
+                    pass
+
+            batch_size = 250
+            failed_files = 0
+            for i in range(0, total_stale, batch_size):
+                # Never let stale-deletes hold the whole run hostage.
+                if (time.time() - delete_start_ts) >= max_delete_s:
+                    try:
+                        _update_repo_push_progress(
+                            progress_id,
+                            status='finalizing',
+                            stage='deleting',
+                            percent=75.0,
+                            method='sftp',
+                            detail=(
+                                f'Removing stale remote files… (removed={removed_files}/{total_stale}, failed={failed_files}) '
+                                f'[skipping remaining deletes: exceeded {max_delete_s:.0f}s budget]'
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    break
+                try:
+                    if _is_repo_push_cancel_requested(progress_id):
+                        raise TimeoutError('cancelled')
+                except TimeoutError:
+                    raise
+                except Exception:
+                    pass
+                batch = stale[i:i + batch_size]
+                # Prefer remote-side deletion via SSH when available; fall back to SFTP remove.
+                rm, fail = _remote_exec_delete_batch(batch)
+                if rm == 0 and fail == len(batch):
+                    rm, fail = _sftp_delete_batch(batch)
+                removed_files += int(rm or 0)
+                failed_files += int(fail or 0)
+                try:
+                    frac = (float(i + len(batch)) / float(total_stale)) if total_stale else 1.0
+                    frac = max(0.0, min(1.0, frac))
+                    pct = 65.0 + (10.0 * frac)
+                    _update_repo_push_progress(
+                        progress_id,
+                        status='finalizing',
+                        stage='deleting',
+                        percent=pct,
+                        method='sftp',
+                        detail=f'Removing stale remote files… (removed={removed_files}/{total_stale}, failed={failed_files})',
+                    )
+                except Exception:
+                    pass
+
+            # Best-effort cleanup of now-empty directories (remote-side for speed).
+            try:
+                if client and hasattr(client, 'exec_command'):
+                    cmd = (
+                        "python3 -c "
+                        + shlex.quote(
+                            "import os,sys\nroot=sys.argv[1].rstrip('/')\n"
+                            "desired=set((sys.argv[2] or '').split(','))\n"
+                            "keep={'outputs','runs'}\n"
+                            "for dp,dns,fns in os.walk(root, topdown=False):\n"
+                            "  rel=os.path.relpath(dp, root).replace('\\\\','/').lstrip('/')\n"
+                            "  if not rel: continue\n"
+                            "  if rel in keep: continue\n"
+                            "  if rel in desired: continue\n"
+                            "  try:\n"
+                            "    os.rmdir(dp)\n"
+                            "  except Exception:\n"
+                            "    pass\n"
+                        )
+                        + " "
+                        + shlex.quote(str(remote_repo))
+                        + " "
+                        + shlex.quote(','.join(sorted(desired_dirs)))
+                    )
+                    client.exec_command(cmd, get_pty=False, timeout=60)
+            except Exception:
+                pass
+
+            try:
+                _update_repo_push_progress(
+                    progress_id,
+                    status='finalizing',
+                    stage='deleting',
+                    percent=75.0,
+                    method='sftp',
+                    detail=f'Removing stale remote files… (removed={removed_files}/{total_stale}, failed={failed_files})',
+                )
+            except Exception:
+                pass
+            # Skip full remote walk when manifest covers our managed files.
+            do_full_remote_walk = False
+        else:
+            do_full_remote_walk = True
+    except Exception:
+        do_full_remote_walk = True
+
+    def _remote_listdir(path: str) -> list[Any]:
+        try:
+            return list(sftp.listdir_attr(path))
+        except Exception:
+            return []
+
+    def _is_dir(attr: Any) -> bool:
+        try:
+            import stat as _stat
+
+            return _stat.S_ISDIR(int(getattr(attr, 'st_mode', 0)))
+        except Exception:
+            return False
+
+    if do_full_remote_walk:
+        # Walk remote tree and delete extras.
+        # We keep it bounded by skipping hidden dirs at the top-level.
+        to_delete_files: list[str] = []
+        to_delete_dirs: list[str] = []
+
+        stack: list[tuple[str, str]] = [(remote_repo, '')]
+        while stack:
+            abs_dir, rel_dir = stack.pop()
+            for entry in _remote_listdir(abs_dir):
+                try:
+                    name = str(getattr(entry, 'filename', '') or '').strip()
+                except Exception:
+                    name = ''
+                if not name or name in {'.', '..'}:
+                    continue
+                if not rel_dir and name.startswith('.') and name not in {'.coretg_repo_hash', manifest_name}:
+                    # Don’t touch unexpected hidden roots.
+                    continue
+                child_rel = (rel_dir + '/' + name) if rel_dir else name
+                child_rel = child_rel.replace('\\', '/').lstrip('/')
+                child_abs = _remote_path_join(abs_dir, name)
+                if _is_dir(entry):
+                    stack.append((child_abs, child_rel))
+                    # Record dirs for potential deletion later.
+                    if child_rel not in desired_dirs and child_rel not in {'outputs'}:
+                        to_delete_dirs.append(child_abs)
+                else:
+                    if child_rel not in desired_files and child_rel != manifest_name:
+                        to_delete_files.append(child_abs)
+
+        # Delete files first.
+        for abs_p in sorted(set(to_delete_files), reverse=True):
+            try:
+                sftp.remove(abs_p)
+            except Exception:
+                pass
+        # Delete directories (deep-first), ignoring failures.
+        for abs_d in sorted(set(to_delete_dirs), reverse=True):
+            try:
+                sftp.rmdir(abs_d)
+            except Exception:
+                pass
+
+    # Write updated manifest for next run (best-effort).
+    try:
+        _update_repo_push_progress(progress_id, status='finalizing', stage='manifest', percent=88.0, method='sftp', detail='Writing remote sync manifest…')
+    except Exception:
+        pass
+    try:
+        new_manifest: dict[str, dict[str, int]] = {}
+        for rel in sorted(desired_files):
+            if rel in {'.coretg_repo_hash', manifest_name}:
+                continue
+            local_path = os.path.join(root, rel)
+            if not os.path.exists(local_path):
+                continue
+            try:
+                if os.path.islink(local_path):
+                    continue
+            except Exception:
+                pass
+            try:
+                st = os.stat(local_path)
+            except Exception:
+                continue
+            try:
+                new_manifest[rel] = {'size': int(st.st_size), 'mtime': int(st.st_mtime)}
+            except Exception:
+                continue
+        payload = json.dumps(new_manifest, ensure_ascii=False, separators=(',', ':'))
+        try:
+            if client is not None:
+                _exec_ssh_command(
+                    client,
+                    f"python3 -c {shlex.quote('import os,sys; p=sys.argv[1]; tmp=p+\".tmp\"; open(tmp,\"w\",encoding=\"utf-8\").write(sys.argv[2]); os.replace(tmp,p)')} {shlex.quote(str(manifest_remote_path))} {shlex.quote(payload)}",
+                    timeout=float(os.getenv('CORETG_REMOTE_MANIFEST_WRITE_TIMEOUT_S', '20') or 20.0),
+                    cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
+                    check=False,
+                )
+            else:
+                raise RuntimeError('no ssh client')
+        except Exception:
+            # Final fallback (best-effort): SFTP write.
+            try:
+                f = sftp.open(manifest_remote_path, 'w')
+                try:
+                    f.write(payload)
+                finally:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        if log_handle:
+            log_handle.write(
+                f"[remote] Repo upload: SFTP delta sync complete (uploaded={uploaded}, unchanged={skipped_unchanged}, symlink_skipped={skipped_symlink}, bytes={done_bytes}/{total_bytes})\n"
+            )
+            log_handle.flush()
+    except Exception:
+        pass
+
 
 
 def _repo_skip_if_unchanged_enabled() -> bool:
@@ -1575,9 +3011,42 @@ def _create_local_repo_archive_from_paths(
     return tmp_path
 
 
-def _read_remote_repo_hash(sftp: Any, remote_repo: str) -> Optional[str]:
+def _read_remote_repo_hash(
+    sftp: Any,
+    remote_repo: str,
+    *,
+    client: Any | None = None,
+    timeout_s: float = 10.0,
+    cancel_check: Any = None,
+) -> Optional[str]:
+    """Read the remote repo hash.
+
+    Prefer SSH (wall-clock timeout, non-blocking reads) because Paramiko SFTP reads
+    can block indefinitely if the transport wedges.
+    """
+    remote_hash_path = _remote_path_join(remote_repo, '.coretg_repo_hash')
     try:
-        remote_hash_path = _remote_path_join(remote_repo, '.coretg_repo_hash')
+        timeout_s2 = float(timeout_s or 10.0)
+    except Exception:
+        timeout_s2 = 10.0
+    timeout_s2 = max(2.0, min(timeout_s2, 60.0))
+
+    if client is not None:
+        try:
+            rc, out, _err = _exec_ssh_command(
+                client,
+                f"bash -lc {shlex.quote('cat ' + shlex.quote(remote_hash_path) + ' 2>/dev/null || true')}",
+                timeout=timeout_s2,
+                cancel_check=cancel_check,
+                check=False,
+            )
+            _ = rc
+            raw = (out or '').strip()
+            return raw or None
+        except Exception:
+            pass
+
+    try:
         with sftp.open(remote_hash_path, 'r') as rf:
             raw = rf.read().decode('utf-8', 'ignore').strip()
             return raw or None
@@ -1609,12 +3078,19 @@ def _push_repo_to_remote(
     repo_root = _get_repo_root()
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
     log.info('[remote-sync] starting repo sync to CORE VM')
-    _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=2.0, detail='Creating repository archive…')
+    _update_repo_push_progress(progress_id, status='packaging', stage='preparing', percent=2.0, detail='Scanning repository for changes…')
     client = _open_ssh_client(cfg)
     sftp = None
     archive_path = None
     try:
         sftp = client.open_sftp()
+        # Avoid indefinite blocking SFTP ops when the transport wedges.
+        try:
+            ch = getattr(sftp, 'get_channel', lambda: None)()
+            if ch is not None and hasattr(ch, 'settimeout'):
+                ch.settimeout(float(os.getenv('CORETG_SFTP_CHANNEL_TIMEOUT_S', '30') or 30))
+        except Exception:
+            pass
         log.info('[remote-sync] SFTP session opened')
         remote_repo = _remote_static_repo_dir(sftp)
         log.info('[remote-sync] remote_repo=%s', remote_repo)
@@ -1639,21 +3115,121 @@ def _push_repo_to_remote(
                 log_handle.flush()
         except Exception:
             pass
+
+        force_tar_bootstrap = False
+        tar_if_missing = True
+
         if _repo_skip_if_unchanged_enabled():
             try:
-                if include_repo_paths:
-                    local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
-                else:
-                    local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
-                log.info('[remote-sync] computed local hash')
-                remote_hash = _read_remote_repo_hash(sftp, remote_repo)
+                try:
+                    _update_repo_push_progress(
+                        progress_id,
+                        status='packaging',
+                        stage='hash',
+                        percent=3.5,
+                        detail='Checking remote repo hash…',
+                    )
+                except Exception:
+                    pass
+
+                remote_hash = _read_remote_repo_hash(
+                    sftp,
+                    remote_repo,
+                    client=client,
+                    timeout_s=float(os.getenv('CORETG_REMOTE_HASH_READ_TIMEOUT_S', '10') or 10.0),
+                    cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
+                )
                 log.info('[remote-sync] remote hash=%s', remote_hash or 'missing')
-                if remote_hash and local_hash == remote_hash:
-                    _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository unchanged; upload skipped.')
-                    log.info('[remote-sync] Repository unchanged; skipping upload to %s', remote_repo)
-                    return {'repo_path': remote_repo, 'progress_id': progress_id, 'skipped': True}
+
+                force_tar_bootstrap = not bool(remote_hash)
+                try:
+                    flag = str(os.getenv('CORETG_REPO_PUSH_TAR_IF_REMOTE_HASH_MISSING', '1') or '1').strip().lower()
+                    tar_if_missing = flag not in ('0', 'false', 'no', 'off')
+                except Exception:
+                    tar_if_missing = True
+
+                if not force_tar_bootstrap:
+                    # Only compute local hash when the remote hash exists and we might skip.
+                    if include_repo_paths:
+                        local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
+                    else:
+                        local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
+                    log.info('[remote-sync] computed local hash')
+                    if remote_hash and local_hash == remote_hash:
+                        _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository unchanged; upload skipped.')
+                        log.info('[remote-sync] Repository unchanged; skipping upload to %s', remote_repo)
+                        return {'repo_path': remote_repo, 'progress_id': progress_id, 'skipped': True}
+                elif tar_if_missing:
+                    try:
+                        _update_repo_push_progress(
+                            progress_id,
+                            status='uploading',
+                            stage='uploading',
+                            percent=8.0,
+                            detail='Remote hash missing; bootstrapping repository via snapshot upload…',
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
+        # Prefer incremental sync to avoid uploading a huge tarball every time.
+        method = _normalize_repo_push_method(cfg)
+        try:
+            # If we determined this is a cold remote repo, optionally force a snapshot bootstrap.
+            if force_tar_bootstrap and tar_if_missing:
+                method = 'tar'
+        except Exception:
+            pass
+        if method in {'rsync', 'sftp'}:
+            _update_repo_push_progress(progress_id, status='uploading', stage='syncing', percent=10.0, detail=f'Starting incremental sync ({method})…')
+            sync_err = None
+            if method == 'rsync':
+                try:
+                    _push_repo_to_remote_via_rsync(
+                        cfg,
+                        remote_repo=remote_repo,
+                        allowed_outputs=allowed_outputs,
+                        include_repo_paths=include_repo_paths,
+                        logger=log,
+                        progress_id=progress_id,
+                        log_handle=log_handle,
+                    )
+                except Exception as exc:
+                    sync_err = exc
+                    # Fall back to SFTP delta when rsync fails (missing rsync, remote lacks rsync, etc.)
+                    method = 'sftp'
+            if method == 'sftp':
+                try:
+                    _push_repo_to_remote_via_sftp_delta(
+                        client,
+                        sftp,
+                        repo_root=repo_root,
+                        remote_repo=remote_repo,
+                        allowed_outputs=allowed_outputs,
+                        include_repo_paths=include_repo_paths,
+                        logger=log,
+                        progress_id=progress_id,
+                        log_handle=log_handle,
+                    )
+                except Exception as exc:
+                    # If we got here because rsync failed, chain for visibility.
+                    if sync_err is not None:
+                        raise RuntimeError(f"Repo sync failed (rsync then sftp): rsync={sync_err}; sftp={exc}")
+                    raise
+
+            # Update remote hash for skip-if-unchanged.
+            try:
+                if _repo_skip_if_unchanged_enabled():
+                    if include_repo_paths:
+                        local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
+                    else:
+                        local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
+                    _write_remote_repo_hash(client, remote_repo, local_hash)
+            except Exception:
+                pass
+            _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host (incremental sync).')
+            return {'repo_path': remote_repo, 'progress_id': progress_id, 'method': method}
         try:
             if log_handle:
                 log_handle.write("[remote] Repo upload: packaging snapshot…\n")
@@ -1724,7 +3300,10 @@ def _push_repo_to_remote(
             return {'repo_path': remote_repo, 'progress_id': progress_id, 'finalizing': True}
         extract_script = (
             f"set -euo pipefail; mkdir -p {shlex.quote(remote_parent)}; "
-            f"rm -rf {shlex.quote(remote_repo)}; "
+            f"repo={shlex.quote(remote_repo)}; "
+            "if [ -z \"$repo\" ] || [ \"$repo\" = \"/\" ]; then echo 'refusing to clear unsafe repo path' >&2; exit 2; fi; "
+            "mkdir -p \"$repo\"; "
+            "find \"$repo\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true; "
             f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}; "
             f"rm -f {shlex.quote(remote_archive)}"
         )
@@ -1787,7 +3366,10 @@ def _schedule_remote_repo_finalize(
         # No async tracking requested; fall back to synchronous finalize.
         extract_script = (
             f"set -euo pipefail; mkdir -p {shlex.quote(remote_parent)}; "
-            f"rm -rf {shlex.quote(remote_repo)}; "
+            f"repo={shlex.quote(remote_repo)}; "
+            "if [ -z \"$repo\" ] || [ \"$repo\" = \"/\" ]; then echo 'refusing to clear unsafe repo path' >&2; exit 2; fi; "
+            "mkdir -p \"$repo\"; "
+            "find \"$repo\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true; "
             f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}; "
             f"rm -f {shlex.quote(remote_archive)}"
         )
@@ -1808,7 +3390,7 @@ def _schedule_remote_repo_finalize(
             if _is_repo_push_cancel_requested(progress_id):
                 _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
                 return
-            _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=55.0, detail='Removing previous repository…')
+            _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=55.0, detail='Clearing previous repository…')
             client = _open_ssh_client(core_cfg)
 
             # Track the remote tar PID so a cancel request can kill it.
@@ -1843,7 +3425,16 @@ def _schedule_remote_repo_finalize(
             )
             _exec_ssh_command(
                 client,
-                f"rm -rf {shlex.quote(remote_repo)}",
+                (
+                    "sh -lc "
+                    + shlex.quote(
+                        "set -e; "
+                        f"repo={shlex.quote(remote_repo)}; "
+                        "if [ -z \"$repo\" ] || [ \"$repo\" = \"/\" ]; then echo 'refusing to clear unsafe repo path' >&2; exit 2; fi; "
+                        "mkdir -p \"$repo\"; "
+                        "find \"$repo\" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true; "
+                    )
+                ),
                 timeout=None,
                 cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
                 check=True,
@@ -6281,11 +7872,32 @@ except Exception:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'coretopogenweb')
+
+# Used for cache-busting and debugging when users have an old tab open.
+_WEBUI_BUILD_ID = os.environ.get('CORETG_WEBUI_BUILD_ID') or uuid.uuid4().hex
 _log_level_name = os.environ.get('WEBAPP_LOG_LEVEL', 'INFO').strip().upper()
 try:
     app.logger.setLevel(getattr(logging, _log_level_name, logging.INFO))
 except Exception:
     pass
+
+
+@app.after_request
+def _disable_html_cache(response):
+    """Avoid cached inline JS/HTML causing stale UI behavior.
+
+    The UI template contains large inline scripts, so browser caching can keep old
+    behavior (eg showing XHR upload=4.3KiB) even after backend changes.
+    """
+    try:
+        ct = (response.headers.get('Content-Type') or '').lower()
+        if 'text/html' in ct:
+            response.headers['Cache-Control'] = 'no-store'
+            response.headers['Pragma'] = 'no-cache'
+            response.headers['Expires'] = '0'
+    except Exception:
+        pass
+    return response
 class _SkipWebuiLogTailFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -9224,42 +10836,6 @@ def participant_ui_details_api():
             session_id, _last_seen = _recent_session_id_for_scenario(scenario_norm, scenario_paths=scenario_paths_live)
         except Exception:
             session_id = None
-
-    try:
-        app.logger.info(
-            '[flow.prepare_preview_for_execute] done scenario=%s chain_len=%s flow_valid=%s flow_errors=%s',
-            scenario_norm,
-            len(chain_nodes or []),
-            bool(flow_valid),
-            (flow_errors or []),
-        )
-    except Exception:
-        pass
-
-    try:
-        realized_flags: list[str] = []
-        for fa in (flag_assignments or []):
-            if not isinstance(fa, dict):
-                continue
-            ro = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else {}
-            flag_val = None
-            if isinstance(ro, dict):
-                flag_val = ro.get('Flag(flag_id)') or ro.get('flag')
-            if not flag_val:
-                flag_val = fa.get('flag_value')
-            if isinstance(flag_val, str) and flag_val.strip():
-                realized_flags.append(flag_val.strip())
-        if realized_flags and len(set(realized_flags)) != len(realized_flags):
-            return jsonify({
-                'ok': False,
-                'error': 'Duplicate flag value detected during resolve; retry with a different chain.',
-                'scenario': scenario_label or scenario_norm,
-                'length': length,
-                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
-                'flag_assignments': flag_assignments,
-            }), 422
-    except Exception:
-        pass
 
     return jsonify({
         'ok': True,
@@ -17505,6 +19081,15 @@ def api_flow_prepare_preview_for_execute():
                     ]
                 except Exception:
                     generator_only = []
+
+                # IMPORTANT: when include_repo_paths is set, remote sync uses a reduced snapshot
+                # and will only upload the explicitly included paths. allowed_outputs_override
+                # alone is not sufficient to include installed generator packs.
+                if generator_only:
+                    try:
+                        include_repo_paths = list(dict.fromkeys([*(include_repo_paths or []), *generator_only]))
+                    except Exception:
+                        pass
                 if generator_only:
                     app.logger.info('[flow.generator] Syncing repo to CORE VM (generators: %d)', len(generator_only))
                 else:
@@ -18071,6 +19656,29 @@ def api_flow_prepare_preview_for_execute():
             "env=os.environ.copy()\n"
             "env['CORETG_DOCKER_USE_SUDO']='1'\n"
             "env['CORETG_DOCKER_HOST_NETWORK']='1'\n"
+            "preflight=''\n"
+            "deps_dir='/tmp/coretg_pydeps'\n"
+            "try:\n"
+            "  import yaml  # noqa\n"
+            "except Exception as _e_yaml:\n"
+            "  try:\n"
+            "    os.makedirs(deps_dir, exist_ok=True)\n"
+            "    pip_cmd=[sys.executable,'-m','pip','install','-q','--disable-pip-version-check','--no-input','-t',deps_dir,'PyYAML==6.0.2']\n"
+            "    r=subprocess.run(pip_cmd, cwd=REPO, check=False, capture_output=True, text=True)\n"
+            "    if r.returncode!=0:\n"
+            "      try:\n"
+            "        subprocess.run([sys.executable,'-m','ensurepip','--upgrade'], cwd=REPO, check=False, capture_output=True, text=True)\n"
+            "      except Exception:\n"
+            "        pass\n"
+            "      r=subprocess.run(pip_cmd, cwd=REPO, check=False, capture_output=True, text=True)\n"
+            "    if deps_dir not in sys.path:\n"
+            "      sys.path.insert(0, deps_dir)\n"
+            "    import yaml  # noqa\n"
+            "    preflight += '[preflight] installed PyYAML into ' + deps_dir + '\\n'\n"
+            "    if (r.stderr or r.stdout):\n"
+            "      preflight += '[preflight] pip: ' + (r.stderr or r.stdout).strip()[-800:] + '\\n'\n"
+            "  except Exception as _e_pip:\n"
+            "    preflight += '[preflight] PyYAML missing and install failed: ' + str(_e_pip) + '\\n'\n"
             f"SUDO_PW={json.dumps(str(sudo_pw or ''))}\n"
             "if SUDO_PW:\n"
             "  env['CORETG_DOCKER_SUDO_PASSWORD']=SUDO_PW\n"
@@ -18130,8 +19738,8 @@ def api_flow_prepare_preview_for_execute():
             "print(json.dumps({\n"
             "  'ok': ok,\n"
             "  'rc': int(p.returncode or 0),\n"
-            "  'stdout': (p.stdout or '')[-4000:],\n"
-            "  'stderr': (p.stderr or '')[-4000:],\n"
+            "  'stdout': (preflight + (p.stdout or ''))[-4000:],\n"
+            "  'stderr': (preflight + (p.stderr or ''))[-4000:],\n"
             "  'manifest': manifest if os.path.exists(manifest) else None,\n"
             "  'outputs': outputs,\n"
             "  'error': err,\n"
@@ -20180,6 +21788,15 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         host_ip_map = {}
 
+    flag_assignments_out = flag_assignments
+    try:
+        flag_assignments_out = [
+            _canonicalize_flow_assignment_paths(x) if isinstance(x, dict) else x
+            for x in (flag_assignments or [])
+        ]
+    except Exception:
+        flag_assignments_out = flag_assignments
+
     try:
         realized_flags: list[str] = []
         for fa in (flag_assignments or []):
@@ -20200,7 +21817,7 @@ def api_flow_prepare_preview_for_execute():
                 'scenario': scenario_label or scenario_norm,
                 'length': length,
                 'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
-                'flag_assignments': flag_assignments,
+                'flag_assignments': flag_assignments_out,
             }), 422
     except Exception:
         pass
@@ -20223,7 +21840,7 @@ def api_flow_prepare_preview_for_execute():
             }
             for n in chain_nodes
         ],
-        'flag_assignments': flag_assignments,
+        'flag_assignments': flag_assignments_out,
         'flags_enabled': bool(flags_enabled),
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
@@ -28238,6 +29855,35 @@ def _container_running(name):
         return False
 
 
+def _container_image(name):
+    try:
+        p = _run_docker(['inspect', '-f', '{{.Config.Image}}', name], timeout=10, capture=True)
+        if p.returncode != 0:
+            return ''
+        return (p.stdout or '').strip()
+    except Exception:
+        return ''
+
+
+def _compose_images_configured(yml_path):
+    try:
+        p = _run_docker(['compose', '-f', yml_path, 'config', '--images'], timeout=25, capture=True)
+        if p.returncode != 0:
+            return []
+        images = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+        # De-dupe while preserving order.
+        out = []
+        seen = set()
+        for img in images:
+            if img in seen:
+                continue
+            seen.add(img)
+            out.append(img)
+        return out
+    except Exception:
+        return []
+
+
 def _images_pulled_for_compose(yml_path):
     # Best-effort: list images referenced by the compose file and confirm they exist locally.
     try:
@@ -28292,6 +29938,8 @@ def main():
         pulled = _images_pulled_for_compose(yml) if exists else False
         c_exists = node_name in names
         running = _container_running(node_name) if c_exists else False
+        img = _container_image(node_name) if c_exists else ''
+        cfg_imgs = _compose_images_configured(yml) if exists else []
         items.append({
             'name': node_name,
             'compose': yml,
@@ -28299,6 +29947,8 @@ def main():
             'pulled': bool(pulled),
             'container_exists': bool(c_exists),
             'running': bool(running),
+            'container_image': img,
+            'compose_images': cfg_imgs,
         })
 
     payload = {'items': items, 'timestamp': int(time.time())}
@@ -29084,6 +30734,146 @@ def docker_status():
         return jsonify(payload)
     except Exception as exc:
         return jsonify({'items': [], 'timestamp': int(time.time()), 'error': str(exc)}), 200
+
+
+@app.route('/docker/compose_text', methods=['GET'])
+def docker_compose_text():
+    """Return a snippet of the remote docker-compose file for a named node.
+
+    This reads from the CORE VM (via SSH), not the local Flask machine.
+    Intended for debugging which image/template was actually generated.
+    """
+    history = _load_run_history()
+    current_user = _current_user()
+    scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_query = request.args.get('scenario', '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_query)
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+    node_name = str(request.args.get('name') or '').strip()
+    if not node_name or not re.match(r'^[A-Za-z0-9._-]{1,64}$', node_name):
+        return jsonify({'ok': False, 'error': 'Invalid node name.'}), 400
+    try:
+        lines = int(request.args.get('lines') or 120)
+    except Exception:
+        lines = 120
+    lines = max(20, min(400, lines))
+
+    core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
+    core_cfg = _ensure_core_vm_metadata(core_cfg)
+
+    script = (
+        "import os, json, time\n"
+        f"name = {json.dumps(node_name)}\n"
+        f"max_lines = int({json.dumps(str(lines))})\n"
+        "base = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen')\n"
+        "def _read_file(path, max_lines=120):\n"
+        "  try:\n"
+        "    out=[]\n"
+        "    with open(path, 'r', encoding='utf-8', errors='ignore') as f:\n"
+        "      for i, ln in enumerate(f):\n"
+        "        if i >= max_lines: break\n"
+        "        out.append(ln.rstrip('\\\\n'))\n"
+        "    return True, '\\\\n'.join(out)\n"
+        "  except Exception as e:\n"
+        "    return False, str(e)\n"
+        "def _imageish_lines(text):\n"
+        "  out=[]\n"
+        "  try:\n"
+        "    for ln in (text or '').split('\\\\n'):\n"
+        "      low=ln.lower()\n"
+        "      if 'image:' in low or 'build:' in low or 'container_name' in low or 'quay.io' in low or 'nfs' in low or 'ganesha' in low:\n"
+        "        out.append(ln)\n"
+        "  except Exception:\n"
+        "    pass\n"
+        "  return out[:120]\n"
+        "candidates = [\n"
+        "  os.path.join(base, 'vulns', 'compose_assignments.json'),\n"
+        "  os.path.join(base, 'outputs', 'vulns', 'compose_assignments.json'),\n"
+        "  os.path.join(base, 'compose_assignments.json'),\n"
+        "  '/tmp/vulns/compose_assignments.json',\n"
+        "]\n"
+        "assign_path = ''\n"
+        "for p in candidates:\n"
+        "  try:\n"
+        "    if os.path.exists(p):\n"
+        "      assign_path = p\n"
+        "      break\n"
+        "  except Exception:\n"
+        "    pass\n"
+        "assign_dir = os.path.dirname(assign_path) if assign_path else '/tmp/vulns'\n"
+        "yml = os.path.join(assign_dir, f'docker-compose-{name}.yml')\n"
+        "exists = False\n"
+        "try: exists = os.path.exists(yml)\n"
+        "except Exception: exists = False\n"
+        "head = ''\n"
+        "image_lines = []\n"
+        "flow_src = ''\n"
+        "flow_run_dir = ''\n"
+        "flow_compose = ''\n"
+        "flow_compose_exists = False\n"
+        "flow_compose_head = ''\n"
+        "flow_compose_image_lines = []\n"
+        "if exists:\n"
+        "  ok, content = _read_file(yml, max_lines=max_lines)\n"
+        "  if ok:\n"
+        "    head = content\n"
+        "    image_lines = _imageish_lines(content)\n"
+        "    try:\n"
+        "      for ln in content.split('\\\\n'):\n"
+        "        low = ln.lower().strip()\n"
+        "        if low.startswith('coretg.flow_artifacts.src:'):\n"
+        "          flow_src = ln.split(':', 1)[1].strip()\n"
+        "          break\n"
+        "    except Exception:\n"
+        "      flow_src = ''\n"
+        "  else:\n"
+        "    head = f'ERROR reading {yml}: {content}'\n"
+
+        "if flow_src:\n"
+        "  try:\n"
+        "    flow_run_dir = os.path.dirname(flow_src.rstrip('/'))\n"
+        "    cand = os.path.join(flow_run_dir, 'docker-compose.yml')\n"
+        "    flow_compose = cand\n"
+        "    flow_compose_exists = bool(os.path.exists(cand))\n"
+        "    if flow_compose_exists:\n"
+        "      ok2, content2 = _read_file(cand, max_lines=max_lines)\n"
+        "      flow_compose_head = content2 if ok2 else ('ERROR reading ' + cand + ': ' + content2)\n"
+        "      if ok2:\n"
+        "        flow_compose_image_lines = _imageish_lines(content2)\n"
+        "  except Exception:\n"
+        "    pass\n"
+
+        "print(json.dumps({\n"
+        "  'ok': True,\n"
+        "  'name': name,\n"
+        "  'compose': yml,\n"
+        "  'exists': bool(exists),\n"
+        "  'head': head,\n"
+        "  'image_lines': image_lines[:80],\n"
+        "  'flow_artifacts_src': flow_src,\n"
+        "  'flow_run_dir': flow_run_dir,\n"
+        "  'flow_compose': flow_compose,\n"
+        "  'flow_compose_exists': bool(flow_compose_exists),\n"
+        "  'flow_compose_image_lines': flow_compose_image_lines[:80],\n"
+        "  'flow_compose_head': flow_compose_head,\n"
+        "  'timestamp': int(time.time()),\n"
+        "}))\n"
+    )
+    try:
+        payload = _run_remote_python_json(
+            core_cfg,
+            script,
+            logger=app.logger,
+            label='docker.compose_text',
+            timeout=30.0,
+        )
+        if not isinstance(payload, dict):
+            payload = {'ok': False, 'error': 'invalid remote payload'}
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 200
 
 
 @app.route('/docker/cleanup', methods=['POST'])
@@ -31659,7 +33449,7 @@ def index():
     except Exception:
         xml_text = ""
 
-    return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
+    return render_template('index.html', payload=payload, logs="", xml_preview=xml_text, ui_build_id=_WEBUI_BUILD_ID)
 
 
 @app.route('/load_xml', methods=['POST'])
@@ -31701,7 +33491,7 @@ def load_xml():
         snapshot = _load_editor_state_snapshot(user)
         if snapshot:
             payload['editor_snapshot'] = snapshot
-        return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
+        return render_template('index.html', payload=payload, logs="", xml_preview=xml_text, ui_build_id=_WEBUI_BUILD_ID)
     except Exception as e:
         flash(f'Failed to parse XML: {e}')
         return redirect(url_for('index'))
@@ -31873,7 +33663,7 @@ def save_xml():
             app.logger.info('[save_xml] success user=%s xml=%s scen_count=%s', username or 'anonymous', out_path, scenario_count)
         except Exception:
             pass
-        return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
+        return render_template('index.html', payload=payload, logs="", xml_preview=xml_text, ui_build_id=_WEBUI_BUILD_ID)
     except Exception as e:
         flash(f'Failed to save XML: {e}')
         return redirect(url_for('index'))
@@ -32317,8 +34107,18 @@ def run_cli():
                 conn_host,
                 '--port',
                 str(conn_port),
-                '--verbose',
             ]
+            try:
+                cli_verbose = str(os.getenv('CORETG_WEBAPP_CLI_VERBOSE') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+            except Exception:
+                cli_verbose = False
+            try:
+                if (not cli_verbose) and str(os.getenv('WEBAPP_LOG_LEVEL') or '').strip().upper() == 'DEBUG':
+                    cli_verbose = True
+            except Exception:
+                pass
+            if cli_verbose:
+                cli_args.append('--verbose')
             if active_scenario_name:
                 cli_args.extend(['--scenario', active_scenario_name])
             proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True, env=cli_env)
@@ -32560,7 +34360,7 @@ def run_cli():
         except Exception as e_hist:
             app.logger.exception("[sync] failed appending run history: %s", e_hist)
         payload = _prepare_payload_for_index(payload, user=user)
-        return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
+        return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success, ui_build_id=_WEBUI_BUILD_ID)
     except Exception as e:
         flash(f'Error running core-topo-gen: {e}')
         return redirect(url_for('index'))
@@ -36081,7 +37881,8 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     scenario_core_override = job_spec.get('scenario_core_override')
     scenario_name_hint = job_spec.get('scenario_name_hint')
     scenario_index_hint = job_spec.get('scenario_index_hint')
-    update_remote_repo = job_spec.get('update_remote_repo')
+    # Repo sync is always enabled for remote (SSH) execution.
+    update_remote_repo = True
     adv_fix_docker_daemon = job_spec.get('adv_fix_docker_daemon')
     adv_run_core_cleanup = job_spec.get('adv_run_core_cleanup')
     adv_check_core_version = job_spec.get('adv_check_core_version')
@@ -36092,7 +37893,8 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     docker_cleanup_before_run = job_spec.get('docker_cleanup_before_run')
     docker_remove_all_containers = job_spec.get('docker_remove_all_containers')
     overwrite_existing_images = job_spec.get('overwrite_existing_images')
-    upload_only_injected_artifacts = job_spec.get('upload_only_injected_artifacts')
+    # Always use full artifacts mode; injected-only uploads are no longer supported.
+    upload_only_injected_artifacts = False
     scenarios_inline = job_spec.get('scenarios_inline')
     flow_enabled = job_spec.get('flow_enabled')
     scenario_for_plan = job_spec.get('scenario_for_plan')
@@ -36263,27 +38065,16 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
             _fail_run(venv_error)
             return
 
-    try:
-        force_remote_sync = str(os.getenv('CORETG_FORCE_REMOTE_REPO_SYNC', '1')).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-    except Exception:
-        force_remote_sync = True
-    if force_remote_sync and bool(core_cfg.get('ssh_enabled')) and not bool(update_remote_repo):
-        update_remote_repo = True
+    if bool(core_cfg.get('ssh_enabled')) and update_remote_repo:
         try:
-            log_f.write("[remote] Repo upload was not requested; forcing upload to keep remote execute code up-to-date.\n")
-        except Exception:
-            pass
-
-    if update_remote_repo:
-        try:
-            log_f.write("[remote] Repo upload starting (requested by execute dialog)\n")
+            log_f.write("[remote] Repo sync starting (always enabled for remote execution)\n")
         except Exception:
             pass
         try:
             repo_sync = _push_repo_to_remote(
                 core_cfg,
                 logger=app.logger,
-                upload_only_injected_artifacts=bool(upload_only_injected_artifacts),
+                upload_only_injected_artifacts=False,
                 log_handle=log_f,
             )
         except Exception as exc:
@@ -36346,11 +38137,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                             pass
             except Exception:
                 pass
-    else:
-        try:
-            log_f.write("[remote] Repo upload skipped; remote repository may be stale.\n")
-        except Exception:
-            pass
+    # Note: for local execution, repo sync is not applicable.
 
     core_host = core_cfg.get('host', '127.0.0.1')
     try:
@@ -36970,8 +38757,18 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
             core_host,
             '--port',
             str(core_port),
-            '--verbose',
         ]
+        try:
+            cli_verbose = str(os.getenv('CORETG_WEBAPP_CLI_VERBOSE') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        except Exception:
+            cli_verbose = False
+        try:
+            if (not cli_verbose) and str(os.getenv('WEBAPP_LOG_LEVEL') or '').strip().upper() == 'DEBUG':
+                cli_verbose = True
+        except Exception:
+            pass
+        if cli_verbose:
+            cli_args.append('--verbose')
         if docker_remove_conflicts:
             cli_args.append('--docker-remove-conflicts')
         if seed is not None:
@@ -37124,7 +38921,8 @@ def run_cli_async():
     scenario_core_override = None
     scenario_name_hint = None
     scenario_index_hint: Optional[int] = None
-    update_remote_repo = False
+    # Repo sync is always enabled for remote execution.
+    update_remote_repo = True
     adv_fix_docker_daemon = False
     adv_run_core_cleanup = False
     adv_check_core_version = False
@@ -37135,6 +38933,7 @@ def run_cli_async():
     docker_cleanup_before_run = False
     docker_remove_all_containers = False
     overwrite_existing_images = False
+    # Always use full artifacts mode; injected-only uploads are no longer supported.
     upload_only_injected_artifacts = False
     scenarios_inline = None
     flow_enabled = True
@@ -37165,8 +38964,6 @@ def run_cli_async():
                 scenario_core_override = json.loads(hitl_core_json)
         except Exception:
             scenario_core_override = None
-        if 'update_remote_repo' in request.form:
-            update_remote_repo = _coerce_bool(request.form.get('update_remote_repo'))
         adv_fix_docker_daemon = _coerce_bool(request.form.get('adv_fix_docker_daemon'))
         adv_run_core_cleanup = _coerce_bool(request.form.get('adv_run_core_cleanup'))
         adv_check_core_version = _coerce_bool(request.form.get('adv_check_core_version'))
@@ -37179,10 +38976,6 @@ def run_cli_async():
             request.form.get('docker_remove_all_containers')
         ) or _coerce_bool(request.form.get('docker_nuke_all'))
         overwrite_existing_images = _coerce_bool(request.form.get('overwrite_existing_images'))
-        upload_only_injected_artifacts = _coerce_bool(
-            request.form.get('upload_only_injected_artifacts')
-            or request.form.get('upload_only_injected')
-        )
         if 'flow_enabled' in request.form:
             flow_enabled = _coerce_bool(request.form.get('flow_enabled'))
     try:
@@ -37211,8 +39004,6 @@ def run_cli_async():
                     scenario_index_hint = int(j.get('scenario_index'))
                 except Exception:
                     scenario_index_hint = None
-            if 'update_remote_repo' in j:
-                update_remote_repo = _coerce_bool(j.get('update_remote_repo'))
             adv_fix_docker_daemon = _coerce_bool(j.get('adv_fix_docker_daemon'))
             adv_run_core_cleanup = _coerce_bool(j.get('adv_run_core_cleanup'))
             adv_check_core_version = _coerce_bool(j.get('adv_check_core_version'))
@@ -37225,10 +39016,6 @@ def run_cli_async():
                 j.get('docker_remove_all_containers')
             ) or _coerce_bool(j.get('docker_nuke_all'))
             overwrite_existing_images = _coerce_bool(j.get('overwrite_existing_images'))
-            upload_only_injected_artifacts = _coerce_bool(
-                j.get('upload_only_injected_artifacts')
-                or j.get('upload_only_injected')
-            )
         except Exception:
             pass
     if not xml_path:
@@ -37648,7 +39435,7 @@ def run_cli_async():
         'scenario_core_override': scenario_core_override,
         'scenario_name_hint': scenario_name_hint,
         'scenario_index_hint': scenario_index_hint,
-        'update_remote_repo': update_remote_repo,
+        'update_remote_repo': True,
         'adv_fix_docker_daemon': adv_fix_docker_daemon,
         'adv_run_core_cleanup': adv_run_core_cleanup,
         'adv_check_core_version': adv_check_core_version,
@@ -37659,7 +39446,7 @@ def run_cli_async():
         'docker_cleanup_before_run': docker_cleanup_before_run,
         'docker_remove_all_containers': docker_remove_all_containers,
         'overwrite_existing_images': overwrite_existing_images,
-        'upload_only_injected_artifacts': upload_only_injected_artifacts,
+        'upload_only_injected_artifacts': False,
         'scenarios_inline': scenarios_inline,
         'flow_enabled': flow_enabled,
         'scenario_for_plan': scenario_for_plan,
@@ -38197,7 +39984,7 @@ def upload_base():
     if payload.get('base_upload'):
         _save_base_upload_state(payload['base_upload'])
     payload = _prepare_payload_for_index(payload, user=user)
-    return render_template('index.html', payload=payload, logs=(errs if not ok else ''), xml_preview='')
+    return render_template('index.html', payload=payload, logs=(errs if not ok else ''), xml_preview='', ui_build_id=_WEBUI_BUILD_ID)
 
 @app.route('/remove_base', methods=['POST'])
 def remove_base():
@@ -38225,7 +40012,7 @@ def remove_base():
         payload.pop('base_upload', None)
         # Do not attach base upload (cleared)
         payload = _prepare_payload_for_index(payload, user=user)
-        return render_template('index.html', payload=payload, logs='', xml_preview='')
+        return render_template('index.html', payload=payload, logs='', xml_preview='', ui_build_id=_WEBUI_BUILD_ID)
     except Exception as e:
         flash(f'Failed to remove base: {e}')
         return redirect(url_for('index'))
@@ -39696,6 +41483,12 @@ def core_push_repo_status(progress_id: str):
         'stage': payload.get('stage'),
         'detail': payload.get('detail'),
         'percent': payload.get('percent'),
+        'done_bytes': payload.get('done_bytes'),
+        'total_bytes': payload.get('total_bytes'),
+        'done_files': payload.get('done_files'),
+        'total_files': payload.get('total_files'),
+        'method': payload.get('method'),
+        'cancel_requested': bool(payload.get('cancel_requested')),
         'updated_at': payload.get('updated_at'),
         'created_at': payload.get('created_at'),
     }
@@ -41168,8 +42961,28 @@ PY
 def stream_logs(run_id: str):
     meta = RUNS.get(run_id)
     if not meta:
-        return Response('event: error\ndata: not found\n\n', mimetype='text/event-stream')
-    log_path = meta.get('log_path')
+        # Important: return a real 404 so clients don't reconnect-loop forever.
+        return Response(
+            'event: error\ndata: not found\n\n'
+            'event: end\ndata: not found\n\n',
+            mimetype='text/event-stream',
+            status=404,
+        )
+    log_path = meta.get('log_path') if isinstance(meta, dict) else None
+    if not isinstance(log_path, str) or not log_path:
+        # Misconfigured run metadata; stream can't proceed.
+        try:
+            if isinstance(meta, dict):
+                meta['done'] = True
+                meta.setdefault('returncode', 1)
+        except Exception:
+            pass
+        return Response(
+            'event: error\ndata: missing log_path\n\n'
+            'event: end\ndata: error\n\n',
+            mimetype='text/event-stream',
+            status=500,
+        )
 
     marker_re = re.compile(
         r'^' + re.escape(_SSE_MARKER_PREFIX) + r'\s+(?P<event>[a-zA-Z0-9_\-]+)\s+(?P<data>\{.*\})\s*$'

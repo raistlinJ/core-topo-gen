@@ -356,6 +356,24 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full4.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full4.txt; echo EXIT_CODE=$code; exit $code",
 			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (runtime timeout tweak)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full5.txt 2>&1; code=$?; tail -n 20 /tmp/pytest_full5.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (journalctl diag)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full6.txt 2>&1; code=$?; tail -n 20 /tmp/pytest_full6.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "Verify installed NFS nodegen output",
+			"type": "shell",
+			"command": "/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/run_flag_generator.py --kind flag-node-generator --generator-id nfs_sensitive_file --out-dir /tmp/coretg-nodegen-nfs-verify --config '{\"seed\":\"seed\",\"node_name\":\"docker-5\",\"flag_prefix\":\"FLAG\",\"nfs_port\":2049}' --repo-root /Users/jcacosta/Documents/core-topo-gen && echo '--- COMPOSE ---' && sed -n '1,120p' /tmp/coretg-nodegen-nfs-verify/outputs/docker-compose.yml | cat && echo '--- GREP ---' && grep -n 'nfs-ganesha|ganesha\\.conf|nfs-server-alpine' /tmp/coretg-nodegen-nfs-verify/outputs/docker-compose.yml || true",
+			"isBackground": false
 		}
 	]
 }

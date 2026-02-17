@@ -155,7 +155,97 @@
     function persistLogs() { try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch (e) { } }
     function isFilterActive() { return !!filterText; }
     const MAX_DOCK_LOG_LINES = 20000;
-    function logLine(level, msg) { const ts = new Date().toISOString(); const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO; const line = `[${ts}] ${level.padEnd(5)} ${msg}`; logBuffer.push({ level, levelValue: lvlVal, line }); if (logBuffer.length > MAX_DOCK_LOG_LINES) { logBuffer.splice(0, logBuffer.length - MAX_DOCK_LOG_LINES); } persistLogs(); if (lvlVal >= currentLogLevel) { if (isFilterActive()) { renderLogs(); } else { if (passFilter(line)) { const el = document.getElementById('logsPre'); if (el) { const text = line + '\n'; if (typeof el.append === 'function') { el.append(text); } else { el.appendChild(document.createTextNode(text)); } if (followLogs) { scrollLogsToBottom(el); const progEl = document.getElementById('runProgressLog'); if (progEl) { scrollLogsToBottom(progEl); } } } } } } }
+      function formatLogTs(dt) {
+        try {
+          const d = dt instanceof Date ? dt : new Date();
+          const pad2 = (n) => String(n).padStart(2, '0');
+          const pad3 = (n) => String(n).padStart(3, '0');
+          const yyyy = d.getFullYear();
+          const mm = pad2(d.getMonth() + 1);
+          const dd = pad2(d.getDate());
+          const hh = pad2(d.getHours());
+          const mi = pad2(d.getMinutes());
+          const ss = pad2(d.getSeconds());
+          const ms = pad3(d.getMilliseconds());
+          return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss},${ms}`;
+        } catch (e) {
+          return '';
+        }
+      }
+      try { if (!window.coretgFormatLogTs) window.coretgFormatLogTs = formatLogTs; } catch (e) { }
+
+      function _normalizeBracketIsoPrefix(s) {
+        // Convert: [2026-02-17T00:06:40.421Z] ...
+        // Into:    [2026-02-16 17:06:40,421] ...   (local time, Python-style)
+        try {
+          const line = String(s || '');
+          const m = line.match(/^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\](.*)$/);
+          if (!m) return line;
+          const iso = m[1];
+          const rest = m[2] || '';
+          const dt = new Date(iso);
+          if (Number.isNaN(dt.getTime())) return line;
+          return `[${formatLogTs(dt)}]${rest}`;
+        } catch (e) {
+          return String(s || '');
+        }
+      }
+
+      function _normalizePersistedLogBufferOnce() {
+        try {
+          if (window.__coretgDockLogsNormalizedTs) return;
+          window.__coretgDockLogsNormalizedTs = true;
+          if (!Array.isArray(logBuffer) || !logBuffer.length) return;
+          let changed = false;
+          for (const rec of logBuffer) {
+            if (!rec || typeof rec !== 'object') continue;
+            const line = (rec.line != null) ? String(rec.line) : '';
+            const norm = _normalizeBracketIsoPrefix(line);
+            if (norm !== line) {
+              rec.line = norm;
+              changed = true;
+            }
+          }
+          if (changed) persistLogs();
+        } catch (e) { }
+      }
+      _normalizePersistedLogBufferOnce();
+      function _lineAlreadyTimestamped(s) {
+        try {
+          const line = String(s || '');
+          // Python logging default: 2026-02-03 00:48:59,316 LEVEL ...
+          if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3}\b/.test(line)) return true;
+          // If a line already contains our own bracketed timestamp prefix, don't re-prefix.
+          if (/^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3}\]/.test(line)) return true;
+          if (/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/.test(line)) return true;
+          return false;
+        } catch (e) {
+          return false;
+        }
+      }
+      function logLine(level, msg) {
+        const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO;
+        const raw0 = (msg != null) ? String(msg) : '';
+        const raw = _normalizeBracketIsoPrefix(raw0);
+        const line = _lineAlreadyTimestamped(raw) ? raw : `[${formatLogTs(new Date())}] ${level.padEnd(5)} ${raw}`;
+        logBuffer.push({ level, levelValue: lvlVal, line });
+        if (logBuffer.length > MAX_DOCK_LOG_LINES) { logBuffer.splice(0, logBuffer.length - MAX_DOCK_LOG_LINES); }
+        persistLogs();
+        if (lvlVal >= currentLogLevel) {
+          if (isFilterActive()) {
+            renderLogs();
+          } else {
+            if (passFilter(line)) {
+              const el = document.getElementById('logsPre');
+              if (el) {
+                const text = line + '\n';
+                if (typeof el.append === 'function') { el.append(text); } else { el.appendChild(document.createTextNode(text)); }
+                if (followLogs) { scrollLogsToBottom(el); const progEl = document.getElementById('runProgressLog'); if (progEl) { scrollLogsToBottom(progEl); } }
+              }
+            }
+          }
+        }
+      }
     function logDebug(m) { logLine('DEBUG', m); }
     function logInfo(m) { logLine('INFO', m); }
     function logWarn(m) { logLine('WARN', m); }
@@ -299,6 +389,7 @@
         return false;
       }
     }
+    try { if (!window.coretgFormatLogTs) window.coretgFormatLogTs = formatLogTs; } catch (e) { }
     if (!window.coretgDockAttachRunStream) {
       window.coretgDockAttachRunStream = attachRunStream;
     }

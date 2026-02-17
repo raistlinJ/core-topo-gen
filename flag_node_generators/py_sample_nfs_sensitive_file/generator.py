@@ -46,20 +46,70 @@ def main() -> None:
 
     flag_value = _compute_flag(seed=seed, node_name=node_name, flag_prefix=flag_prefix)
 
-    _write_text(outputs_dir / "creds.txt", credential_pair + "\n")
-    _write_text(outputs_dir / "flag.txt", flag_value + "\n")
+    exports_dir = outputs_dir / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    _write_text(exports_dir / "creds.txt", credential_pair + "\n")
+    _write_text(exports_dir / "flag.txt", flag_value + "\n")
+
+    # Use a user-space NFS server so the container does not require kernel `nfsd`
+    # support (which typically needs `--privileged` and mounting /proc/fs/nfsd).
+    # Prefer NFSv4-only to avoid rpcbind/mountd extra ports.
+    ganesha_conf_text = (
+        "NFS_Core_Param {\n"
+        "  Protocols = 4;\n"
+        "  # Avoid auxiliary RPC services in minimal containers.\n"
+        "  Enable_NLM = false;\n"
+        "  Enable_RQUOTA = false;\n"
+        "}\n"
+        "\n"
+        "DBus {\n"
+        "  Enabled = false;\n"
+        "}\n"
+        "\n"
+        "EXPORT {\n"
+        "  Export_Id = 1;\n"
+        "  Path = /exports;\n"
+        "  Pseudo = /exports;\n"
+        "  Access_Type = RW;\n"
+        "  Squash = no_root_squash;\n"
+        "  SecType = sys;\n"
+        "  Protocols = 4;\n"
+        "  Transports = TCP;\n"
+        "  FSAL {\n"
+        "    Name = VFS;\n"
+        "  }\n"
+        "}\n"
+    )
+    _write_text(outputs_dir / "ganesha.conf", ganesha_conf_text)
+
+    # CORE VMs often block/require auth for Quay.io pulls. To avoid registry auth
+    # issues, build a tiny image locally (from a public base) that installs Ganesha.
+    # This does require outbound apt access during build.
+    dockerfile_text = (
+        "FROM ubuntu:22.04\n"
+        "ENV DEBIAN_FRONTEND=noninteractive\n"
+        "RUN apt-get update \\\n"
+        "  && apt-get install -y --no-install-recommends nfs-ganesha nfs-ganesha-vfs rpcbind netbase iproute2 \\\n"
+        "  && rm -rf /var/lib/apt/lists/*\n"
+        "\n"
+        "# ganesha.nfsd is installed by the packages above\n"
+    )
+    _write_text(outputs_dir / "Dockerfile", dockerfile_text)
 
     compose_text = (
         "services:\n"
         "  node:\n"
-        "    image: itsthenetwork/nfs-server-alpine:latest\n"
+        "    build:\n"
+        "      context: .\n"
+        "      dockerfile: Dockerfile\n"
+        "    command: ['sh','-lc','rpcbind -w -f & RPCBIND_PID=$!; trap ""kill $RPCBIND_PID 2>/dev/null || true"" EXIT; ganesha.nfsd -F -L STDOUT -f /etc/ganesha/ganesha.conf || { echo \\\"[coretg] ganesha failed; keeping container alive\\\" >&2; sleep infinity; }']\n"
         "    privileged: true\n"
-        "    environment:\n"
-        "      SHARED_DIRECTORY: /exports\n"
         "    ports:\n"
         f"      - \"{nfs_port}:2049\"\n"
         "    volumes:\n"
-        "      - .:/exports\n"
+        "      - ./exports:/exports\n"
+        "      - ./ganesha.conf:/etc/ganesha/ganesha.conf:ro\n"
+        "    hostname: nfs\n"
     )
 
     compose_path = outputs_dir / "docker-compose.yml"
@@ -72,7 +122,7 @@ def main() -> None:
             "Credential(user, password)": credential_pair,
             "File(path)": str(compose_path.name),
             "PortForward(host, port)": nfs_port,
-            "Directory(host, path)": ".",
+            "Directory(host, path)": "exports",
         },
     }
     _write_text(outputs_dir / "outputs.json", json.dumps(manifest, indent=2) + "\n")

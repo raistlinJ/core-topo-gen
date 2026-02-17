@@ -1078,6 +1078,76 @@ def _prune_service_ports(service: Dict[str, object]) -> None:
 		service['ports'] = new_ports
 
 
+def _ports_to_expose(service: Dict[str, object]) -> None:
+	"""Convert compose `ports:` entries into container-side `expose:` (best-effort).
+
+	Why: when we force `network_mode: none` we must not publish host ports, but we
+	still want to preserve *which* container ports a node is expected to serve so
+	we can surface them in reports/metadata and allow downstream logic to discover
+	service ports.
+
+	This does not change runtime behavior by itself; it only preserves port intent
+	without Docker host publishing.
+	"""
+	if not isinstance(service, dict):
+		return
+	ports = service.get('ports')
+	if not ports:
+		return
+	if not isinstance(ports, list):
+		ports = [ports]
+
+	existing_expose = service.get('expose')
+	if existing_expose is None:
+		expose_list: List[object] = []
+	elif isinstance(existing_expose, list):
+		expose_list = list(existing_expose)
+	else:
+		expose_list = [existing_expose]
+
+	seen: set[str] = set()
+	for x in expose_list:
+		try:
+			seen.add(str(x).strip())
+		except Exception:
+			continue
+
+	for entry in ports:
+		try:
+			if isinstance(entry, dict):
+				# long syntax: published/target
+				target = entry.get('target') or entry.get('container_port') or entry.get('port')
+				if target in (None, ''):
+					continue
+				proto = str(entry.get('protocol') or 'tcp').strip().lower() or 'tcp'
+				val = str(target).strip()
+				# Keep the common `port/proto` shape when proto is explicit.
+				if '/' not in val and proto and proto != 'tcp':
+					val = f"{val}/{proto}"
+				if val and val not in seen:
+					expose_list.append(val)
+					seen.add(val)
+				continue
+			# short syntax: "published:target[/proto]" or "target[/proto]"
+			text = str(entry).strip()
+			if not text:
+				continue
+			if '#' in text:
+				text = text.split('#', 1)[0].strip()
+			if not text or text.startswith('{'):
+				continue
+			# Keep only the container segment.
+			container_seg = _strip_port_mapping_value(text)
+			if container_seg and container_seg not in seen:
+				expose_list.append(container_seg)
+				seen.add(container_seg)
+		except Exception:
+			continue
+
+	if expose_list:
+		service['expose'] = expose_list
+
+
 def _force_service_network_mode_none(service: Dict[str, object]) -> None:
 	"""Force a docker-compose service to run without Docker-managed networking.
 
@@ -1106,7 +1176,9 @@ def _force_compose_no_network(compose_obj: dict) -> dict:
 			if isinstance(svc, dict):
 				_force_service_network_mode_none(svc)
 				# With network_mode none, host port publishing is meaningless and can
-				# create collisions or validation errors. Drop ports entirely.
+				# create collisions or validation errors. Preserve container-side port intent
+				# via `expose`, then drop `ports` entirely.
+				_ports_to_expose(svc)
 				svc.pop('ports', None)
 		compose_obj.pop('networks', None)
 		return compose_obj
@@ -1399,7 +1471,35 @@ def _rewrite_abs_paths_from_dir_to_dir(compose_obj: dict, from_dir: str, to_dir:
 			try:
 				os.makedirs(os.path.dirname(dst), exist_ok=True)
 				if os.path.isdir(p_abs):
-					shutil.copytree(p_abs, dst, dirs_exist_ok=True)
+					# Avoid pathological recursion when destination is inside source
+					# (common when isolating a base_dir into base_dir/node-<name>/...).
+					try:
+						src_common = os.path.commonpath([p_abs, dst])
+					except Exception:
+						src_common = ''
+					if src_common and os.path.abspath(src_common) == os.path.abspath(p_abs) and os.path.abspath(dst) != os.path.abspath(p_abs):
+						# Copy directory contents excluding the destination subtree.
+						os.makedirs(dst, exist_ok=True)
+						for child in os.listdir(p_abs):
+							src_child = os.path.join(p_abs, child)
+							dst_child = os.path.join(dst, child)
+							try:
+								src_child_abs = os.path.abspath(src_child)
+								dst_abs = os.path.abspath(dst)
+								if src_child_abs == dst_abs or src_child_abs.startswith(dst_abs + os.sep):
+									continue
+							except Exception:
+								pass
+							try:
+								if os.path.isdir(src_child):
+									shutil.copytree(src_child, dst_child, dirs_exist_ok=True)
+								elif os.path.exists(src_child):
+									os.makedirs(os.path.dirname(dst_child), exist_ok=True)
+									shutil.copy2(src_child, dst_child)
+							except Exception:
+								pass
+					else:
+						shutil.copytree(p_abs, dst, dirs_exist_ok=True)
 				elif os.path.exists(p_abs):
 					shutil.copy2(p_abs, dst)
 			except Exception:
@@ -2185,7 +2285,77 @@ def _ensure_list_field_has(value: object, item: str) -> List[str]:
 	return out
 
 
-def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
+def _ensure_keepalive_for_base_os_images(compose_obj: dict, node_name: str, prefer_service: Optional[str] = None) -> dict:
+	"""Best-effort: keep base OS images running by injecting a default command.
+
+	Rationale: docker-compose templates that use a base OS image (ubuntu/alpine/debian/etc)
+	with no long-running entrypoint will exit immediately (often CMD=/bin/bash or /bin/sh).
+	That leaves CORE docker nodes with pid=0, which can break core-daemon startup.
+
+	We only apply this for images that *look* like base OS images, and only when the
+	compose service does not already specify a command/entrypoint.
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return compose_obj
+		svc_key = _select_service_key(compose_obj, prefer_service=prefer_service or node_name)
+		if not svc_key or svc_key not in services:
+			return compose_obj
+		svc = services.get(svc_key)
+		if not isinstance(svc, dict):
+			return compose_obj
+
+		if svc.get('command') is not None:
+			return compose_obj
+		if svc.get('entrypoint') is not None:
+			return compose_obj
+
+		labels = svc.get('labels') if isinstance(svc.get('labels'), dict) else {}
+		base_image = ''
+		try:
+			base_image = str(labels.get('coretg.wrapper_base_image') or '').strip()
+		except Exception:
+			base_image = ''
+		if not base_image:
+			try:
+				base_image = str(svc.get('image') or '').strip()
+			except Exception:
+				base_image = ''
+		import re as _re
+		norm = base_image.lower().strip()
+		# Only treat *actual base images* as base OS.
+		# Avoid substring matches like `itsthenetwork/nfs-server-alpine`.
+		base_os_patterns = (
+			r'(^|/)ubuntu([:@]|$)',
+			r'(^|/)debian([:@]|$)',
+			r'(^|/)alpine([:@]|$)',
+			r'(^|/)centos([:@]|$)',
+			r'(^|/)fedora([:@]|$)',
+			r'(^|/)rockylinux([:@]|$)',
+			r'(^|/)amazonlinux([:@]|$)',
+			r'(^|/)busybox([:@]|$)',
+			r'(^|/)kalilinux([:@]|$)',
+			r'(^|/)kali([:@]|$)',
+		)
+		is_base_os = any(_re.search(pat, norm) for pat in base_os_patterns)
+		if not is_base_os:
+			return compose_obj
+
+		# Use POSIX sh (works on ubuntu/alpine) and keep the container alive.
+		svc['command'] = ['sh', '-lc', 'sleep infinity']
+		try:
+			logger.info('[vuln] injected keepalive command node=%s service=%s image=%s', node_name, svc_key, base_image)
+		except Exception:
+			pass
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
+def _write_iproute2_wrapper(out_dir: str, base_image: str, *, extra_apt_packages: Optional[List[str]] = None) -> str:
 	"""Write a minimal Dockerfile that installs baseline tooling (best-effort across distros).
 
 	Rationale: CORE docker nodes often run with no internet access from inside the container
@@ -2194,15 +2364,39 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 	"""
 	os.makedirs(out_dir, exist_ok=True)
 	dockerfile_path = os.path.join(out_dir, 'Dockerfile')
+	# Strict by default: fail wrapper build when we cannot install baseline tools
+	# and the base image doesn't already include them. This prevents silent starts
+	# where CORE services later fail mysteriously.
+	try:
+		strict = str(os.getenv('CORETG_IPROUTE2_WRAPPER_STRICT') or '').strip().lower()
+		strict_enabled = True if strict == '' else (strict not in ('0', 'false', 'no', 'off'))
+	except Exception:
+		strict_enabled = True
+	install_suffix = '' if strict_enabled else ' || true'
+	update_suffix = '' if strict_enabled else ' || true'
+	strict_note = 'STRICT=1' if strict_enabled else 'STRICT=0'
+	extra_apt = []
+	try:
+		if isinstance(extra_apt_packages, list):
+			extra_apt = [str(x).strip() for x in extra_apt_packages if x is not None and str(x).strip()]
+	except Exception:
+		extra_apt = []
+	extra_apt_suffix = (' ' + ' '.join(extra_apt)) if extra_apt else ''
 	lines = [
 		f"FROM {base_image}",
 		"",
 		# Avoid `set -x` to reduce giant build logs; keep `-e` and `-u`.
 		"RUN set -eu; \\",
+		f"\techo '[coretg-wrapper] {strict_note} base={base_image}' >&2; \\",
+		"\t# If ip already exists in the base image, we don't need a package manager. \\",
+		"\tif command -v ip >/dev/null 2>&1; then \\",
+		"\t\techo '[coretg-wrapper] ip already present; skipping install' >&2; \\",
+		"\texit 0; \\",
+		"\tfi; \\",
 		"\tif command -v apt-get >/dev/null 2>&1; then \\",
 		# Use conservative timeouts/retries so builds don't hang on offline CORE VMs.
 		"\t\tAPT_OPTS='-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15'; \\",
-		"\t\tif ! apt-get $APT_OPTS update; then \\",
+		f"\t\tif ! apt-get $APT_OPTS update{update_suffix}; then \\",
 		"\t\t\trm -f /etc/apt/sources.list; \\",
 		"\t\t\trm -f /etc/apt/sources.list.d/*.list || true; \\",
 		"\t\t\tprintf '%s\\n' \\",
@@ -2211,26 +2405,126 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian stretch main\" \\",
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian stretch-updates main\" \\",
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main\" > /etc/apt/sources.list; \\",
-		"\t\t\tapt-get $APT_OPTS -o Acquire::Check-Valid-Until=false update || true; \\",
+		f"\t\t\tapt-get $APT_OPTS -o Acquire::Check-Valid-Until=false update{update_suffix}; \\",
 		"\t\tfi; \\",
-		"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true; \\",
+		f"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3{extra_apt_suffix}{install_suffix}; \\",
 		"\t\trm -rf /var/lib/apt/lists/*; \\",
 		"\telif command -v apk >/dev/null 2>&1; then \\",
-		"\t\tapk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3 || true; \\",
+		f"\t\tapk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3{install_suffix}; \\",
 		"\telif command -v dnf >/dev/null 2>&1; then \\",
-		"\t\tdnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \\",
+		f"\t\tdnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl{install_suffix}; \\",
 		"\t\tdnf clean all || true; \\",
 		"\telif command -v yum >/dev/null 2>&1; then \\",
-		"\t\tyum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \\",
+		f"\t\tyum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl{install_suffix}; \\",
 		"\t\tyum clean all || true; \\",
 		"\telse \\",
-		"\t\techo \"No supported package manager found to install baseline tools (continuing)\" >&2; \\",
-		"\tfi",
+		"\t\techo \"[coretg-wrapper] no supported package manager found\" >&2; \\",
+		f"\t\t{'exit 1' if strict_enabled else 'exit 0'}; \\",
+		"\tfi; \\",
+		("\tcommand -v ip >/dev/null 2>&1" if strict_enabled else "\ttrue"),
 	]
 	content = "\n".join(lines) + "\n"
 	with open(dockerfile_path, 'w', encoding='utf-8') as f:
 		f.write(content)
 	return dockerfile_path
+
+
+def _inject_iproute2_into_build_only_service(svc: Dict[str, object], *, logger: logging.Logger, node_name: str, svc_key: str) -> bool:
+	"""Best-effort ensure build-only service installs iproute2.
+
+	When a compose service has `build:` but no `image:`, the wrapper strategy (which
+	rewrites `image` + `build` to a wrapper context) can't be applied without losing
+	the original build context. Instead, we patch the copied build context Dockerfile
+	(in /tmp/vulns/... produced by _copy_build_contexts) to install iproute2.
+
+	Returns True if we modified the Dockerfile.
+	"""
+	try:
+		build = svc.get('build') if isinstance(svc, dict) else None
+		ctx = None
+		dockerfile_rel = 'Dockerfile'
+		if isinstance(build, dict):
+			ctx = build.get('context')
+			df = build.get('dockerfile')
+			if isinstance(df, str) and df.strip():
+				dockerfile_rel = df.strip()
+		elif isinstance(build, str):
+			ctx = build.strip()
+		if not isinstance(ctx, str) or not ctx.strip():
+			return False
+		ctx = ctx.strip()
+		if not os.path.isdir(ctx):
+			return False
+
+		# Resolve Dockerfile path (relative to context by compose convention).
+		dockerfile_path = dockerfile_rel
+		if not os.path.isabs(dockerfile_path):
+			dockerfile_path = os.path.join(ctx, dockerfile_path)
+		if not os.path.isfile(dockerfile_path):
+			return False
+
+		try:
+			text = open(dockerfile_path, 'r', encoding='utf-8', errors='ignore').read()
+		except Exception:
+			return False
+		low = text.lower()
+		if 'iproute2' in low or '\nrun ip ' in low or ' command -v ip ' in low:
+			# Still ensure NET_ADMIN for DefaultRoute.
+			svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+			return False
+
+		# Keep this best-effort by default; allow strict mode to fail builds when desired.
+		try:
+			strict = str(os.getenv('CORETG_IPROUTE2_WRAPPER_STRICT') or '').strip().lower()
+			strict_enabled = True if strict == '' else (strict not in ('0', 'false', 'no', 'off'))
+		except Exception:
+			strict_enabled = True
+		install_suffix = '' if strict_enabled else ' || true'
+		update_suffix = '' if strict_enabled else ' || true'
+
+		snippet = (
+			"\n\n"
+			"# coretg: ensure iproute2 present for CORE DefaultRoute / network scripts\n"
+			"RUN set -eu; \\\n"
+			"\tif command -v ip >/dev/null 2>&1; then exit 0; fi; \\\n"
+			"\tif command -v apt-get >/dev/null 2>&1; then \\\n"
+			"\t\tAPT_OPTS='-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15'; \\\n"
+			f"\t\tapt-get $APT_OPTS update{update_suffix}; \\\n"
+			f"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3{install_suffix}; \\\n"
+			"\t\trm -rf /var/lib/apt/lists/*; \\\n"
+			"\telif command -v apk >/dev/null 2>&1; then \\\n"
+			f"\t\tapk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3{install_suffix}; \\\n"
+			"\telif command -v dnf >/dev/null 2>&1; then \\\n"
+			f"\t\tdnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl{install_suffix}; \\\n"
+			"\t\tdnf clean all || true; \\\n"
+			"\telif command -v yum >/dev/null 2>&1; then \\\n"
+			f"\t\tyum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl{install_suffix}; \\\n"
+			"\t\tyum clean all || true; \\\n"
+			"\telse \\\n"
+			+ (
+				"\t\techo '[coretg] no package manager found for iproute2 install' >&2; exit 1; \\\n"
+				if strict_enabled
+				else "\t\techo '[coretg] no package manager found for iproute2 install' >&2; exit 0; \\\n"
+			)
+			+ "\tfi; \\\n"
+			+ ("\tcommand -v ip >/dev/null 2>&1\n" if strict_enabled else "\ttrue\n")
+		)
+
+		try:
+			with open(dockerfile_path, 'a', encoding='utf-8') as f:
+				f.write(snippet)
+		except Exception:
+			return False
+
+		# Ensure NET_ADMIN for DefaultRoute.
+		svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+		try:
+			logger.info('[vuln] injected iproute2 install into build-only Dockerfile node=%s service=%s dockerfile=%s', node_name, svc_key, dockerfile_path)
+		except Exception:
+			pass
+		return True
+	except Exception:
+		return False
 
 
 def _parse_compose_ports_entry(entry: object) -> List[Tuple[str, int]]:
@@ -2346,18 +2640,25 @@ def extract_compose_ports(rec: Dict[str, str], out_base: str = "/tmp/vulns", com
 	for svc_name, svc_body in services.items():
 		if not isinstance(svc_body, dict):
 			continue
+		# Prefer ports, but fall back to expose for sanitized compose (network_mode none).
+		fields: List[object] = []
 		ports_field = svc_body.get('ports')
-		if not ports_field:
+		if ports_field:
+			fields.append(ports_field)
+		expose_field = svc_body.get('expose')
+		if expose_field:
+			fields.append(expose_field)
+		if not fields:
 			continue
-		if not isinstance(ports_field, list):
-			ports_field = [ports_field]
-		for entry in ports_field:
-			for proto, port in _parse_compose_ports_entry(entry):
-				key = (proto, port)
-				if key in seen:
-					continue
-				seen.add(key)
-				ports.append({"protocol": proto, "port": port, "service": svc_name})
+		for field in fields:
+			entries = field if isinstance(field, list) else [field]
+			for entry in entries:
+				for proto, port in _parse_compose_ports_entry(entry):
+					key = (proto, port)
+					if key in seen:
+						continue
+					seen.add(key)
+					ports.append({"protocol": proto, "port": port, "service": svc_name})
 
 	_COMPOSE_PORT_CACHE[cache_key] = ports
 	if ports and 'compose_ports' not in rec:
@@ -2465,6 +2766,14 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			if not node_key:
 				return compose_obj
 			if node_key in services:
+				# Even when the node-name service already exists, ensure container_name
+				# matches the CORE node name when enabled. CORE docker-node startup can
+				# rely on predictable container naming for PID discovery.
+				try:
+					if _compose_set_container_name_enabled() and isinstance(services.get(node_key), dict):
+						services.get(node_key)['container_name'] = node_key
+				except Exception:
+					pass
 				return compose_obj
 
 			src_key = None
@@ -2487,6 +2796,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 
 			import copy as _copy
 			services[node_key] = _copy.deepcopy(services.get(src_key) or {})
+			try:
+				if _compose_set_container_name_enabled() and isinstance(services.get(node_key), dict):
+					services.get(node_key)['container_name'] = node_key
+			except Exception:
+				pass
 			return compose_obj
 		except Exception:
 			return compose_obj
@@ -2643,24 +2957,33 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			src_path = os.path.join(base_dir, compose_name)
 			ok = False
 			is_local = False
-			# Prefer already-downloaded compose artifacts under out_base/<safe_name>/... .
-			# This avoids re-fetching from the network on offline CORE hosts.
+			# IMPORTANT: if the record points at a local compose file (common for flag-node-generators
+			# and Flow-injected artifacts), prefer that path over any previously cached/downloaded
+			# compose under out_base/<safe_name>/... . Otherwise we can accidentally reuse a stale
+			# compose and end up mounting empty directories.
 			try:
-				dl_path = _compose_path_from_download(rec, out_base=out_base, compose_name=compose_name)
-				if dl_path and os.path.exists(dl_path):
-					src_path = dl_path
-					ok = True
+				if key[1] and os.path.exists(key[1]):
+					logger.info("[vuln] copying compose from local path=%s dest=%s", key[1], src_path)
+					ok = _download_to(key[1], src_path)
+					is_local = True
 			except Exception:
-				pass
+				ok = False
+				is_local = False
+			if not ok:
+				# Prefer already-downloaded compose artifacts under out_base/<safe_name>/... .
+				# This avoids re-fetching from the network on offline CORE hosts.
+				try:
+					dl_path = _compose_path_from_download(rec, out_base=out_base, compose_name=compose_name)
+					if dl_path and os.path.exists(dl_path):
+						src_path = dl_path
+						ok = True
+				except Exception:
+					pass
 			if not ok:
 				raw_url = _guess_compose_raw_url(key[1], compose_name=compose_name)
 				if raw_url:
 					logger.info("[vuln] fetching compose url=%s dest=%s", raw_url, src_path)
 					ok = _download_to(raw_url, src_path)
-				if not ok and key[1] and os.path.exists(key[1]):
-					logger.info("[vuln] copying compose from local path=%s dest=%s", key[1], src_path)
-					ok = _download_to(key[1], src_path)
-					is_local = True
 			if not ok:
 				cache[key] = (None, None, None, False)
 				try:
@@ -2926,14 +3249,41 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					if base_image.startswith('coretg/') and base_image.endswith(':iproute2'):
 						raise RuntimeError('already_wrapped')
 					if base_image:
+						# Quay.io may require auth on some CORE VMs (401). If the upstream image is
+						# nfs-ganesha from Quay, switch to a public base and install Ganesha in the
+						# wrapper so we don't need to pull from Quay at all.
+						orig_base_image = base_image
+						extra_apt: Optional[List[str]] = None
+						try:
+							low = base_image.lower()
+						except Exception:
+							low = base_image
+						if isinstance(low, str) and low.startswith('quay.io/nfs-ganesha/nfs-ganesha'):
+							try:
+								override = str(os.getenv('CORETG_NFS_GANESHA_WRAPPER_BASE_IMAGE') or 'ubuntu:22.04').strip() or 'ubuntu:22.04'
+							except Exception:
+								override = 'ubuntu:22.04'
+							base_image = override
+							extra_apt = ['nfs-ganesha', 'nfs-ganesha-vfs']
 						wrap_dir = os.path.join(out_base, f"docker-wrap-{scenario_tag_safe}-{_safe_name(node_name)}")
-						_write_iproute2_wrapper(wrap_dir, base_image)
+						_write_iproute2_wrapper(wrap_dir, base_image, extra_apt_packages=extra_apt)
 						# Rewrite service to build the wrapper; keep a tagged image for caching.
 						# NOTE: some CORE VM Docker installs are missing the default "bridge" network,
 						# which causes `docker compose build` to fail with "network bridge not found".
 						# Force host networking for the build to avoid relying on the bridge network.
 						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile', 'network': 'host'}
 						svc['image'] = f"coretg/{scenario_tag_safe}-{_safe_name(node_name)}:iproute2"
+						# Preserve the original base image for later heuristics/diagnostics.
+						try:
+							labs = svc.get('labels')
+							if not isinstance(labs, dict):
+								labs = {}
+							labs.setdefault('coretg.wrapper_base_image', str(orig_base_image))
+							if str(orig_base_image) != str(base_image):
+								labs.setdefault('coretg.wrapper_effective_base_image', str(base_image))
+							svc['labels'] = labs
+						except Exception:
+							pass
 						# Avoid pull warnings for local wrapper image.
 						svc['pull_policy'] = 'never'
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
@@ -2945,7 +3295,19 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						except Exception:
 							pass
 					else:
-						logger.warning("[vuln] compose service has no image; cannot inject iproute2 wrapper for node=%s service=%s", node_name, svc_key)
+						try:
+							svc_obj = services.get(svc_key) if isinstance(services, dict) else None
+							has_build = isinstance(svc_obj, dict) and bool(svc_obj.get('build'))
+						except Exception:
+							has_build = False
+						if has_build:
+							# Build-only: patch the build context Dockerfile to install iproute2.
+							try:
+								_inject_iproute2_into_build_only_service(svc, logger=logger, node_name=node_name, svc_key=str(svc_key))
+							except Exception:
+								logger.debug("[vuln] compose service has no image (build-only); iproute2 injection failed node=%s service=%s", node_name, svc_key)
+						else:
+							logger.warning("[vuln] compose service has no image; cannot inject iproute2 wrapper for node=%s service=%s", node_name, svc_key)
 			except Exception:
 				# Best-effort: wrapper injection is optional.
 				pass
@@ -2981,6 +3343,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					obj = _ensure_service_named_as_node(obj, node_name, prefer_service=alias_src or prefer)
 					# CORE should start the node-name service.
 					rec['compose_service'] = str(node_name)
+				except Exception:
+					pass
+				# Keep base OS images alive (avoid immediate exit -> pid=0 -> core-daemon errors).
+				try:
+					obj = _ensure_keepalive_for_base_os_images(obj, node_name, prefer_service=str(node_name))
 				except Exception:
 					pass
 				text = _yaml_dump_literal_multiline(obj)
