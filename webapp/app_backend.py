@@ -45769,6 +45769,19 @@ def vuln_catalog_items_test_start():
                     if isinstance(ctx, str) and ctx.startswith(local_base):
                         rel = os.path.relpath(ctx, local_base)
                         build['context'] = _remote_path_join(remote_base, rel)
+                # Rewrite label paths (wrapper build context, inject source dir, etc.)
+                labels = svc.get('labels')
+                if isinstance(labels, dict):
+                    for k, v in list(labels.items()):
+                        try:
+                            if not isinstance(v, str):
+                                continue
+                            vv = v
+                            if vv.startswith(local_base):
+                                rel = os.path.relpath(vv, local_base)
+                                labels[k] = _remote_path_join(remote_base, rel)
+                        except Exception:
+                            continue
                 # Rewrite volume bind mount paths
                 volumes = svc.get('volumes')
                 if isinstance(volumes, list):
@@ -45924,6 +45937,202 @@ def vuln_catalog_items_test_start():
         except Exception:
             err = b''.join(stderr_chunks).decode('latin-1', 'replace')
         return rc, out.strip(), err.strip()
+
+    def _remote_compose_preflight(
+        *,
+        ssh_client: Any,
+        core_cfg: dict[str, Any],
+        compose_path: str,
+        project_name: str,
+        node_service: str,
+        password: str,
+        log_handle: Any,
+    ) -> tuple[bool, str | None]:
+        """Run an offline-friendly docker-compose preflight on the CORE VM.
+
+        Goals:
+        - build wrapper images referenced via labels (no `build:` stanza)
+        - pull pull-only services
+        - create containers without starting them (`up --no-start`)
+        - start the node service with `--no-build`
+        - wait for non-zero PID to avoid core-daemon `/proc/0/environ` races
+        """
+        try:
+            log_handle.write('[remote] preflight: begin\n')
+        except Exception:
+            pass
+        try:
+            py = _select_remote_python_interpreter(ssh_client, core_cfg or {})
+        except Exception:
+            py = 'python3'
+
+        # Parse compose YAML to find wrapper builds and pull-only services.
+        parse_script = (
+            "import json\n"
+            "try:\n"
+            "  import yaml\n"
+            "except Exception:\n"
+            "  yaml=None\n"
+            "p=%r\n"
+            "obj={}\n"
+            "if yaml is not None:\n"
+            "  try:\n"
+            "    obj=yaml.safe_load(open(p,'r',encoding='utf-8',errors='ignore')) or {}\n"
+            "  except Exception:\n"
+            "    obj={}\n"
+            "services=(obj.get('services') if isinstance(obj,dict) else None)\n"
+            "wrap=[]\n"
+            "pull=[]\n"
+            "if isinstance(services,dict):\n"
+            "  for name,svc in services.items():\n"
+            "    if not isinstance(svc,dict):\n"
+            "      continue\n"
+            "    img=str(svc.get('image') or '').strip()\n"
+            "    labs=svc.get('labels') if isinstance(svc.get('labels'),dict) else {}\n"
+            "    ctx=str(labs.get('coretg.wrapper_build_context') or '').strip()\n"
+            "    df=str(labs.get('coretg.wrapper_build_dockerfile') or 'Dockerfile').strip()\n"
+            "    net=str(labs.get('coretg.wrapper_build_network') or 'host').strip()\n"
+            "    if img and img.startswith('coretg/') and img.endswith(':iproute2') and ctx:\n"
+            "      wrap.append({'service':str(name),'image':img,'context':ctx,'dockerfile':df,'network':net})\n"
+            "      continue\n"
+            "    if svc.get('build'):\n"
+            "      continue\n"
+            "    try:\n"
+            "      if str(svc.get('pull_policy') or '').strip().lower()=='never':\n"
+            "        continue\n"
+            "    except Exception:\n"
+            "      pass\n"
+            "    if img and not img.startswith('coretg/'):\n"
+            "      pull.append(str(name))\n"
+            "print(json.dumps({'wrap':wrap,'pull':pull},ensure_ascii=False))\n"
+        ) % (compose_path,)
+
+        inner = f"{shlex.quote(py)} -c {shlex.quote(parse_script)}"
+        cmd = f"bash -lc {shlex.quote(inner)}"
+        rc, out, err = _exec_ssh_sudo_capture(ssh_client, cmd, password)
+        if rc != 0:
+            try:
+                log_handle.write(f"[remote] preflight: failed to parse compose rc={rc} err={err or out}\n")
+            except Exception:
+                pass
+            return False, 'failed to parse compose on CORE VM'
+
+        payload: dict[str, Any] = {}
+        try:
+            payload = json.loads((out or '').strip() or '{}')
+        except Exception:
+            payload = {}
+
+        wrap_items = payload.get('wrap') if isinstance(payload, dict) else None
+        pull_services = payload.get('pull') if isinstance(payload, dict) else None
+        if not isinstance(wrap_items, list):
+            wrap_items = []
+        if not isinstance(pull_services, list):
+            pull_services = []
+
+        # Build wrapper images first.
+        for w in wrap_items:
+            if not isinstance(w, dict):
+                continue
+            img = str(w.get('image') or '').strip()
+            ctx = str(w.get('context') or '').strip()
+            df = str(w.get('dockerfile') or 'Dockerfile').strip() or 'Dockerfile'
+            net = str(w.get('network') or 'host').strip() or 'host'
+            if not img or not ctx:
+                continue
+            try:
+                log_handle.write(f"[remote] preflight: docker build image={img} context={ctx}\n")
+            except Exception:
+                pass
+            inner = (
+                f"sudo -S -p '' -k docker build --network {shlex.quote(net)} "
+                f"-t {shlex.quote(img)} -f {shlex.quote(os.path.join(ctx, df))} {shlex.quote(ctx)}"
+            )
+            cmd = f"bash -lc {shlex.quote(inner)}"
+            rc, out, err = _exec_ssh_sudo_capture(ssh_client, cmd, password)
+            if rc != 0:
+                try:
+                    log_handle.write(f"[remote] preflight: wrapper build failed rc={rc} output={(err or out)[-800:]}\n")
+                except Exception:
+                    pass
+                return False, 'wrapper build failed on CORE VM'
+
+        # Pull pull-only services.
+        pull_services = [str(s).strip() for s in pull_services if str(s).strip()]
+        pull_services = list(dict.fromkeys(pull_services))
+        if pull_services:
+            try:
+                log_handle.write(f"[remote] preflight: docker compose pull services={len(pull_services)}\n")
+            except Exception:
+                pass
+            inner = (
+                f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} sudo -S -p '' -k "
+                f"docker compose -f {shlex.quote(compose_path)} pull " + ' '.join([shlex.quote(s) for s in pull_services])
+            )
+            cmd = f"bash -lc {shlex.quote(inner)}"
+            rc, out, err = _exec_ssh_sudo_capture(ssh_client, cmd, password)
+            if rc != 0:
+                try:
+                    log_handle.write(f"[remote] preflight: pull failed rc={rc} output={(err or out)[-800:]}\n")
+                except Exception:
+                    pass
+                return False, 'image pull failed on CORE VM'
+
+        # Create containers without starting (avoid implicit builds).
+        try:
+            log_handle.write('[remote] preflight: docker compose up --no-start --no-build\n')
+        except Exception:
+            pass
+        inner = (
+            f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} sudo -S -p '' -k "
+            f"docker compose -f {shlex.quote(compose_path)} up --no-start --no-build --remove-orphans"
+        )
+        cmd = f"bash -lc {shlex.quote(inner)}"
+        rc, out, err = _exec_ssh_sudo_capture(ssh_client, cmd, password)
+        if rc != 0:
+            try:
+                log_handle.write(f"[remote] preflight: up --no-start failed rc={rc} output={(err or out)[-800:]}\n")
+            except Exception:
+                pass
+            return False, 'docker compose up --no-start failed on CORE VM'
+
+        # Start the node service and wait for a non-zero PID.
+        try:
+            log_handle.write(f"[remote] preflight: docker compose up -d --no-build {node_service}\n")
+        except Exception:
+            pass
+        inner = (
+            f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} sudo -S -p '' -k "
+            f"docker compose -f {shlex.quote(compose_path)} up -d --no-build --remove-orphans {shlex.quote(node_service)}"
+        )
+        cmd = f"bash -lc {shlex.quote(inner)}"
+        rc, out, err = _exec_ssh_sudo_capture(ssh_client, cmd, password)
+        if rc != 0:
+            try:
+                log_handle.write(f"[remote] preflight: up -d failed rc={rc} output={(err or out)[-800:]}\n")
+            except Exception:
+                pass
+            return False, 'docker compose up -d failed on CORE VM'
+
+        wait_inner = (
+            "set -euo pipefail; "
+            f"p={shlex.quote(project_name)}; f={shlex.quote(compose_path)}; s={shlex.quote(node_service)}; "
+            "for i in $(seq 1 14); do "
+            "  cid=$(sudo -S -p '' -k docker compose -f \"$f\" -p \"$p\" ps -q \"$s\" 2>/dev/null | head -n 1 || true); "
+            "  if [ -n \"$cid\" ]; then "
+            "    pid=$(sudo -S -p '' -k docker inspect --format '{{.State.Pid}}' \"$cid\" 2>/dev/null || echo 0); "
+            "    if [ \"$pid\" != \"0\" ] && [ -n \"$pid\" ]; then echo \"pid=$pid\"; exit 0; fi; "
+            "  fi; "
+            "  sleep 0.5; "
+            "done; echo 'pid_wait_timeout'; exit 0"
+        )
+        cmd = f"bash -lc {shlex.quote(wait_inner)}"
+        _exec_ssh_sudo_capture(ssh_client, cmd, password)
+        try:
+            log_handle.write('[remote] preflight: done\n')
+        except Exception:
+            pass
+        return True, None
 
     # Upload prepared compose assets to CORE VM and execute there.
     remote_run_dir = f"/tmp/tests/test-{run_id}"
@@ -46120,17 +46329,38 @@ def vuln_catalog_items_test_start():
             pass
 
         remote_compose_runtime_path = remote_runtime_compose_path
-        log_f.write(f"[remote] docker compose up (project={project_name})\n")
+        log_f.write(f"[remote] docker compose preflight+up (project={project_name})\n")
 
         pw = ''
         try:
             pw = str(core_cfg.get('ssh_password') or '')
         except Exception:
             pw = ''
+        # Preflight: build wrappers + pulls + create containers + start node service with --no-build.
+        try:
+            node_service = f"vuln-test-{item_id}"
+        except Exception:
+            node_service = "vuln-test"
+        ok_pf, err_pf = _remote_compose_preflight(
+            ssh_client=ssh_client,
+            core_cfg=core_cfg,
+            compose_path=remote_compose_runtime_path,
+            project_name=project_name,
+            node_service=node_service,
+            password=pw,
+            log_handle=log_f,
+        )
+        if not ok_pf:
+            try:
+                log_f.write(f"[remote] preflight failed: {err_pf}\n")
+            except Exception:
+                pass
+            return jsonify({'ok': False, 'error': err_pf or 'remote preflight failed'}), 422
+
         inner_cmd = (
             f"cd {shlex.quote(remote_run_dir)} && "
             f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} sudo -S -p '' -k "
-            f"docker compose -f {shlex.quote(remote_compose_runtime_path)} up --remove-orphans"
+            f"docker compose -f {shlex.quote(remote_compose_runtime_path)} up --remove-orphans --no-build"
         )
         cmd = f"bash -lc {shlex.quote(inner_cmd)}"
         channel = ssh_client.get_transport().open_session() if ssh_client.get_transport() else None
