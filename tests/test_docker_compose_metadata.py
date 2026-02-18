@@ -55,15 +55,30 @@ services:
         assert "expose" in svc and "80" in [str(x) for x in (svc.get("expose") or [])]
         # CORE services may chmod/create files using relative paths; ensure root workdir.
         assert svc.get("working_dir") == "/"
-        assert "build" in svc
-        assert svc["build"]["dockerfile"] == "Dockerfile"
+        # Compose handed to CORE should NOT include `build:`; core-daemon would
+        # attempt to build during scenario startup (and therefore pull packages/images).
+        assert "build" not in svc
         assert "cap_add" in svc and "NET_ADMIN" in (svc["cap_add"] or [])
-        wrap_dir = svc["build"]["context"]
+        labels = svc.get("labels") or {}
+        assert isinstance(labels, dict)
+        assert labels.get("coretg.wrapper_build_dockerfile") == "Dockerfile"
+        wrap_dir = str(labels.get("coretg.wrapper_build_context") or "").strip()
+        assert wrap_dir
         dockerfile = os.path.join(wrap_dir, "Dockerfile")
         assert os.path.exists(dockerfile)
         txt = open(dockerfile, encoding="utf-8").read()
-        assert "iproute2" in txt
-        assert "ethtool" in txt
+        # Wrapper Dockerfile should ensure an `ip` command exists.
+        # Default strategy is offline-safe (busybox injection), with legacy
+        # package-manager installs available behind an env var.
+        assert "ip" in txt
+        assert (
+            "busybox injection" in txt
+            or "COPY --from=coretg_iptools" in txt
+            or "apt-get install" in txt
+            or "apk add" in txt
+            or "yum install" in txt
+            or "dnf install" in txt
+        )
 
 
 def test_apply_docker_compose_meta_pushes_options(tmp_path):
@@ -169,6 +184,8 @@ services:
         image: apache/airflow:2.9.0
         environment:
             - AIRFLOW_UID=${AIRFLOW_UID:-50000}
+                healthcheck:
+                    test: ["CMD-SHELL", "echo $${HOSTNAME}"]
 """.strip()
                 + "\n",
                 encoding="utf-8",
@@ -182,11 +199,17 @@ services:
         assert out_path in created
         text = open(out_path, encoding="utf-8").read()
 
-        assert '${"${AIRFLOW_UID:-50000}"}' in text
+        # `${VAR:-default}` interpolation is resolved to a plain literal so docker-compose
+        # (and CORE's Mako templating) can both process the generated compose.
+        assert 'AIRFLOW_UID=50000' in text
+        assert '${' not in text
+        assert '$${HOSTNAME}' not in text
+        assert '$HOSTNAME' in text
         assert "\\${AIRFLOW_UID:-50000}" not in text
         assert "$${AIRFLOW_UID:-50000}" not in text
         assert re.search(r"(?<![\"'])\$\{AIRFLOW_UID:-50000\}(?![\"'])", text) is None
-        assert re.search(r"\$\{\s*[\"']\$\{AIRFLOW_UID:-50000\}[\"']\s*\}", text) is not None
+        # Wrapper form should not be present after literal resolution.
+        assert re.search(r"\$\{\s*[\"']\$\{AIRFLOW_UID:-50000\}[\"']\s*\}", text) is None
 
 
 def test_prepare_compose_local_template_dot_bind_isolation(tmp_path):

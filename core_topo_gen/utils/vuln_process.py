@@ -654,6 +654,58 @@ def remove_docker_conflicts(conflicts: dict) -> dict:
 			containers = []
 		if not isinstance(images, list):
 			images = []
+
+		def _container_image_ids(name: str) -> list[str]:
+			ids: list[str] = []
+			try:
+				p0 = subprocess.run(
+					['docker', 'container', 'inspect', '-f', '{{.Image}}', str(name)],
+					stdout=subprocess.PIPE,
+					stderr=subprocess.DEVNULL,
+					text=True,
+				)
+				if p0.returncode == 0:
+					val = (p0.stdout or '').strip()
+					if val:
+						ids.append(val)
+			except Exception:
+				pass
+			return list(dict.fromkeys([x for x in ids if x]))
+
+		def _image_unused(img: str) -> bool:
+			try:
+				p1 = subprocess.run(
+					['docker', 'ps', '-a', '-q', '--filter', f'ancestor={img}'],
+					stdout=subprocess.PIPE,
+					stderr=subprocess.DEVNULL,
+					text=True,
+				)
+				if p1.returncode != 0:
+					return False
+				return not bool((p1.stdout or '').strip())
+			except Exception:
+				return False
+
+		def _try_remove_image(img: str) -> None:
+			try:
+				p = subprocess.run(['docker', 'image', 'rm', '-f', str(img)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+				if p.returncode == 0:
+					result['removed_images'].append(str(img))
+				else:
+					out = (p.stdout or '').strip()[-500:]
+					result['image_errors'][str(img)] = out or f'rc={p.returncode}'
+			except Exception as exc:
+				result['image_errors'][str(img)] = str(exc)
+
+		# Collect image IDs for containers we intend to remove.
+		container_image_ids: list[str] = []
+		for cn in containers:
+			try:
+				container_image_ids.extend(_container_image_ids(str(cn)))
+			except Exception:
+				pass
+		container_image_ids = list(dict.fromkeys([x for x in container_image_ids if x]))
+
 		for cn in containers:
 			try:
 				p = subprocess.run(['docker', 'rm', '-f', str(cn)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -664,16 +716,22 @@ def remove_docker_conflicts(conflicts: dict) -> dict:
 					result['container_errors'][str(cn)] = out or f'rc={p.returncode}'
 			except Exception as exc:
 				result['container_errors'][str(cn)] = str(exc)
+
+		# Remove explicit conflicting images.
 		for img in images:
+			if not img:
+				continue
+			_try_remove_image(str(img))
+
+		# Remove images associated with removed containers (only if unused now).
+		for img_id in container_image_ids:
 			try:
-				p = subprocess.run(['docker', 'image', 'rm', '-f', str(img)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-				if p.returncode == 0:
-					result['removed_images'].append(str(img))
-				else:
-					out = (p.stdout or '').strip()[-500:]
-					result['image_errors'][str(img)] = out or f'rc={p.returncode}'
-			except Exception as exc:
-				result['image_errors'][str(img)] = str(exc)
+				if img_id in (result.get('removed_images') or []):
+					continue
+				if _image_unused(img_id):
+					_try_remove_image(img_id)
+			except Exception:
+				pass
 		return result
 	except Exception:
 		return result
@@ -1776,7 +1834,71 @@ def _select_service_key(compose_obj: dict, prefer_service: Optional[str] = None)
 					target_key = str(svc_key)
 					break
 		if target_key is None:
-			target_key = str(next(iter(services.keys())))
+			# Heuristic selection for multi-service stacks where the first service is
+			# often infra (db/redis) and the "main" app/web service appears later.
+			# This is important for CORE docker nodes because we alias a single service
+			# under the node name (docker compose up -d <node_name>).
+			infra_name_tokens = {
+				'db', 'database', 'postgres', 'postgresql', 'mysql', 'mariadb', 'redis', 'memcached',
+				'mongo', 'mongodb', 'rabbit', 'rabbitmq', 'zookeeper', 'kafka', 'etcd',
+				'elasticsearch', 'kibana', 'logstash', 'prometheus', 'grafana', 'minio',
+				'vault', 'consul', 'registry', 'smtp', 'mail', 'mq',
+			}
+			app_name_tokens = {
+				'web', 'webserver', 'server', 'app', 'api', 'ui', 'frontend', 'front',
+				'nginx', 'apache', 'http', 'gunicorn', 'uwsgi', 'php-fpm',
+			}
+			init_name_tokens = {
+				'init', 'setup', 'bootstrap', 'migrate', 'migration', 'seed', 'worker', 'scheduler',
+				'queue', 'celery', 'cron', 'beat',
+			}
+
+			def _svc_score(svc_key: str, svc_obj: object) -> int:
+				key_l = str(svc_key or '').strip().lower()
+				score = 0
+				# Prefer services that expose ports (likely interactive web/API entrypoints).
+				try:
+					if isinstance(svc_obj, dict):
+						ports = svc_obj.get('ports')
+						expose = svc_obj.get('expose')
+						if ports:
+							score += 40
+						if expose:
+							score += 10
+						cmd = svc_obj.get('command')
+						if cmd is not None:
+							cmd_l = str(cmd).lower()
+							if any(t in cmd_l for t in ('web', 'webserver', 'server', 'gunicorn', 'uwsgi')):
+								score += 15
+				except Exception:
+					pass
+
+				# Name-based boosts/penalties.
+				if any(t in key_l for t in infra_name_tokens):
+					score -= 50
+				if any(t in key_l for t in init_name_tokens):
+					score -= 15
+				if any(t in key_l for t in app_name_tokens):
+					score += 20
+				# Slight preference for shorter/cleaner keys when scores tie.
+				score -= min(len(key_l), 40) // 10
+				return score
+
+			best_key: Optional[str] = None
+			best_score: Optional[int] = None
+			for svc_key, svc_obj in services.items():
+				try:
+					k = str(svc_key)
+				except Exception:
+					continue
+				s = _svc_score(k, svc_obj)
+				if best_score is None or s > best_score or (s == best_score and k < str(best_key)):
+					best_key = k
+					best_score = s
+			if best_key is not None:
+				target_key = best_key
+			else:
+				target_key = str(next(iter(services.keys())))
 		return target_key
 	except Exception:
 		return None
@@ -2017,8 +2139,31 @@ def _expand_injects_from_outputs(out_manifest: str, inject_files: list[str]) -> 
 	if not isinstance(outputs, dict):
 		return list(inject_files or [])
 
-	def _looks_like_path(s: str) -> bool:
-		return '/' in (s or '')
+	def _looks_like_path(s: str, *, key_hint: str = '') -> bool:
+		"""Heuristic: treat both absolute/relative paths and bare filenames as paths.
+
+		Flow generators often emit outputs like:
+		  "File(path)": "flag.txt"
+		which has no '/' but is still a path relative to the artifacts dir.
+		"""
+		text = str(s or '').strip()
+		if not text:
+			return False
+		# obvious paths
+		if '/' in text or text.startswith('./'):
+			return True
+		# treat file-like artifact keys as paths even when value is a bare filename
+		kh = str(key_hint or '').strip().lower()
+		if kh:
+			if 'file(' in kh or 'directory(' in kh or kh.endswith('(path)'):
+				return True
+		# common filenames/extensions
+		base = os.path.basename(text)
+		if base != text:
+			return True
+		if '.' in base:
+			return True
+		return False
 
 	out: list[str] = []
 	for raw in inject_files or []:
@@ -2030,14 +2175,14 @@ def _expand_injects_from_outputs(out_manifest: str, inject_files: list[str]) -> 
 			v = outputs.get(key)
 			if isinstance(v, str):
 				vv = v.strip()
-				if vv and _looks_like_path(vv):
+				if vv and _looks_like_path(vv, key_hint=key):
 					out.append(f"{vv} -> {dest_raw}" if dest_raw else vv)
 					continue
 			if isinstance(v, list):
 				vals: list[str] = []
 				for item in v:
 					s = str(item or '').strip()
-					if s and _looks_like_path(s):
+					if s and _looks_like_path(s, key_hint=key):
 						vals.append(s)
 				if vals:
 					if dest_raw:
@@ -2116,21 +2261,6 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 	if not inject_map:
 		raise RuntimeError(f"[injects] no valid inject mappings produced from {inject_files}")
 
-	# Persist inject mapping metadata for remote copy mode.
-	try:
-		inject_items = [{'src': k, 'dest': v} for k, v in inject_map.items()]
-		obj = _inject_service_labels(
-			compose_obj,
-			{
-				'coretg.inject.source_dir': str(source_dir),
-				'coretg.inject.map': json.dumps(inject_items, ensure_ascii=False),
-			},
-			prefer_service=target_service,
-		)
-		compose_obj = obj
-	except Exception:
-		pass
-
 	def _volume_name_for_dest(dest_dir: str) -> str:
 		slug = dest_dir.strip('/') or 'injects'
 		slug = ''.join([c if c.isalnum() else '-' for c in slug])
@@ -2159,6 +2289,20 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		except Exception:
 			pass
 		return compose_obj
+
+	# Persist inject mapping metadata for remote copy mode (labels on target service).
+	try:
+		inject_items = [{'src': k, 'dest': v} for k, v in inject_map.items()]
+		compose_obj = _inject_service_labels(
+			compose_obj,
+			{
+				'coretg.inject.source_dir': str(source_dir),
+				'coretg.inject.map': json.dumps(inject_items, ensure_ascii=False),
+			},
+			prefer_service=target_service,
+		)
+	except Exception:
+		pass
 	try:
 		logger.info(
 			"[injects] applying injects to service=%s mode=%s map=%s",
@@ -2224,8 +2368,20 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 	if not cmds:
 		raise RuntimeError("[injects] no copy commands generated; refusing to skip inject service")
 
+	# Prefer reusing the target service image to avoid pulling an extra base image
+	# on CORE hosts that restrict outbound internet.
+	copy_image = 'alpine:3.19'
+	try:
+		svc = services.get(target_service)
+		if isinstance(svc, dict):
+			img = str(svc.get('image') or '').strip()
+			if img:
+				copy_image = img
+	except Exception:
+		copy_image = 'alpine:3.19'
+
 	services[copy_service_name] = {
-		'image': 'alpine:3.19',
+		'image': copy_image,
 		'volumes': copy_vols,
 		'command': ['sh', '-lc', ' && '.join(cmds)],
 	}
@@ -2355,15 +2511,130 @@ def _ensure_keepalive_for_base_os_images(compose_obj: dict, node_name: str, pref
 		return compose_obj
 
 
-def _write_iproute2_wrapper(out_dir: str, base_image: str, *, extra_apt_packages: Optional[List[str]] = None) -> str:
-	"""Write a minimal Dockerfile that installs baseline tooling (best-effort across distros).
+def _write_iproute2_wrapper(
+	out_dir: str,
+	base_image: str,
+	*,
+	extra_apt_packages: Optional[List[str]] = None,
+	extra_pip_packages: Optional[List[str]] = None,
+) -> str:
+	"""Write a wrapper Dockerfile that ensures an `ip` command exists.
 
 	Rationale: CORE docker nodes often run with no internet access from inside the container
-	(e.g., network_mode none + CORE-managed interfaces). Installing required tools at build
-	time avoids runtime apt/apk/yum failures.
+	(e.g., network_mode none + CORE-managed interfaces). A missing `ip` breaks CORE services
+	like DefaultRoute.
+
+	By default we avoid using a package manager at build time (no `apt-get`, `apk`, etc.)
+	by injecting a tiny `ip` implementation from BusyBox.
+
+	Fallback: set `CORETG_IPROUTE2_WRAPPER_STRATEGY=packages` to use the legacy
+	package-manager install behavior.
 	"""
 	os.makedirs(out_dir, exist_ok=True)
 	dockerfile_path = os.path.join(out_dir, 'Dockerfile')
+	# Best-effort: optional Python dependencies (installed at image build time on the CORE host).
+	# This is used to fix stacks like Airflow that may crash immediately when a Python module
+	# is missing (e.g., `argcomplete`), which in turn triggers CORE PID=0 errors.
+	extra_pip: list[str] = []
+	try:
+		if isinstance(extra_pip_packages, list):
+			extra_pip = [str(x).strip() for x in extra_pip_packages if x is not None and str(x).strip()]
+	except Exception:
+		extra_pip = []
+	try:
+		base_low = str(base_image or '').lower()
+	except Exception:
+		base_low = ''
+	# Airflow: ensure `argcomplete` is available so `airflow webserver` doesn't crash.
+	if base_low and 'airflow' in base_low and 'argcomplete' not in {p.lower() for p in extra_pip}:
+		extra_pip.append('argcomplete')
+	is_airflow = bool(base_low and 'airflow' in base_low)
+	# Strategy: default to a no-package-manager wrapper (BusyBox `ip`).
+	try:
+		strategy = str(os.getenv('CORETG_IPROUTE2_WRAPPER_STRATEGY') or '').strip().lower()
+		# Historical behavior was package-manager installs; keep it available.
+		use_packages = strategy in ('packages', 'pkg', 'apt', 'apk', 'yum', 'dnf')
+	except Exception:
+		use_packages = False
+
+	if not use_packages:
+		# NOTE: we keep a small, predictable Dockerfile. This wrapper is intended to be built
+		# on the CORE host and then started inside CORE networks that may be offline.
+		#
+		# We install *nothing* via apt/apk/yum. We only inject an `ip` command.
+		lines = [
+			"# coretg: ensure iproute2-like `ip` command present for CORE DefaultRoute",
+			"# Strategy: busybox injection (no package manager, offline-safe)",
+			"FROM busybox:1.36.1-musl AS coretg_iptools",
+			"",
+			f"FROM {base_image}",
+			"",
+		]
+		if is_airflow:
+			# Airflow images often install python packages under /home/airflow/.local.
+			# When CORE runs the container as root (to allow DefaultRoute chmod/scripts),
+			# Python's user-site resolves under /root/.local by default, breaking imports.
+			lines += [
+				"ENV HOME=/home/airflow",
+				"ENV PYTHONUSERBASE=/home/airflow/.local",
+				"ENV PATH=/home/airflow/.local/bin:$PATH",
+				"",
+			]
+		lines += [
+			"USER root",
+			"",
+			"# If the base image already provides `ip`, keep it; otherwise inject busybox as `ip`.",
+			"# We avoid any RUN that relies on networked package repositories.",
+			"COPY --from=coretg_iptools /bin/busybox /usr/local/coretg/bin/busybox",
+			"",
+			"RUN set -eu; \\",
+			f"\techo '[coretg-wrapper] STRICT=0 mode=busybox base={base_image}' >&2; \\",
+			"\tchmod 0755 /usr/local/coretg/bin/busybox; \\",
+			"\tif command -v ip >/dev/null 2>&1; then \\",
+			"\t\techo '[coretg-wrapper] ip already present; leaving base image ip as-is' >&2; \\",
+			"\t\texit 0; \\",
+			"\tfi; \\",
+			"\tmkdir -p /usr/sbin /sbin; \\",
+			"\t# Provide `ip` on common paths (CORE scripts typically call `ip` directly). \\",
+			"\tln -sf /usr/local/coretg/bin/busybox /usr/sbin/ip; \\",
+			"\tln -sf /usr/local/coretg/bin/busybox /sbin/ip; \\",
+			"\t/usr/sbin/ip -V >/dev/null 2>&1 || true",
+		]
+		if extra_pip:
+			pkgs = ' '.join(extra_pip)
+			lines += [
+				"",
+				"# coretg: optional python deps (installed at build time on host)",
+				"RUN set -eu; \\",
+				f"\techo '[coretg-wrapper] python_deps={pkgs}' >&2; \\",
+				"\tPY=''; \\",
+				"\tif command -v python >/dev/null 2>&1; then PY=python; fi; \\",
+				"\tif [ -z \"$PY\" ] && command -v python3 >/dev/null 2>&1; then PY=python3; fi; \\",
+				"\tif [ -z \"$PY\" ]; then echo '[coretg-wrapper] python not found; cannot install python deps' >&2; exit 1; fi; \\",
+				f"\t$PY -c 'import {extra_pip[0]}' >/dev/null 2>&1 && echo '[coretg-wrapper] python deps already present' >&2 && exit 0 || true; \\",
+				"\tif $PY -m pip --version >/dev/null 2>&1; then \\",
+				f"\t\t$PY -m pip install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+				"\telif command -v pip3 >/dev/null 2>&1; then \\",
+				f"\t\tpip3 install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+				"\telif command -v pip >/dev/null 2>&1; then \\",
+				f"\t\tpip install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+				"\telif command -v apt-get >/dev/null 2>&1; then \\",
+				"\t\tapt-get update; \\",
+				"\t\tapt-get install -y --no-install-recommends python3-pip; \\",
+				f"\t\tpython3 -m pip install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+				"\t\trm -rf /var/lib/apt/lists/*; \\",
+				"\telif command -v apk >/dev/null 2>&1; then \\",
+				"\t\tapk add --no-cache py3-pip; \\",
+				f"\t\tpython3 -m pip install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+				"\telse \\",
+				"\t\techo '[coretg-wrapper] pip not available; cannot install python deps' >&2; exit 1; \\",
+				"\tfi",
+			]
+		content = "\n".join(lines) + "\n"
+		with open(dockerfile_path, 'w', encoding='utf-8') as f:
+			f.write(content)
+		return dockerfile_path
+
 	# Strict by default: fail wrapper build when we cannot install baseline tools
 	# and the base image doesn't already include them. This prevents silent starts
 	# where CORE services later fail mysteriously.
@@ -2382,8 +2653,13 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str, *, extra_apt_packages
 	except Exception:
 		extra_apt = []
 	extra_apt_suffix = (' ' + ' '.join(extra_apt)) if extra_apt else ''
+	# Many vuln images set a non-root USER by default (e.g., airflow). The wrapper
+	# needs root privileges to install iproute2 tooling.
 	lines = [
 		f"FROM {base_image}",
+		"",
+		"USER root",
+		"",
 		"",
 		# Avoid `set -x` to reduce giant build logs; keep `-e` and `-u`.
 		"RUN set -eu; \\",
@@ -2407,15 +2683,15 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str, *, extra_apt_packages
 		"\t\t\t\t\"deb [trusted=yes] http://archive.debian.org/debian-security stretch/updates main\" > /etc/apt/sources.list; \\",
 		f"\t\t\tapt-get $APT_OPTS -o Acquire::Check-Valid-Until=false update{update_suffix}; \\",
 		"\t\tfi; \\",
-		f"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3{extra_apt_suffix}{install_suffix}; \\",
+		f"\t\tapt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps{extra_apt_suffix}{install_suffix}; \\",
 		"\t\trm -rf /var/lib/apt/lists/*; \\",
 		"\telif command -v apk >/dev/null 2>&1; then \\",
-		f"\t\tapk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3{install_suffix}; \\",
+		f"\t\tapk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps{install_suffix}; \\",
 		"\telif command -v dnf >/dev/null 2>&1; then \\",
-		f"\t\tdnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl{install_suffix}; \\",
+		f"\t\tdnf install -y iproute ethtool iptables iputils net-tools procps ca-certificates curl{install_suffix}; \\",
 		"\t\tdnf clean all || true; \\",
 		"\telif command -v yum >/dev/null 2>&1; then \\",
-		f"\t\tyum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl{install_suffix}; \\",
+		f"\t\tyum install -y iproute ethtool iptables iputils net-tools procps ca-certificates curl{install_suffix}; \\",
 		"\t\tyum clean all || true; \\",
 		"\telse \\",
 		"\t\techo \"[coretg-wrapper] no supported package manager found\" >&2; \\",
@@ -2423,6 +2699,35 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str, *, extra_apt_packages
 		"\tfi; \\",
 		("\tcommand -v ip >/dev/null 2>&1" if strict_enabled else "\ttrue"),
 	]
+	if is_airflow:
+		lines += [
+			"",
+			"ENV HOME=/home/airflow",
+			"ENV PYTHONUSERBASE=/home/airflow/.local",
+			"ENV PATH=/home/airflow/.local/bin:$PATH",
+		]
+	if extra_pip:
+		pkgs = ' '.join(extra_pip)
+		lines += [
+			"",
+			"# coretg: optional python deps (installed at build time on host)",
+			"RUN set -eu; \\",
+			f"\techo '[coretg-wrapper] python_deps={pkgs}' >&2; \\",
+			"\tPY=''; \\",
+			"\tif command -v python >/dev/null 2>&1; then PY=python; fi; \\",
+			"\tif [ -z \"$PY\" ] && command -v python3 >/dev/null 2>&1; then PY=python3; fi; \\",
+			"\tif [ -z \"$PY\" ]; then echo '[coretg-wrapper] python not found; cannot install python deps' >&2; exit 1; fi; \\",
+			f"\t$PY -c 'import {extra_pip[0]}' >/dev/null 2>&1 && echo '[coretg-wrapper] python deps already present' >&2 && exit 0 || true; \\",
+			"\tif $PY -m pip --version >/dev/null 2>&1; then \\",
+			f"\t\t$PY -m pip install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+			"\telif command -v pip3 >/dev/null 2>&1; then \\",
+			f"\t\tpip3 install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+			"\telif command -v pip >/dev/null 2>&1; then \\",
+			f"\t\tpip install --no-cache-dir{' --user' if is_airflow else ''} {pkgs}; \\",
+			"\telse \\",
+			"\t\techo '[coretg-wrapper] pip not available; cannot install python deps' >&2; exit 1; \\",
+			"\tfi",
+		]
 	content = "\n".join(lines) + "\n"
 	with open(dockerfile_path, 'w', encoding='utf-8') as f:
 		f.write(content)
@@ -2485,6 +2790,7 @@ def _inject_iproute2_into_build_only_service(svc: Dict[str, object], *, logger: 
 		snippet = (
 			"\n\n"
 			"# coretg: ensure iproute2 present for CORE DefaultRoute / network scripts\n"
+			"USER root\n"
 			"RUN set -eu; \\\n"
 			"\tif command -v ip >/dev/null 2>&1; then exit 0; fi; \\\n"
 			"\tif command -v apt-get >/dev/null 2>&1; then \\\n"
@@ -2856,6 +3162,114 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		except Exception:
 			return text
 
+	def _resolve_compose_interpolations(text: str) -> str:
+		"""Resolve docker-compose `${VAR}` interpolation patterns to plain literals.
+
+		This is preferable to the Mako wrapper form `${"${VAR}"}` because docker-compose
+		rejects that wrapper as an invalid interpolation format.
+
+		Rules (best-effort):
+		- `${VAR}` -> env(VAR) or ''
+		- `${VAR:-default}` -> env(VAR) if set and non-empty else default
+		- `${VAR-default}` -> env(VAR) if set else default
+		- `${VAR:?msg}`/`${VAR?msg}` -> env(VAR) or ''
+		- `${VAR:+alt}`/`${VAR+alt}` -> alt when set
+		Also unwraps legacy wrapper form `${"${VAR}"}` back to `${VAR}` before resolving.
+		"""
+		try:
+			import re as _re
+			if not text or '${' not in text:
+				return text
+
+			def _hostname_default() -> str:
+				try:
+					import socket as _socket
+					return str(_socket.gethostname() or '')
+				except Exception:
+					return ''
+
+			def _resolve_expr(expr: str) -> str:
+				inner = str(expr or '').strip()
+				m = _re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$', inner)
+				if not m:
+					return ''
+				var = str(m.group(1) or '').strip()
+				tail = str(m.group(2) or '')
+				op = None
+				arg = ''
+				if tail.startswith(':-'):
+					op = ':-'; arg = tail[2:]
+				elif tail.startswith(':?'):
+					op = ':?'; arg = tail[2:]
+				elif tail.startswith(':+'):
+					op = ':+'; arg = tail[2:]
+				elif tail.startswith('-'):
+					op = '-'; arg = tail[1:]
+				elif tail.startswith('?'):
+					op = '?'; arg = tail[1:]
+				elif tail.startswith('+'):
+					op = '+'; arg = tail[1:]
+				arg = arg.lstrip() if arg else ''
+				try:
+					is_set = var in os.environ
+					val = os.environ.get(var)
+				except Exception:
+					is_set = False
+					val = None
+				val_str = str(val) if val is not None else ''
+				nonempty = bool(val_str)
+				if op is None:
+					if is_set:
+						return val_str
+					if var == 'HOSTNAME':
+						return _hostname_default()
+					return ''
+				if op == ':-':
+					return val_str if nonempty else str(arg)
+				if op == '-':
+					return val_str if is_set else str(arg)
+				if op in (':?', '?'):
+					return val_str if (nonempty if op == ':?' else is_set) else ''
+				if op in (':+', '+'):
+					return str(arg) if (nonempty if op == ':+' else is_set) else ''
+				return val_str
+
+			out = text
+			# Mako hazard: docker-compose uses `$${VAR}` to escape a literal `$`.
+			# But Mako will still see `${VAR}` starting at the second `$` and raise
+			# NameError("Undefined"). Rewrite `$${VAR}` to `$VAR` so shells inside the
+			# container can still expand it, without braces.
+			try:
+				out = _re.sub(r'\$\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}', r'$\1', out)
+			except Exception:
+				pass
+			# Unwrap wrapper forms: ${"${VAR}"} -> ${VAR}
+			wrapper_re = _re.compile(r"\$\{\s*(?:\\)?(['\"])\s*\$\{([^}]*)\}\s*(?:\\)?\1\s*\}")
+			for _ in range(5):
+				out2 = wrapper_re.sub(lambda m: '${' + str(m.group(2) or '') + '}', out)
+				if out2 == out:
+					break
+				out = out2
+			# Resolve remaining ${...}
+			token_re = _re.compile(r'(?<!\$)\$\{([^}]*)\}')
+			for _ in range(3):
+				if '${' not in out:
+					break
+				out2 = token_re.sub(lambda m: _resolve_expr(m.group(1) or ''), out)
+				if out2 == out:
+					break
+				out = out2
+			# Final safety: remove any remaining `${...}` tokens so core-daemon Mako
+			# rendering cannot fail.
+			try:
+				if '${' in out:
+					out = _re.sub(r'\$\{[^}]*\}', '', out)
+			except Exception:
+				pass
+			return out
+		except Exception:
+			return text
+
 	def _escape_core_printf_percents(text: str) -> str:
 		"""Escape `%` so CORE's `printf "..." >> docker-compose.yml` writes literal percents.
 
@@ -3111,10 +3525,6 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			# Many callers/tests expect the original selected service (often the first
 			# service, e.g. `app`) to be modified in-place.
 			# We create/refresh the node-name alias AFTER modifications, just before dump.
-			# Optional: set container_name for the selected service.
-			# Default OFF because it can interfere with CORE's service execution on docker nodes.
-			if _compose_set_container_name_enabled():
-				obj = _set_container_name_for_selected_service(obj, node_name, prefer_service=prefer)
 			# Track which service we modified (used later to alias it under node_name).
 			modified_service_key: Optional[str] = None
 			try:
@@ -3162,6 +3572,8 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				pass
 
 			# Inject allowlisted files into the target container (copy by default).
+			source_dir = ''
+			outputs_manifest = ''
 			try:
 				inject_files = rec.get('InjectFiles') or rec.get('inject_files')
 				source_dir = str(rec.get('InjectSourceDir') or rec.get('ArtifactsDir') or '').strip()
@@ -3172,6 +3584,21 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					cand = os.path.join(run_dir, 'outputs.json') if run_dir else ''
 					if cand and os.path.exists(cand):
 						outputs_manifest = cand
+					# Fallback: Flow artifacts often live under ArtifactsDir (or its parent)
+					# even when RunDir wasn't persisted.
+					if (not outputs_manifest) and source_dir:
+						try:
+							sd = source_dir
+							if not os.path.isabs(sd):
+								sd = os.path.abspath(sd)
+							cand2 = os.path.join(sd, 'outputs.json')
+							cand3 = os.path.join(os.path.dirname(sd), 'outputs.json')
+							if os.path.exists(cand2):
+								outputs_manifest = cand2
+							elif os.path.exists(cand3):
+								outputs_manifest = cand3
+						except Exception:
+							pass
 				if isinstance(inject_files, list) and inject_files and source_dir:
 					obj = _inject_copy_for_inject_files(
 						obj,
@@ -3180,8 +3607,17 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						outputs_manifest=outputs_manifest,
 						prefer_service=prefer,
 					)
-			except Exception:
-				pass
+			except Exception as exc:
+				try:
+					logger.warning(
+						"[injects] failed to apply injects node=%s source_dir=%s outputs_manifest=%s err=%s",
+						node_name,
+						source_dir,
+						outputs_manifest,
+						exc,
+					)
+				except Exception:
+					pass
 			# Optional overlays for traffic/segmentation nodes (kept out of baseline template).
 			try:
 				def _truthy(val: object) -> bool:
@@ -3236,6 +3672,64 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
 					svc = services.get(svc_key)
 					base_image = str(svc.get('image') or '').strip()
+					# Some vulhub images (notably airflow) rely on an ENTRYPOINT of `airflow`
+					# with a bare subcommand (e.g. `command: webserver`). If ENTRYPOINT is not
+					# set/preserved, Docker will try to exec `webserver` directly and fail.
+					try:
+						img_low = base_image.lower().strip() if isinstance(base_image, str) else ''
+						cmd = svc.get('command')
+						cmd_token = None
+						if isinstance(cmd, str):
+							cmd_token = cmd.strip().split()[0] if cmd.strip() else None
+						elif isinstance(cmd, list) and cmd:
+							cmd_token = str(cmd[0]).strip() if str(cmd[0]).strip() else None
+						airflow_cmds = {
+							'webserver',
+							'scheduler',
+							'worker',
+							'flower',
+							'initdb',
+							'db',
+						}
+						if 'airflow' in img_low and cmd_token in airflow_cmds:
+							# CORE DockerNodes do not use docker-compose's default network/DNS once CORE
+							# attaches its own interfaces, so service-name DNS like `postgres` often
+							# fails. Make Airflow self-contained for CORE by using SQLite + SequentialExecutor
+							# and initializing the DB before starting the webserver.
+							try:
+								env = svc.get('environment')
+								if not isinstance(env, dict):
+									env = {}
+								# Force overrides: many upstream compose files set postgres/redis/celery defaults.
+								env['AIRFLOW__CORE__EXECUTOR'] = 'SequentialExecutor'
+								env['AIRFLOW__CORE__SQL_ALCHEMY_CONN'] = 'sqlite:////home/airflow/airflow.db'
+								env['AIRFLOW__CORE__LOAD_EXAMPLES'] = 'False'
+								# Remove celery/redis broker settings when present.
+								for k in [
+									'AIRFLOW__CELERY__BROKER_URL',
+									'AIRFLOW__CELERY__RESULT_BACKEND',
+									'CELERY_BROKER_URL',
+									'CELERY_RESULT_BACKEND',
+								]:
+									env.pop(k, None)
+								svc['environment'] = env
+							except Exception:
+								pass
+							# Avoid starting additional compose services that won't be reachable anyway.
+							try:
+								svc.pop('depends_on', None)
+								svc.pop('links', None)
+							except Exception:
+								pass
+							# Run initdb and then start webserver. Use sh so we don't rely on docker
+							# entrypoint semantics for airflow subcommands.
+							try:
+								svc['entrypoint'] = 'sh'
+								svc['command'] = ['-lc', 'airflow initdb && airflow webserver']
+							except Exception:
+								pass
+					except Exception:
+						pass
 					try:
 						# Some base images (e.g., ActiveMQ) rely on relative startup paths.
 						# Preserve their expected WORKDIR to avoid '/bin/activemq: not found'.
@@ -3246,9 +3740,62 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						pass
 					# If this compose already references our wrapper tag, don't wrap again.
 					# Double-wrapping can make Docker try to pull the wrapper tag as a base image.
-					if base_image.startswith('coretg/') and base_image.endswith(':iproute2'):
-						raise RuntimeError('already_wrapped')
-					if base_image:
+					already_wrapped = bool(base_image.startswith('coretg/') and base_image.endswith(':iproute2'))
+					if already_wrapped:
+						# Already wrapped: still apply best-effort runtime fixes to avoid
+						# immediate container exit (PID=0) and DefaultRoute chmod failures.
+						try:
+							labs = svc.get('labels')
+							if not isinstance(labs, dict):
+								labs = {}
+							base_hint = str(
+								labs.get('coretg.wrapper_effective_base_image')
+								or labs.get('coretg.wrapper_base_image')
+								or ''
+							).strip().lower()
+							cmd = svc.get('command')
+							cmd_token = None
+							if isinstance(cmd, str):
+								cmd_token = cmd.strip().split()[0] if cmd.strip() else None
+							elif isinstance(cmd, list) and cmd:
+								cmd_token = str(cmd[0]).strip() if str(cmd[0]).strip() else None
+							aif_cmds = {
+								'webserver',
+								'scheduler',
+								'worker',
+								'flower',
+								'initdb',
+								'db',
+							}
+							if base_hint and 'airflow' in base_hint and cmd_token in aif_cmds and svc.get('entrypoint') in (None, ''):
+								svc['entrypoint'] = 'airflow'
+						except Exception:
+							pass
+						try:
+							svc['pull_policy'] = 'never'
+						except Exception:
+							pass
+						try:
+							svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+						except Exception:
+							pass
+						try:
+							u = svc.get('user')
+							u_s = str(u).strip() if u is not None else ''
+							if u_s and u_s not in ('0', 'root', '0:0', 'root:root'):
+								svc.pop('user', None)
+								try:
+									logger.info('[vuln] removed non-root user (already wrapped) node=%s service=%s user=%s', node_name, svc_key, u_s)
+								except Exception:
+									pass
+						except Exception:
+							pass
+						try:
+							if _compose_force_root_workdir_enabled():
+								_force_service_workdir_root(svc)
+						except Exception:
+							pass
+					if base_image and not already_wrapped:
 						# Quay.io may require auth on some CORE VMs (401). If the upstream image is
 						# nfs-ganesha from Quay, switch to a public base and install Ganesha in the
 						# wrapper so we don't need to pull from Quay at all.
@@ -3267,17 +3814,24 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							extra_apt = ['nfs-ganesha', 'nfs-ganesha-vfs']
 						wrap_dir = os.path.join(out_base, f"docker-wrap-{scenario_tag_safe}-{_safe_name(node_name)}")
 						_write_iproute2_wrapper(wrap_dir, base_image, extra_apt_packages=extra_apt)
-						# Rewrite service to build the wrapper; keep a tagged image for caching.
-						# NOTE: some CORE VM Docker installs are missing the default "bridge" network,
-						# which causes `docker compose build` to fail with "network bridge not found".
-						# Force host networking for the build to avoid relying on the bridge network.
-						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile', 'network': 'host'}
+						# IMPORTANT: do NOT leave a `build:` stanza in the compose file that CORE will
+						# later run. core-daemon uses `docker compose up -d <node>` and will attempt to
+						# build (and therefore pull packages/images) during scenario startup.
+						#
+						# Instead, we rely on host-side preflight (executed on the CORE VM) to build the
+						# wrapper image ahead of time, then CORE only needs to start the already-built
+						# `image:` tag.
+						svc.pop('build', None)
 						svc['image'] = f"coretg/{scenario_tag_safe}-{_safe_name(node_name)}:iproute2"
 						# Preserve the original base image for later heuristics/diagnostics.
 						try:
 							labs = svc.get('labels')
 							if not isinstance(labs, dict):
 								labs = {}
+							# Provide wrapper build metadata for host-side preflight.
+							labs.setdefault('coretg.wrapper_build_context', str(wrap_dir))
+							labs.setdefault('coretg.wrapper_build_dockerfile', 'Dockerfile')
+							labs.setdefault('coretg.wrapper_build_network', 'host')
 							labs.setdefault('coretg.wrapper_base_image', str(orig_base_image))
 							if str(orig_base_image) != str(base_image):
 								labs.setdefault('coretg.wrapper_effective_base_image', str(base_image))
@@ -3288,6 +3842,23 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						svc['pull_policy'] = 'never'
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
 						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+						# IMPORTANT: Many upstream vuln stacks pin a non-root `user:` (e.g., airflow
+						# `50000:50000`). CORE's DefaultRoute service writes and chmods scripts inside
+						# the container using `docker exec <node> chmod ...`. When the container runs
+						# as non-root, this fails with "Operation not permitted".
+						#
+						# For CORE DockerNodes, prefer running the wrapped service as root.
+						try:
+							u = svc.get('user')
+							u_s = str(u).strip() if u is not None else ''
+							if u_s and u_s not in ('0', 'root', '0:0', 'root:root'):
+								svc.pop('user', None)
+								try:
+									logger.info('[vuln] removed non-root user for CORE docker wrapper node=%s service=%s user=%s', node_name, svc_key, u_s)
+								except Exception:
+									pass
+						except Exception:
+							pass
 						# CORE services often manipulate files using relative paths; force root workdir.
 						try:
 							if _compose_force_root_workdir_enabled():
@@ -3343,6 +3914,17 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					obj = _ensure_service_named_as_node(obj, node_name, prefer_service=alias_src or prefer)
 					# CORE should start the node-name service.
 					rec['compose_service'] = str(node_name)
+					# Optional: set container_name ONLY for the node-name service.
+					# This avoids duplicate container_name across multiple services (which can
+					# cause docker compose conflicts or cause CORE to inspect the wrong container).
+					try:
+						if _compose_set_container_name_enabled():
+							obj = _remove_container_names_all_services(obj)
+							services = obj.get('services') if isinstance(obj, dict) else None
+							if isinstance(services, dict) and isinstance(services.get(node_name), dict):
+								services.get(node_name)['container_name'] = str(node_name)
+					except Exception:
+						pass
 				except Exception:
 					pass
 				# Keep base OS images alive (avoid immediate exit -> pid=0 -> core-daemon errors).
@@ -3351,8 +3933,10 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				except Exception:
 					pass
 				text = _yaml_dump_literal_multiline(obj)
+				# Resolve docker-compose ${...} env interpolation into literals so both
+				# CORE (Mako) and docker-compose can process the file.
+				text = _resolve_compose_interpolations(text)
 				text = _escape_core_printf_backslashes(text)
-				text = _escape_mako_dollars(text)
 				text = _escape_core_printf_percents(text)
 				with open(out_path, 'w', encoding='utf-8') as f:
 					f.write(text)
@@ -3408,9 +3992,9 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						text_sanitized = _strip_port_mappings_from_text(txt)
 						if _compose_force_root_workdir_enabled():
 							text_sanitized = _inject_working_dir_root_text(text_sanitized)
-					# Escape `${...}` to prevent Mako NameError during template rendering.
+					# Resolve `${...}` to avoid both Mako NameError and docker-compose invalid wrappers.
+					text_sanitized = _resolve_compose_interpolations(text_sanitized)
 					text_sanitized = _escape_core_printf_backslashes(text_sanitized)
-					text_sanitized = _escape_mako_dollars(text_sanitized)
 					text_sanitized = _escape_core_printf_percents(text_sanitized)
 					logger.debug(
 						"[vuln] sanitized compose text node=%s original_len=%s new_len=%s",

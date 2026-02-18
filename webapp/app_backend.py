@@ -2160,7 +2160,20 @@ def _push_repo_to_remote_via_sftp_delta(
     planning_total_files = max(0, len(desired_files) - (1 if '.coretg_repo_hash' in desired_files else 0))
     last_plan_update_ts = time.time()
 
-    assume_upload_all = not bool(remote_manifest)
+    # If include_repo_paths is set, this is a reduced snapshot intended to keep
+    # generator code and manifests in sync. Remote mtimes available via SFTP/ssh
+    # are second-resolution, so rapid edits within the same second can be missed
+    # and old generator code can persist. In include-only mode, default to always
+    # uploading files we include.
+    force_upload_include = False
+    try:
+        if include_repo_paths:
+            flag = str(os.getenv('CORETG_SFTP_FORCE_UPLOAD_INCLUDE', '1') or '1').strip().lower()
+            force_upload_include = flag not in ('0', 'false', 'no', 'off')
+    except Exception:
+        force_upload_include = bool(include_repo_paths)
+
+    assume_upload_all = (not bool(remote_manifest)) or bool(force_upload_include)
 
     for rel in sorted(desired_files):
         if rel == '.coretg_repo_hash':
@@ -30507,7 +30520,17 @@ def _run_docker(cmd, timeout=20):
 
 def main():
     results = []
+    image_ids = []
     for nm in (NAMES or []):
+        # Capture container image id before removal.
+        try:
+            p0 = _run_docker(['container', 'inspect', '-f', '{{.Image}}', nm], timeout=20)
+            if getattr(p0, 'returncode', 1) == 0:
+                img_id = (getattr(p0, 'stdout', '') or '').strip().splitlines()[:1]
+                if img_id and img_id[0].strip():
+                    image_ids.append(img_id[0].strip())
+        except Exception:
+            pass
         stopped = removed = False
         try:
             p1 = _run_docker(['stop', nm], timeout=20)
@@ -30520,6 +30543,31 @@ def main():
         except Exception:
             removed = False
         results.append({'name': nm, 'stopped': bool(stopped), 'removed': bool(removed)})
+
+    # Remove images associated with removed containers, but only if unused.
+    removed_images = []
+    image_errors = {}
+    try:
+        uniq = []
+        for x in image_ids:
+            if x and x not in uniq:
+                uniq.append(x)
+        for img in uniq:
+            try:
+                p_used = _run_docker(['ps', '-a', '-q', '--filter', 'ancestor=' + str(img)], timeout=30)
+                used = bool((getattr(p_used, 'stdout', '') or '').strip()) if getattr(p_used, 'returncode', 1) == 0 else True
+                if used:
+                    continue
+                p_rm = _run_docker(['image', 'rm', '-f', str(img)], timeout=60)
+                if getattr(p_rm, 'returncode', 1) == 0:
+                    removed_images.append(str(img))
+                else:
+                    out = (getattr(p_rm, 'stdout', '') or '').strip()[-500:]
+                    image_errors[str(img)] = out or ('rc=' + str(getattr(p_rm, 'returncode', 1)))
+            except Exception as e:
+                image_errors[str(img)] = str(e)
+    except Exception:
+        pass
     # Prune unused networks to avoid exhausting Docker's default address pools.
     # CORE docker nodes frequently create per-node compose networks; if sessions are
     # started/stopped repeatedly without network cleanup, docker can hit:
@@ -30533,7 +30581,7 @@ def main():
     except Exception as e:
         net_prune_ok = False
         net_prune_out = str(e)
-    print(json.dumps({'ok': True, 'results': results, 'network_prune': {'ok': bool(net_prune_ok), 'output': net_prune_out}}))
+    print(json.dumps({'ok': True, 'results': results, 'removed_images': removed_images, 'image_errors': image_errors, 'network_prune': {'ok': bool(net_prune_ok), 'output': net_prune_out}}))
 
 
 if __name__ == '__main__':
@@ -38797,12 +38845,36 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
             activate_path = posixpath.join(venv_bin_remote.rstrip('/'), 'activate')
             activate_prefix = f". {shlex.quote(activate_path)} >/dev/null 2>&1 || true; "
         
+        # For remote SSH runs, default to sudo-backed docker and strict pull.
+        # This ensures the CLI can preflight (pull/build) images *before* CORE's
+        # core-daemon tries to start docker nodes.
         docker_env_parts: list[str] = []
-        if _coerce_bool(core_cfg.get('ssh_enabled')):
-             docker_env_parts.append('CORETG_DOCKER_USE_SUDO=1')
-             docker_env_parts.append('CORETG_DOCKER_STRICT_PULL=1')
-             if core_cfg.get('ssh_password'):
-                 docker_env_parts.append('CORETG_DOCKER_SUDO_PASSWORD_STDIN=1')
+        docker_use_sudo = core_cfg.get('docker_use_sudo')
+        docker_strict_pull = core_cfg.get('docker_strict_pull')
+        docker_build_pull = core_cfg.get('docker_build_pull')
+
+        if docker_use_sudo is None:
+            docker_use_sudo = True
+        if docker_strict_pull is None:
+            docker_strict_pull = True
+        if docker_build_pull is None:
+            docker_build_pull = False
+
+        if _coerce_bool(docker_use_sudo):
+            docker_env_parts.append('CORETG_DOCKER_USE_SUDO=1')
+        if _coerce_bool(docker_strict_pull):
+            docker_env_parts.append('CORETG_DOCKER_STRICT_PULL=1')
+
+        # Explicitly set build-pull to override any remote VM environment defaults.
+        # `docker build --pull` can trigger registry metadata fetches even when cached.
+        docker_env_parts.append('CORETG_DOCKER_BUILD_PULL=1' if _coerce_bool(docker_build_pull) else 'CORETG_DOCKER_BUILD_PULL=0')
+
+        # CORE docker nodes expect to be able to address the container by node name.
+        # Inject `container_name: <node>` into generated compose by default.
+        docker_env_parts.append('CORETG_COMPOSE_SET_CONTAINER_NAME=1')
+
+        if core_cfg.get('ssh_password') and _coerce_bool(docker_use_sudo):
+            docker_env_parts.append('CORETG_DOCKER_SUDO_PASSWORD_STDIN=1')
         
         docker_env_prefix = (' '.join(docker_env_parts) + ' ') if docker_env_parts else ''
         flow_env_parts: list[str] = ['CORETG_FLOW_ARTIFACTS_MODE=copy']

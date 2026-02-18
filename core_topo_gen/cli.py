@@ -46,6 +46,103 @@ from .utils.vuln_process import (
 )
 
 
+def _preview_vuln_slot_overrides(
+    preview_full: Any,
+    *,
+    vuln_items: list[dict] | None,
+    catalog: list[Dict[str, str]] | None,
+    slot_names: list[str],
+) -> Dict[str, Dict[str, str]]:
+    """Best-effort force slot->vuln compose mapping based on preview_full.
+
+    The orchestration/preview plan can already contain an explicit mapping of which
+    host IDs get which vulnerability names (vulnerabilities_by_node). When present,
+    we should honor that mapping to maintain preview parity and avoid falling back
+    to the standard docker template.
+
+    Returns a dict keyed by slot key (e.g., slot-1) to a compose record.
+    """
+    try:
+        if not isinstance(preview_full, dict):
+            return {}
+        vbn = preview_full.get('vulnerabilities_by_node') or preview_full.get('vulnerabilities_preview') or {}
+        if not isinstance(vbn, dict) or not vbn:
+            return {}
+        hosts_preview = preview_full.get('hosts') or []
+        if not isinstance(hosts_preview, list) or not hosts_preview:
+            return {}
+
+        ordered_hosts = sorted(hosts_preview, key=lambda h: (h.get('node_id', 0) if isinstance(h, dict) else 0))
+        slot_map: dict[int, str] = {}
+        for idx, h in enumerate(ordered_hosts):
+            if not isinstance(h, dict):
+                continue
+            try:
+                hid = int(h.get('node_id'))
+            except Exception:
+                continue
+            slot_map[hid] = f"slot-{idx+1}"
+
+        slot_set = set(str(s) for s in (slot_names or []))
+        items = vuln_items or []
+        cat = catalog or []
+
+        def _record_for_name(vname: str) -> Dict[str, str] | None:
+            name = str(vname or '').strip()
+            if not name:
+                return None
+            # Prefer explicit v_path from vuln_items (Scenario XML "Specific" rows).
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if str(it.get('v_name') or '').strip() != name:
+                    continue
+                path = str(it.get('v_path') or '').strip()
+                if not path:
+                    continue
+                vec = str(it.get('v_vector') or it.get('Vector') or '').strip()
+                return {'Type': 'docker-compose', 'Name': name, 'Path': path, 'Vector': vec}
+            # Fallback: find by catalog name.
+            for r in cat:
+                if not isinstance(r, dict):
+                    continue
+                if str(r.get('Name') or '').strip() != name:
+                    continue
+                path = str(r.get('Path') or '').strip()
+                if not path:
+                    continue
+                vec = str(r.get('Vector') or '').strip()
+                return {'Type': 'docker-compose', 'Name': name, 'Path': path, 'Vector': vec}
+            return None
+
+        overrides: Dict[str, Dict[str, str]] = {}
+        for key, names in vbn.items():
+            try:
+                hid = int(key)
+            except Exception:
+                continue
+            slot = slot_map.get(hid)
+            if not slot or slot not in slot_set:
+                continue
+            # vbn values are commonly list[str] of vuln names; accept scalar too.
+            chosen = None
+            if isinstance(names, list) and names:
+                for cand in names:
+                    if isinstance(cand, str) and cand.strip():
+                        chosen = cand.strip()
+                        break
+            elif isinstance(names, str) and names.strip():
+                chosen = names.strip()
+            if not chosen:
+                continue
+            rec = _record_for_name(chosen)
+            if rec:
+                overrides[slot] = rec
+        return overrides
+    except Exception:
+        return {}
+
+
 def _core_session_id(session: Any) -> int | None:
     try:
         sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)
@@ -113,6 +210,87 @@ def _is_shutdown_state(state: str) -> bool:
     return s in {'shutdown', 'shutdown_state'}
 
 
+def _docker_use_sudo_enabled() -> bool:
+    try:
+        v = os.getenv('CORETG_DOCKER_USE_SUDO')
+        if v is None:
+            return False
+        return str(v).strip().lower() not in ('0', 'false', 'no', 'off', '')
+    except Exception:
+        return False
+
+
+def _docker_sudo_password_env() -> str | None:
+    try:
+        pw = os.getenv('CORETG_DOCKER_SUDO_PASSWORD')
+        if pw is None:
+            return None
+        pw = str(pw).rstrip('\n')
+        return pw if pw.strip() else None
+    except Exception:
+        return None
+
+
+def _docker_permission_denied(text: str) -> bool:
+    t = (text or '').lower()
+    return (
+        'got permission denied' in t
+        or 'permission denied' in t
+        or 'cannot connect to the docker daemon' in t
+        or ('docker daemon' in t and 'permission' in t)
+        or ('dial unix' in t and 'docker.sock' in t and 'permission' in t)
+    )
+
+
+def _docker_sudo_prefix() -> tuple[list[str], str | None]:
+    """Return sudo prefix and stdin input (if needed) for docker commands."""
+    if not shutil.which('sudo'):
+        return [], None
+    pw = _docker_sudo_password_env()
+    if pw:
+        return ['sudo', '-S', '-p', ''], pw + '\n'
+    return ['sudo', '-n'], None
+
+
+def _run_docker_cmd(args: list[str], *, timeout_s: float = 20.0, allow_sudo_retry: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run a docker command, honoring CORETG_DOCKER_USE_SUDO and auto-retrying on permission errors."""
+    # Primary attempt
+    tried_sudo = False
+    prefix: list[str] = []
+    stdin_input: str | None = None
+    if _docker_use_sudo_enabled():
+        prefix, stdin_input = _docker_sudo_prefix()
+        tried_sudo = bool(prefix)
+    proc = subprocess.run(
+        prefix + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=float(timeout_s or 20.0),
+        input=stdin_input,
+    )
+    if proc.returncode == 0:
+        return proc
+    if not allow_sudo_retry:
+        return proc
+    if tried_sudo:
+        return proc
+    # Retry with sudo if we hit docker socket permission issues.
+    if _docker_permission_denied(proc.stdout or ''):
+        sp, sp_in = _docker_sudo_prefix()
+        if sp:
+            proc2 = subprocess.run(
+                sp + args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=float(timeout_s or 20.0),
+                input=sp_in,
+            )
+            return proc2
+    return proc
+
+
 def _docker_container_state(name: str) -> dict[str, Any]:
     """Best-effort docker inspect state for a container name."""
     name = str(name or '').strip()
@@ -121,13 +299,7 @@ def _docker_container_state(name: str) -> dict[str, Any]:
     if not shutil.which('docker'):
         return {'name': name, 'exists': None, 'running': None, 'status': '', 'exit_code': None, 'error': 'docker not found'}
     try:
-        p = subprocess.run(
-            ['docker', 'inspect', '--format', '{{json .State}}', name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=20,
-        )
+        p = _run_docker_cmd(['docker', 'inspect', '--format', '{{json .State}}', name], timeout_s=20.0)
     except Exception as exc:
         return {'name': name, 'exists': False, 'running': False, 'status': '', 'exit_code': None, 'error': f'{exc.__class__.__name__}: {exc}'}
     if p.returncode != 0:
@@ -172,13 +344,7 @@ def _docker_container_config(name: str) -> dict[str, Any]:
     if not shutil.which('docker'):
         return {'name': name, 'exists': None, 'image': None, 'cmd': None, 'entrypoint': None, 'error': 'docker not found'}
     try:
-        p = subprocess.run(
-            ['docker', 'inspect', '--format', '{{json .Config}}', name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=20,
-        )
+        p = _run_docker_cmd(['docker', 'inspect', '--format', '{{json .Config}}', name], timeout_s=20.0)
     except Exception as exc:
         return {'name': name, 'exists': False, 'image': None, 'cmd': None, 'entrypoint': None, 'error': f'{exc.__class__.__name__}: {exc}'}
     if p.returncode != 0:
@@ -299,9 +465,9 @@ def _docker_compose_restart_service(compose_path: str, service: str, *, timeout_
     if not shutil.which('docker'):
         return {'ok': False, 'error': 'docker not found', 'compose_path': p, 'service': svc}
 
-    cmd = ['docker', 'compose', '-f', p, 'up', '-d', svc]
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=float(timeout_s or 120))
+        cmd = ['docker', 'compose', '-f', p, 'up', '-d', svc]
+        proc = _run_docker_cmd(cmd, timeout_s=float(timeout_s or 120.0), allow_sudo_retry=True)
     except Exception as exc:
         return {'ok': False, 'error': f'{exc.__class__.__name__}: {exc}', 'compose_path': p, 'service': svc, 'cmd': cmd}
     out = (proc.stdout or '').strip()
@@ -1170,17 +1336,37 @@ def main():
         core = wrap_core_client_retry(core, logging.getLogger("core_topo_gen.grpc"))
     except Exception:
         pass
-    # Wrap with a logging proxy to trace all gRPC calls
-    try:
-        from .utils.grpc_logging import wrap_core_client as wrap_core_client_logging
-        core = wrap_core_client_logging(core, logging.getLogger("core_topo_gen.grpc"))
-    except Exception:
-        pass
     logging.info("[grpc] CoreGrpcClient.connect() -> %s:%s", args.host, args.port)
     core.connect()
     try:
         from .utils.grpc_helpers import start_grpc_keepalive
+        # IMPORTANT: start keepalive before applying any gRPC logging proxy.
+        # The keepalive pings call get_sessions() on an interval (default 20s).
+        # If we wrap the client with a logging proxy at INFO, that turns into
+        # repetitive INFO log spam even after the scenario is running.
         start_grpc_keepalive(core)
+    except Exception:
+        pass
+    # Optional: wrap with a logging proxy to trace all gRPC calls.
+    # Default OFF unless explicitly enabled (or logger already in DEBUG).
+    try:
+        enable_trace = False
+        try:
+            v = os.getenv('CORETG_GRPC_CALL_TRACE')
+            if v is None:
+                enable_trace = False
+            else:
+                enable_trace = str(v).strip().lower() not in ('0', 'false', 'no', 'off', '')
+        except Exception:
+            enable_trace = False
+        try:
+            if logging.getLogger('core_topo_gen.grpc').isEnabledFor(logging.DEBUG):
+                enable_trace = True
+        except Exception:
+            pass
+        if enable_trace:
+            from .utils.grpc_logging import wrap_core_client as wrap_core_client_logging
+            core = wrap_core_client_logging(core, logging.getLogger("core_topo_gen.grpc"))
     except Exception:
         pass
     # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots (reuse orchestrator raw)
@@ -1260,6 +1446,35 @@ def main():
             seed=seed_for_vuln,
             shuffle_nodes=not bool(preview_vuln_slots),
         )
+
+        # Preview parity: if the preview plan has explicit vulnerabilities_by_node,
+        # force those vulnerability names onto the corresponding slots. This prevents
+        # silently falling back to the standard docker compose template for vuln nodes.
+        try:
+            overrides = _preview_vuln_slot_overrides(
+                preview_full,
+                vuln_items=vuln_items or [],
+                catalog=catalog or [],
+                slot_names=slot_names,
+            )
+        except Exception:
+            overrides = {}
+        if overrides:
+            if not isinstance(assignments_slots, dict):
+                assignments_slots = {}
+            changed = 0
+            for slot, rec in overrides.items():
+                if not isinstance(rec, dict):
+                    continue
+                prev = assignments_slots.get(slot)
+                if prev != rec:
+                    assignments_slots[slot] = rec
+                    changed += 1
+            logging.info(
+                "Applied %d preview-based vulnerability slot overrides (%d total assignments)",
+                int(changed),
+                int(len(assignments_slots or {})),
+            )
         if assignments_slots:
             docker_slot_plan = assignments_slots
             logging.info("Planned %d docker-compose assignments over %d host slots", len(assignments_slots), len(slot_names))
@@ -2281,18 +2496,13 @@ def main():
                     start_ok = False
                     start_error = f"Docker node(s) not running: {', '.join(docker_runtime.get('not_running') or [])}"
 
-            # Strict: ensure flag-node-generator derived docker nodes are running the intended compose service.
+            # Strict: ensure docker-compose nodes are running the intended compose service/image.
             # This prevents intermittent outcomes where CORE starts the default "sleep" container before we swap
             # in the generated compose metadata.
             if start_ok and docker_names2:
                 try:
-                    strict_vecs = {'flag-nodegen', 'flag', 'flag-node-generator'}
                     mismatches: list[dict[str, Any]] = []
                     for nm in docker_names2:
-                        rec = docker_by_name.get(nm) if isinstance(docker_by_name, dict) else None
-                        vec = str((rec or {}).get('Vector') or '').strip().lower() if isinstance(rec, dict) else ''
-                        if vec and vec not in strict_vecs:
-                            continue
                         # Generated per-node compose path (CORE host path).
                         compose_path = f"/tmp/vulns/docker-compose-{nm}.yml"
                         expected = _expected_container_config_from_compose(compose_path, service=str(nm))

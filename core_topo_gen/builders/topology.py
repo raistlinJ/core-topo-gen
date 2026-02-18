@@ -216,6 +216,17 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     except Exception:
         strict_pull = False
 
+    # IMPORTANT: `docker build --pull` forces registry metadata fetches, which can
+    # fail on restricted/offline CORE VMs or hit Docker Hub rate limits even when
+    # the base image is already present locally. Keep pulls strict for *pull-only*
+    # services, but default builds to NOT forcing pull unless explicitly enabled.
+    build_pull = False
+    try:
+        raw = str(os.getenv('CORETG_DOCKER_BUILD_PULL') or '').strip().lower()
+        build_pull = raw in ('1', 'true', 'yes', 'y', 'on')
+    except Exception:
+        build_pull = False
+
     def _run(args: List[str], timeout: int) -> tuple[int, str]:
         returncode = 1
         tail = ''
@@ -262,6 +273,7 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     # `docker compose pull` fails for buildable services with scenario-scoped tags
     # (e.g., `coretg/scenarios-...`) because those are expected to be built locally.
     pull_services: List[str] = []
+    wrapper_builds: List[tuple[str, str, str]] = []  # (service, image, context)
     try:
         import yaml  # type: ignore
 
@@ -272,18 +284,71 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
             for svc_name, svc in services.items():
                 if not isinstance(svc, dict):
                     continue
+                image = str(svc.get('image') or '').strip()
+                labels = svc.get('labels') if isinstance(svc.get('labels'), dict) else {}
+
+                # Wrapper strategy: compose may omit `build:` to prevent core-daemon from
+                # building during scenario startup. In that case, host-side preflight must
+                # build the wrapper image using label-provided context.
+                try:
+                    ctx = str(labels.get('coretg.wrapper_build_context') or '').strip()
+                except Exception:
+                    ctx = ''
+                if image.startswith('coretg/') and image.endswith(':iproute2') and ctx:
+                    wrapper_builds.append((str(svc_name), image, ctx))
+                    # Do NOT include in pull services; it's a local-only tag.
+                    continue
+
+                # Buildable services are handled by build phase.
                 if svc.get('build'):
                     continue
+
+                # Local-only tags should not be pulled.
+                if image.startswith('coretg/'):
+                    continue
+                try:
+                    if str(svc.get('pull_policy') or '').strip().lower() == 'never':
+                        continue
+                except Exception:
+                    pass
                 # pull-only service
                 pull_services.append(str(svc_name))
     except Exception:
         # If parsing fails, fall back to best-effort pulls with flags that avoid buildables when available.
         pull_services = []
 
+    # Track whether we successfully built anything.
+    built_any = False
+
+    # Build wrapper images declared via labels (no `build:` stanza) first.
+    # This ensures core-daemon will not attempt to build/pull when it later starts nodes.
+    try:
+        compose_dir = os.path.dirname(os.path.abspath(compose_path))
+        for svc_name, image, ctx in wrapper_builds:
+            df_path = os.path.join(ctx, 'Dockerfile')
+            if not os.path.isabs(df_path):
+                df_path = os.path.abspath(df_path)
+            ctx_path = ctx
+            if not os.path.isabs(ctx_path):
+                ctx_path = os.path.join(compose_dir, ctx_path)
+            try:
+                logger.info('[docker-node] preflight wrapper build service=%s image=%s context=%s dockerfile=%s', svc_name, image, ctx_path, df_path)
+            except Exception:
+                pass
+
+            args = docker_cmd + ['build', '--network', 'host']
+            if build_pull:
+                args.append('--pull')
+            args += ['-t', image, '-f', df_path, ctx_path]
+            rc, _tail = _run(args, timeout=1800)
+            if rc == 0:
+                built_any = True
+    except Exception:
+        pass
+
     # Build any services that declare a `build:` stanza using host networking.
     # This avoids reliance on Docker's default bridge network (which may be disabled
     # on CORE VMs) and prevents apt/apk installs from failing due to missing DNS.
-    built_any = False
     try:
         import yaml  # type: ignore
 
@@ -330,7 +395,10 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 except Exception:
                     pass
 
-                args = docker_cmd + ['build', '--network', 'host', '--pull', '-t', image, '-f', df_path, ctx_path]
+                args = docker_cmd + ['build', '--network', 'host']
+                if build_pull:
+                    args.append('--pull')
+                args += ['-t', image, '-f', df_path, ctx_path]
                 rc, _tail = _run(args, timeout=1800)
                 if rc == 0:
                     built_any = True
@@ -339,7 +407,10 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
 
     if not built_any:
         # Fallback: let compose handle builds (best-effort). This will pull base images.
-        _run(compose_base + ['build', '--pull'], timeout=1200)
+        build_args = compose_base + ['build']
+        if build_pull:
+            build_args.append('--pull')
+        _run(build_args, timeout=1200)
 
     # Pull only non-build services (if any). This avoids pulling scenario-scoped build targets.
     if pull_services:
@@ -368,6 +439,63 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
         _run(compose_base + ['up', '--no-start', '--no-build'], timeout=600)
     else:
         _run(compose_base + ['up', '--no-start'], timeout=600)
+
+    # IMPORTANT: Some CORE daemon versions start Docker nodes immediately during add_node()
+    # and then attempt to read `/proc/<pid>/environ` for the container PID. If the container
+    # is not running yet (or exited quickly), Docker reports PID=0 and CORE errors on
+    # `cat /proc/0/environ`.
+    #
+    # Mitigation: start the target compose service here (host-side) and wait until the
+    # container PID is non-zero before allowing CORE to proceed.
+    try:
+        import yaml  # type: ignore
+
+        target_service = None
+        with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+            compose_obj = yaml.safe_load(fh)  # type: ignore
+        services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
+        if isinstance(services, dict) and services:
+            if node_name in services:
+                target_service = node_name
+            else:
+                # Fall back to first service key; docker compose will include dependencies.
+                try:
+                    target_service = str(next(iter(services.keys())))
+                except Exception:
+                    target_service = None
+
+        if target_service:
+            # Never build here; wrapper images should already be built above.
+            rc, tail = _run(compose_base + ['up', '-d', '--no-build', str(target_service)], timeout=900)
+            if strict_pull and rc != 0:
+                raise RuntimeError(f"docker compose up -d failed (node={node_name} svc={target_service} rc={rc})\n{tail}".strip())
+
+            # Best-effort: wait for PID to be non-zero.
+            # Container name should match node_name when `container_name` is set (our default).
+            # If not, this still helps in many cases because CORE uses the node name.
+            inspect_name = node_name
+            for _ in range(12):
+                try:
+                    rc2, tail2 = _run(docker_cmd + ['inspect', '--format', '{{.State.Pid}} {{.State.Status}}', inspect_name], timeout=20)
+                    if rc2 == 0:
+                        parts = (tail2 or '').strip().split()
+                        if parts:
+                            try:
+                                pid = int(parts[0])
+                            except Exception:
+                                pid = 0
+                            if pid and pid > 0:
+                                break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+    except Exception as exc:
+        if strict_pull:
+            raise
+        try:
+            logger.warning('[docker-node] preflight start/wait skipped node=%s err=%s', node_name, exc)
+        except Exception:
+            pass
 
     try:
         logger.info('[docker-node] preflight done node=%s elapsed_ms=%s', node_name, int((time.time() - start) * 1000))
@@ -483,6 +611,14 @@ def _resolve_compose_interpolations(text: str) -> str:
 
     out = text
 
+    # Mako hazard: docker-compose uses `$${VAR}` to escape a literal `$`.
+    # Mako will still parse `${VAR}` starting at the second `$` and raise NameError.
+    # Rewrite to `$VAR` (no braces) so shells inside the container can expand it.
+    try:
+        out = _re.sub(r'\$\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}', r'$\1', out)
+    except Exception:
+        pass
+
     # First, unwrap wrapper forms used to make `${...}` Mako-safe.
     #
     # Examples seen in the wild:
@@ -509,6 +645,14 @@ def _resolve_compose_interpolations(text: str) -> str:
         if out2 == out:
             break
         out = out2
+
+    # Final safety: remove any remaining `${...}` tokens so core-daemon Mako
+    # rendering cannot fail.
+    try:
+        if '${' in out:
+            out = _re.sub(r'\$\{[^}]*\}', '', out)
+    except Exception:
+        pass
     return out
 
 
@@ -841,14 +985,14 @@ def _docker_compose_service_for_record(compose_path: str, rec: Optional[Dict[str
     except Exception:
         requested = None
 
-    def _parse_services(path: str) -> list[str]:
+    def _parse_services(path: str) -> tuple[list[str], dict]:
         p = str(path or '').strip()
         if not p or not os.path.exists(p):
-            return []
+            return [], {}
         try:
             import yaml  # type: ignore
         except Exception:
-            return []
+            return [], {}
         try:
             with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
                 obj = yaml.safe_load(fh) or {}
@@ -859,17 +1003,86 @@ def _docker_compose_service_for_record(compose_path: str, rec: Optional[Dict[str
                     kk = str(k or '').strip()
                     if kk:
                         out.append(kk)
-                return out
+                return out, obj if isinstance(obj, dict) else {}
         except Exception:
-            return []
-        return []
+            return [], {}
+        return [], {}
 
-    services = _parse_services(compose_path)
+    services, obj = _parse_services(compose_path)
     if requested and services:
         return requested if requested in services else None
     if requested and not services:
         return None
-    return services[0] if services else None
+
+    if not services:
+        return None
+
+    # Heuristic selection: avoid short-lived init/migrate services (e.g. airflow-init) that
+    # exit immediately. CORE's DockerNode startup reads `/proc/<pid>/environ`; for an exited
+    # container Docker reports PID=0, causing `/proc/0/environ` errors.
+    try:
+        svc_map = obj.get('services') if isinstance(obj, dict) else None
+        if not isinstance(svc_map, dict) or not svc_map:
+            return services[0]
+
+        infra_tokens = {
+            'db', 'database', 'postgres', 'postgresql', 'mysql', 'mariadb', 'redis', 'memcached',
+            'mongo', 'mongodb', 'rabbit', 'rabbitmq', 'zookeeper', 'kafka', 'etcd',
+            'elasticsearch', 'kibana', 'logstash',
+        }
+        app_tokens = {
+            'web', 'webserver', 'server', 'app', 'api', 'ui', 'frontend', 'nginx', 'apache', 'http',
+            'gunicorn', 'uwsgi',
+        }
+        init_tokens = {
+            'init', 'setup', 'bootstrap', 'migrate', 'migration', 'seed', 'upgrade',
+            'initdb',
+        }
+
+        def _score(name: str, svc: object) -> int:
+            key_l = str(name or '').strip().lower()
+            score = 0
+            try:
+                if isinstance(svc, dict):
+                    if svc.get('ports'):
+                        score += 40
+                    if svc.get('expose'):
+                        score += 10
+                    cmd = svc.get('command')
+                    if cmd is not None:
+                        cmd_l = str(cmd).lower()
+                        if any(t in cmd_l for t in ('web', 'webserver', 'server', 'gunicorn', 'uwsgi')):
+                            score += 15
+                        if any(t in cmd_l for t in ('init', 'migrate', 'upgrade', 'seed', 'initdb')):
+                            score -= 25
+                    try:
+                        rp = str(svc.get('restart') or '').strip().lower()
+                        if rp in ('no', 'false', '0'):
+                            score -= 20
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if any(t in key_l for t in infra_tokens):
+                score -= 50
+            if any(t in key_l for t in init_tokens):
+                score -= 30
+            if any(t in key_l for t in app_tokens):
+                score += 20
+            score -= min(len(key_l), 40) // 10
+            return score
+
+        best = services[0]
+        best_s = None
+        for k in services:
+            s = _score(k, svc_map.get(k))
+            if best_s is None or s > best_s:
+                best = k
+                best_s = s
+        return best
+    except Exception:
+        return services[0]
 
 
 def _docker_node_add_node_kwargs(node_name: str, rec: Optional[Dict[str, str]]) -> dict[str, Any]:
@@ -2862,8 +3075,10 @@ def _try_build_segmented_topology_from_preview(
                     else:
                         logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan during preview realization")
                 if is_docker_node:
-                    flow_rec = _flow_flag_record_from_host_metadata(hdata)
-                    base_rec = flow_rec or docker_slot_plan[slot_key]
+                    # IMPORTANT: slot-plan docker-compose records (e.g., vulnerabilities) must remain
+                    # the base record. Flow flag-generators should only overlay artifacts/injects,
+                    # not replace the compose stack with the standard ubuntu template.
+                    base_rec = docker_slot_plan[slot_key]
                     overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
                     docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
                     _apply_mount_overlays(docker_by_name.get(name))
