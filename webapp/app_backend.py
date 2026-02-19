@@ -9043,6 +9043,121 @@ def _delete_core_credentials(identifier: str) -> bool:
     return False
 
 
+def _flaggen_test_core_hint_path() -> str:
+    # Store ONLY a pointer to the encrypted secret record, not the password itself.
+    # This makes generator-test credential reuse stable across browser origins.
+    return os.path.join(_outputs_dir(), 'flag_generators_test_core_hint.json')
+
+
+def _load_flaggen_test_core_hint() -> dict[str, Any]:
+    path = _flaggen_test_core_hint_path()
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_flaggen_test_core_hint(hint: dict[str, Any]) -> None:
+    path = _flaggen_test_core_hint_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(hint or {}, fh, indent=2)
+    os.replace(tmp, path)
+
+
+@app.route('/api/flag_generators_test/core_credentials/save', methods=['POST'])
+def api_flag_generators_test_core_credentials_save():
+    current = _current_user()
+    if not current or not current.get('username'):
+        return jsonify({'ok': False, 'error': 'Authentication required'}), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or not payload:
+        try:
+            payload = request.form.to_dict(flat=True) if request.form else {}
+        except Exception:
+            payload = {}
+    ssh_host = str(payload.get('ssh_host') or payload.get('host') or '').strip()
+    ssh_username = str(payload.get('ssh_username') or payload.get('username') or '').strip()
+    ssh_password_raw = payload.get('ssh_password') or payload.get('password') or ''
+    ssh_password = str(ssh_password_raw) if not isinstance(ssh_password_raw, str) else ssh_password_raw
+    try:
+        ssh_port = int(payload.get('ssh_port') or 22)
+    except Exception:
+        ssh_port = 22
+    if not ssh_host:
+        return jsonify({'ok': False, 'error': 'ssh_host is required'}), 400
+    if not ssh_username:
+        return jsonify({'ok': False, 'error': 'ssh_username is required'}), 400
+    if not ssh_password:
+        return jsonify({'ok': False, 'error': 'ssh_password is required'}), 400
+
+    # For generator tests, assume gRPC host/port match the VM unless provided.
+    grpc_host = str(payload.get('grpc_host') or payload.get('host') or ssh_host).strip()
+    try:
+        grpc_port = int(payload.get('grpc_port') or payload.get('port') or CORE_PORT)
+    except Exception:
+        grpc_port = CORE_PORT
+
+    secret_payload = {
+        'scenario_name': 'flag-generators-test',
+        'scenario_index': None,
+        'grpc_host': grpc_host,
+        'grpc_port': grpc_port,
+        'ssh_host': ssh_host,
+        'ssh_port': ssh_port,
+        'ssh_username': ssh_username,
+        'ssh_password': ssh_password,
+        'ssh_enabled': True,
+        'venv_bin': DEFAULT_CORE_VENV_BIN,
+    }
+    try:
+        stored_meta = _save_core_credentials(secret_payload)
+    except Exception as exc:
+        app.logger.exception('[flaggen_test] failed to persist CORE creds: %s', exc)
+        return jsonify({'ok': False, 'error': 'Failed to store credentials'}), 500
+    try:
+        _save_flaggen_test_core_hint({
+            'core_secret_id': stored_meta.get('identifier'),
+            'stored_at': stored_meta.get('stored_at'),
+            'ssh_host': stored_meta.get('ssh_host'),
+            'ssh_port': stored_meta.get('ssh_port'),
+            'ssh_username': stored_meta.get('ssh_username'),
+        })
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'core_secret_id': stored_meta.get('identifier'), 'summary': stored_meta})
+
+
+@app.route('/api/flag_generators_test/core_credentials/get', methods=['POST'])
+def api_flag_generators_test_core_credentials_get():
+    current = _current_user()
+    if not current or not current.get('username'):
+        return jsonify({'ok': False, 'error': 'Authentication required'}), 401
+    hint = _load_flaggen_test_core_hint()
+    secret_id = str(hint.get('core_secret_id') or '').strip()
+    if not secret_id:
+        return jsonify({'ok': True, 'credentials': None})
+    record = _load_core_credentials(secret_id)
+    if not record:
+        return jsonify({'ok': True, 'credentials': None})
+    creds = {
+        'ssh_host': record.get('ssh_host') or '',
+        'ssh_port': int(record.get('ssh_port') or 22),
+        'ssh_username': record.get('ssh_username') or '',
+        'ssh_password': record.get('ssh_password_plain') or record.get('password_plain') or '',
+        'grpc_host': record.get('grpc_host') or record.get('host') or '',
+        'grpc_port': int(record.get('grpc_port') or record.get('port') or CORE_PORT),
+        'core_secret_id': record.get('identifier') or secret_id,
+        'stored_at': record.get('stored_at'),
+    }
+    return jsonify({'ok': True, 'credentials': creds})
+
+
 def _connect_proxmox_from_secret(identifier: str, *, timeout: float = 8.0) -> tuple[Any, Dict[str, Any]]:
     if ProxmoxAPI is None:  # pragma: no cover - dependency missing
         raise RuntimeError('Proxmox integration unavailable: install proxmoxer package')
@@ -30256,14 +30371,15 @@ def main():
             except Exception:
                 pass
 
-        flow_copy_ok = bool(src and dest and os.path.isdir(src))
+        # We intentionally do NOT copy full Flow artifacts into /flow_artifacts.
+        # Keep only the allowlisted inject copy behavior (into /flow_injects).
         inject_copy_ok = bool(isinstance(inject_items, list) and inject_items)
 
-        # If neither flow artifacts nor inject mappings are present, treat as no-op.
-        if not flow_copy_ok and not inject_copy_ok:
-            note = 'no flow artifacts labels and no inject mappings; created /flow_artifacts and /flow_injects only'
-            if (src and dest) and (not os.path.isdir(src)):
-                note = f'flow labels present but src dir missing: {src}'
+        # If no inject mappings are present, treat as a no-op (dirs are still created).
+        if not inject_copy_ok:
+            note = 'no inject mappings; created /flow_artifacts and /flow_injects only'
+            if src and dest:
+                note += ' (flow artifacts copy disabled)'
             items.append({
                 'node': node_name,
                 'compose': yml,
@@ -30277,30 +30393,6 @@ def main():
                 'command_outputs': command_outputs,
             })
             continue
-
-        # If flow labels exist but src dir is missing, report it, but still attempt
-        # inject copying when inject mappings exist.
-        if (src and dest) and (not os.path.isdir(src)) and inject_copy_ok:
-            errs.append(f"src dir missing: {src}")
-
-        # Copy flow artifacts directory into the declared mount path when labels are present.
-        if flow_copy_ok:
-            for t in targets:
-                try:
-                    _docker_exec_sh(t, f"mkdir -p {dest}", timeout=25)
-                except Exception:
-                    pass
-                cp_src = src.rstrip('/') + '/.'
-                cp_dest = f"{t}:{dest}"
-                commands.append(f"docker cp {cp_src} {cp_dest}")
-                p = _run_docker(['cp', cp_src, cp_dest], timeout=90, capture=True)
-                out = (getattr(p, 'stdout', '') or '').strip()
-                rc = int(getattr(p, 'returncode', 1) or 0)
-                command_outputs.append({'target': t, 'rc': rc, 'out': out, 'kind': 'flow_artifacts', 'dest': dest})
-                if getattr(p, 'returncode', 1) == 0:
-                    copied_any = True
-                else:
-                    errs.append(out)
 
         # Apply inject mappings when present (independent of flow artifacts labels).
         if inject_items:

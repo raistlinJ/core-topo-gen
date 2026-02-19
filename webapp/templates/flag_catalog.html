@@ -1421,9 +1421,46 @@
     }
   }
 
+  async function _loadSavedGenTestCredsFromServer() {
+    try {
+      const resp = await fetchJson('/api/flag_generators_test/core_credentials/get', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({}),
+      });
+      if (resp && resp.ok && resp.credentials) {
+        return resp.credentials;
+      }
+    } catch (e) {}
+    return null;
+  }
+
   function _saveGenTestCreds(creds) {
     try {
       localStorage.setItem('coretg_flag_test_ssh', JSON.stringify(creds || {}));
+    } catch (e) {}
+  }
+
+  async function _saveGenTestCredsToServer(creds) {
+    try {
+      await fetchJson('/api/flag_generators_test/core_credentials/save', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          ssh_host: (creds && creds.ssh_host) || '',
+          ssh_port: (creds && creds.ssh_port) || 22,
+          ssh_username: (creds && creds.ssh_username) || '',
+          ssh_password: (creds && creds.ssh_password) || '',
+        }),
+      });
     } catch (e) {}
   }
 
@@ -1438,12 +1475,17 @@
       const contBtn = document.getElementById('genTestCredsContinue');
       if (!modalEl) return resolve(null);
 
-      const saved = _loadSavedGenTestCreds() || {};
-      if (hostEl) hostEl.value = saved.ssh_host || '';
-      if (portEl) portEl.value = saved.ssh_port || 22;
-      if (userEl) userEl.value = saved.ssh_username || '';
-      if (passEl) passEl.value = saved.ssh_password || '';
-      if (saveEl) saveEl.checked = saved.save !== false;
+      // Prefer server-stored creds (works across localhost vs 127.0.0.1),
+      // fall back to browser localStorage.
+      (async () => {
+        const serverSaved = await _loadSavedGenTestCredsFromServer();
+        const saved = serverSaved || _loadSavedGenTestCreds() || {};
+        if (hostEl) hostEl.value = saved.ssh_host || '';
+        if (portEl) portEl.value = saved.ssh_port || 22;
+        if (userEl) userEl.value = saved.ssh_username || '';
+        if (passEl) passEl.value = saved.ssh_password || '';
+        if (saveEl) saveEl.checked = saved.save !== false;
+      })();
 
       const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl)) : null;
       const onHidden = () => {
@@ -1462,7 +1504,10 @@
             ssh_password: (passEl && passEl.value || '').toString(),
           };
           const shouldSave = !!(saveEl && saveEl.checked);
-          if (shouldSave) _saveGenTestCreds({ ...creds, save: true });
+          if (shouldSave) {
+            _saveGenTestCreds({ ...creds, save: true });
+            _saveGenTestCredsToServer(creds);
+          }
           resolve(creds);
           try { modalObj?.hide(); } catch (e) {}
         };
