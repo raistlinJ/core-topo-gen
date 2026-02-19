@@ -109,5 +109,10 @@ To reduce Test-vs-Execute drift, enforce these constraints when generating code 
 - Treat package-manager/network setup as optional best-effort (do not make generator success depend on apt/apk availability).
 - Ensure `outputs.json` and any `injects`-referenced files are deterministic and present before success exit.
 - Validate both:
-	- generator Test endpoint run
+	- generator Test endpoint run (local)
+	- generator Test endpoint run (remote CORE VM, when CORE credentials are provided in the UI)
 	- full Execute run (remote CORE path)
+
+Remote Test note:
+- The Flag Catalog Test flow can run `scripts/run_flag_generator.py` on the CORE VM via SSH.
+- This improves parity with Execute for environment/runtime differences, but it still validates generator runtime/output behavior (not full CORE topology/session startup).

@@ -257,6 +257,7 @@ Use this checklist before shipping a generator pack:
 
 5. **Validate both execution modes when possible**
   - UI Test run (local web process)
+  - UI Test run (remote CORE VM via SSH, when configured)
   - Full Execute run (remote CORE path)
   - Compare logs if behavior diverges.
 

@@ -3229,20 +3229,37 @@ def _push_repo_to_remote(
                     # If we got here because rsync failed, chain for visibility.
                     if sync_err is not None:
                         raise RuntimeError(f"Repo sync failed (rsync then sftp): rsync={sync_err}; sftp={exc}")
-                    raise
+                    # SFTP delta sync can fail intermittently (e.g., connection reset) on large repos.
+                    # Fall back to a single tar.gz snapshot upload to reduce SFTP churn.
+                    try:
+                        msg = str(exc)
+                    except Exception:
+                        msg = ''
+                    try:
+                        if log_handle:
+                            log_handle.write(f"[remote] Repo upload: incremental sync failed ({msg}); falling back to snapshot upload (tar)\n")
+                            log_handle.flush()
+                    except Exception:
+                        pass
+                    # Proceed to tar snapshot below.
+                    method = 'tar'
 
-            # Update remote hash for skip-if-unchanged.
-            try:
-                if _repo_skip_if_unchanged_enabled():
-                    if include_repo_paths:
-                        local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
-                    else:
-                        local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
-                    _write_remote_repo_hash(client, remote_repo, local_hash)
-            except Exception:
-                pass
-            _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host (incremental sync).')
-            return {'repo_path': remote_repo, 'progress_id': progress_id, 'method': method}
+            # If incremental sync succeeded, finalize and return.
+            if method != 'tar':
+                # Update remote hash for skip-if-unchanged.
+                try:
+                    if _repo_skip_if_unchanged_enabled():
+                        if include_repo_paths:
+                            local_hash = _compute_repo_fingerprint_includes(repo_root, include_repo_paths)
+                        else:
+                            local_hash = _compute_repo_fingerprint(repo_root, allowed_outputs=allowed_outputs)
+                        _write_remote_repo_hash(client, remote_repo, local_hash)
+                except Exception:
+                    pass
+                _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host (incremental sync).')
+                return {'repo_path': remote_repo, 'progress_id': progress_id, 'method': method}
+
+            # else: fall through to tar snapshot upload.
         try:
             if log_handle:
                 log_handle.write("[remote] Repo upload: packaging snapshot…\n")
@@ -4064,13 +4081,10 @@ def _extract_expected_docker_and_vuln_nodes_from_plan_xml(
     return _dedupe(expected_docker), _dedupe(expected_vuln)
 
 
-def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_mount_dir: bool = False) -> List[str]:
+def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str) -> List[str]:
     """Extract local artifact directories referenced by the plan.
 
-    By default we look for `artifacts_dir` keys.
-    When `prefer_mount_dir` is True, we first look for `mount_dir` keys (typically
-    pointing at a filtered `.../injected` directory). If none are found, we
-    fall back to `artifacts_dir` to preserve backwards compatibility.
+    We look for `artifacts_dir` keys.
     """
     payload = None
     try:
@@ -4085,18 +4099,9 @@ def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_moun
     root = full if isinstance(full, dict) else payload
 
     dirs: List[str] = []
-    if prefer_mount_dir:
-        for v in _iter_values_by_key(root, {'mount_dir'}):
-            if isinstance(v, str) and v:
-                dirs.append(v)
-        if not dirs:
-            for v in _iter_values_by_key(root, {'artifacts_dir'}):
-                if isinstance(v, str) and v:
-                    dirs.append(v)
-    else:
-        for v in _iter_values_by_key(root, {'artifacts_dir'}):
-            if isinstance(v, str) and v:
-                dirs.append(v)
+    for v in _iter_values_by_key(root, {'artifacts_dir'}):
+        if isinstance(v, str) and v:
+            dirs.append(v)
 
     # Fallback: scan metadata.flow (PlanPreview metadata) and FlowState in XML.
     if not dirs:
@@ -4104,36 +4109,18 @@ def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_moun
             meta = payload.get('metadata') if isinstance(payload, dict) else None
             flow = meta.get('flow') if isinstance(meta, dict) else None
             if isinstance(flow, dict):
-                if prefer_mount_dir:
-                    for v in _iter_values_by_key(flow, {'mount_dir'}):
-                        if isinstance(v, str) and v:
-                            dirs.append(v)
-                    if not dirs:
-                        for v in _iter_values_by_key(flow, {'artifacts_dir'}):
-                            if isinstance(v, str) and v:
-                                dirs.append(v)
-                else:
-                    for v in _iter_values_by_key(flow, {'artifacts_dir'}):
-                        if isinstance(v, str) and v:
-                            dirs.append(v)
+                for v in _iter_values_by_key(flow, {'artifacts_dir'}):
+                    if isinstance(v, str) and v:
+                        dirs.append(v)
         except Exception:
             pass
     if not dirs and str(preview_plan_path).lower().endswith('.xml'):
         try:
             flow_state = _flow_state_from_xml_path(preview_plan_path, None)
             if isinstance(flow_state, dict):
-                if prefer_mount_dir:
-                    for v in _iter_values_by_key(flow_state, {'mount_dir'}):
-                        if isinstance(v, str) and v:
-                            dirs.append(v)
-                    if not dirs:
-                        for v in _iter_values_by_key(flow_state, {'artifacts_dir'}):
-                            if isinstance(v, str) and v:
-                                dirs.append(v)
-                else:
-                    for v in _iter_values_by_key(flow_state, {'artifacts_dir'}):
-                        if isinstance(v, str) and v:
-                            dirs.append(v)
+                for v in _iter_values_by_key(flow_state, {'artifacts_dir'}):
+                    if isinstance(v, str) and v:
+                        dirs.append(v)
         except Exception:
             pass
 
@@ -4160,22 +4147,13 @@ def _upload_flow_artifacts_for_plan_to_remote(
     When running the CLI on a remote CORE VM, those directories must exist on
     the remote filesystem or bind mounts / docker cp will see nothing.
     """
-    artifact_dirs = _extract_flow_artifact_dirs_from_plan(
-        preview_plan_path,
-        prefer_mount_dir=bool(upload_only_injected_artifacts),
-    )
+    artifact_dirs = _extract_flow_artifact_dirs_from_plan(preview_plan_path)
     if not artifact_dirs:
         try:
             log_handle.write('[remote] No flow artifact dirs referenced in preview plan\n')
         except Exception:
             pass
         return
-
-    try:
-        if upload_only_injected_artifacts:
-            log_handle.write('[remote] Flow artifacts upload mode: mount_dir only (prefer injected)\n')
-    except Exception:
-        pass
 
     repo_root = _get_repo_root()
     outputs_root = os.path.join(repo_root, 'outputs')
@@ -8375,7 +8353,7 @@ def _looks_like_path_field(field_name: str) -> bool:
         or key.endswith('_dir')
         or key.endswith('_file')
         or key.endswith('_filepath')
-        or key in {'file', 'mount_dir', 'run_dir', 'outputs_manifest'}
+        or key in {'file', 'run_dir', 'outputs_manifest'}
     )
 
 
@@ -8383,13 +8361,12 @@ def _canonicalize_flow_assignment_paths(assignment: dict[str, Any]) -> dict[str,
     if not isinstance(assignment, dict):
         return assignment
     out = dict(assignment)
-    for key in ('artifacts_dir', 'mount_dir', 'run_dir', 'outputs_manifest'):
+    for key in ('artifacts_dir', 'run_dir', 'outputs_manifest'):
         if key in out:
             out[key] = _abs_path_or_original(out.get(key))
     base_dir = (
         str(out.get('run_dir') or '').strip()
         or str(out.get('artifacts_dir') or '').strip()
-        or str(out.get('mount_dir') or '').strip()
         or ''
     )
     if not base_dir:
@@ -8400,14 +8377,55 @@ def _canonicalize_flow_assignment_paths(assignment: dict[str, Any]) -> dict[str,
         except Exception:
             base_dir = ''
 
+    def _split_inject_spec_global(raw: str) -> tuple[str, str]:
+        text = str(raw or '').strip()
+        if not text:
+            return '', ''
+        for sep in ('->', '=>'):
+            if sep in text:
+                left, right = text.split(sep, 1)
+                return left.strip(), right.strip()
+        return text, ''
+
+    def _looks_like_artifact_key(text: str) -> bool:
+        s = str(text or '').strip()
+        if not s:
+            return False
+        low = s.lower()
+        # Common Flow artifact key shapes
+        if low.startswith(('file(', 'directory(', 'flag(', 'credential(', 'knowledge(')):
+            return True
+        if low.endswith('(path)'):
+            return True
+        return False
+
+    def _looks_like_fs_path(text: str) -> bool:
+        s = str(text or '').strip()
+        if not s:
+            return False
+        if _looks_like_artifact_key(s):
+            return False
+        if s.startswith('upload:'):
+            return True
+        if s.startswith(('/', './', '../', '~')):
+            return True
+        if '/' in s or '\\' in s:
+            return True
+        return False
+
     inject_files = out.get('inject_files') if isinstance(out.get('inject_files'), list) else None
     if inject_files is not None:
         fixed_injects: list[Any] = []
         for item in inject_files:
-            if isinstance(item, str):
-                fixed_injects.append(_abs_path_or_original(item, base_dir=base_dir or None))
-            else:
+            if not isinstance(item, str):
                 fixed_injects.append(item)
+                continue
+            src, dest = _split_inject_spec_global(item)
+            if _looks_like_fs_path(src):
+                fixed_src = _abs_path_or_original(src, base_dir=base_dir or None)
+                fixed_injects.append(f"{fixed_src} -> {dest}" if dest else fixed_src)
+            else:
+                fixed_injects.append(str(item))
         out['inject_files'] = fixed_injects
 
     detail = out.get('inject_files_detail') if isinstance(out.get('inject_files_detail'), list) else None
@@ -8469,6 +8487,61 @@ def _canonicalize_flow_state_paths(flow_state: dict[str, Any], *, xml_path: str 
             _canonicalize_flow_assignment_paths(a) if isinstance(a, dict) else a
             for a in assigns
         ]
+    return out
+
+
+def _backfill_flow_state_inject_files_from_catalog(flow_state: dict[str, Any]) -> dict[str, Any]:
+    """Ensure FlowState flag_assignments include inject_files from generator manifests.
+
+    The UI chain tables are sourced from generator catalogs (manifest injects). Persisted
+    FlowState may omit inject_files (or leave it empty). We backfill before writing XML
+    so CLI execution sees the intended allowlist.
+    """
+    if not isinstance(flow_state, dict):
+        return flow_state
+    assigns = flow_state.get('flag_assignments') if isinstance(flow_state.get('flag_assignments'), list) else None
+    if not isinstance(assigns, list) or not assigns:
+        return flow_state
+
+    gen_injects: dict[str, list[str]] = {}
+    try:
+        gens, _errs = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _errs2 = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+    for g in list(gens or []) + list(node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        inj = g.get('inject_files') if isinstance(g.get('inject_files'), list) else None
+        if not gid or not isinstance(inj, list):
+            continue
+        cleaned = [str(x or '').strip() for x in inj if str(x or '').strip()]
+        if cleaned:
+            gen_injects[gid] = cleaned
+
+    if not gen_injects:
+        return flow_state
+
+    out = dict(flow_state)
+    out_assigns: list[Any] = []
+    for a in assigns:
+        if not isinstance(a, dict):
+            out_assigns.append(a)
+            continue
+        a2 = dict(a)
+        existing = a2.get('inject_files') if isinstance(a2.get('inject_files'), list) else []
+        if isinstance(existing, list) and any(str(x or '').strip() for x in existing):
+            out_assigns.append(a2)
+            continue
+        gid = str(a2.get('id') or a2.get('generator_id') or '').strip()
+        if gid and gid in gen_injects:
+            a2['inject_files'] = list(gen_injects[gid])
+        out_assigns.append(a2)
+    out['flag_assignments'] = out_assigns
     return out
 
 
@@ -14580,7 +14653,7 @@ def api_flow_revalidate_flow():
                 'generator_type': entry.get('type') or entry.get('generator_type'),
                 'run_dir': entry.get('run_dir') or entry.get('artifacts_dir'),
                 'artifacts_dir': entry.get('artifacts_dir'),
-                'mount_dir': entry.get('mount_dir'),
+                'inject_source_dir': entry.get('inject_source_dir'),
                 'outputs_manifest': entry.get('outputs_manifest'),
                 'inject_files_detail': entry.get('inject_files_detail'),
                 'inject_files': entry.get('inject_files'),
@@ -15947,7 +16020,7 @@ def _flow_enrich_saved_flag_assignments(
 def _infer_flow_artifacts_dir_from_assignment(assignment: dict[str, Any], *, max_dirs: int = 60) -> dict[str, str]:
     """Infer artifacts/run/mount dirs from existing assignment data.
 
-    Returns a dict with any of: artifacts_dir, mount_dir, run_dir, outputs_manifest.
+    Returns a dict with any of: artifacts_dir, run_dir, outputs_manifest, inject_source_dir.
     """
     if not isinstance(assignment, dict):
         return {}
@@ -16031,17 +16104,17 @@ def _infer_flow_artifacts_dir_from_assignment(assignment: dict[str, Any], *, max
     for rd in run_dirs:
         try:
             if any(_exists_in_run(rd, rel) for rel in rels):
-                mount_dir = ''
-                if os.path.isdir(os.path.join(rd, 'artifacts')):
-                    mount_dir = os.path.join(rd, 'artifacts')
-                elif os.path.isdir(os.path.join(rd, 'injected')):
-                    mount_dir = os.path.join(rd, 'injected')
+                inject_source_dir = ''
+                if os.path.isdir(os.path.join(rd, 'injected')):
+                    inject_source_dir = os.path.join(rd, 'injected')
+                elif os.path.isdir(os.path.join(rd, 'artifacts')):
+                    inject_source_dir = os.path.join(rd, 'artifacts')
                 else:
-                    mount_dir = rd
+                    inject_source_dir = rd
                 out = {
                     'artifacts_dir': rd,
-                    'mount_dir': mount_dir,
                     'run_dir': rd,
+                    'inject_source_dir': inject_source_dir,
                 }
                 manifest = os.path.join(rd, 'outputs.json')
                 if os.path.exists(manifest):
@@ -16194,7 +16267,7 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
                         changed = True
         except Exception:
             pass
-        needs = not any(a2.get(k) for k in ('artifacts_dir', 'mount_dir', 'run_dir', 'outputs_manifest'))
+        needs = not any(a2.get(k) for k in ('artifacts_dir', 'run_dir', 'outputs_manifest', 'inject_source_dir'))
         if needs:
             inferred = _infer_flow_artifacts_dir_from_assignment(a2)
             if inferred:
@@ -16203,7 +16276,7 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
         # Resolve relative paths in inject_files_detail and resolved_outputs to absolute paths.
         # This ensures docker-compose generation gets full paths when loading from saved XML.
         try:
-            art_dir = str(a2.get('artifacts_dir') or a2.get('mount_dir') or a2.get('run_dir') or '').strip()
+            art_dir = str(a2.get('inject_source_dir') or a2.get('artifacts_dir') or a2.get('run_dir') or '').strip()
             if art_dir and os.path.isabs(art_dir):
                 # Resolve relative paths in inject_files_detail.resolved
                 detail = a2.get('inject_files_detail') if isinstance(a2.get('inject_files_detail'), list) else None
@@ -16359,14 +16432,14 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
                         pass
 
                     try:
-                        mount_info = rp2.get('mount_dir') if isinstance(rp2.get('mount_dir'), dict) else None
-                        if mount_info is not None:
-                            cur = str(mount_info.get('path') or '').strip()
+                        inj_info = rp2.get('inject_source_dir') if isinstance(rp2.get('inject_source_dir'), dict) else None
+                        if inj_info is not None:
+                            cur = str(inj_info.get('path') or '').strip()
                             nxt = _norm_flow_path(cur)
                             if nxt and nxt != cur:
-                                m2 = dict(mount_info)
-                                m2['path'] = nxt
-                                rp2['mount_dir'] = m2
+                                i2 = dict(inj_info)
+                                i2['path'] = nxt
+                                rp2['inject_source_dir'] = i2
                                 changed = True
                     except Exception:
                         pass
@@ -21128,7 +21201,7 @@ def api_flow_prepare_preview_for_execute():
                 def _collect_resolved_path_info(
                     *,
                     artifacts_dir: str,
-                    mount_dir: str,
+                    inject_source_dir: str,
                     inject_detail_list: Any,
                     inject_specs: list[str],
                     source_dir: str,
@@ -21212,7 +21285,7 @@ def api_flow_prepare_preview_for_execute():
 
                     return {
                         'artifacts_dir': _info(artifacts_dir),
-                        'mount_dir': _info(mount_dir),
+                        'inject_source_dir': _info(inject_source_dir),
                         'inject_sources': sources,
                     }
 
@@ -21233,8 +21306,8 @@ def api_flow_prepare_preview_for_execute():
                         out_entries: list[tuple[str, str]] = []
                         if isinstance(paths.get('artifacts_dir'), dict):
                             out_entries.append(('artifacts_dir', str(paths['artifacts_dir'].get('path') or '').strip()))
-                        if isinstance(paths.get('mount_dir'), dict):
-                            out_entries.append(('mount_dir', str(paths['mount_dir'].get('path') or '').strip()))
+                        if isinstance(paths.get('inject_source_dir'), dict):
+                            out_entries.append(('inject_source_dir', str(paths['inject_source_dir'].get('path') or '').strip()))
                         inject_entries = paths.get('inject_sources') if isinstance(paths.get('inject_sources'), list) else []
                         for idx, entry in enumerate(inject_entries):
                             if not isinstance(entry, dict):
@@ -21262,7 +21335,7 @@ def api_flow_prepare_preview_for_execute():
                             if not os.path.isabs(p):
                                 issues.append(f'{label} must be absolute: {p}')
                                 continue
-                            if label in ('artifacts_dir', 'mount_dir'):
+                            if label in ('artifacts_dir', 'inject_source_dir'):
                                 if not (p_norm == '/tmp/vulns' or p_norm.startswith('/tmp/vulns/')):
                                     issues.append(f'{label} must be under /tmp/vulns: {p}')
                                     continue
@@ -21299,7 +21372,7 @@ def api_flow_prepare_preview_for_execute():
 
                 resolved_paths = _collect_resolved_path_info(
                     artifacts_dir=str(flow_out_dir or ''),
-                    mount_dir=inject_source_dir,
+                    inject_source_dir=inject_source_dir,
                     inject_detail_list=inject_detail_raw,
                     inject_specs=list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else [],
                     source_dir=inject_source_dir,
@@ -21320,7 +21393,7 @@ def api_flow_prepare_preview_for_execute():
                     'generator_language': str(fa.get('language') or ''),
                     'generator_source': str(fa.get('flag_generator') or ''),
                     'artifacts_dir': str(flow_out_dir or ''),
-                    'mount_dir': inject_source_dir,
+                    'inject_source_dir': inject_source_dir,
                     'inject_files': normalized_inject_files,
                     'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
                     'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
@@ -21347,7 +21420,7 @@ def api_flow_prepare_preview_for_execute():
                     fa['generated'] = bool(ok_run)
                     fa['generation_note'] = str(note or '')
                     fa['artifacts_dir'] = str(flow_out_dir or '')
-                    fa['mount_dir'] = inject_source_dir
+                    fa['inject_source_dir'] = inject_source_dir
                     fa['inject_files'] = list(normalized_inject_files or [])
                     if isinstance(inject_detail_raw, list) and not normalized_inject_files:
                         fa['inject_files_detail'] = []
@@ -30039,24 +30112,11 @@ def _docker_names():
 
 
 def _parse_flow_labels(txt: str):
-    # YAML-ish key:value, possibly quoted.
-    src = None
-    dest = None
-    m1 = re.search(r"coretg\.flow_artifacts\.src\s*:\s*(['\"]?)([^\n'\"]+)\1", txt)
-    if m1:
-        src = (m1.group(2) or '').strip()
-    m2 = re.search(r"coretg\.flow_artifacts\.dest\s*:\s*(['\"]?)([^\n'\"]+)\1", txt)
-    if m2:
-        dest = (m2.group(2) or '').strip()
+    # Flow artifacts labels can appear as YAML dict entries (key: value) or as
+    # docker-compose list labels (key=value). Use the generic extractor.
+    src = _extract_label_value(txt, 'coretg.flow_artifacts.src') or None
+    dest = _extract_label_value(txt, 'coretg.flow_artifacts.dest') or None
     return src, dest
-
-
-def _parse_flow_bind_mount(txt: str):
-    # Fallback: parse a volumes entry like /tmp/vulns/flag_generators_runs/...:/flow_artifacts:ro
-    m = re.search(r"(/tmp/vulns/(?:flag_generators_runs|flag_node_generators_runs)/[^:\s\"\']+)\s*:\s*([^:\s\"\']+)", txt)
-    if not m:
-        return None, None
-    return (m.group(1) or '').strip(), (m.group(2) or '').strip()
 
 
 def _extract_label_value(txt: str, key: str):
@@ -30095,7 +30155,27 @@ def _compose_container_ids(project: str, yml: str):
     p = _run_docker(['compose', '-p', project, '-f', yml, 'ps', '-q'], timeout=25, capture=True)
     if getattr(p, 'returncode', 1) != 0:
         return []
-    return [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+    out = []
+    for ln in (p.stdout or '').splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        # docker compose may emit warnings to stdout; only keep real container IDs.
+        if re.fullmatch(r"[0-9a-f]{12,}", s, flags=re.I):
+            out.append(s)
+    return out
+
+
+def _docker_exec_sh(target: str, cmd: str, timeout: int = 30):
+    # Best-effort `docker exec` that works even when /bin/sh is missing.
+    # Our wrapper images inject BusyBox at /usr/local/coretg/bin/busybox.
+    # Prefer running through that binary when present.
+    # Try BusyBox first (works even if /bin/sh is absent in the base image).
+    p1 = _run_docker(['exec', target, '/usr/local/coretg/bin/busybox', 'sh', '-lc', cmd], timeout=timeout, capture=True)
+    if getattr(p1, 'returncode', 1) == 0:
+        return p1
+    # Fall back to `sh -lc`.
+    return _run_docker(['exec', target, 'sh', '-lc', cmd], timeout=timeout, capture=True)
 
 
 def main():
@@ -30134,34 +30214,28 @@ def main():
             txt = ''
 
         src, dest = _parse_flow_labels(txt)
-        if not src or not dest:
-            src2, dest2 = _parse_flow_bind_mount(txt)
-            src = src or src2
-            dest = dest or dest2
 
         inject_source, inject_items = _parse_inject_labels(txt)
 
-        if not src or not dest:
-            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'flow artifacts src/dest not found'})
-            continue
-
-        if not os.path.isdir(src):
-            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'src dir missing'})
-            continue
-
-        # Find container targets: prefer container named node_name; else use compose project containers.
+        # Find container targets: prefer compose project containers (actual services),
+        # and optionally include the node-name alias when present.
         targets = []
         last_err = ''
+        project = f"{node_name}conf" if node_name else 'coretg'
         for _ in range(6):
             names, err = _docker_names()
             last_err = err or last_err
-            if node_name in names:
-                targets = [node_name]
-                break
-            project = f"{node_name}conf" if node_name else 'coretg'
             ids = _compose_container_ids(project, yml)
             if ids:
-                targets = ids
+                targets = list(ids)
+                try:
+                    if node_name in names and node_name not in targets:
+                        targets.append(node_name)
+                except Exception:
+                    pass
+                break
+            if node_name in names:
+                targets = [node_name]
                 break
             time.sleep(2)
 
@@ -30174,9 +30248,67 @@ def main():
         commands = []
         command_outputs = []
 
-        # Prefer explicit inject mapping when available.
+        # Always ensure canonical dirs exist for validation/debug UX.
+        for t in targets:
+            try:
+                _docker_exec_sh(t, 'mkdir -p /flow_artifacts /flow_injects', timeout=25)
+                commands.append(f"docker exec {t} <sh> -lc mkdir -p /flow_artifacts /flow_injects")
+            except Exception:
+                pass
+
+        flow_copy_ok = bool(src and dest and os.path.isdir(src))
+        inject_copy_ok = bool(isinstance(inject_items, list) and inject_items)
+
+        # If neither flow artifacts nor inject mappings are present, treat as no-op.
+        if not flow_copy_ok and not inject_copy_ok:
+            note = 'no flow artifacts labels and no inject mappings; created /flow_artifacts and /flow_injects only'
+            if (src and dest) and (not os.path.isdir(src)):
+                note = f'flow labels present but src dir missing: {src}'
+            items.append({
+                'node': node_name,
+                'compose': yml,
+                'src': src,
+                'dest': dest,
+                'targets': targets,
+                'ok': True,
+                'note': note,
+                'errors': [],
+                'commands': commands,
+                'command_outputs': command_outputs,
+            })
+            continue
+
+        # If flow labels exist but src dir is missing, report it, but still attempt
+        # inject copying when inject mappings exist.
+        if (src and dest) and (not os.path.isdir(src)) and inject_copy_ok:
+            errs.append(f"src dir missing: {src}")
+
+        # Copy flow artifacts directory into the declared mount path when labels are present.
+        if flow_copy_ok:
+            for t in targets:
+                try:
+                    _docker_exec_sh(t, f"mkdir -p {dest}", timeout=25)
+                except Exception:
+                    pass
+                cp_src = src.rstrip('/') + '/.'
+                cp_dest = f"{t}:{dest}"
+                commands.append(f"docker cp {cp_src} {cp_dest}")
+                p = _run_docker(['cp', cp_src, cp_dest], timeout=90, capture=True)
+                out = (getattr(p, 'stdout', '') or '').strip()
+                rc = int(getattr(p, 'returncode', 1) or 0)
+                command_outputs.append({'target': t, 'rc': rc, 'out': out, 'kind': 'flow_artifacts', 'dest': dest})
+                if getattr(p, 'returncode', 1) == 0:
+                    copied_any = True
+                else:
+                    errs.append(out)
+
+        # Apply inject mappings when present (independent of flow artifacts labels).
         if inject_items:
             source_dir = inject_source or src
+            if not source_dir:
+                # No usable base path for relative inject sources.
+                errs.append('inject mappings present but no inject source_dir and no flow src')
+                source_dir = ''
             for t in targets:
                 for entry in inject_items:
                     rel = str(entry.get('src') or '').strip()
@@ -30198,7 +30330,7 @@ def main():
                     else:
                         mkdir_cmd = f"mkdir -p {dest_dir.rstrip('/')}"
                     commands.append(f"docker exec {t} sh -lc {mkdir_cmd}")
-                    _run_docker(['exec', t, 'sh', '-lc', mkdir_cmd], timeout=30, capture=True)
+                    _docker_exec_sh(t, mkdir_cmd, timeout=30)
                     commands.append(f"docker cp {src_path} {t}:{dest_path}")
                     p = _run_docker(['cp', src_path, f"{t}:{dest_path}"], timeout=60, capture=True)
                     out = (getattr(p, 'stdout', '') or '').strip()
@@ -30208,22 +30340,6 @@ def main():
                         copied_any = True
                     else:
                         errs.append(out)
-
-        # Fallback: copy entire artifacts directory into flow_artifacts mount path.
-        if not inject_items:
-            for t in targets:
-                # Copy directory contents into dest.
-                cp_src = src.rstrip('/') + '/.'
-                cp_dest = f"{t}:{dest}"
-                commands.append(f"docker cp {cp_src} {cp_dest}")
-                p = _run_docker(['cp', cp_src, cp_dest], timeout=60, capture=True)
-                out = (getattr(p, 'stdout', '') or '').strip()
-                rc = int(getattr(p, 'returncode', 1) or 0)
-                command_outputs.append({'target': t, 'rc': rc, 'out': out})
-                if getattr(p, 'returncode', 1) == 0:
-                    copied_any = True
-                else:
-                    errs.append(out)
         items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs, 'commands': commands, 'command_outputs': command_outputs})
 
     print(json.dumps({'ok': True, 'items': items, 'timestamp': int(time.time()), 'assignments_count': len(assignments), 'assignments_keys': sorted(assignments.keys())}))
@@ -30291,33 +30407,12 @@ def _sync_local_vulns_to_remote(
             if os.path.exists(yml):
                 local_files.append(yml)
 
-    # Flow flag artifacts: bind-mounted into docker-compose services (e.g., to /flow_artifacts).
-    # These directories live under /tmp/vulns/* on the webapp host and must be present on the
-    # CORE VM too; otherwise the container sees an empty mount.
     local_dirs: List[str] = []
-    try:
-        import re
-
-        for yml in [p for p in local_files if p.endswith('.yml') or p.endswith('.yaml')]:
-            try:
-                txt = ''
-                with open(yml, 'r', encoding='utf-8', errors='ignore') as f:
-                    txt = f.read()
-                # Match the source side of a bind mount that points into /tmp/vulns.
-                # Example: /tmp/vulns/flag_generators_runs/flow-...:/flow_artifacts:ro
-                for m in re.findall(r'(/tmp/vulns/(?:flag_generators_runs|flag_node_generators_runs)/[^:\s\"\']+)', txt):
-                    pth = str(m).strip().strip('"').strip("'")
-                    if pth and os.path.isdir(pth):
-                        local_dirs.append(pth)
-            except Exception:
-                continue
-    except Exception:
-        local_dirs = []
 
     # Fallback: include any Flow artifact dirs from the preview plan / FlowState (XML).
     if flow_plan_path:
         try:
-            for pth in _extract_flow_artifact_dirs_from_plan(flow_plan_path, prefer_mount_dir=False):
+            for pth in _extract_flow_artifact_dirs_from_plan(flow_plan_path):
                 if pth and os.path.isdir(pth):
                     local_dirs.append(pth)
         except Exception:
@@ -31885,6 +31980,8 @@ def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_st
         return False, 'xml_path not found'
     if not isinstance(flow_state, dict) or not flow_state:
         return False, 'flow_state empty'
+    # Backfill inject_files from current generator catalogs before persisting.
+    flow_state = _backfill_flow_state_inject_files_from_catalog(flow_state)
     flow_state = _canonicalize_flow_state_paths(flow_state, xml_path=xml_path)
     try:
         tree = ET.parse(xml_path)
@@ -31932,6 +32029,45 @@ def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_st
         return True, 'ok'
     except Exception as e:
         return False, f'failed to update xml: {e}'
+
+
+def _read_flow_state_from_xml_path(xml_path: str, scenario_label: str | None) -> dict[str, Any] | None:
+    """Best-effort read of FlagSequencing/FlowState JSON from a scenario XML file."""
+    xml_path = _abs_path_or_original(xml_path)
+    if not xml_path or not os.path.exists(xml_path):
+        return None
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception:
+        return None
+
+    scenario_norm = _normalize_scenario_label(scenario_label or '')
+    scen_el = None
+    try:
+        scenarios = root.findall('.//Scenario')
+        if scenario_norm:
+            for sc in scenarios:
+                nm = str(sc.get('name') or '').strip()
+                if _normalize_scenario_label(nm) == scenario_norm:
+                    scen_el = sc
+                    break
+        if scen_el is None and scenarios:
+            scen_el = scenarios[0]
+    except Exception:
+        scen_el = None
+
+    if scen_el is None:
+        return None
+    try:
+        flow_el = scen_el.find('.//FlagSequencing/FlowState')
+        raw = (flow_el.text or '').strip() if flow_el is not None else ''
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def _clear_flow_state_in_xml(xml_path: str, scenario_label: str | None) -> tuple[bool, str]:
@@ -34169,6 +34305,14 @@ def run_cli():
                 cli_args.append('--verbose')
             if active_scenario_name:
                 cli_args.extend(['--scenario', active_scenario_name])
+
+            # Ensure FlowState inject_files are backfilled into the XML before the CLI reads it.
+            try:
+                fs = _read_flow_state_from_xml_path(xml_path, active_scenario_name)
+                if isinstance(fs, dict) and fs:
+                    _update_flow_state_in_xml(xml_path, active_scenario_name, fs)
+            except Exception:
+                pass
             proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True, env=cli_env)
         logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
         app.logger.debug("[sync] CLI return code: %s", proc.returncode)
@@ -36626,7 +36770,7 @@ def main():
         gen_name = str(a.get('generator_name') or a.get('name') or '')
         gen_type = str(a.get('generator_type') or a.get('type') or '')
         run_dir = str(a.get('run_dir') or a.get('artifacts_dir') or '')
-        artifacts_dir = str(a.get('mount_dir') or a.get('artifacts_dir') or '')
+        artifacts_dir = str(a.get('inject_source_dir') or a.get('artifacts_dir') or '')
         outputs_manifest = str(a.get('outputs_manifest') or '')
         outputs_missing = []
         outputs_checked = []
@@ -36877,7 +37021,7 @@ def _validate_session_nodes_and_injects(
                             return True
                     return False
 
-                for key in ('artifacts_dir', 'mount_dir'):
+                for key in ('artifacts_dir', 'inject_source_dir'):
                     info = paths.get(key)
                     if not isinstance(info, dict):
                         continue
@@ -37298,7 +37442,7 @@ def _validate_session_nodes_and_injects(
                     'generator_type': fa.get('type') or fa.get('generator_type'),
                     'run_dir': fa.get('run_dir') or fa.get('artifacts_dir'),
                     'artifacts_dir': fa.get('artifacts_dir'),
-                    'mount_dir': fa.get('mount_dir'),
+                    'inject_source_dir': fa.get('inject_source_dir'),
                     'outputs_manifest': fa.get('outputs_manifest'),
                     'inject_files_detail': fa.get('inject_files_detail'),
                     'inject_files': fa.get('inject_files'),
@@ -37385,7 +37529,7 @@ def _validate_session_nodes_and_injects(
     if flow_enabled and isinstance(assignments_list, list) and assignments_list and not summary['generator_validation_detail']:
         for fa in assignments_list:
             run_dir = str(fa.get('run_dir') or fa.get('artifacts_dir') or '')
-            artifacts_dir = str(fa.get('artifacts_dir') or fa.get('mount_dir') or '')
+            artifacts_dir = str(fa.get('inject_source_dir') or fa.get('artifacts_dir') or '')
             outputs_checked: List[str] = []
             inject_checked: List[str] = []
             try:
@@ -37563,25 +37707,58 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
 
         # Verify: list /flow_artifacts inside target container(s) so logs prove the copy worked.
         try:
-            verify_targets: List[str] = []
+            import re as _re
+
+            def _is_hex_container_id(text: str) -> bool:
+                # docker short ids are 12 hex chars; full ids are 64.
+                try:
+                    return bool(_re.fullmatch(r"[0-9a-f]{12,64}", str(text or '').strip().lower()))
+                except Exception:
+                    return False
+
+            # Prioritize verifying nodes that actually had a Flow artifacts src (these are the
+            # ones where we expect /flow_artifacts and /flow_injects to contain files).
+            # Also prefer real hex container IDs over aliases like the node name.
+            preferred: List[str] = []
+            fallback: List[str] = []
             if isinstance(items, list):
+                # 1) Items with `src` (flow artifacts) first
                 for it in items:
                     if not isinstance(it, dict) or not it.get('ok'):
+                        continue
+                    src = str(it.get('src') or '').strip()
+                    if not src:
                         continue
                     targets = it.get('targets')
                     if isinstance(targets, list):
                         for t in targets:
                             name = str(t or '').strip()
-                            if name:
-                                verify_targets.append(name)
+                            if not name:
+                                continue
+                            (preferred if _is_hex_container_id(name) else fallback).append(name)
+                # 2) Remaining items (no src)
+                for it in items:
+                    if not isinstance(it, dict) or not it.get('ok'):
+                        continue
+                    src = str(it.get('src') or '').strip()
+                    if src:
+                        continue
+                    targets = it.get('targets')
+                    if isinstance(targets, list):
+                        for t in targets:
+                            name = str(t or '').strip()
+                            if not name:
+                                continue
+                            (preferred if _is_hex_container_id(name) else fallback).append(name)
+
             seen: set[str] = set()
             uniq: List[str] = []
-            for t in verify_targets:
+            for t in (preferred + fallback):
                 if t in seen:
                     continue
                 seen.add(t)
                 uniq.append(t)
-                if len(uniq) >= 5:
+                if len(uniq) >= 10:
                     break
 
             if uniq:
@@ -37906,6 +38083,10 @@ def main():
             'ls -la /flow_artifacts 2>&1 || true; '
             'echo "--- find /flow_artifacts (files) ---"; '
             f"find /flow_artifacts -maxdepth 3 -type f -print 2>/dev/null | head -n {MAX_FIND} || true; "
+            'echo "--- ls -la /flow_injects ---"; '
+            'ls -la /flow_injects 2>&1 || true; '
+            'echo "--- find /flow_injects (files) ---"; '
+            f"find /flow_injects -maxdepth 3 -type f -print 2>/dev/null | head -n {MAX_FIND} || true; "
         )
         p = _run(['docker', 'exec', c, 'sh', '-c', shell], timeout=25)
         items.append({'container': c, 'ok': p.returncode == 0, 'rc': int(p.returncode), 'output': (p.stdout or '')})
@@ -37940,6 +38121,15 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     docker_remove_conflicts = job_spec.get('docker_remove_conflicts')
     docker_cleanup_before_run = job_spec.get('docker_cleanup_before_run')
     docker_remove_all_containers = job_spec.get('docker_remove_all_containers')
+
+    # Ensure FlowState inject_files are backfilled into the XML before uploading/running.
+    try:
+        if isinstance(xml_path, str) and xml_path.strip() and os.path.exists(str(xml_path)):
+            fs = _read_flow_state_from_xml_path(str(xml_path), scenario_name_hint)
+            if isinstance(fs, dict) and fs:
+                _update_flow_state_in_xml(str(xml_path), scenario_name_hint, fs)
+    except Exception:
+        pass
     overwrite_existing_images = job_spec.get('overwrite_existing_images')
     # Always use full artifacts mode; injected-only uploads are no longer supported.
     upload_only_injected_artifacts = False
@@ -38074,6 +38264,20 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     except _SSHTunnelError as exc:
         _fail_run(str(exc))
         return
+
+    # Persist remote execution context into RUNS metadata so postrun steps
+    # (docker copy into /flow_artifacts and /flow_injects) have access to SSH creds.
+    try:
+        meta = RUNS.get(run_id_local)
+        if isinstance(meta, dict):
+            meta['core_cfg'] = dict(core_cfg) if isinstance(core_cfg, dict) else core_cfg
+            try:
+                meta['remote'] = bool(_coerce_bool(core_cfg.get('ssh_enabled')))
+            except Exception:
+                meta['remote'] = True
+            meta.setdefault('remote_base_dir', '/tmp/core-topo-gen')
+    except Exception:
+        pass
 
     preferred_cli_venv = _sanitize_venv_bin_path(core_cfg.get('venv_bin'))
     venv_is_explicit = _venv_is_explicit(core_cfg, preferred_cli_venv)
@@ -38955,6 +39159,18 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         RUNS[run_id_local]['status'] = final_status
         RUNS[run_id_local]['returncode'] = exit_code
         RUNS[run_id_local]['done'] = True
+
+        # IMPORTANT: perform postrun Flow artifact copy immediately on completion.
+        # Relying on /run_status polling is fragile (RUNS is in-memory and can be lost
+        # on webapp restart). This step populates /flow_artifacts and /flow_injects
+        # inside vuln containers when CORETG_FLOW_ARTIFACTS_MODE=copy.
+        try:
+            _maybe_copy_flow_artifacts_into_containers(RUNS.get(run_id_local), stage='postrun')
+        except Exception as exc:
+            try:
+                log_f.write(f"{log_prefix}docker.copy_flow_artifacts(postrun) failed: {exc}\n")
+            except Exception:
+                pass
         
         # Do not append run history here. Canonical history persistence happens in
         # run_status once report/summary/session artifacts and validation are resolved.
@@ -39413,7 +39629,6 @@ def run_cli_async():
                     return text
 
                 _add_missing_flow_path('artifacts_dir', str(fa.get('artifacts_dir') or fa.get('run_dir') or '').strip())
-                _add_missing_flow_path('mount_dir', str(fa.get('mount_dir') or '').strip())
                 inject_files = fa.get('inject_files') if isinstance(fa.get('inject_files'), list) else []
                 for inject_raw in inject_files:
                     _add_missing_flow_path('inject_source', _inject_source_for_precheck(inject_raw))
@@ -46150,9 +46365,8 @@ def vuln_catalog_items_test_start():
         if prepared_compose_path != compose_path:
             log_f.write(f"compose_prepared: {os.path.relpath(prepared_compose_path, _get_repo_root())}\n")
         try:
-            inject_mode = str(os.getenv('CORETG_INJECT_FILES_MODE') or '').strip() or 'copy'
             flow_mode = str(os.getenv('CORETG_FLOW_ARTIFACTS_MODE') or '').strip() or 'copy'
-            log_f.write(f"[local] inject_files_mode={inject_mode} flow_artifacts_mode={flow_mode}\n")
+            log_f.write(f"[local] inject_files_mode=copy flow_artifacts_mode={flow_mode}\n")
         except Exception:
             pass
         try:

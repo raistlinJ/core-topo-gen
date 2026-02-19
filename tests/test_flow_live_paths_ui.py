@@ -23,7 +23,6 @@ def test_flow_chain_editor_hides_resolved_paths_row() -> None:
     removed_snippets = [
         "const resolved = (fa && typeof fa.resolved_paths === 'object'",
         "addPathEntry('artifacts_dir'",
-        "addPathEntry('mount_dir'",
         "inject_source ${srcIdx + 1}",
         "addRow('Resolved Paths', wrapLive",
     ]

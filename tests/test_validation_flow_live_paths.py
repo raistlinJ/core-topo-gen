@@ -15,7 +15,7 @@ def _patch_validation_dependencies(monkeypatch):
 
 def test_validate_flow_live_paths_flags_local_missing(monkeypatch):
     _patch_validation_dependencies(monkeypatch)
-    monkeypatch.setattr(backend.os.path, 'exists', lambda p: str(p).strip() == '/tmp/vulns/mount-ok')
+    monkeypatch.setattr(backend.os.path, 'exists', lambda p: str(p).strip() == '/tmp/vulns/inject-ok')
 
     monkeypatch.setattr(
         backend,
@@ -30,8 +30,8 @@ def test_validate_flow_live_paths_flags_local_missing(monkeypatch):
                             'path': '/tmp/vulns/missing-artifacts',
                             'is_remote': False,
                         },
-                        'mount_dir': {
-                            'path': '/tmp/vulns/mount-ok',
+                        'inject_source_dir': {
+                            'path': '/tmp/vulns/inject-ok',
                             'is_remote': False,
                         },
                         'inject_sources': [],
@@ -73,8 +73,8 @@ def test_validate_flow_live_paths_ignores_remote_missing(monkeypatch):
                             'path': '/tmp/vulns/remote-artifacts',
                             'is_remote': True,
                         },
-                        'mount_dir': {
-                            'path': '/tmp/vulns/remote-mount',
+                        'inject_source_dir': {
+                            'path': '/tmp/vulns/remote-inject-source',
                             'is_remote': True,
                         },
                         'inject_sources': [

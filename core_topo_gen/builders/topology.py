@@ -1976,7 +1976,7 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
         # flag-generators do NOT create new nodes/services.
         # They generate artifacts that should be inserted into an existing docker node.
         if ftype == 'flag-generator':
-            artifacts_dir = str(flow_flag.get('mount_dir') or flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+            artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
             if not artifacts_dir:
                 return None
             if not os.path.isabs(artifacts_dir):
@@ -1994,6 +1994,18 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                 pass
             hint_text = str(flow_flag.get('hint') or '').strip()
             mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
+
+            inject_source_dir = str(flow_flag.get('inject_source_dir') or '').strip() or artifacts_dir
+            # Many Flow runs store file outputs under <run_dir>/artifacts/.
+            # Prefer that as the inject source root so inject specs like "artifacts/x"
+            # normalize to "x" and exist on disk.
+            try:
+                if inject_source_dir and os.path.basename(inject_source_dir.rstrip('/')) != 'artifacts':
+                    cand = os.path.join(inject_source_dir, 'artifacts')
+                    if os.path.isdir(cand):
+                        inject_source_dir = cand
+            except Exception:
+                pass
             rec2: Dict[str, str] = {
                 **_standard_docker_compose_record(),
                 'Vector': 'flag',
@@ -2002,7 +2014,7 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                 'ArtifactsMountPath': mount_path,
                 # Inject files (copy into container at runtime).
                 'InjectFiles': flow_flag.get('inject_files') or [],
-                'InjectSourceDir': artifacts_dir,
+                'InjectSourceDir': inject_source_dir,
                 'OutputsManifest': str(flow_flag.get('outputs_manifest') or ''),
                 'RunDir': str(flow_flag.get('run_dir') or ''),
             }
@@ -2035,7 +2047,7 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
         # flag-node-generators are expected to provide their own docker-compose.yml.
         if ftype != 'flag-generator':
             return None
-        artifacts_dir = str(flow_flag.get('mount_dir') or flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+        artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
         if not artifacts_dir:
             return None
         if not os.path.isabs(artifacts_dir):
@@ -2053,11 +2065,19 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
             pass
         hint_text = str(flow_flag.get('hint') or '').strip()
         mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
+        inject_source_dir = str(flow_flag.get('inject_source_dir') or '').strip() or artifacts_dir
+        try:
+            if inject_source_dir and os.path.basename(inject_source_dir.rstrip('/')) != 'artifacts':
+                cand = os.path.join(inject_source_dir, 'artifacts')
+                if os.path.isdir(cand):
+                    inject_source_dir = cand
+        except Exception:
+            pass
         overlay: Dict[str, str] = {
             'ArtifactsDir': artifacts_dir,
             'ArtifactsMountPath': mount_path,
             'InjectFiles': flow_flag.get('inject_files') or [],
-            'InjectSourceDir': artifacts_dir,
+            'InjectSourceDir': inject_source_dir,
             'OutputsManifest': str(flow_flag.get('outputs_manifest') or ''),
             'RunDir': str(flow_flag.get('run_dir') or ''),
         }
@@ -2112,7 +2132,7 @@ def _flow_flag_artifacts_overlay_from_env(hdata: Any) -> Optional[Dict[str, str]
             ftype = ''
         if ftype != 'flag-generator':
             return None
-        artifacts_dir = str(match.get('mount_dir') or match.get('artifacts_dir') or match.get('run_dir') or '').strip()
+        artifacts_dir = str(match.get('artifacts_dir') or match.get('run_dir') or '').strip()
         if not artifacts_dir:
             return None
         if not os.path.isabs(artifacts_dir):
@@ -2129,11 +2149,19 @@ def _flow_flag_artifacts_overlay_from_env(hdata: Any) -> Optional[Dict[str, str]
         except Exception:
             pass
         mount_path = '/flow_artifacts'
+        inject_source_dir = str(match.get('inject_source_dir') or '').strip() or artifacts_dir
+        try:
+            if inject_source_dir and os.path.basename(inject_source_dir.rstrip('/')) != 'artifacts':
+                cand = os.path.join(inject_source_dir, 'artifacts')
+                if os.path.isdir(cand):
+                    inject_source_dir = cand
+        except Exception:
+            pass
         overlay: Dict[str, str] = {
             'ArtifactsDir': artifacts_dir,
             'ArtifactsMountPath': mount_path,
             'InjectFiles': match.get('inject_files') or [],
-            'InjectSourceDir': artifacts_dir,
+            'InjectSourceDir': inject_source_dir,
             'OutputsManifest': str(match.get('outputs_manifest') or ''),
             'RunDir': str(match.get('run_dir') or ''),
         }

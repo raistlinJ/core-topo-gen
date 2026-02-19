@@ -158,6 +158,10 @@ Live CORE credential parity smoke for flag tests:
 	- The UI provides a per-pack file browser so users can download/view the extracted files.
 	- The server generates a `vuln_list_w_url.csv` internally so downstream vulnerability selection/processing remains unchanged.
 
+Vulnerability template testing:
+- The Vuln-Catalog page includes a **Test** action per catalog item.
+- When provided CORE VM SSH credentials, the test runs *on the CORE VM* and uses the same offline-safe docker preflight steps as scenario execution (build wrapper images, pull pull-only images, create containers with `--no-start`, then start with `--no-build`).
+
 ## Architecture overview
 | Folder | Purpose |
 | --- | --- |
@@ -177,6 +181,7 @@ These are general constraints that affect generator authoring and “docker vuln
 - **CORE treats docker-compose as a template.** Compose files attached to CORE docker nodes are treated as Mako templates by CORE.
 	- Avoid docker-compose env interpolation syntax like `${VAR}` / `${VAR:-default}` in shipped compose templates unless you know it will be resolved before CORE sees it.
 	- If you must use interpolation, prefer resolving it on the CORE host *before* node creation.
+	- This project resolves/strips `${...}` tokens in generated per-node compose files to avoid CORE Mako failures, but catalog templates should still prefer literal values where possible.
 
 - **Docker nodes run with `network_mode: none`.** This project enforces `network_mode: none` in compose services for CORE docker nodes to prevent Docker from adding an unmanaged default gateway/interface.
 	- Consequence: you can’t count on “normal Docker networking” inside the container.
@@ -188,6 +193,7 @@ These are general constraints that affect generator authoring and “docker vuln
 
 - **Assume no internet / no package manager at runtime.** Containers may have no outbound access in CORE.
 	- Anything required for runtime should be baked into the image (or installed at build time via the iproute2 wrapper flow).
+	- Wrapper images default to an offline-safe strategy (inject a BusyBox-backed `ip` implementation). Legacy package-manager installs can be enabled via `CORETG_IPROUTE2_WRAPPER_STRATEGY=packages`.
 
 - **Kernel services may not exist in containers.** Some “system daemons” are kernel-backed (or expect systemd) and won’t work in typical docker-node constraints.
 	- Example: an NFS server using kernel `nfsd` usually requires privileged access (mounting `/proc/fs/nfsd`).

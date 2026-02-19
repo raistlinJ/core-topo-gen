@@ -341,6 +341,44 @@ Important behavior:
 `GET /flag_node_generators_data`
 : Returns `{ "generators": [...], "errors": [...] }` for installed flag-node-generators (manifest-based).
 
+### Generator Tests (Flag Catalog)
+
+These endpoints back the **Test** button in the Flag Catalog UI. Tests can run either:
+- locally (inside the webapp host), or
+- remotely on a CORE VM (via SSH) when the request includes a `core` JSON payload.
+
+`POST /flag_generators_test/run`
+: Multipart form (text + file uploads).
+	- Required field: `generator_id`
+	- Optional field: `core` (JSON string containing SSH/gRPC config; when present, the generator runs on the CORE VM)
+	- Additional fields: generator-declared input names (from manifest `inputs[]`)
+
+Returns `{ ok, run_id, saved_uploads }`.
+
+`POST /flag_node_generators_test/run`
+: Same as `/flag_generators_test/run`, but runs a `flag-node-generator`.
+
+Artifacts/logs for generator tests:
+
+`GET /flag_generators_test/outputs/<run_id>`
+: Returns `{ ok, inputs, outputs, misc, done, returncode }` for the run directory.
+
+`GET /flag_generators_test/download/<run_id>?p=<rel_path>`
+: Downloads a file under the run directory.
+
+`GET /flag_node_generators_test/outputs/<run_id>`
+: Same as flag generator outputs, for node-generator runs.
+
+`GET /flag_node_generators_test/download/<run_id>?p=<rel_path>`
+: Downloads a file under the node-generator run directory.
+
+`POST /flag_node_generators_test/cleanup/<run_id>`
+: Deletes the run artifacts (scoped to `outputs/`).
+
+Parity note:
+- Generator tests exercise `scripts/run_flag_generator.py` directly.
+- They validate generator output/inject staging, but do not start a full CORE topology session.
+
 ### Run Execution & Reports
 
 `POST /run_cli`
@@ -501,6 +539,27 @@ Parity note:
 
 `POST /vuln_catalog_packs/delete/<catalog_id>`
 : Deletes the selected catalog pack.
+
+### Vulnerability Catalog Item Tests
+
+These endpoints back the **Test** action in the Vuln-Catalog UI. When CORE VM credentials are provided, the test runs on the CORE VM and performs an offline-friendly preflight (build wrapper images, pull pull-only images, create containers with `--no-start`, then start with `--no-build`).
+
+`POST /vuln_catalog_items/test/start`
+: JSON body containing:
+	- `item_id` (int)
+	- `core` (object): CORE VM SSH/gRPC config (required)
+	- `force_replace` (bool, optional): remove existing conflicting images/containers on the CORE VM
+
+Returns `{ ok, run_id }` on success, or `{ ok: true, replace_required: true, existing_images, existing_containers }` when replacement confirmation is required.
+
+`POST /vuln_catalog_items/test/status`
+: JSON `{ run_id }` returning `{ ok, done, cleanup_started, cleanup_done }`.
+
+`POST /vuln_catalog_items/test/stop`
+: JSON `{ run_id, ok?: true|false|null }` to stop and cleanup the remote compose. `ok=null` marks the validation status as incomplete.
+
+`POST /vuln_catalog_items/test/stop_active`
+: Stops the currently running vulnerability test (if any) with `{ ok?: true|false|null }`.
 
 `POST /vuln_compose/status`
 : JSON `{ "items": [{ "Name": "Node1", "Path": "...", "compose"?: "docker-compose.yml" }] }`. Returns `{ "items": [...], "log": [...] }` with compose availability and Docker pull state.

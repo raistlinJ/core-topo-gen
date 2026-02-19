@@ -2048,33 +2048,19 @@ def _inject_service_labels(compose_obj: dict, labels: Dict[str, str], prefer_ser
 
 
 def _flow_artifacts_mode() -> str:
-	"""How Flow generator artifacts should be delivered into compose services.
+	"""How Flow generator artifacts are delivered into containers.
 
-	- copy: do not mount; emit labels so a caller can docker-cp the directory in (default)
-	- mount: bind-mount ArtifactsDir into the service
+	This project only supports copy-based delivery.
 	"""
-	try:
-		val = str(os.getenv('CORETG_FLOW_ARTIFACTS_MODE') or '').strip().lower()
-		if val in ('mount', 'bind', 'bind-mount'):
-			return 'mount'
-		return 'copy'
-	except Exception:
-		return 'copy'
+	return 'copy'
 
 
 def _inject_files_copy_mode() -> str:
-	"""How inject_files should be delivered into compose services.
+	"""How inject_files are delivered into containers.
 
-	- copy: copy into a volume-mounted destination (default)
-	- mount: bind-mount the source files directly into destination
+	This project only supports copy-based delivery.
 	"""
-	try:
-		val = str(os.getenv('CORETG_INJECT_FILES_MODE') or '').strip().lower()
-		if val in ('mount', 'bind', 'bind-mount'):
-			return 'mount'
-		return 'copy'
-	except Exception:
-		return 'copy'
+	return 'copy'
 
 
 def _norm_inject_rel(raw: str) -> str:
@@ -2198,8 +2184,9 @@ def _expand_injects_from_outputs(out_manifest: str, inject_files: list[str]) -> 
 
 
 def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str], source_dir: str, outputs_manifest: str = '', prefer_service: str = '') -> dict:
-	if not isinstance(compose_obj, dict) or not inject_files:
+	if not isinstance(compose_obj, dict):
 		return compose_obj
+	explicit_requested = bool(inject_files)
 	if source_dir:
 		try:
 			if not os.path.isabs(source_dir):
@@ -2220,6 +2207,8 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		pass
 
 	inject_files = _expand_injects_from_outputs(outputs_manifest, inject_files)
+	if not inject_files:
+		return compose_obj
 	try:
 		logger.info("[injects] expanded injects=%s", inject_files)
 	except Exception:
@@ -2231,9 +2220,41 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 
 	# Build inject mapping: relpath -> dest_dir
 	inject_map: dict[str, str] = {}
+	# Flow default: if inject specs omit a destination, prefer /flow_injects so the
+	# UI validation and user expectations align.
+	flow_default_dest = str(os.getenv('CORETG_FLOW_INJECTS_DIR') or '').strip() or '/flow_injects'
+	is_flow_source = False
+	try:
+		sd_low = str(source_dir or '').replace('\\', '/').lower()
+		if '/tmp/vulns/flag_generators_runs/' in sd_low or '/tmp/vulns/flag_node_generators_runs/' in sd_low:
+			is_flow_source = True
+		elif '/flag_generators_runs/' in sd_low or '/flag_node_generators_runs/' in sd_low:
+			is_flow_source = True
+	except Exception:
+		is_flow_source = False
 	for raw in inject_files or []:
 		src_raw, dest_raw = _split_inject_spec(str(raw))
 		src_raw_s = str(src_raw or '').strip()
+		# If src is an absolute path that points into source_dir, interpret it as an
+		# artifacts path (relative to source_dir) rather than a container destination.
+		try:
+			if src_raw_s.startswith('/'):
+				sd_abs = os.path.abspath(source_dir)
+				src_abs = os.path.abspath(src_raw_s)
+				if os.path.commonpath([sd_abs, src_abs]) == sd_abs:
+					rel = os.path.relpath(src_abs, sd_abs)
+					src_norm2 = _norm_inject_rel(rel)
+					if src_norm2:
+						dest_dir2 = _normalize_inject_dest_dir(dest_raw)
+						try:
+							if (not str(dest_raw or '').strip()) and is_flow_source and dest_dir2 == '/tmp' and flow_default_dest.startswith('/'):
+								dest_dir2 = flow_default_dest
+						except Exception:
+							pass
+						inject_map[src_norm2] = dest_dir2
+						continue
+		except Exception:
+			pass
 		# If src is an absolute path, treat it as a destination path inside the
 		# container and map the source to the basename in artifacts. If a dest is
 		# provided, honor it but still use the basename to avoid /tmp/tmp/... paths.
@@ -2249,17 +2270,33 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 					dest_dir = _normalize_inject_dest_dir(dest_raw)
 					inject_map[base] = dest_dir
 					continue
-				# No dest provided: default to /tmp to avoid /tmp/tmp/... paths.
-				inject_map[base] = '/tmp'
+				# No dest provided: for Flow-sourced injects prefer /flow_injects;
+				# otherwise default to /tmp to avoid /tmp/tmp/... paths.
+				try:
+					if is_flow_source and flow_default_dest.startswith('/'):
+						inject_map[base] = flow_default_dest
+					else:
+						inject_map[base] = '/tmp'
+				except Exception:
+					inject_map[base] = '/tmp'
 				continue
 		src_norm = _norm_inject_rel(src_raw)
 		if not src_norm:
 			continue
 		dest_dir = _normalize_inject_dest_dir(dest_raw)
+		# If no destination was specified and this is a Flow artifacts source,
+		# use /flow_injects rather than /tmp.
+		try:
+			if (not str(dest_raw or '').strip()) and is_flow_source and dest_dir == '/tmp' and flow_default_dest.startswith('/'):
+				dest_dir = flow_default_dest
+		except Exception:
+			pass
 		inject_map[src_norm] = dest_dir
 
 	if not inject_map:
-		raise RuntimeError(f"[injects] no valid inject mappings produced from {inject_files}")
+		if explicit_requested:
+			raise RuntimeError(f"[injects] no valid inject mappings produced from {inject_files}")
+		return compose_obj
 
 	def _volume_name_for_dest(dest_dir: str) -> str:
 		slug = dest_dir.strip('/') or 'injects'
@@ -2307,22 +2344,11 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		logger.info(
 			"[injects] applying injects to service=%s mode=%s map=%s",
 			target_service,
-			_inject_files_copy_mode(),
+			'copy',
 			inject_map,
 		)
 	except Exception:
 		pass
-
-	mode = _inject_files_copy_mode()
-	if mode == 'mount':
-		# Bind-mount each source path directly into the target container.
-		for rel, dest_dir in inject_map.items():
-			src_path = os.path.join(source_dir, rel)
-			if not os.path.exists(src_path):
-				raise RuntimeError(f"[injects] missing source file for bind: {src_path}")
-			bind = f"{src_path}:{dest_dir}/{rel}:ro"
-			compose_obj = _inject_service_bind_mount(compose_obj, bind, prefer_service=target_service)
-		return compose_obj
 
 	# Copy mode: use a helper init service to copy into named volumes.
 	copy_service_name = 'inject_copy'
@@ -2345,28 +2371,16 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		copy_vols.append(f"{vol_name}:{mount_path}")
 
 	missing_sources: list[str] = []
-	for rel in inject_map.keys():
+	for rel in list(inject_map.keys()):
 		src_path = os.path.join(source_dir, rel)
 		if not os.path.exists(src_path):
 			missing_sources.append(src_path)
-	if missing_sources:
+			if not explicit_requested:
+				inject_map.pop(rel, None)
+	if missing_sources and explicit_requested:
 		raise RuntimeError(f"[injects] missing source files: {missing_sources}")
-
-	cmds: list[str] = []
-	for rel, dest_dir in inject_map.items():
-		mount_path = dest_mounts.get(dest_dir)
-		if not mount_path:
-			continue
-		rel_dir = os.path.dirname(rel)
-		rel_dir_escaped = rel_dir.replace('"', '\\"')
-		src_escaped = rel.replace('"', '\\"')
-		dst_escaped = rel.replace('"', '\\"')
-		if rel_dir:
-			cmds.append(f"mkdir -p \"{mount_path}/{rel_dir_escaped}\"")
-		cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\"")
-
-	if not cmds:
-		raise RuntimeError("[injects] no copy commands generated; refusing to skip inject service")
+	if not inject_map:
+		return compose_obj
 
 	# Prefer reusing the target service image to avoid pulling an extra base image
 	# on CORE hosts that restrict outbound internet.
@@ -2380,10 +2394,55 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 	except Exception:
 		copy_image = 'alpine:3.19'
 
+	use_wrapper_busybox = bool(
+		str(copy_image).startswith('coretg/') and str(copy_image).endswith(':iproute2')
+	)
+
+	cmds: list[str] = []
+	# If we're running inside a coretg wrapper image, we can rely on a BusyBox
+	# binary at /usr/local/coretg/bin/busybox.
+	# Otherwise, avoid referencing that path (it won't exist pre-wrapper) and
+	# fall back to standard coreutils (`mkdir`, `cp`) provided by the image.
+	bb_path = '/usr/local/coretg/bin/busybox'
+	bb_fallback = 'busybox'
+	for rel, dest_dir in inject_map.items():
+		mount_path = dest_mounts.get(dest_dir)
+		if not mount_path:
+			continue
+		rel_dir = os.path.dirname(rel)
+		rel_dir_escaped = rel_dir.replace('"', '\\"')
+		src_escaped = rel.replace('"', '\\"')
+		dst_escaped = rel.replace('"', '\\"')
+		if rel_dir:
+			if use_wrapper_busybox:
+				cmds.append(
+					f"{bb_path} mkdir -p \"{mount_path}/{rel_dir_escaped}\" 2>/dev/null || "
+					f"{bb_fallback} mkdir -p \"{mount_path}/{rel_dir_escaped}\""
+				)
+			else:
+				cmds.append(f"mkdir -p \"{mount_path}/{rel_dir_escaped}\"")
+		if use_wrapper_busybox:
+			cmds.append(
+				f"{bb_path} cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" 2>/dev/null || "
+				f"{bb_fallback} cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\""
+			)
+		else:
+			cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\"")
+
+	if not cmds:
+		raise RuntimeError("[injects] no copy commands generated; refusing to skip inject service")
+
 	services[copy_service_name] = {
 		'image': copy_image,
 		'volumes': copy_vols,
-		'command': ['sh', '-lc', ' && '.join(cmds)],
+		# If the image is a coretg wrapper, run via its BusyBox so we don't depend
+		# on `/bin/sh` existing in the base image.
+		**({
+			'entrypoint': ['/usr/local/coretg/bin/busybox'],
+			'command': ['sh', '-lc', ' && '.join(cmds)],
+		} if use_wrapper_busybox else {
+			'command': ['sh', '-lc', ' && '.join(cmds)],
+		}),
 	}
 
 	# Mount volumes into target service
@@ -3565,9 +3624,6 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						},
 						prefer_service=prefer,
 					)
-					if _flow_artifacts_mode() != 'copy':
-						bind = f"{art_dir}:{mount_path}:ro"
-						obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
 			except Exception:
 				pass
 

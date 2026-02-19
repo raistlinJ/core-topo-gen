@@ -298,3 +298,117 @@ def test_prepare_compose_prefers_local_path_over_cached(tmp_path):
     txt = out_path.read_text("utf-8", errors="ignore")
     assert "echo two" in txt
     assert "echo STALE" not in txt
+
+
+def test_prepare_compose_inject_copy_uses_busybox_entrypoint_for_wrapper(tmp_path, monkeypatch):
+    """Regression: inject_copy must work even if base image lacks /bin/sh/cp.
+
+    When we wrap services into `coretg/*:iproute2`, the wrapper injects a BusyBox
+    binary at /usr/local/coretg/bin/busybox. The inject_copy init service should
+    use that BusyBox as entrypoint.
+    """
+    # Create a minimal compose.
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        (
+            "services:\n"
+            "  app:\n"
+            "    image: nginx:latest\n"
+            "    command: ['sh','-lc','sleep 1']\n"
+        ),
+        encoding="utf-8",
+    )
+
+    # Prepare a fake artifacts dir with a file we will inject.
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "flag.txt").write_text("FLAG{X}\n", encoding="utf-8")
+
+    # Force wrapper strategy to busybox injection (default) and enable inject copy mode.
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+    monkeypatch.setenv("CORETG_COMPOSE_SET_CONTAINER_NAME", "1")
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+        "InjectFiles": ["flag.txt -> /tmp"],
+        "InjectSourceDir": str(artifacts),
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    assert "inject_copy" in services or any(str(k).startswith("inject_copy") for k in services.keys())
+    # Find the inject_copy service key.
+    ik = "inject_copy" if "inject_copy" in services else sorted([k for k in services.keys() if str(k).startswith("inject_copy")])[0]
+    inject = services[ik]
+    assert isinstance(inject, dict)
+    # When the target service is wrapped, inject_copy should use BusyBox entrypoint.
+    # We don't assert the exact wrapper tag here, just the entrypoint behavior.
+    ep = inject.get("entrypoint")
+    if ep is not None:
+        # compose can represent entrypoint as list or string
+        text = " ".join(ep) if isinstance(ep, list) else str(ep)
+        assert "/usr/local/coretg/bin/busybox" in text
+
+
+def test_prepare_compose_flow_injects_default_to_flow_injects_dir(tmp_path, monkeypatch):
+    """Regression: flow inject specs without explicit dest should default to /flow_injects."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: nginx:latest\n    command: ['sh','-lc','sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    # Emulate a Flow artifacts run directory structure.
+    flow_root = tmp_path / "tmp" / "vulns" / "flag_generators_runs" / "flow-x" / "01_gen" / "artifacts"
+    flow_root.mkdir(parents=True, exist_ok=True)
+    (flow_root / "payload.bin").write_text("x\n", encoding="utf-8")
+    # Also include an outputs.json so expansion sees a plausible artifact key.
+    (flow_root / "outputs.json").write_text('{"outputs": {"File(path)": "payload.bin"}}\n', encoding="utf-8")
+
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+        "ArtifactsDir": str(flow_root),
+        "ArtifactsMountPath": "/flow_artifacts",
+        # No explicit dest
+        "InjectFiles": ["File(path)"],
+        "InjectSourceDir": str(flow_root),
+        "OutputsManifest": str(flow_root / "outputs.json"),
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    # Find inject_copy service and verify volumes include /flow_injects volume mount.
+    ikeys = [k for k in services.keys() if str(k).startswith("inject_copy")]
+    assert ikeys, "expected inject_copy service"
+    # Target service should mount an inject volume at /flow_injects.
+    target = services.get("docker-1") or services.get("app")
+    assert isinstance(target, dict)
+    vols = target.get("volumes") or []
+    assert any(str(v).endswith(":/flow_injects") for v in vols), vols
+
+

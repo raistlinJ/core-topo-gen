@@ -218,7 +218,6 @@ def test_run_cli_async_blocks_when_flow_artifact_paths_missing(tmp_path, monkeyp
     )
 
     missing_artifacts = str(tmp_path / 'missing' / 'artifacts')
-    missing_mount = str(tmp_path / 'missing' / 'mount')
     missing_inject = str(tmp_path / 'missing' / 'inject' / 'exports')
 
     def _fake_preview_payload(_path, _scenario):
@@ -230,7 +229,6 @@ def test_run_cli_async_blocks_when_flow_artifact_paths_missing(tmp_path, monkeyp
                             'node_id': '7',
                             'id': 'nfs_sensitive_file',
                             'artifacts_dir': missing_artifacts,
-                            'mount_dir': missing_mount,
                             'inject_files': [missing_inject],
                             'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
                         }
@@ -260,7 +258,6 @@ def test_run_cli_async_blocks_when_flow_artifact_paths_missing(tmp_path, monkeyp
     assert 'Execute requires pre-generated Flow values' in str(payload.get('error') or '')
     details = payload.get('details') if isinstance(payload.get('details'), list) else []
     assert any(isinstance(d, dict) and d.get('reason') == 'missing artifacts_dir' for d in details)
-    assert any(isinstance(d, dict) and d.get('reason') == 'missing mount_dir' for d in details)
     assert any(isinstance(d, dict) and d.get('reason') == 'missing inject_source' for d in details)
 
 
@@ -296,7 +293,6 @@ def test_run_cli_async_remote_allows_missing_local_flow_paths(tmp_path, monkeypa
     monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
 
     missing_artifacts = str(tmp_path / 'missing' / 'artifacts')
-    missing_mount = str(tmp_path / 'missing' / 'mount')
     missing_inject = str(tmp_path / 'missing' / 'inject' / 'exports.txt')
 
     def _fake_preview_payload(_path, _scenario):
@@ -308,7 +304,6 @@ def test_run_cli_async_remote_allows_missing_local_flow_paths(tmp_path, monkeypa
                             'node_id': '7',
                             'id': 'nfs_sensitive_file',
                             'artifacts_dir': missing_artifacts,
-                            'mount_dir': missing_mount,
                             'inject_files': [f'{missing_inject} -> /tmp/seed'],
                             'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
                         }
@@ -369,10 +364,8 @@ def test_run_cli_async_accepts_inject_spec_with_dest_when_source_exists(tmp_path
     )
 
     artifacts_dir = tmp_path / 'ok' / 'artifacts'
-    mount_dir = tmp_path / 'ok' / 'mount'
     inject_source = tmp_path / 'ok' / 'inject' / 'exports.txt'
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    mount_dir.mkdir(parents=True, exist_ok=True)
     inject_source.parent.mkdir(parents=True, exist_ok=True)
     inject_source.write_text('ok', encoding='utf-8')
 
@@ -385,7 +378,6 @@ def test_run_cli_async_accepts_inject_spec_with_dest_when_source_exists(tmp_path
                             'node_id': '7',
                             'id': 'nfs_sensitive_file',
                             'artifacts_dir': str(artifacts_dir),
-                            'mount_dir': str(mount_dir),
                             'inject_files': [f'{inject_source} -> /tmp/seed'],
                             'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
                         }
