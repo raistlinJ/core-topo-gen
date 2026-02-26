@@ -1960,8 +1960,23 @@
             const af = previewData && previewData.attackflow ? previewData.attackflow : null;
             const direct = previewData && previewData.chain ? previewData.chain : null;
             const flowIds = flow && Array.isArray(flow.chain_ids) ? flow.chain_ids : null;
+            const flowAssignments = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : null;
+            let assignmentChain = null;
+            if (flowAssignments && flowAssignments.length) {
+              assignmentChain = flowAssignments
+                .map((a) => {
+                  if (!a || typeof a !== 'object') return null;
+                  const nodeId = a.node_id ?? a.nodeId ?? a.id ?? null;
+                  if (nodeId === null || nodeId === undefined) return null;
+                  return {
+                    id: nodeId,
+                    name: a.node_name ?? a.nodeName ?? a.name ?? '',
+                  };
+                })
+                .filter(Boolean);
+            }
             // Prefer plan metadata flow ordering when present to keep preview + sequencing aligned.
-            const candidates = [flow && flow.chain, flowIds, afPrev && afPrev.chain, af && af.chain, direct];
+            const candidates = [flow && flow.chain, flowIds, assignmentChain, afPrev && afPrev.chain, af && af.chain, direct];
             for (const c of candidates) {
               if (Array.isArray(c) && c.length) return c;
             }
@@ -1974,7 +1989,11 @@
             const resolveNodeForChainEntry = (entry) => {
               let raw = entry;
               if (entry && typeof entry === 'object') {
-                raw = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? entry;
+                let nested = entry;
+                if (entry.node && typeof entry.node === 'object') nested = entry.node;
+                else if (entry.target && typeof entry.target === 'object') nested = entry.target;
+                else if (entry.host && typeof entry.host === 'object') nested = entry.host;
+                raw = nested.id ?? nested.node_id ?? nested.nodeId ?? nested.host_id ?? nested.hostId ?? nested.value ?? entry.value ?? entry;
               }
               if (raw === undefined || raw === null) return null;
 

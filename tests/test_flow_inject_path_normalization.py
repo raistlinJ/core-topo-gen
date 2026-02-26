@@ -122,3 +122,39 @@ def test_update_flow_state_xml_backfills_inject_files_from_manifest(tmp_path) ->
     assert isinstance(assigns, list) and assigns
     inj = assigns[0].get("inject_files") if isinstance(assigns[0], dict) else None
     assert inj == ["File(path)"], inj
+
+
+def test_enrich_flow_state_does_not_double_artifacts_prefix_when_local_missing(monkeypatch) -> None:
+    artifacts_dir = "/tmp/vulns/flag_generators_runs/flow-newscenario1/01_binary_embed_text_docker-3/artifacts"
+
+    # Simulate remote-style unresolved local paths (os.path.exists always False).
+    monkeypatch.setattr(backend.os.path, "exists", lambda _p: False)
+
+    flow_state = {
+        "flag_assignments": [
+            {
+                "node_id": "docker-3",
+                "id": "binary_embed_text",
+                "inject_source_dir": artifacts_dir,
+                "artifacts_dir": artifacts_dir,
+                "inject_files_detail": [
+                    {
+                        "path": "/tmp/challenge_cf7c967dd5",
+                        "resolved": "artifacts/challenge_cf7c967dd5",
+                    }
+                ],
+            }
+        ],
+    }
+
+    enriched = backend._enrich_flow_state_with_artifacts(flow_state)
+    assignments = enriched.get("flag_assignments") if isinstance(enriched, dict) else None
+    assert isinstance(assignments, list) and assignments
+    detail = assignments[0].get("inject_files_detail") if isinstance(assignments[0], dict) else None
+    assert isinstance(detail, list) and detail
+
+    resolved = str((detail[0] or {}).get("resolved") or "")
+    assert "/artifacts/artifacts/" not in resolved
+    assert resolved.endswith("/artifacts/challenge_cf7c967dd5")
+
+

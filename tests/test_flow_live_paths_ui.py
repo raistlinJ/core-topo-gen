@@ -56,3 +56,10 @@ def test_flow_inject_override_editor_shows_resolved_column() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing resolved-path column wiring in inject override editor: " + "; ".join(missing)
+
+
+def test_flow_page_does_not_auto_generate_on_load() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    forbidden_snippet = "await generate(false, { autoLoad: true, resolveOnGenerate: false });"
+    assert forbidden_snippet not in text, "Flow page should not auto-generate on load; Generate button must be explicit"

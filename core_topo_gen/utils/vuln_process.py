@@ -1263,12 +1263,12 @@ def _compose_force_root_workdir_enabled() -> bool:
 	paths relative to the container filesystem root. For images with non-root WORKDIR,
 	this can cause CORE to fail to chmod service files that were copied into `/`.
 
-	Default: enabled. Disable by setting `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=0/false/off`.
+	Default: disabled. Enable by setting `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=1/true/on`.
 	"""
 	val = os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR')
 	if val is None:
-		return True
-	return str(val).strip().lower() not in ('0', 'false', 'no', 'off', '')
+		return False
+	return str(val).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 def _force_service_workdir_root(service: Dict[str, object]) -> None:
@@ -2423,17 +2423,24 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 				cmds.append(f"mkdir -p \"{mount_path}/{rel_dir_escaped}\"")
 		if use_wrapper_busybox:
 			cmds.append(
+				f"if [ -e \"/src/{src_escaped}\" ]; then "
 				f"{bb_path} cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" 2>/dev/null || "
-				f"{bb_fallback} cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\""
+				f"{bb_fallback} cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\"; "
+				f"else echo \"[injects] missing /src/{src_escaped}; skipping\"; fi"
 			)
 		else:
-			cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\"")
+			cmds.append(
+				f"if [ -e \"/src/{src_escaped}\" ]; then "
+				f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\"; "
+				f"else echo \"[injects] missing /src/{src_escaped}; skipping\"; fi"
+			)
 
 	if not cmds:
 		raise RuntimeError("[injects] no copy commands generated; refusing to skip inject service")
 
 	services[copy_service_name] = {
 		'image': copy_image,
+		'user': '0:0',
 		'volumes': copy_vols,
 		# If the image is a coretg wrapper, run via its BusyBox so we don't depend
 		# on `/bin/sh` existing in the base image.
@@ -2835,6 +2842,7 @@ def _inject_iproute2_into_build_only_service(svc: Dict[str, object], *, logger: 
 		if 'iproute2' in low or '\nrun ip ' in low or ' command -v ip ' in low:
 			# Still ensure NET_ADMIN for DefaultRoute.
 			svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+			svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_RAW')
 			return False
 
 		# Keep this best-effort by default; allow strict mode to fail builds when desired.
@@ -2883,6 +2891,7 @@ def _inject_iproute2_into_build_only_service(svc: Dict[str, object], *, logger: 
 
 		# Ensure NET_ADMIN for DefaultRoute.
 		svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+		svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_RAW')
 		try:
 			logger.info('[vuln] injected iproute2 install into build-only Dockerfile node=%s service=%s dockerfile=%s', node_name, svc_key, dockerfile_path)
 		except Exception:
@@ -3833,6 +3842,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							pass
 						try:
 							svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+							svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_RAW')
 						except Exception:
 							pass
 						try:
@@ -3898,6 +3908,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						svc['pull_policy'] = 'never'
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
 						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_RAW')
 						# IMPORTANT: Many upstream vuln stacks pin a non-root `user:` (e.g., airflow
 						# `50000:50000`). CORE's DefaultRoute service writes and chmods scripts inside
 						# the container using `docker exec <node> chmod ...`. When the container runs

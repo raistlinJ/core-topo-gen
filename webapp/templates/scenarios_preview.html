@@ -210,6 +210,22 @@
       if (inXml) inXml.value = xmlPath;
       if (inSc) inSc.value = scenario;
 
+      if (!xmlPath && scenario) {
+        try {
+          const latestResp = await fetch('/api/scenario/latest_xml?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+          const latestData = await latestResp.json();
+          if (latestResp.ok && latestData && latestData.ok && latestData.xml_path) {
+            xmlPath = String(latestData.xml_path || '').trim();
+            if (inXml) inXml.value = xmlPath;
+            try {
+              if (typeof window.coretgSetLatestXmlPathForScenario === 'function') {
+                window.coretgSetLatestXmlPathForScenario(scenario, xmlPath);
+              }
+            } catch (e) { }
+          }
+        } catch (e) { }
+      }
+
       // Use a stable per-scenario seed unless the user explicitly changes it on the embedded page.
       try {
         if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {

@@ -14,7 +14,7 @@ class DummySession:
         self.calls.append((node_id, options, kwargs))
 
 
-def test_prepare_compose_for_assignments_records_compose_path(tmp_path):
+def test_prepare_compose_for_assignments_records_compose_path(tmp_path, monkeypatch):
     compose_src = tmp_path / "base-compose.yml"
     compose_src.write_text(
         """
@@ -31,6 +31,8 @@ services:
 
     record = {"Type": "docker-compose", "Name": "Example", "Path": str(compose_src)}
     name_to_vuln = {"host-1": record}
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
 
     created = prepare_compose_for_assignments(name_to_vuln, out_base=str(tmp_path))
 
@@ -53,12 +55,13 @@ services:
         assert "ports" not in svc
         # Preserve container-side port intent for reporting/metadata.
         assert "expose" in svc and "80" in [str(x) for x in (svc.get("expose") or [])]
-        # CORE services may chmod/create files using relative paths; ensure root workdir.
-        assert svc.get("working_dir") == "/"
+        # Root workdir forcing is opt-in; default behavior preserves image WORKDIR.
+        assert "working_dir" not in svc
         # Compose handed to CORE should NOT include `build:`; core-daemon would
         # attempt to build during scenario startup (and therefore pull packages/images).
         assert "build" not in svc
         assert "cap_add" in svc and "NET_ADMIN" in (svc["cap_add"] or [])
+        assert "NET_RAW" in (svc["cap_add"] or [])
         labels = svc.get("labels") or {}
         assert isinstance(labels, dict)
         assert labels.get("coretg.wrapper_build_dockerfile") == "Dockerfile"
@@ -410,5 +413,122 @@ def test_prepare_compose_flow_injects_default_to_flow_injects_dir(tmp_path, monk
     assert isinstance(target, dict)
     vols = target.get("volumes") or []
     assert any(str(v).endswith(":/flow_injects") for v in vols), vols
+
+
+def test_prepare_compose_inject_copy_runtime_guard_nonfatal_by_default(tmp_path, monkeypatch):
+    """Regression: inject_copy command should guard missing runtime sources by default."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: nginx:latest\n    command: ['sh','-lc','sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "present.txt").write_text("ok\n", encoding="utf-8")
+
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+    monkeypatch.delenv("CORETG_INJECT_COPY_STRICT", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+        "InjectFiles": ["present.txt"],
+        "InjectSourceDir": str(artifacts),
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    ikeys = [k for k in services.keys() if str(k).startswith("inject_copy")]
+    assert ikeys, "expected inject_copy service"
+    inject = services[ikeys[0]]
+    assert isinstance(inject, dict)
+    cmd = inject.get("command")
+    cmd_text = " ".join(cmd) if isinstance(cmd, list) else str(cmd or "")
+    assert "if [ -e" in cmd_text
+    assert "missing /src/" in cmd_text
+    assert "skipping" in cmd_text
+    assert "exit 1" not in cmd_text
+
+
+def test_prepare_compose_inject_copy_runs_as_root_for_volume_writes(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: vulhub/weblogic:12.2.1.3-2018\n",
+        encoding="utf-8",
+    )
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "challenge.bin").write_text("ok\n", encoding="utf-8")
+
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+        "InjectFiles": ["challenge.bin"],
+        "InjectSourceDir": str(artifacts),
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    ikeys = [k for k in services.keys() if str(k).startswith("inject_copy")]
+    assert ikeys, "expected inject_copy service"
+    inject = services[ikeys[0]]
+    assert isinstance(inject, dict)
+    assert str(inject.get("user") or "") == "0:0"
+
+
+def test_prepare_compose_does_not_force_root_workdir_by_default(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  web:\n    image: vulhub/nextjs:15.5.6\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1")
+    assert isinstance(target, dict)
+    assert "working_dir" not in target
 
 

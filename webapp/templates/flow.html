@@ -1155,25 +1155,102 @@
   }
 
   function getSavedFlowStateForScenario(scenarioName) {
+    const hasResolvedFields = (assignments) => {
+      if (!Array.isArray(assignments) || !assignments.length) return false;
+      return assignments.some((a) => {
+        if (!a || typeof a !== 'object') return false;
+        const hasInputs = a.resolved_inputs && typeof a.resolved_inputs === 'object' && !Array.isArray(a.resolved_inputs) && Object.keys(a.resolved_inputs).length > 0;
+        const hasOutputs = a.resolved_outputs && typeof a.resolved_outputs === 'object' && !Array.isArray(a.resolved_outputs) && Object.keys(a.resolved_outputs).length > 0;
+        return !!(hasInputs || hasOutputs);
+      });
+    };
+
+    const mergeAssignmentsPreferResolved = (serverAssignments, localAssignments) => {
+      const serverList = Array.isArray(serverAssignments) ? serverAssignments : [];
+      const localList = Array.isArray(localAssignments) ? localAssignments : [];
+      if (!localList.length) return serverList;
+      const out = serverList.length
+        ? serverList.map((a) => (a && typeof a === 'object') ? { ...a } : {})
+        : localList.map((a) => (a && typeof a === 'object') ? { ...a } : {});
+
+      const byNode = new Map();
+      localList.forEach((a, idx) => {
+        if (!a || typeof a !== 'object') return;
+        const nid = String(a.node_id || '').trim();
+        if (nid) byNode.set(nid, a);
+        byNode.set(`idx:${idx}`, a);
+      });
+
+      const maxLen = Math.max(out.length, localList.length);
+      for (let i = 0; i < maxLen; i++) {
+        const cur = (out[i] && typeof out[i] === 'object') ? out[i] : {};
+        const nid = String(cur.node_id || '').trim();
+        const src = byNode.get(nid) || byNode.get(`idx:${i}`);
+        if (!src || typeof src !== 'object') {
+          out[i] = cur;
+          continue;
+        }
+
+        const hasInputs = cur.resolved_inputs && typeof cur.resolved_inputs === 'object' && !Array.isArray(cur.resolved_inputs) && Object.keys(cur.resolved_inputs).length > 0;
+        const hasOutputs = cur.resolved_outputs && typeof cur.resolved_outputs === 'object' && !Array.isArray(cur.resolved_outputs) && Object.keys(cur.resolved_outputs).length > 0;
+        if (!hasInputs && src.resolved_inputs && typeof src.resolved_inputs === 'object' && !Array.isArray(src.resolved_inputs)) {
+          cur.resolved_inputs = src.resolved_inputs;
+        }
+        if (!hasOutputs && src.resolved_outputs && typeof src.resolved_outputs === 'object' && !Array.isArray(src.resolved_outputs)) {
+          cur.resolved_outputs = src.resolved_outputs;
+        }
+        if ((!Array.isArray(cur.inject_files) || !cur.inject_files.length) && Array.isArray(src.inject_files) && src.inject_files.length) {
+          cur.inject_files = src.inject_files;
+        }
+        if ((!Array.isArray(cur.inject_files_detail) || !cur.inject_files_detail.length) && Array.isArray(src.inject_files_detail) && src.inject_files_detail.length) {
+          cur.inject_files_detail = src.inject_files_detail;
+        }
+        out[i] = cur;
+      }
+      return out;
+    };
+
+    const isUsableState = (state) => {
+      if (!state || typeof state !== 'object') return false;
+      if (Array.isArray(state.chain_ids) && state.chain_ids.length) return true;
+      if (state.flow_enabled === false) return true;
+      return false;
+    };
+
     try {
       const fromServer = getFlowStateForScenario(scenarioName);
-      if (fromServer && Array.isArray(fromServer.chain_ids) && fromServer.chain_ids.length) {
-        return fromServer;
-      }
-      if (fromServer && fromServer.flow_enabled === false) {
-        return fromServer;
-      }
-    } catch (e) { }
-    try {
+      let fromLocal = null;
       if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
-        const saved = window.coretgGetSavedFlowStateForScenario(scenarioName);
-        if (saved && Array.isArray(saved.chain_ids) && saved.chain_ids.length) {
-          return saved;
-        }
-        if (saved && saved.flow_enabled === false) {
-          return saved;
-        }
+        fromLocal = window.coretgGetSavedFlowStateForScenario(scenarioName);
       }
+
+      const serverUsable = isUsableState(fromServer);
+      const localUsable = isUsableState(fromLocal);
+
+      if (serverUsable && localUsable) {
+        if (fromServer.flow_enabled === false) return fromServer;
+        const serverHasResolved = hasResolvedFields(fromServer.flag_assignments);
+        const localHasResolved = hasResolvedFields(fromLocal.flag_assignments);
+        if (!serverHasResolved && localHasResolved) {
+          const merged = {
+            ...fromServer,
+            flag_assignments: mergeAssignmentsPreferResolved(fromServer.flag_assignments, fromLocal.flag_assignments),
+          };
+          if (!merged.initial_facts && fromLocal.initial_facts) merged.initial_facts = fromLocal.initial_facts;
+          if (!merged.goal_facts && fromLocal.goal_facts) merged.goal_facts = fromLocal.goal_facts;
+          if ((!Array.isArray(merged.chain_ids) || !merged.chain_ids.length) && Array.isArray(fromLocal.chain_ids) && fromLocal.chain_ids.length) {
+            merged.chain_ids = fromLocal.chain_ids.slice();
+          }
+          if ((!Number.isFinite(+merged.length) || +merged.length <= 0) && Number.isFinite(+fromLocal.length)) {
+            merged.length = +fromLocal.length;
+          }
+          return merged;
+        }
+        return fromServer;
+      }
+
+      if (serverUsable) return fromServer;
+      if (localUsable) return fromLocal;
     } catch (e) { }
     return null;
   }
@@ -7663,13 +7740,50 @@
         }
         appendLoadingLog('CORE VM connection OK');
 
-        setStatus('Saving XML…', false);
-        showLoading('Saving XML…');
-        setLoadingSteps(progressSteps, 1);
-        appendLoadingLog(`Preset: ${preset || 'Random'} | Length: ${length}`);
-        const xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
-        if (!xmlPath) {
-          throw new Error('Save did not return xml_path');
+        let xmlPath = '';
+        const hasTopologyState = !!(
+          window.state &&
+          Array.isArray(window.state.scenarios) &&
+          window.state.scenarios.length &&
+          window.state.scenarios.some((sc) => sc && typeof sc === 'object' && sc.sections && typeof sc.sections === 'object' && Object.keys(sc.sections).length)
+        );
+
+        if (hasTopologyState) {
+          setStatus('Saving XML…', false);
+          showLoading('Saving XML…');
+          setLoadingSteps(progressSteps, 1);
+          appendLoadingLog(`Preset: ${preset || 'Random'} | Length: ${length}`);
+          xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+          if (!xmlPath) {
+            throw new Error('Save did not return xml_path');
+          }
+        } else {
+          setStatus('Using saved XML…', false);
+          showLoading('Using saved XML…');
+          setLoadingSteps(progressSteps, 1);
+          appendLoadingLog('No live Topology editor state on this tab; reusing latest saved XML');
+          try {
+            if (scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+              xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
+            }
+          } catch (e) { xmlPath = ''; }
+          if (!xmlPath && scenario) {
+            try {
+              const latestResp = await fetch('/api/scenario/latest_xml?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+              const latestData = await latestResp.json();
+              if (latestResp.ok && latestData && latestData.ok && latestData.xml_path) {
+                xmlPath = String(latestData.xml_path).trim();
+                try {
+                  if (typeof window.coretgSetLatestXmlPathForScenario === 'function') {
+                    window.coretgSetLatestXmlPathForScenario(scenario, xmlPath);
+                  }
+                } catch (e) { }
+              }
+            } catch (e) { }
+          }
+          if (!xmlPath) {
+            throw new Error('No saved XML found for this scenario. Save XML from Topology first.');
+          }
         }
         try {
           const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
@@ -8969,7 +9083,7 @@
     });
   }
 
-  // Auto-generate on load (per-scenario page). If there are no scenarios, disable.
+  // Initialize per-scenario page state. If there are no scenarios, disable.
   if (!activeScenario) {
     setStatus('No scenarios available yet.', true);
     if (btnEl) btnEl.disabled = true;
@@ -8994,12 +9108,8 @@
   clearPreviewPlanCacheForScenario(activeScenario);
   await refreshLatestPreviewPlanPathForScenario(activeScenario);
   const restored = await restoreSavedFlowForScenario(activeScenario);
-  if (!restored && flowEnabled && flowEligible) {
-    try {
-      await generate(false, { autoLoad: true, resolveOnGenerate: false });
-    } catch (e) {
-      setStatus('No saved flow chain. Click Generate to start.', false);
-    }
+  if (!restored) {
+    setStatus('No saved flow chain. Click Generate to start.', false);
   }
   // Scenarios header Preview tab: route to /scenarios/preview.
   document.addEventListener('DOMContentLoaded', () => {

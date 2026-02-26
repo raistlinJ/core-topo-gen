@@ -1160,20 +1160,50 @@ def _is_repo_push_cancel_requested(progress_id: Optional[str]) -> bool:
 def _open_ssh_client(core_cfg: Dict[str, Any]) -> Any:
     cfg = _require_core_ssh_credentials(core_cfg)
     _ensure_paramiko_available()
-    client = paramiko.SSHClient()  # type: ignore[assignment]
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
-    client.connect(
-        hostname=cfg.get('ssh_host') or cfg.get('host') or 'localhost',
-        port=int(cfg.get('ssh_port') or 22),
-        username=cfg.get('ssh_username'),
-        password=cfg.get('ssh_password') or '',
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=30.0,
-        banner_timeout=30.0,
-        auth_timeout=30.0,
-    )
-    return client
+    host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
+    port = int(cfg.get('ssh_port') or 22)
+    username = cfg.get('ssh_username')
+    password = cfg.get('ssh_password') or ''
+    last_exc: Exception | None = None
+    try:
+        max_attempts = int(os.getenv('CORETG_SSH_CONNECT_RETRIES', '2') or 2)
+    except Exception:
+        max_attempts = 2
+    max_attempts = max(1, max_attempts)
+    for attempt in range(1, max_attempts + 1):
+        client = paramiko.SSHClient()  # type: ignore[assignment]
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
+        try:
+            client.connect(
+                hostname=host,
+                port=port,
+                username=username,
+                password=password,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=30.0,
+                banner_timeout=30.0,
+                auth_timeout=30.0,
+            )
+            return client
+        except Exception as exc:
+            last_exc = exc
+            try:
+                client.close()
+            except Exception:
+                pass
+            if attempt >= max_attempts:
+                break
+            try:
+                time.sleep(min(2.0, 0.4 * attempt))
+            except Exception:
+                pass
+    if last_exc is not None:
+        raise RuntimeError(
+            f"SSH connect failed to {host}:{port} as {username}: "
+            f"{type(last_exc).__name__}: {str(last_exc) or repr(last_exc)}"
+        ) from last_exc
+    raise RuntimeError(f"SSH connect failed to {host}:{port} as {username}")
 
 
 def _remote_expand_path(sftp: Any, path: str | None) -> str:
@@ -9717,6 +9747,12 @@ def _parse_iso_datetime(raw: Any) -> Optional[datetime.datetime]:
     except Exception:
         pass
     try:
+        dt = datetime.datetime.strptime(text, '%m/%d/%Y/%H/%M/%S')
+        local_tz = datetime.datetime.now().astimezone().tzinfo
+        return dt.replace(tzinfo=local_tz)
+    except Exception:
+        pass
+    try:
         if text.endswith('Z'):
             text = text[:-1] + '+00:00'
         dt = datetime.datetime.fromisoformat(text)
@@ -9726,6 +9762,19 @@ def _parse_iso_datetime(raw: Any) -> Optional[datetime.datetime]:
         return dt
     except Exception:
         return None
+
+
+def _format_local_timestamp(raw: Any) -> str:
+    dt = _parse_iso_datetime(raw)
+    if isinstance(dt, datetime.datetime):
+        try:
+            return dt.astimezone().isoformat(timespec='seconds')
+        except Exception:
+            pass
+    try:
+        return str(raw or '').strip()
+    except Exception:
+        return ''
 
 
 def _select_builder_hitl_fallback(hints: dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -9959,7 +10008,26 @@ def _builder_filter_report_scenarios(
     return filtered, normalized_selection, allowed_norms
 
 # Diagnostic endpoint for environment/module troubleshooting
-@app.route('/diag/modules')
+try:
+    from webapp.routes import diagnostics_health as _diagnostics_health_routes
+
+    _diagnostics_health_routes.register(
+        app,
+        current_user_getter=_current_user,
+        is_admin_view_role=_is_admin_view_role,
+        normalize_role_value=_normalize_role_value,
+        ui_view_allowed=_UI_VIEW_ALLOWED,
+        ui_view_default=_UI_VIEW_DEFAULT,
+        admin_view_roles=_ADMIN_VIEW_ROLES,
+        ui_view_session_key=_UI_VIEW_SESSION_KEY,
+        urlparse_func=urlparse,
+        parse_qs_func=parse_qs,
+        resolve_ui_view_redirect_target=_resolve_ui_view_redirect_target,
+    )
+except Exception:
+    pass
+
+
 def diag_modules():
     out = {}
     # core_topo_gen package file
@@ -10089,7 +10157,6 @@ def _inject_ui_view_state() -> dict:
     return {'ui_view_mode': getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)}
 
 
-@app.route('/ui-view', methods=['POST'])
 def set_ui_view_mode():
     user = _current_user()
     if not user or not _is_admin_view_role(user.get('role')):
@@ -10210,7 +10277,13 @@ def _parse_iso_ts(ts: Any) -> float:
     try:
         return datetime.datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
     except Exception:
-        return 0.0
+        pass
+    for fmt in ('%m/%d/%y/%H/%M/%S', '%m/%d/%Y/%H/%M/%S'):
+        try:
+            return datetime.datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            continue
+    return 0.0
 
 
 def _latest_run_history_for_scenario(scenario_norm: str, history: Optional[list[dict]] = None) -> Optional[dict]:
@@ -10912,7 +10985,8 @@ def participant_ui_details_api():
     # Execute history
     history = _load_run_history()
     last_run = _latest_run_history_for_scenario(scenario_norm, history)
-    last_execute_ts = (last_run or {}).get('timestamp') if isinstance(last_run, dict) else ''
+    last_execute_raw = (last_run or {}).get('timestamp') if isinstance(last_run, dict) else ''
+    last_execute_ts = _format_local_timestamp(last_execute_raw)
     returncode = (last_run or {}).get('returncode') if isinstance(last_run, dict) else None
     try:
         returncode_int = int(returncode) if returncode is not None else None
@@ -10945,6 +11019,8 @@ def participant_ui_details_api():
     session_xml_path = None
     if isinstance(last_run, dict):
         session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+    if (not session_xml_path) and scenario_norm:
+        session_xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
     session_xml_exists = bool(session_xml_path and os.path.exists(str(session_xml_path)))
     subnetworks = _subnet_cidrs_from_session_xml(session_xml_path) if session_xml_exists else []
 
@@ -11050,7 +11126,7 @@ def participant_ui_details_api():
         'gateway': gateway or '',
         'open_stats': {
             'open_count': int(scenario_stats.get('open_count') or 0),
-            'last_open_ts': str(scenario_stats.get('last_open_ts') or ''),
+            'last_open_ts': _format_local_timestamp(scenario_stats.get('last_open_ts')),
         },
         'execute': {
             'last_execute_ts': str(last_execute_ts or ''),
@@ -11432,11 +11508,11 @@ def participant_ui_stats_api():
         'scenario_norm': scenario_norm,
         'scenario': {
             'open_count': int(scenario_stats.get('open_count') or 0),
-            'last_open_ts': scenario_stats.get('last_open_ts') or '',
+            'last_open_ts': _format_local_timestamp(scenario_stats.get('last_open_ts')),
         },
         'totals': {
             'open_count': int(totals.get('open_count') or 0),
-            'last_open_ts': totals.get('last_open_ts') or '',
+            'last_open_ts': _format_local_timestamp(totals.get('last_open_ts')),
         },
     })
 
@@ -11534,15 +11610,15 @@ ATTACK_FLOW_SCHEMA_VERSION = "2.0.0"
 
 def _iso_now() -> str:
     try:
-        return datetime.datetime.now().strftime('%m/%d/%y/%H/%M/%S')
+        return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
     except Exception:
-        return "01/01/70/00/00/00"
+        return "1970-01-01T00:00:00+00:00"
     
 def _local_timestamp_display() -> str:
     try:
-        return datetime.datetime.now().strftime('%m/%d/%y/%H/%M/%S')
+        return datetime.datetime.now().astimezone().isoformat(timespec='seconds')
     except Exception:
-        return "01/01/70/00/00/00"
+        return "1970-01-01T00:00:00+00:00"
 
 def _local_timestamp_safe() -> str:
     try:
@@ -11576,6 +11652,34 @@ def _latest_session_xml_for_scenario_norm(scenario_norm: str) -> str | None:
             if ap and os.path.exists(ap):
                 return ap
 
+        # Additional best-effort history fields sometimes hold the latest post/session XML.
+        extra_candidates: list[str] = []
+        for key in ('post_xml_path', 'scenario_xml_path', 'single_scenario_xml_path', 'xml_path', 'full_scenario_path'):
+            raw = last_run.get(key)
+            txt = str(raw).strip() if raw is not None else ''
+            if txt:
+                extra_candidates.append(txt)
+
+        scored: list[tuple[int, str]] = []
+        for c in extra_candidates:
+            try:
+                ap = os.path.abspath(c)
+            except Exception:
+                ap = c
+            if not ap or not os.path.exists(ap):
+                continue
+            score = 0
+            low = str(ap).lower()
+            if '/core-post/' in low or f'{os.sep}core-post{os.sep}' in low:
+                score += 10
+            base = os.path.basename(low)
+            if base.startswith('session-') or 'session' in base:
+                score += 5
+            scored.append((score, ap))
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return scored[0][1]
+
     # Fallback: run history can become stale if artifacts under outputs/ are purged.
     # Best-effort: pick the newest matching session XML under outputs/core-sessions/.
     try:
@@ -11600,6 +11704,59 @@ def _latest_session_xml_for_scenario_norm(scenario_norm: str) -> str | None:
                     best_path = p
             if best_path and os.path.exists(best_path):
                 return os.path.abspath(best_path)
+    except Exception:
+        pass
+
+    # Secondary fallback: pick newest matching XML under outputs/scenarios-*/**.
+    # This captures execute artifacts like .../scenarios-*/core-post/*.xml.
+    try:
+        out_dir = _outputs_dir()
+        if scenario_norm and out_dir and os.path.isdir(out_dir):
+            best_path: str | None = None
+            best_score: tuple[float, int] = (-1.0, -1)
+            for dirname in os.listdir(out_dir):
+                if not str(dirname).startswith('scenarios-'):
+                    continue
+                base = os.path.join(out_dir, dirname)
+                if not os.path.isdir(base):
+                    continue
+                for dp, _dn, files in os.walk(base):
+                    for fn in files:
+                        if not str(fn).lower().endswith('.xml'):
+                            continue
+                        cand = os.path.join(dp, fn)
+                        try:
+                            names = _scenario_names_from_xml(cand)
+                        except Exception:
+                            names = []
+                        if not any(_normalize_scenario_label(nm) == scenario_norm for nm in (names or [])):
+                            continue
+                        try:
+                            mtime = float(os.path.getmtime(cand))
+                        except Exception:
+                            mtime = 0.0
+                        pref = 0
+                        low = cand.lower()
+                        if '/core-post/' in low or f'{os.sep}core-post{os.sep}' in low:
+                            pref += 10
+                        if '/core-sessions/' in low or f'{os.sep}core-sessions{os.sep}' in low:
+                            pref += 7
+                        if os.path.basename(low).startswith('session-'):
+                            pref += 3
+                        score = (mtime, pref)
+                        if score > best_score:
+                            best_score = score
+                            best_path = cand
+            if best_path and os.path.exists(best_path):
+                return os.path.abspath(best_path)
+    except Exception:
+        pass
+
+    # Last fallback: latest scenario XML known for the scenario.
+    try:
+        latest_xml = _latest_xml_path_for_scenario(scenario_norm)
+        if latest_xml and os.path.exists(latest_xml):
+            return os.path.abspath(latest_xml)
     except Exception:
         pass
 
@@ -12082,10 +12239,8 @@ def _pick_flag_chain_nodes_for_preset(
         if not nid:
             continue
         id_to_node[nid] = n
-        t_raw = str(n.get('type') or '')
-        t = t_raw.strip().lower()
-        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
+        is_docker = _flow_node_is_docker_role(n)
+        is_vuln = _flow_node_is_vuln(n)
         if is_vuln:
             vuln_ids.add(nid)
             eligible_ids.append(nid)
@@ -13459,7 +13614,29 @@ def _require_admin() -> bool:
     return False
 
 
-@app.route('/login', methods=['GET', 'POST'])
+try:
+    from webapp.routes import auth_users as _auth_users_routes
+
+    _auth_users_routes.register(
+        app,
+        load_users=_load_users,
+        save_users=_save_users,
+        require_admin=_require_admin,
+        current_user_getter=_current_user,
+        set_current_user=_set_current_user,
+        normalize_role_value=_normalize_role_value,
+        allowed_user_roles=lambda: set(_ALLOWED_USER_ROLES),
+        normalize_scenario_label=_normalize_scenario_label,
+        normalize_scenario_assignments=_normalize_scenario_assignments,
+        scenario_catalog_for_user=_scenario_catalog_for_user,
+        default_ui_view_mode_for_role=_default_ui_view_mode_for_role,
+        is_participant_role=_is_participant_role,
+        ui_view_session_key=_UI_VIEW_SESSION_KEY,
+    )
+except Exception:
+    pass
+
+
 def login():
     if request.method == 'GET':
         return render_template('login.html')
@@ -13486,7 +13663,6 @@ def login():
     return render_template('login.html', error=True), 401
 
 
-@app.route('/logout', methods=['POST', 'GET'])
 def logout():
     _set_current_user(None)
     return redirect(url_for('login'))
@@ -13494,9 +13670,8 @@ def logout():
 
 @app.route('/scenarios/flag-sequencing')
 def flow_page():
-    history = _load_run_history()
     current_user = _current_user()
-    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=current_user)
     scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
     participant_url_flags = {
         norm: bool(url)
@@ -13573,9 +13748,8 @@ def scenarios_preview_page():
     This page renders a lightweight shell and loads the existing full preview page
     into an iframe while showing a loading modal.
     """
-    history = _load_run_history()
     current_user = _current_user()
-    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=current_user)
 
     scenario_query = (request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
@@ -16404,12 +16578,19 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
                         item2 = dict(item)
                         resolved = str(item2.get('resolved') or '').strip()
                         if resolved and not os.path.isabs(resolved):
+                            rel_resolved = resolved.lstrip('/').replace('\\', '/')
+                            try:
+                                if os.path.basename(os.path.normpath(art_dir)) == 'artifacts':
+                                    while rel_resolved.startswith('artifacts/'):
+                                        rel_resolved = rel_resolved[len('artifacts/'):]
+                            except Exception:
+                                pass
                             # Resolve relative path to absolute using artifacts_dir
                             # 1. Try literal join
-                            full_path = os.path.join(art_dir, resolved.lstrip('/'))
+                            full_path = os.path.join(art_dir, rel_resolved)
                             # 2. Try outputs/ subdirectory
                             if not os.path.exists(full_path):
-                                cand = os.path.join(art_dir, 'outputs', resolved.lstrip('/'))
+                                cand = os.path.join(art_dir, 'outputs', rel_resolved)
                                 if os.path.exists(cand):
                                     full_path = cand
                             # 3. Try without 'artifacts/' prefix if it exists
@@ -16432,13 +16613,20 @@ def _enrich_flow_state_with_artifacts(flow_state: dict[str, Any]) -> dict[str, A
                     fixed_ro = {}
                     for k, v in ro.items():
                         if isinstance(v, str) and v.strip() and not os.path.isabs(v):
+                            rel_v = v.lstrip('/').replace('\\', '/')
+                            try:
+                                if os.path.basename(os.path.normpath(art_dir)) == 'artifacts':
+                                    while rel_v.startswith('artifacts/'):
+                                        rel_v = rel_v[len('artifacts/'):]
+                            except Exception:
+                                pass
                             # Check if this looks like a file path (contains slash or file extension)
                             if '/' in v or ('.' in v and not v.startswith('{')):
                                 # Try to find the file in art_dir or art_dir/outputs
                                 flat_v = os.path.basename(v)
-                                full_path = os.path.join(art_dir, v.lstrip('/'))
+                                full_path = os.path.join(art_dir, rel_v)
                                 if not os.path.exists(full_path):
-                                    cand = os.path.join(art_dir, 'outputs', v.lstrip('/'))
+                                    cand = os.path.join(art_dir, 'outputs', rel_v)
                                     if os.path.exists(cand):
                                         full_path = cand
                                 if not os.path.exists(full_path):
@@ -21257,22 +21445,35 @@ def api_flow_prepare_preview_for_execute():
                         })
 
                 def _normalize_inject_src_for_copy(raw_src: str, source_dir: str) -> str:
+                    def _normalize_rel_artifacts(rel_src: str, base_dir: str) -> str:
+                        out = str(rel_src or '').replace('\\', '/').strip()
+                        if out.startswith('./'):
+                            out = out[2:]
+                        out = out.lstrip('/')
+                        try:
+                            if base_dir and os.path.basename(os.path.normpath(base_dir)) == 'artifacts':
+                                while out.startswith('artifacts/'):
+                                    out = out[len('artifacts/'):]
+                        except Exception:
+                            pass
+                        return out
+
                     src = str(raw_src or '').strip()
                     if not src:
                         return ''
                     if not os.path.isabs(src):
-                        return src
+                        return _normalize_rel_artifacts(src, source_dir)
                     try:
                         if source_dir:
                             src_abs = os.path.abspath(src)
                             base_abs = os.path.abspath(source_dir)
                             if os.path.commonpath([src_abs, base_abs]) == base_abs:
-                                return os.path.relpath(src_abs, base_abs)
+                                return _normalize_rel_artifacts(os.path.relpath(src_abs, base_abs), source_dir)
                     except Exception:
                         pass
                     for marker in ('/artifacts/', '/flow_artifacts/'):
                         if marker in src:
-                            return src.split(marker, 1)[1].lstrip('/')
+                            return _normalize_rel_artifacts(src.split(marker, 1)[1], source_dir)
                     return ''
 
                 def _normalize_inject_spec_for_copy(raw: str, source_dir: str) -> str:
@@ -21462,7 +21663,7 @@ def api_flow_prepare_preview_for_execute():
                     return ''
 
                 if flow_run_remote:
-                    inject_source_dir = str(posixpath.join(str(flow_out_dir or ''), 'artifacts')) if flow_out_dir else ''
+                    inject_source_dir = str(flow_out_dir or '')
                 else:
                     inject_source_dir = str(
                         os.path.join(flow_out_dir, 'injected')
@@ -23807,7 +24008,6 @@ def api_flow_attackflow():
     }), 410
 
 
-@app.route('/users', methods=['GET'])
 def users_page():
     if not _require_admin():
         return redirect(url_for('index'))
@@ -23854,7 +24054,6 @@ def users_page():
     )
 
 
-@app.route('/users', methods=['POST'])
 def users_create():
     if not _require_admin():
         return redirect(url_for('index'))
@@ -23882,7 +24081,6 @@ def users_create():
     return redirect(url_for('users_page'))
 
 
-@app.route('/users/delete/<username>', methods=['POST'])
 def users_delete(username: str):
     if not _require_admin():
         return redirect(url_for('users_page'))
@@ -23906,7 +24104,6 @@ def users_delete(username: str):
     return redirect(url_for('users_page'))
 
 
-@app.route('/users/password/<username>', methods=['POST'])
 def users_password(username: str):
     if not _require_admin():
         return redirect(url_for('users_page'))
@@ -23929,7 +24126,6 @@ def users_password(username: str):
     return redirect(url_for('users_page'))
 
 
-@app.route('/users/role/<username>', methods=['POST'])
 def users_update_role(username: str):
     if not _require_admin():
         return redirect(url_for('users_page'))
@@ -23963,7 +24159,6 @@ def users_update_role(username: str):
     return redirect(url_for('users_page'))
 
 
-@app.route('/users/scenarios/<username>', methods=['POST'])
 def users_assign_scenarios(username: str):
     if not _require_admin():
         return redirect(url_for('users_page'))
@@ -23988,7 +24183,6 @@ def users_assign_scenarios(username: str):
     return redirect(url_for('users_page'))
 
 
-@app.route('/me/password', methods=['GET', 'POST'])
 def me_password():
     if _current_user() is None:
         return redirect(url_for('login'))
@@ -24018,12 +24212,10 @@ def me_password():
     return redirect(url_for('index'))
 
 
-@app.route('/healthz')
 def healthz():
     return Response('ok', mimetype='text/plain')
 
 
-@app.route('/favicon.ico')
 def favicon():
     # The UI uses an inline data-URL favicon in the base template, but some browsers
     # still request /favicon.ico. Return a no-content response to avoid noisy 404s.
@@ -26685,6 +26877,48 @@ def _resolve_ui_view_redirect_target(candidate: Optional[str]) -> str:
     return fallback
 
 
+try:
+    from webapp.routes import diagnostics_health as _diagnostics_health_routes_late
+
+    _diagnostics_health_routes_late.register(
+        app,
+        current_user_getter=_current_user,
+        is_admin_view_role=_is_admin_view_role,
+        normalize_role_value=_normalize_role_value,
+        ui_view_allowed=_UI_VIEW_ALLOWED,
+        ui_view_default=_UI_VIEW_DEFAULT,
+        admin_view_roles=_ADMIN_VIEW_ROLES,
+        ui_view_session_key=_UI_VIEW_SESSION_KEY,
+        urlparse_func=urlparse,
+        parse_qs_func=parse_qs,
+        resolve_ui_view_redirect_target=_resolve_ui_view_redirect_target,
+    )
+except Exception:
+    pass
+
+try:
+    from webapp.routes import auth_users as _auth_users_routes_late
+
+    _auth_users_routes_late.register(
+        app,
+        load_users=_load_users,
+        save_users=_save_users,
+        require_admin=_require_admin,
+        current_user_getter=_current_user,
+        set_current_user=_set_current_user,
+        normalize_role_value=_normalize_role_value,
+        allowed_user_roles=lambda: set(_ALLOWED_USER_ROLES),
+        normalize_scenario_label=_normalize_scenario_label,
+        normalize_scenario_assignments=_normalize_scenario_assignments,
+        scenario_catalog_for_user=_scenario_catalog_for_user,
+        default_ui_view_mode_for_role=_default_ui_view_mode_for_role,
+        is_participant_role=_is_participant_role,
+        ui_view_session_key=_UI_VIEW_SESSION_KEY,
+    )
+except Exception:
+    pass
+
+
 def _select_single_scenario_path(candidates, scenario_norm: str) -> Optional[str]:
     """Prefer a path that contains exactly one matching scenario."""
     if not candidates:
@@ -27152,28 +27386,54 @@ def _ensure_core_vm_metadata(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
 def _apply_core_secret_to_config(core_cfg: Dict[str, Any], scenario_norm: str) -> Dict[str, Any]:
     if not isinstance(core_cfg, dict):
         return core_cfg
+    secret_record = None
     try:
-        secret_record = _select_latest_core_secret_record(scenario_norm or None)
+        configured_secret_id = str(core_cfg.get('core_secret_id') or '').strip()
     except Exception:
-        secret_record = None
+        configured_secret_id = ''
+    if configured_secret_id:
+        try:
+            secret_record = _load_core_credentials(configured_secret_id)
+        except Exception:
+            secret_record = None
+    if not secret_record:
+        try:
+            secret_record = _select_latest_core_secret_record(scenario_norm or None)
+        except Exception:
+            secret_record = None
     if not secret_record:
         return core_cfg
     enriched = dict(core_cfg)
+    prefer_secret_values = bool(configured_secret_id)
     secret_password = secret_record.get('ssh_password_plain') or secret_record.get('password_plain') or ''
-    if secret_password and not enriched.get('ssh_password'):
+    if secret_password and (prefer_secret_values or not enriched.get('ssh_password')):
         enriched['ssh_password'] = secret_password
-    if enriched.get('ssh_username') in (None, ''):
-        value = secret_record.get('ssh_username')
-        if value not in (None, ''):
-            enriched['ssh_username'] = value
-    if enriched.get('ssh_host') in (None, ''):
-        value = secret_record.get('ssh_host') or secret_record.get('host') or secret_record.get('grpc_host')
-        if value not in (None, ''):
-            enriched['ssh_host'] = value
+    def _is_loopback_host(value: Any) -> bool:
+        try:
+            s = str(value or '').strip().lower()
+        except Exception:
+            return False
+        return s in {'localhost', '127.0.0.1', '::1'}
+
+    value = secret_record.get('ssh_username')
+    if value not in (None, '') and (prefer_secret_values or enriched.get('ssh_username') in (None, '')):
+        enriched['ssh_username'] = value
+    secret_ssh_host = secret_record.get('ssh_host') or secret_record.get('host') or secret_record.get('grpc_host')
+    if enriched.get('ssh_host') in (None, '') or _is_loopback_host(enriched.get('ssh_host')):
+        if secret_ssh_host not in (None, ''):
+            enriched['ssh_host'] = secret_ssh_host
     if enriched.get('ssh_port') in (None, '', 0):
         value = secret_record.get('ssh_port')
         if value not in (None, ''):
             enriched['ssh_port'] = value
+    secret_host = secret_record.get('host') or secret_record.get('grpc_host')
+    if enriched.get('host') in (None, '') or _is_loopback_host(enriched.get('host')):
+        if secret_host not in (None, ''):
+            enriched['host'] = secret_host
+    if enriched.get('port') in (None, '', 0):
+        value = secret_record.get('port') or secret_record.get('grpc_port')
+        if value not in (None, ''):
+            enriched['port'] = value
     if enriched.get('venv_bin') in (None, ''):
         value = secret_record.get('venv_bin')
         if value not in (None, ''):
@@ -28774,6 +29034,24 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
         payload.pop('builder_no_assignments', None)
         payload.pop('builder_assigned_scenarios', None)
         payload.pop('builder_no_assignments', None)
+
+    # Keep Scenarios-page lists consistent across tabs: if active XML hydration
+    # produced only a subset of scenarios, append catalog-backed stubs for any
+    # missing scenario names so VM/Access + Topology show the same list as
+    # Flag Sequencing + Preview.
+    try:
+        if allowed_norms is None:
+            catalog_names = payload.get('scenario_catalog_names') if isinstance(payload.get('scenario_catalog_names'), list) else []
+            existing_norms = _collect_scenario_norms(normalized_scenarios)
+            for display_name in catalog_names:
+                norm = _normalize_scenario_label(display_name)
+                if not norm or norm in existing_norms:
+                    continue
+                normalized_scenarios.append(_default_scenario_payload(display_name))
+                existing_norms.add(norm)
+    except Exception:
+        pass
+
     payload['scenarios'] = normalized_scenarios
 
     # --- Base upload metadata ---
@@ -28869,6 +29147,27 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     if scenario_hint:
         payload['scenario_query'] = scenario_hint
 
+    return payload
+
+
+def _merge_catalog_scenario_stubs_into_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ensure payload.scenarios contains catalog-named scenario stubs for missing entries."""
+    if not isinstance(payload, dict):
+        return payload if isinstance(payload, dict) else {}
+
+    try:
+        scenarios = payload.get('scenarios') if isinstance(payload.get('scenarios'), list) else []
+        catalog_names = payload.get('scenario_catalog_names') if isinstance(payload.get('scenario_catalog_names'), list) else []
+        existing_norms = _collect_scenario_norms(scenarios)
+        for display_name in catalog_names:
+            norm = _normalize_scenario_label(display_name)
+            if not norm or norm in existing_norms:
+                continue
+            scenarios.append(_default_scenario_payload(display_name))
+            existing_norms.add(norm)
+        payload['scenarios'] = scenarios
+    except Exception:
+        pass
     return payload
 
 
@@ -30942,7 +31241,26 @@ if __name__ == '__main__':
     ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
-@app.route('/docker/status', methods=['GET'])
+try:
+    from webapp.routes import docker_routes as _docker_routes
+
+    _docker_routes.register(
+        app,
+        load_run_history=_load_run_history,
+        current_user_getter=_current_user,
+        scenario_catalog_for_user=_scenario_catalog_for_user,
+        normalize_scenario_label=_normalize_scenario_label,
+        select_core_config_for_page=_select_core_config_for_page,
+        ensure_core_vm_metadata=_ensure_core_vm_metadata,
+        run_remote_python_json=_run_remote_python_json,
+        remote_docker_status_script_builder=_remote_docker_status_script,
+        remote_docker_cleanup_script_builder=_remote_docker_cleanup_script,
+        logger=app.logger,
+    )
+except Exception:
+    pass
+
+
 def docker_status():
     # Use the scenario-selected CORE VM (remote) to populate docker status.
     history = _load_run_history()
@@ -30971,7 +31289,6 @@ def docker_status():
         return jsonify({'items': [], 'timestamp': int(time.time()), 'error': str(exc)}), 200
 
 
-@app.route('/docker/compose_text', methods=['GET'])
 def docker_compose_text():
     """Return a snippet of the remote docker-compose file for a named node.
 
@@ -31111,7 +31428,6 @@ def docker_compose_text():
         return jsonify({'ok': False, 'error': str(exc)}), 200
 
 
-@app.route('/docker/cleanup', methods=['POST'])
 def docker_cleanup():
     names: list[str] = []
     try:
@@ -31898,6 +32214,24 @@ def _parse_scenarios_xml(path):
                 scen['base_nodes'] = int(base_nodes_attr)
             except Exception:
                 scen['base_nodes'] = base_nodes_attr
+        try:
+            min_en_attr = str(scen_el.get('density_count_min_enabled') or '').strip().lower()
+            if min_en_attr in ('1', 'true', 'yes', 'on'):
+                scen['density_count_min_enabled'] = True
+                min_attr = scen_el.get('density_count_min')
+                if min_attr not in (None, ''):
+                    scen['density_count_min'] = int(min_attr)
+        except Exception:
+            pass
+        try:
+            max_en_attr = str(scen_el.get('density_count_max_enabled') or '').strip().lower()
+            if max_en_attr in ('1', 'true', 'yes', 'on'):
+                scen['density_count_max_enabled'] = True
+                max_attr = scen_el.get('density_count_max')
+                if max_attr not in (None, ''):
+                    scen['density_count_max'] = int(max_attr)
+        except Exception:
+            pass
         se = scen_el.find("ScenarioEditor")
         if se is None:
             continue
@@ -32024,15 +32358,61 @@ def _latest_xml_path_for_scenario(scenario_norm: str) -> str | None:
             return None
         current_user = _current_user()
         scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(None, user=current_user)
-        if not scenario_names or not isinstance(scenario_paths, dict):
-            return None
-        path_candidates = scenario_paths.get(scen_norm) or scenario_paths.get(_resolve_scenario_display(scen_norm, scenario_names, scen_norm)) or None
+        path_candidates = None
+        if scenario_names and isinstance(scenario_paths, dict):
+            path_candidates = scenario_paths.get(scen_norm) or scenario_paths.get(_resolve_scenario_display(scen_norm, scenario_names, scen_norm)) or None
         filtered = None
         if isinstance(path_candidates, (list, tuple, set)):
             filtered = [p for p in path_candidates if not _is_autosave_xml_path(str(p or ''))]
         preferred = _select_single_scenario_path(filtered or path_candidates, scen_norm)
         # Only return a single-scenario XML. Avoid aggregate files.
-        return preferred
+        if preferred:
+            return preferred
+
+        # Fallback: scan outputs/scenarios-* for per-scenario XML files and pick newest
+        # match by scenario label + mtime. This covers cases where catalog/history mapping
+        # is stale or missing for scenario-only API calls.
+        try:
+            out_dir = _outputs_dir()
+            if not out_dir or not os.path.isdir(out_dir):
+                return None
+            best_path = None
+            best_mtime = -1.0
+            for dirname in os.listdir(out_dir):
+                if not str(dirname).startswith('scenarios-'):
+                    continue
+                base = os.path.join(out_dir, dirname)
+                if not os.path.isdir(base):
+                    continue
+                try:
+                    names = os.listdir(base)
+                except Exception:
+                    continue
+                for fn in names:
+                    if not str(fn).lower().endswith('.xml'):
+                        continue
+                    cand = os.path.join(base, fn)
+                    if _is_autosave_xml_path(cand):
+                        continue
+                    scen_names = _scenario_names_from_xml(cand)
+                    matched = False
+                    if isinstance(scen_names, list) and scen_names:
+                        for nm in scen_names:
+                            if _normalize_scenario_label(nm) == scen_norm:
+                                matched = True
+                                break
+                    if not matched:
+                        continue
+                    try:
+                        mtime = float(os.path.getmtime(cand))
+                    except Exception:
+                        mtime = 0.0
+                    if mtime >= best_mtime:
+                        best_mtime = mtime
+                        best_path = cand
+            return best_path
+        except Exception:
+            return None
     except Exception:
         return None
 
@@ -32421,6 +32801,24 @@ def _parse_scenario_editor(se):
         if not name:
             continue
         entry = {"density": None, "total_nodes": None, "items": []}
+        try:
+            min_en_attr = str(sec.get('node_count_min_enabled') or '').strip().lower()
+            if min_en_attr in ('1', 'true', 'yes', 'on'):
+                entry['node_count_min_enabled'] = True
+                min_attr = sec.get('node_count_min')
+                if min_attr not in (None, ''):
+                    entry['node_count_min'] = int(min_attr)
+        except Exception:
+            pass
+        try:
+            max_en_attr = str(sec.get('node_count_max_enabled') or '').strip().lower()
+            if max_en_attr in ('1', 'true', 'yes', 'on'):
+                entry['node_count_max_enabled'] = True
+                max_attr = sec.get('node_count_max')
+                if max_attr not in (None, ''):
+                    entry['node_count_max'] = int(max_attr)
+        except Exception:
+            pass
         if name == "Node Information":
             tn = sec.get("total_nodes")
             if tn is not None:
@@ -32568,6 +32966,22 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
         try:
             if 'density_count' in scen and scen.get('density_count') is not None:
                 scen_el.set('density_count', str(int(scen.get('density_count'))))
+        except Exception:
+            pass
+        try:
+            if bool(scen.get('density_count_min_enabled')):
+                scen_el.set('density_count_min_enabled', 'true')
+                v = scen.get('density_count_min')
+                if v is not None and str(v).strip() != '':
+                    scen_el.set('density_count_min', str(int(v)))
+        except Exception:
+            pass
+        try:
+            if bool(scen.get('density_count_max_enabled')):
+                scen_el.set('density_count_max_enabled', 'true')
+                v = scen.get('density_count_max')
+                if v is not None and str(v).strip() != '':
+                    scen_el.set('density_count_max', str(int(v)))
         except Exception:
             pass
         se = ET.SubElement(scen_el, "ScenarioEditor")
@@ -32805,6 +33219,23 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     sec_el.set("weight_rows", str(len(weight_rows)))
                     sec_el.set("count_rows", str(len(count_rows)))
                     sec_el.set("weight_sum", f"{weight_sum:.3f}")
+
+            try:
+                if bool(sec.get('node_count_min_enabled')):
+                    sec_el.set('node_count_min_enabled', 'true')
+                    min_val = sec.get('node_count_min')
+                    if min_val is not None and str(min_val).strip() != '':
+                        sec_el.set('node_count_min', str(int(min_val)))
+            except Exception:
+                pass
+            try:
+                if bool(sec.get('node_count_max_enabled')):
+                    sec_el.set('node_count_max_enabled', 'true')
+                    max_val = sec.get('node_count_max')
+                    if max_val is not None and str(max_val).strip() != '':
+                        sec_el.set('node_count_max', str(int(max_val)))
+            except Exception:
+                pass
 
             for item in items_list:
                 it = ET.SubElement(sec_el, "item")
@@ -33685,6 +34116,10 @@ def index():
     except Exception:
         pass
 
+    # Keep VM/Access + Topology scenario list in sync with Scenarios tabs/catalog
+    # even when active XML hydration currently contains only one scenario.
+    payload = _merge_catalog_scenario_stubs_into_payload(payload)
+
     # Populate XML preview on initial load so the dock isn't blank after refresh.
     xml_text = ""
     try:
@@ -33728,7 +34163,36 @@ def index():
     return render_template('index.html', payload=payload, logs="", xml_preview=xml_text, ui_build_id=_WEBUI_BUILD_ID)
 
 
-@app.route('/load_xml', methods=['POST'])
+try:
+    from webapp.routes import xml_editor_io as _xml_editor_io_routes
+
+    _xml_editor_io_routes.register(
+        app,
+        current_user_getter=_current_user,
+        allowed_file_func=allowed_file,
+        parse_scenarios_xml=_parse_scenarios_xml,
+        default_core_dict=_default_core_dict,
+        attach_base_upload=_attach_base_upload,
+        hydrate_base_upload_from_disk=_hydrate_base_upload_from_disk,
+        enumerate_host_interfaces=_enumerate_host_interfaces,
+        save_base_upload_state=_save_base_upload_state,
+        prepare_payload_for_index=_prepare_payload_for_index,
+        persist_editor_state_snapshot=_persist_editor_state_snapshot,
+        load_editor_state_snapshot=_load_editor_state_snapshot,
+        normalize_core_config=_normalize_core_config,
+        normalize_scenario_names_strict=_normalize_scenario_names_strict,
+        local_timestamp_safe=_local_timestamp_safe,
+        outputs_dir=_outputs_dir,
+        sanitize_scenario_name_strict=_sanitize_scenario_name_strict,
+        build_scenarios_xml=_build_scenarios_xml,
+        persist_scenario_catalog=_persist_scenario_catalog,
+        ui_build_id=_WEBUI_BUILD_ID,
+        logger=app.logger,
+    )
+except Exception:
+    pass
+
+
 def load_xml():
     user = _current_user()
     file = request.files.get('scenarios_xml')
@@ -33773,7 +34237,6 @@ def load_xml():
         return redirect(url_for('index'))
 
 
-@app.route('/save_xml', methods=['POST'])
 def save_xml():
     data_str = request.form.get('scenarios_json')
     if not data_str:
@@ -33945,7 +34408,6 @@ def save_xml():
         return redirect(url_for('index'))
 
 
-@app.route('/save_xml_api', methods=['POST'])
 def save_xml_api():
     try:
         user = _current_user()
@@ -34107,7 +34569,6 @@ def save_xml_api():
         return jsonify({ 'ok': False, 'error': str(e) }), 500
 
 
-@app.route('/render_xml_api', methods=['POST'])
 def render_xml_api():
     """Render scenario XML for preview without persisting to disk."""
     try:
@@ -35419,6 +35880,53 @@ def plan_full_preview_from_xml():
             return redirect(url_for('index'))
 
         payload = _load_plan_preview_from_xml(xml_path, scenario)
+        # Fallbacks for stale or mismatched xml_path/scenario combinations:
+        # 1) retry same XML without scenario filter
+        # 2) retry latest XML for scenario (with and without scenario filter)
+        if not payload:
+            try:
+                payload = _load_plan_preview_from_xml(xml_path, None)
+            except Exception:
+                payload = None
+        if not payload and scenario:
+            try:
+                scen_norm = _normalize_scenario_label(scenario)
+                latest_xml = _latest_xml_path_for_scenario(scen_norm) if scen_norm else None
+            except Exception:
+                latest_xml = None
+            if latest_xml:
+                try:
+                    latest_xml_abs = os.path.abspath(latest_xml)
+                except Exception:
+                    latest_xml_abs = latest_xml
+                if latest_xml_abs and os.path.exists(latest_xml_abs):
+                    try:
+                        payload = _load_plan_preview_from_xml(latest_xml_abs, scenario)
+                        if not payload:
+                            payload = _load_plan_preview_from_xml(latest_xml_abs, None)
+                        if payload:
+                            xml_path = latest_xml_abs
+                    except Exception:
+                        pass
+        if not payload:
+            # Last-resort recovery: regenerate PlanPreview from XML so Preview can load
+            # even when XML was saved without an embedded plan.
+            try:
+                recomputed = _planner_persist_flow_plan(
+                    xml_path=xml_path,
+                    scenario=scenario,
+                    seed=None,
+                    persist_plan_file=False,
+                )
+            except Exception:
+                recomputed = None
+            if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
+                payload = recomputed
+            else:
+                try:
+                    payload = _load_plan_preview_from_xml(xml_path, scenario) or _load_plan_preview_from_xml(xml_path, None)
+                except Exception:
+                    payload = None
         if not payload:
             flash('PlanPreview not found in XML')
             return redirect(url_for('index'))
@@ -36078,7 +36586,32 @@ def api_download_scripts():
     filename = f"{kind}_{scope}_scripts.zip"
     return _send_file(buf, mimetype='application/zip', as_attachment=True, download_name=filename)
 
-@app.route('/download_report')
+try:
+    from webapp.routes import reports_downloads as _reports_downloads_routes
+
+    _reports_downloads_routes.register(
+        app,
+        get_repo_root=_get_repo_root,
+        outputs_dir=_outputs_dir,
+        load_run_history=_load_run_history,
+        derive_summary_from_report=_derive_summary_from_report,
+        load_summary_counts=_load_summary_counts,
+        summary_text_from_counts=_summary_text_from_counts,
+        current_user_getter=_current_user,
+        scenario_catalog_for_user=_scenario_catalog_for_user,
+        collect_scenario_participant_urls=_collect_scenario_participant_urls,
+        normalize_scenario_label=_normalize_scenario_label,
+        builder_filter_report_scenarios=_builder_filter_report_scenarios,
+        filter_history_by_scenario=_filter_history_by_scenario,
+        resolve_scenario_display=_resolve_scenario_display,
+        scenario_names_from_xml=_scenario_names_from_xml,
+        run_history_path=RUN_HISTORY_PATH,
+        logger=app.logger,
+    )
+except Exception:
+    pass
+
+
 def download_report():
     result_path = request.args.get('path')
     # Normalize incoming value: strip quotes, decode percent-encoding, handle file://, expand ~
@@ -36224,7 +36757,6 @@ def node_schema_authoring_yaml():
         download_name='node_schema_authoring.yaml',
     )
 
-@app.route('/reports')
 def reports_page():
     raw = _load_run_history()
     enriched = []
@@ -36302,7 +36834,6 @@ def reports_page():
         participant_url_flags=participant_url_flags,
     )
 
-@app.route('/reports_data')
 def reports_data():
     raw = _load_run_history()
     enriched = []
@@ -36376,7 +36907,6 @@ def reports_data():
         'participant_url_flags': participant_url_flags,
     })
 
-@app.route('/reports/delete', methods=['POST'])
 def reports_delete():
     """Delete run history entries by run_id and remove associated artifacts under outputs/.
     Does not delete files under ./reports (reports are preserved by policy).
@@ -36788,32 +37318,69 @@ def _resolve_output_path(val: str, run_dir: str, artifacts_dir: str, scenario_ta
     
     if os.path.isabs(v):
         return _map_container_mount_path(v)
-    if v.startswith('artifacts/') and artifacts_dir:
-        return os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/'))
-    if run_dir:
-        return os.path.join(run_dir, v.lstrip('/'))
+
+    rel = v.lstrip('/')
+    candidates = []
     if artifacts_dir:
-        return os.path.join(artifacts_dir, v.lstrip('/'))
+        if v.startswith('artifacts/'):
+            candidates.append(os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/')))
+        else:
+            candidates.append(os.path.join(artifacts_dir, rel))
+    if run_dir:
+        candidates.append(os.path.join(run_dir, rel))
+        if not v.startswith('artifacts/'):
+            candidates.append(os.path.join(run_dir, 'artifacts', rel))
+            candidates.append(os.path.join(run_dir, 'outputs', rel))
+            candidates.append(os.path.join(run_dir, 'outputs', 'artifacts', rel))
+
+    seen = set()
+    uniq_candidates = []
+    for c in candidates:
+        if not c:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        uniq_candidates.append(c)
+
+    for c in uniq_candidates:
+        if _safe_exists(c):
+            return c
+    if uniq_candidates:
+        return uniq_candidates[0]
     return v
 
 
 def _normalize_inject_src_for_copy(raw_src: str, source_dir: str) -> str:
+    def _normalize_rel_artifacts(rel_src: str, base_dir: str) -> str:
+        out = str(rel_src or '').replace('\\', '/').strip()
+        if out.startswith('./'):
+            out = out[2:]
+        out = out.lstrip('/')
+        try:
+            if base_dir and os.path.basename(os.path.normpath(base_dir)) == 'artifacts':
+                while out.startswith('artifacts/'):
+                    out = out[len('artifacts/'):]
+        except Exception:
+            pass
+        return out
+
     src = str(raw_src or '').strip()
     if not src:
         return ''
     if not os.path.isabs(src):
-        return src
+        return _normalize_rel_artifacts(src, source_dir)
     try:
         if source_dir:
             src_abs = os.path.abspath(src)
             base_abs = os.path.abspath(source_dir)
             if os.path.commonpath([src_abs, base_abs]) == base_abs:
-                return os.path.relpath(src_abs, base_abs)
+                return _normalize_rel_artifacts(os.path.relpath(src_abs, base_abs), source_dir)
     except Exception:
         pass
     for marker in ('/artifacts/', '/flow_artifacts/'):
         if marker in src:
-            return src.split(marker, 1)[1].lstrip('/')
+            return _normalize_rel_artifacts(src.split(marker, 1)[1], source_dir)
     return ''
 
 
@@ -37587,12 +38154,33 @@ def _validate_session_nodes_and_injects(
             return ''
         if os.path.isabs(v):
             return v
-        if v.startswith('artifacts/') and artifacts_dir:
-            return os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/'))
-        if run_dir:
-            return os.path.join(run_dir, v.lstrip('/'))
+        rel = v.lstrip('/')
+        candidates: List[str] = []
         if artifacts_dir:
-            return os.path.join(artifacts_dir, v.lstrip('/'))
+            if v.startswith('artifacts/'):
+                candidates.append(os.path.join(artifacts_dir, v.split('artifacts/', 1)[1].lstrip('/')))
+            else:
+                candidates.append(os.path.join(artifacts_dir, rel))
+        if run_dir:
+            candidates.append(os.path.join(run_dir, rel))
+            if not v.startswith('artifacts/'):
+                candidates.append(os.path.join(run_dir, 'artifacts', rel))
+                candidates.append(os.path.join(run_dir, 'outputs', rel))
+                candidates.append(os.path.join(run_dir, 'outputs', 'artifacts', rel))
+
+        seen: set[str] = set()
+        uniq_candidates: List[str] = []
+        for c in candidates:
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            uniq_candidates.append(c)
+
+        for c in uniq_candidates:
+            if os.path.exists(c):
+                return c
+        if uniq_candidates:
+            return uniq_candidates[0]
         return v
 
     def _normalize_inject_source_local(raw: str, run_dir: str, artifacts_dir: str) -> str:
@@ -38422,7 +39010,8 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                 log_handle=log_f,
             )
         except Exception as exc:
-            _fail_run(f"Repo upload failed: {exc}", code=1)
+            detail_text = f"{type(exc).__name__}: {str(exc) or repr(exc)}"
+            _fail_run(f"Repo upload failed: {detail_text}", detail=repr(exc), code=1)
             return
         else:
             repo_path = repo_sync.get('repo_path') if isinstance(repo_sync, dict) else None
@@ -40563,7 +41152,7 @@ def _migrate_core_sessions_store_with_core_targets(store: dict, history: list[di
             mt = _safe_path_mtime_epoch(path)
             if mt is not None:
                 try:
-                    value['updated_at'] = datetime.datetime.fromtimestamp(mt).strftime('%m/%d/%y/%H/%M/%S')
+                    value['updated_at'] = datetime.datetime.fromtimestamp(mt).astimezone().isoformat(timespec='seconds')
                     dirty = True
                 except Exception:
                     pass
@@ -50453,7 +51042,23 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
     except Exception:
         return 0
 
-@app.route('/purge_history_for_scenario', methods=['POST'])
+try:
+    from webapp.routes import scenario_delete_purge as _scenario_delete_purge_routes
+
+    _scenario_delete_purge_routes.register(
+        app,
+        purge_run_history_for_scenario=_purge_run_history_for_scenario,
+        purge_planner_state_for_scenarios=_purge_planner_state_for_scenarios,
+        purge_plan_artifacts_for_scenarios=_purge_plan_artifacts_for_scenarios,
+        remove_scenarios_from_catalog=_remove_scenarios_from_catalog,
+        delete_saved_scenario_xml_artifacts=_delete_saved_scenario_xml_artifacts,
+        remove_scenarios_from_all_editor_snapshots=_remove_scenarios_from_all_editor_snapshots,
+        logger=app.logger,
+    )
+except Exception:
+    pass
+
+
 def purge_history_for_scenario():
     try:
         data = request.get_json(silent=True) or {}
@@ -50472,7 +51077,6 @@ def purge_history_for_scenario():
         return jsonify({'removed': 0, 'error': str(e)}), 200
 
 
-@app.route('/delete_scenarios', methods=['POST'])
 def delete_scenarios():
     """Persist scenario deletions across refresh.
 

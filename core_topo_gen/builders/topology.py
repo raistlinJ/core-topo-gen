@@ -1418,7 +1418,25 @@ def _make_safe_link_tracker():
             # When we can introspect a link list, confirm the link actually exists.
             present = _session_has_link(session_obj, key)
             if present is False:
-                raise RuntimeError('add_link reported success but link not present in session.links')
+                # CORE gRPC can be eventually consistent: add_link may return success, but
+                # the session.links view updates slightly later. Retry briefly before failing.
+                try:
+                    import time as _time
+
+                    for _i in range(10):
+                        _time.sleep(0.05)
+                        present2 = _session_has_link(session_obj, key)
+                        if present2 is True:
+                            present = True
+                            break
+                        if present2 is None:
+                            # Can't introspect; stop verifying.
+                            present = None
+                            break
+                except Exception:
+                    pass
+                if present is False:
+                    raise RuntimeError('add_link reported success but link not present in session.links')
 
             if GRPC_TRACE:
                 try:
