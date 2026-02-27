@@ -11,6 +11,9 @@ services:
       - CORE_PORT=${CORE_PORT:-50051}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    dns:
+      - ${CORETG_DNS_1:-1.1.1.1}
+      - ${CORETG_DNS_2:-8.8.8.8}
     volumes:
       # Persist state/artifacts on the host.
       - ./outputs:/app/outputs
@@ -47,6 +50,9 @@ services:
       - CERT_DAYS=${CERT_DAYS:-365}
       - CERT_SUBJECT=${CERT_SUBJECT:-/CN=localhost}
       - CERT_SANS=${CERT_SANS:-}
+    dns:
+      - ${CORETG_DNS_1:-1.1.1.1}
+      - ${CORETG_DNS_2:-8.8.8.8}
     restart: unless-stopped
     networks:
       - app_net
