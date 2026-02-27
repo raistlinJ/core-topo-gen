@@ -143,6 +143,41 @@ def _preview_vuln_slot_overrides(
         return {}
 
 
+def _merge_vuln_slot_assignments_with_preview(
+    assignments_slots: Any,
+    *,
+    overrides: Dict[str, Dict[str, str]] | None,
+    preview_full: Any,
+) -> Dict[str, Dict[str, str]]:
+    try:
+        base: Dict[str, Dict[str, str]] = {}
+        if isinstance(assignments_slots, dict):
+            base = {
+                str(k): v
+                for k, v in assignments_slots.items()
+                if isinstance(k, str) and isinstance(v, dict)
+            }
+        ov = overrides or {}
+        if not ov:
+            return base
+
+        vbn = None
+        if isinstance(preview_full, dict):
+            vbn = preview_full.get('vulnerabilities_by_node') or preview_full.get('vulnerabilities_preview') or {}
+        has_explicit_preview_map = isinstance(vbn, dict) and bool(vbn)
+
+        if has_explicit_preview_map:
+            return {str(k): v for k, v in ov.items() if isinstance(k, str) and isinstance(v, dict)}
+
+        merged = dict(base)
+        for k, rec in ov.items():
+            if isinstance(k, str) and isinstance(rec, dict):
+                merged[k] = rec
+        return merged
+    except Exception:
+        return assignments_slots if isinstance(assignments_slots, dict) else {}
+
+
 def _core_session_id(session: Any) -> int | None:
     try:
         sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)
@@ -980,6 +1015,14 @@ def main():
                 seed_candidate = preview_full.get('seed')
             if isinstance(seed_candidate, int):
                 args.seed = seed_candidate
+    else:
+        # Web runs typically pass only --xml; when that XML embeds PlanPreview,
+        # use it as the preview source so runtime slot/vulnerability mapping stays
+        # aligned with the persisted scenario plan.
+        try:
+            preview_payload, preview_full = _load_preview_plan(args.xml, args.scenario)
+        except Exception:
+            preview_payload, preview_full = None, None
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1460,20 +1503,18 @@ def main():
         except Exception:
             overrides = {}
         if overrides:
-            if not isinstance(assignments_slots, dict):
-                assignments_slots = {}
-            changed = 0
-            for slot, rec in overrides.items():
-                if not isinstance(rec, dict):
-                    continue
-                prev = assignments_slots.get(slot)
-                if prev != rec:
-                    assignments_slots[slot] = rec
-                    changed += 1
+            before_len = len(assignments_slots) if isinstance(assignments_slots, dict) else 0
+            assignments_slots = _merge_vuln_slot_assignments_with_preview(
+                assignments_slots,
+                overrides=overrides,
+                preview_full=preview_full,
+            )
+            after_len = len(assignments_slots) if isinstance(assignments_slots, dict) else 0
             logging.info(
-                "Applied %d preview-based vulnerability slot overrides (%d total assignments)",
-                int(changed),
-                int(len(assignments_slots or {})),
+                "Applied %d preview-based vulnerability slot overrides (%d -> %d total assignments)",
+                int(len(overrides or {})),
+                int(before_len),
+                int(after_len),
             )
         if assignments_slots:
             docker_slot_plan = assignments_slots

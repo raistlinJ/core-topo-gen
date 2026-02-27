@@ -55,7 +55,7 @@ services:
         assert "ports" not in svc
         # Preserve container-side port intent for reporting/metadata.
         assert "expose" in svc and "80" in [str(x) for x in (svc.get("expose") or [])]
-        # Root workdir forcing is opt-in; default behavior preserves image WORKDIR.
+        # Auto mode only forces root workdir for base OS-style images.
         assert "working_dir" not in svc
         # Compose handed to CORE should NOT include `build:`; core-daemon would
         # attempt to build during scenario startup (and therefore pull packages/images).
@@ -82,6 +82,8 @@ services:
             or "yum install" in txt
             or "dnf install" in txt
         )
+        assert "ln -sfn /defaultroute.sh" in txt
+        assert "ln -sfn /runtraffic.sh" in txt
 
 
 def test_apply_docker_compose_meta_pushes_options(tmp_path):
@@ -101,6 +103,83 @@ def test_apply_docker_compose_meta_pushes_options(tmp_path):
     assert getattr(node, "image") == ""
     assert getattr(options, "type") == ""
     assert getattr(options, "image") == ""
+
+
+def test_prepare_compose_wrapper_packages_strategy_keeps_service_script_symlinks(tmp_path, monkeypatch):
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        """
+version: '3'
+services:
+  app:
+    image: nginx:latest
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = {"Type": "docker-compose", "Name": "Example", "Path": str(compose_src)}
+    monkeypatch.setenv("CORETG_IPROUTE2_WRAPPER_STRATEGY", "packages")
+
+    created = prepare_compose_for_assignments({"host-2": record}, out_base=str(tmp_path))
+    assert created
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    out_path = tmp_path / "docker-compose-host-2.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    svc = (obj or {}).get("services", {}).get("app") or {}
+    labels = svc.get("labels") or {}
+    wrap_dir = str(labels.get("coretg.wrapper_build_context") or "").strip()
+    assert wrap_dir
+    dockerfile = os.path.join(wrap_dir, "Dockerfile")
+    assert os.path.exists(dockerfile)
+    txt = open(dockerfile, encoding="utf-8").read()
+
+    assert "ln -sfn /defaultroute.sh" in txt
+    assert "ln -sfn /runtraffic.sh" in txt
+
+
+def test_prepare_compose_docker34_name_keeps_service_script_symlinks(tmp_path, monkeypatch):
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        """
+version: '3'
+services:
+  app:
+    image: nginx:latest
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = {"Type": "docker-compose", "Name": "Example", "Path": str(compose_src)}
+    monkeypatch.delenv("CORETG_IPROUTE2_WRAPPER_STRATEGY", raising=False)
+
+    created = prepare_compose_for_assignments({"docker-34": record}, out_base=str(tmp_path))
+    assert created
+    assert str(tmp_path / "docker-compose-docker-34.yml") in created
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    out_path = tmp_path / "docker-compose-docker-34.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    svc = (obj or {}).get("services", {}).get("app") or {}
+    labels = svc.get("labels") or {}
+    wrap_dir = str(labels.get("coretg.wrapper_build_context") or "").strip()
+    assert wrap_dir
+    dockerfile = os.path.join(wrap_dir, "Dockerfile")
+    assert os.path.exists(dockerfile)
+    txt = open(dockerfile, encoding="utf-8").read()
+
+    assert "ln -sfn /defaultroute.sh" in txt
+    assert "ln -sfn /runtraffic.sh" in txt
 
 
 def test_apply_docker_compose_meta_uses_real_service_name(tmp_path):
@@ -500,7 +579,39 @@ def test_prepare_compose_inject_copy_runs_as_root_for_volume_writes(tmp_path, mo
     assert str(inject.get("user") or "") == "0:0"
 
 
-def test_prepare_compose_does_not_force_root_workdir_by_default(tmp_path, monkeypatch):
+def test_prepare_compose_root_workdir_auto_mode_skips_app_images(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  web:\n    image: vulhub/wordpress:6.0\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1")
+    assert isinstance(target, dict)
+    assert "working_dir" not in target
+
+
+def test_prepare_compose_root_workdir_auto_mode_does_not_force_nextjs(tmp_path, monkeypatch):
     try:
         import yaml  # type: ignore
     except Exception:
@@ -513,6 +624,134 @@ def test_prepare_compose_does_not_force_root_workdir_by_default(tmp_path, monkey
     )
 
     monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1")
+    assert isinstance(target, dict)
+    assert "working_dir" not in target
+
+
+def test_prepare_compose_root_workdir_auto_mode_forces_base_os(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  node:\n    image: ubuntu:22.04\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1")
+    assert isinstance(target, dict)
+    assert target.get("working_dir") == "/"
+
+
+def test_prepare_compose_root_workdir_auto_mode_forces_weblogic(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  web:\n    image: vulhub/weblogic:12.2.1.3-2018\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1")
+    assert isinstance(target, dict)
+    assert target.get("working_dir") == "/"
+
+
+def test_prepare_compose_root_workdir_can_force_all_with_env(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  web:\n    image: vulhub/nextjs:15.5.6\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", "1")
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1")
+    assert isinstance(target, dict)
+    assert target.get("working_dir") == "/"
+
+
+def test_prepare_compose_can_disable_root_workdir_with_env(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  web:\n    image: vulhub/nextjs:15.5.6\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", "0")
 
     record = {
         "Type": "docker-compose",

@@ -813,6 +813,20 @@ def _docker_default_route_enabled() -> bool:
     return val not in ('0', 'false', 'False', '')
 
 
+def _docker_traffic_service_enabled() -> bool:
+    """Whether Docker nodes should keep CORE's Traffic service.
+
+    Default is OFF for Docker nodes because some CORE service templates execute
+    relative file paths (for example `runtraffic.sh`) that can fail on
+    compose-based images with non-root working directories.
+    Enable explicitly with CORETG_DOCKER_ADD_TRAFFIC=1/true.
+    """
+    val = os.getenv('CORETG_DOCKER_ADD_TRAFFIC')
+    if val is None:
+        return False
+    return str(val).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
 def _session_add_node(
     session: object,
     node_id: int,
@@ -1135,12 +1149,16 @@ def _is_docker_node_type(node_type: object) -> bool:
 
 def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
     """Ensure DefaultRoute service is present on a DOCKER node (best-effort)."""
-    if not _docker_default_route_enabled():
-        return
-    try:
-        ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
-    except Exception:
-        pass
+    if _docker_default_route_enabled():
+        try:
+            ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
+        except Exception:
+            pass
+    if not _docker_traffic_service_enabled():
+        try:
+            remove_service(session, getattr(node_obj, 'id'), "Traffic", node_obj=node_obj)
+        except Exception:
+            pass
 
 
 def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[object], *, context: str) -> None:
@@ -1149,7 +1167,8 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
     Rationale: some build paths call set_node_services() later (eg distribution) which can overwrite
     earlier service additions. This final pass makes DefaultRoute a last-write-wins policy for Docker.
     """
-    if not _docker_default_route_enabled():
+    add_default_route = _docker_default_route_enabled()
+    if not add_default_route:
         return
     for node in node_objs:
         try:
@@ -1159,22 +1178,22 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
             node_type = getattr(node, 'type', None)
             if not _is_docker_node_type(node_type) and getattr(node, 'model', None) != 'docker':
                 continue
-            try:
-                ensure_service(session, node_id, "DefaultRoute", node_obj=node)
-            except Exception:
-                continue
-            try:
-                if not has_service(session, node_id, "DefaultRoute", node_obj=node):
-                    logger.info(
-                        "DefaultRoute not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
-                        "this can be a CORE service readback limitation for Docker nodes",
-                        node_id,
-                        getattr(node, 'name', None),
-                        context,
-                    )
-            except Exception:
-                # Some CORE wrappers cannot reliably read back services; don't fail the build.
-                pass
+            if add_default_route:
+                try:
+                    ensure_service(session, node_id, "DefaultRoute", node_obj=node)
+                except Exception:
+                    continue
+                try:
+                    if not has_service(session, node_id, "DefaultRoute", node_obj=node):
+                        logger.info(
+                            "DefaultRoute not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
+                            "this can be a CORE service readback limitation for Docker nodes",
+                            node_id,
+                            getattr(node, 'name', None),
+                            context,
+                        )
+                except Exception:
+                    pass
         except Exception:
             continue
 

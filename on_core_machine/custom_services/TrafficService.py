@@ -11,13 +11,13 @@ class TrafficService(CoreService):
     #directories: list[str] = ["/usr/local/core"]
     # files that this service should generate, defaults to nodes home directory
     # or can provide an absolute path to a mounted directory
-    files: list[str] = ["runtraffic.sh"]
+    files: list[str] = ["/runtraffic.sh"]
     # executables that should exist on path, that this service depends on
     executables: list[str] = []
     # other services that this service depends on, defines service start order
     dependencies: list[str] = ["CoreTGPrereqs"]
     # commands to run to start this service
-    startup: list[str] = ["/bin/bash runtraffic.sh &"]
+    startup: list[str] = ["/bin/bash /runtraffic.sh &"]
     # commands to run to validate this service
     validate: list[str] = []
     # commands to run to stop this service
@@ -41,10 +41,14 @@ class TrafficService(CoreService):
         #!/bin/bash
         # Traffic starter
         # node id(${node.id}) name(${node.name})
-        cp /tmp/traffic/traffic_${node.id}_*.py .
-        for file in traffic_${node.id}_*.py; do
-           echo "running: python3 $file" >> output.txt
-           python3 $file &
+          set -e
+          runtime_dir=/tmp/coretg_traffic
+          mkdir -p "$runtime_dir"
+          cp /tmp/traffic/traffic_${node.id}_*.py "$runtime_dir"/ 2>/dev/null || true
+          for file in "$runtime_dir"/traffic_${node.id}_*.py; do
+              [ -f "$file" ] || continue
+              echo "running: python3 $file" >> "$runtime_dir/output.txt"
+              python3 "$file" >> "$runtime_dir/output.txt" 2>&1 &
         done
         """
 

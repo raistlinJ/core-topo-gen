@@ -1263,12 +1263,94 @@ def _compose_force_root_workdir_enabled() -> bool:
 	paths relative to the container filesystem root. For images with non-root WORKDIR,
 	this can cause CORE to fail to chmod service files that were copied into `/`.
 
-	Default: disabled. Enable by setting `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=1/true/on`.
+	Default: auto (base-OS images only). Modes:
+	- unset / auto: force only for base OS-style images
+	- 1/true/yes/on/all: force for all services
+	- 0/false/no/off: disable
 	"""
+	mode = _compose_force_root_workdir_mode()
+	return mode != 'off'
+
+
+def _compose_force_root_workdir_mode() -> str:
+	"""Return root-workdir forcing mode: off | auto | all."""
 	val = os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR')
 	if val is None:
+		return 'auto'
+	low = str(val).strip().lower()
+	if low in ('0', 'false', 'no', 'off', ''):
+		return 'off'
+	if low in ('1', 'true', 'yes', 'on', 'all'):
+		return 'all'
+	if low in ('auto', 'default'):
+		return 'auto'
+	return 'auto'
+
+
+def _looks_like_base_os_image(image_ref: str) -> bool:
+	"""Return True when image reference appears to be a base OS image."""
+	import re as _re
+	norm = str(image_ref or '').lower().strip()
+	if not norm:
 		return False
-	return str(val).strip().lower() in ('1', 'true', 'yes', 'on')
+	base_os_patterns = (
+		r'(^|/)ubuntu([:@]|$)',
+		r'(^|/)debian([:@]|$)',
+		r'(^|/)alpine([:@]|$)',
+		r'(^|/)centos([:@]|$)',
+		r'(^|/)fedora([:@]|$)',
+		r'(^|/)rockylinux([:@]|$)',
+		r'(^|/)amazonlinux([:@]|$)',
+		r'(^|/)busybox([:@]|$)',
+		r'(^|/)kalilinux([:@]|$)',
+		r'(^|/)kali([:@]|$)',
+	)
+	return any(_re.search(pat, norm) for pat in base_os_patterns)
+
+
+def _service_effective_image(service: Dict[str, object]) -> str:
+	"""Best-effort effective image for a service, preferring wrapper base labels."""
+	if not isinstance(service, dict):
+		return ''
+	labels = service.get('labels') if isinstance(service.get('labels'), dict) else {}
+	try:
+		base_label = str(
+			labels.get('coretg.wrapper_effective_base_image')
+			or labels.get('coretg.wrapper_base_image')
+			or ''
+		).strip()
+		if base_label:
+			return base_label
+	except Exception:
+		pass
+	try:
+		return str(service.get('image') or '').strip()
+	except Exception:
+		return ''
+
+
+def _should_force_service_workdir_root(service: Dict[str, object]) -> bool:
+	"""Decide whether working_dir should be forced to root for this service."""
+	mode = _compose_force_root_workdir_mode()
+	if mode == 'off':
+		return False
+	if mode == 'all':
+		return True
+	# auto mode: only base OS-like images to reduce risk of breaking app startup.
+	image_ref = _service_effective_image(service)
+	if _looks_like_base_os_image(image_ref):
+		return True
+	# Some vuln app images are known to be compatible with root workdir and are
+	# prone to CORE service relative-path chmod failures when workdir is non-root.
+	# Keep this list conservative: app stacks (for example Next.js) can rely on a
+	# non-root working directory for startup and fail if forced to '/'.
+	try:
+		img = str(image_ref or '').lower().strip()
+		if 'weblogic' in img:
+			return True
+	except Exception:
+		pass
+	return False
 
 
 def _force_service_workdir_root(service: Dict[str, object]) -> None:
@@ -1282,6 +1364,15 @@ def _force_service_workdir_root(service: Dict[str, object]) -> None:
 	except Exception:
 		pass
 	service['working_dir'] = '/'
+
+
+def _maybe_force_service_workdir_root(service: Dict[str, object]) -> None:
+	"""Force root working_dir when policy and service characteristics require it."""
+	if not isinstance(service, dict):
+		return
+	if not _should_force_service_workdir_root(service):
+		return
+	_force_service_workdir_root(service)
 
 
 def _copy_build_contexts(obj: dict, src_dir: str, base_dir: str) -> dict:
@@ -2546,23 +2637,7 @@ def _ensure_keepalive_for_base_os_images(compose_obj: dict, node_name: str, pref
 				base_image = str(svc.get('image') or '').strip()
 			except Exception:
 				base_image = ''
-		import re as _re
-		norm = base_image.lower().strip()
-		# Only treat *actual base images* as base OS.
-		# Avoid substring matches like `itsthenetwork/nfs-server-alpine`.
-		base_os_patterns = (
-			r'(^|/)ubuntu([:@]|$)',
-			r'(^|/)debian([:@]|$)',
-			r'(^|/)alpine([:@]|$)',
-			r'(^|/)centos([:@]|$)',
-			r'(^|/)fedora([:@]|$)',
-			r'(^|/)rockylinux([:@]|$)',
-			r'(^|/)amazonlinux([:@]|$)',
-			r'(^|/)busybox([:@]|$)',
-			r'(^|/)kalilinux([:@]|$)',
-			r'(^|/)kali([:@]|$)',
-		)
-		is_base_os = any(_re.search(pat, norm) for pat in base_os_patterns)
+		is_base_os = _looks_like_base_os_image(base_image)
 		if not is_base_os:
 			return compose_obj
 
@@ -2649,6 +2724,14 @@ def _write_iproute2_wrapper(
 		lines += [
 			"USER root",
 			"",
+			"# CORE may chmod relative service script paths (e.g., defaultroute.sh, runtraffic.sh).",
+			"# Ensure those relative names resolve from the image WORKDIR to root-level files.",
+			"RUN set -eu; \\",
+			"\twd=\"$(pwd)\"; \\",
+			"\tmkdir -p \"$wd\"; \\",
+			"\tln -sfn /defaultroute.sh \"$wd/defaultroute.sh\" || true; \\",
+			"\tln -sfn /runtraffic.sh \"$wd/runtraffic.sh\" || true",
+			"",
 			"# If the base image already provides `ip`, keep it; otherwise inject busybox as `ip`.",
 			"# We avoid any RUN that relies on networked package repositories.",
 			"COPY --from=coretg_iptools /bin/busybox /usr/local/coretg/bin/busybox",
@@ -2725,6 +2808,14 @@ def _write_iproute2_wrapper(
 		f"FROM {base_image}",
 		"",
 		"USER root",
+		"",
+		"# CORE may chmod relative service script paths (e.g., defaultroute.sh, runtraffic.sh).",
+		"# Ensure those relative names resolve from the image WORKDIR to root-level files.",
+		"RUN set -eu; \\",
+		"\twd=\"$(pwd)\"; \\",
+		"\tmkdir -p \"$wd\"; \\",
+		"\tln -sfn /defaultroute.sh \"$wd/defaultroute.sh\" || true; \\",
+		"\tln -sfn /runtraffic.sh \"$wd/runtraffic.sh\" || true",
 		"",
 		"",
 		# Avoid `set -x` to reduce giant build logs; keep `-e` and `-u`.
@@ -3858,7 +3949,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							pass
 						try:
 							if _compose_force_root_workdir_enabled():
-								_force_service_workdir_root(svc)
+								_maybe_force_service_workdir_root(svc)
 						except Exception:
 							pass
 					if base_image and not already_wrapped:
@@ -3929,7 +4020,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						# CORE services often manipulate files using relative paths; force root workdir.
 						try:
 							if _compose_force_root_workdir_enabled():
-								_force_service_workdir_root(svc)
+								_maybe_force_service_workdir_root(svc)
 						except Exception:
 							pass
 					else:
@@ -3955,7 +4046,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						svc_key = _select_service_key(obj, prefer_service=prefer)
 						services = obj.get('services') if isinstance(obj, dict) else None
 						if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
-							_force_service_workdir_root(services.get(svc_key))
+							_maybe_force_service_workdir_root(services.get(svc_key))
 				except Exception:
 					pass
 			# Apply published-port pruning late so overlays/wrappers can't reintroduce
@@ -4050,14 +4141,14 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						# Option B: ensure no Docker-managed network (no docker eth0/default route).
 						# Also drop ports/networks blocks to avoid compose validation conflicts.
 						text_sanitized = _inject_network_mode_none_text(txt)
-						if _compose_force_root_workdir_enabled():
+						if _compose_force_root_workdir_mode() == 'all':
 							text_sanitized = _inject_working_dir_root_text(text_sanitized)
 						text_sanitized = _drop_key_block_from_text(text_sanitized, 'ports')
 						text_sanitized = _drop_key_block_from_text(text_sanitized, 'networks')
 					else:
 						# Strip published host port mappings while preserving networks.
 						text_sanitized = _strip_port_mappings_from_text(txt)
-						if _compose_force_root_workdir_enabled():
+						if _compose_force_root_workdir_mode() == 'all':
 							text_sanitized = _inject_working_dir_root_text(text_sanitized)
 					# Resolve `${...}` to avoid both Mako NameError and docker-compose invalid wrappers.
 					text_sanitized = _resolve_compose_interpolations(text_sanitized)

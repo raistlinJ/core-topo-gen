@@ -396,6 +396,42 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && latest_xml=$(ls -1t outputs/scenarios-*/NewScenario12.xml 2>/dev/null | head -n 1) && echo XML=$latest_xml && curl -s -c /tmp/coretg.cookies -b /tmp/coretg.cookies http://127.0.0.1:9090/login >/dev/null && curl -s -L -c /tmp/coretg.cookies -b /tmp/coretg.cookies -d 'username=coreadmin&password=coreadmin' -H 'Content-Type: application/x-www-form-urlencoded' http://127.0.0.1:9090/login >/dev/null && curl -s -w \"\\nHTTP_STATUS=%{http_code}\\n\" -G -b /tmp/coretg.cookies --data-urlencode \"scenario=NewScenario12\" --data-urlencode \"xml_path=$latest_xml\" --data-urlencode \"length=3\" --data-urlencode \"preset=sample\" --data-urlencode \"prefer_flow=1\" http://127.0.0.1:9090/api/flag-sequencing/attackflow_preview > /tmp/flow_sample3_live.txt && python -c \"import json,re,pathlib; p=pathlib.Path('/tmp/flow_sample3_live.txt').read_text(errors='ignore'); m=re.search(r'\\nHTTP_STATUS=(\\d+)\\s*$',p); status=(m.group(1) if m else 'NA'); body=(p[:m.start()] if m else p); print('status',status,'body_len',len(body)); d=json.loads(body); print('ok',d.get('ok'),'length',d.get('length'),'requested',d.get('requested_length'),'chain_len',len(d.get('chain') or []),'error',d.get('error')); print('ids',[str((a or {}).get('id') or '') for a in (d.get('flag_assignments') or [])])\"",
 			"isBackground": false
+		},
+		{
+			"label": "smoke: core session dialog flow",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_core_session_dialog_smoke.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke: core session dialog flow (retry)",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_core_session_dialog_smoke.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "debug: core session dialog functions",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_core_session_dialog_debug.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke: capture real dialogs",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_capture_real_dialogs.py"
+			],
+			"isBackground": false
 		}
 	]
 }

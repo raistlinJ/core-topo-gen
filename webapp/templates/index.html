@@ -16785,6 +16785,15 @@
                 if (!executeProgressState || !executeProgressState.active) return;
                 const msg = ev?.message || 'Unknown error';
                 appendExecuteProgressLog(`[ui] JS error: ${msg}`);
+                try {
+                    reportExecuteNetworkFailure('ui.js_error', {
+                        reason: 'window_error',
+                        message: msg,
+                        source: ev?.filename || '',
+                        lineno: ev?.lineno,
+                        colno: ev?.colno,
+                    });
+                } catch (e) { }
             } catch (e) { }
         });
         window.addEventListener('unhandledrejection', (ev) => {
@@ -16793,8 +16802,41 @@
                 const reason = ev?.reason;
                 const msg = (reason && (reason.message || String(reason))) || 'Unhandled promise rejection';
                 appendExecuteProgressLog(`[ui] JS unhandled rejection: ${msg}`);
+                try {
+                    reportExecuteNetworkFailure('ui.unhandled_rejection', {
+                        reason: 'unhandled_rejection',
+                        message: msg,
+                        name: reason?.name || '',
+                        code: (reason && (reason.code ?? reason.errno)) ? (reason.code ?? reason.errno) : undefined,
+                    });
+                } catch (e) { }
             } catch (e) { }
         });
+    }
+
+    if (!window.__coretg_alert_diag_hooked) {
+        window.__coretg_alert_diag_hooked = true;
+        try {
+            const originalAlert = window.alert ? window.alert.bind(window) : null;
+            window.alert = function (message) {
+                try {
+                    const text = String(message ?? '');
+                    if (executeProgressState && executeProgressState.active) {
+                        appendExecuteProgressLog(`[ui] alert: ${text}`);
+                        if (/error\s*code\s*\d+/i.test(text) || /timeout/i.test(text)) {
+                            reportExecuteNetworkFailure('ui.alert', {
+                                reason: 'alert_message',
+                                message: text,
+                            });
+                        }
+                    }
+                } catch (e) { }
+                if (originalAlert) {
+                    return originalAlert(message);
+                }
+                return undefined;
+            };
+        } catch (e) { }
     }
 
     function ensureExecuteConfirmElements() {
@@ -20028,6 +20070,78 @@
         return `HTTP ${response.status}${statusText}`.trim();
     }
 
+    function _safeExecuteDiagJson(value) {
+        try {
+            return JSON.stringify(value);
+        } catch (err) {
+            try {
+                return String(value);
+            } catch (err2) {
+                return '';
+            }
+        }
+    }
+
+    function reportExecuteNetworkFailure(stage, details = {}) {
+        try {
+            const payload = {
+                stage: String(stage || 'unknown'),
+                ts: Date.now(),
+                ...((details && typeof details === 'object') ? details : { detail: String(details || '') }),
+            };
+            try {
+                const currentRunId = (typeof runProgressRunId !== 'undefined' && runProgressRunId)
+                    ? String(runProgressRunId)
+                    : ((executeProgressState && executeProgressState.runId) ? String(executeProgressState.runId) : '');
+                if (currentRunId) payload.run_id = currentRunId;
+            } catch (e) { }
+            try {
+                window.__lastExecuteNetworkFailure = payload;
+            } catch (e) { }
+            const summaryParts = [];
+            if (payload.reason) summaryParts.push(`reason=${payload.reason}`);
+            if (payload.message) summaryParts.push(`message=${payload.message}`);
+            if (payload.code !== undefined && payload.code !== null && String(payload.code).trim()) summaryParts.push(`code=${payload.code}`);
+            if (payload.status !== undefined && payload.status !== null) summaryParts.push(`status=${payload.status}`);
+            if (payload.readyState !== undefined && payload.readyState !== null) summaryParts.push(`readyState=${payload.readyState}`);
+            if (payload.online !== undefined && payload.online !== null) summaryParts.push(`online=${payload.online}`);
+            const summary = summaryParts.join(' | ') || 'unknown network failure';
+            const line = `[ui][net-fail] ${payload.stage}: ${summary}`;
+            try {
+                if (executeProgressState && executeProgressState.active) {
+                    appendExecuteProgressLog(line);
+                } else if (typeof runProgressLogLine === 'function') {
+                    runProgressLogLine(line);
+                } else {
+                    logError(line);
+                }
+            } catch (e) {
+                try { logError(line); } catch (e2) { }
+            }
+            const raw = _safeExecuteDiagJson(payload);
+            if (raw) {
+                const rawLine = `[ui][net-fail][raw] ${raw}`;
+                try {
+                    if (executeProgressState && executeProgressState.active) {
+                        appendExecuteProgressLog(rawLine);
+                    } else if (typeof runProgressLogLine === 'function') {
+                        runProgressLogLine(rawLine);
+                    } else {
+                        logError(rawLine);
+                    }
+                } catch (e) { }
+            }
+            try {
+                fetch('/api/client_exec_diag', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    keepalive: true,
+                }).catch(() => { });
+            } catch (e) { }
+        } catch (e) { }
+    }
+
     async function pushRepoToRemote(xmlPath, options = {}) {
         const formOptions = { ...options };
         const onProgress = typeof formOptions.onProgress === 'function' ? formOptions.onProgress : null;
@@ -20036,6 +20150,10 @@
         delete formOptions.onProgress;
         delete formOptions.onResponseProgress;
         delete formOptions.onFinalizeProgress;
+        const uploadTimeoutMsRaw = Number(formOptions.uploadTimeoutMs);
+        const uploadTimeoutMs = Number.isFinite(uploadTimeoutMsRaw) && uploadTimeoutMsRaw > 0
+            ? uploadTimeoutMsRaw
+            : (15 * 60 * 1000);
         formOptions.updateRemoteRepo = false;
         const form = buildRunFormData(xmlPath, formOptions);
         logInfo('Uploading repository to CORE host…');
@@ -20045,6 +20163,12 @@
                 const res = await fetch(PUSH_REPO_URL, { method: 'POST', body: form });
                 if (!res.ok) {
                     const detail = await extractResponseDetail(res);
+                    reportExecuteNetworkFailure('repo.upload.fetch.non_ok', {
+                        reason: 'non_ok_response',
+                        status: res.status,
+                        statusText: res.statusText || '',
+                        message: detail || '',
+                    });
                     const message = detail ? `Repo upload failed: ${detail}` : `Repo upload failed (HTTP ${res.status})`;
                     logError(message);
                     alert(message);
@@ -20103,6 +20227,13 @@
                 }
                 return true;
             } catch (err) {
+                reportExecuteNetworkFailure('repo.upload.fetch.exception', {
+                    reason: 'fetch_exception',
+                    message: err?.message || String(err || ''),
+                    code: (err && (err.code ?? err.errno)) ? (err.code ?? err.errno) : undefined,
+                    name: err?.name || '',
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                });
                 const message = `Repo upload exception: ${err?.message || err}`;
                 logError(message);
                 alert(message);
@@ -20189,6 +20320,14 @@
                 };
             }
             xhr.onerror = () => {
+                reportExecuteNetworkFailure('repo.upload.xhr.onerror', {
+                    reason: 'xhr_onerror',
+                    status: xhr.status,
+                    statusText: xhr.statusText || '',
+                    readyState: xhr.readyState,
+                    responseURL: xhr.responseURL || '',
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                });
                 const message = 'Repo upload exception: network error';
                 logError(message);
                 alert(message);
@@ -20197,6 +20336,22 @@
             xhr.onabort = () => {
                 // Cancellation should not alert; it is user-driven.
                 try { logInfo('Repo upload cancelled by user.'); } catch (e) { }
+                settle(false);
+            };
+            xhr.ontimeout = () => {
+                const secs = Math.max(1, Math.round(uploadTimeoutMs / 1000));
+                reportExecuteNetworkFailure('repo.upload.xhr.timeout', {
+                    reason: 'xhr_timeout',
+                    message: `timeout after ${secs}s`,
+                    status: xhr.status,
+                    readyState: xhr.readyState,
+                    timeoutMs: uploadTimeoutMs,
+                    responseURL: xhr.responseURL || '',
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                });
+                const message = `Repo upload timed out after ${secs}s. Check CORE VM reachability and retry.`;
+                logError(message);
+                alert(message);
                 settle(false);
             };
             xhr.onreadystatechange = async () => {
@@ -20260,14 +20415,31 @@
                     return;
                 }
                 const detail = extractDetailFromXhr(xhr);
+                reportExecuteNetworkFailure('repo.upload.xhr.non_ok', {
+                    reason: 'non_ok_response',
+                    status: xhr.status,
+                    statusText: xhr.statusText || '',
+                    readyState: xhr.readyState,
+                    responseURL: xhr.responseURL || '',
+                    message: detail || '',
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                });
                 const message = detail ? `Repo upload failed: ${detail}` : `Repo upload failed (HTTP ${xhr.status})`;
                 logError(message);
                 alert(message);
                 settle(false);
             };
             try {
+                xhr.timeout = uploadTimeoutMs;
                 xhr.send(form);
             } catch (err) {
+                reportExecuteNetworkFailure('repo.upload.xhr.send_exception', {
+                    reason: 'send_exception',
+                    message: err?.message || String(err || ''),
+                    code: (err && (err.code ?? err.errno)) ? (err.code ?? err.errno) : undefined,
+                    name: err?.name || '',
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                });
                 const message = `Repo upload exception: ${err?.message || err}`;
                 logError(message);
                 alert(message);
@@ -20289,7 +20461,13 @@
         }
         const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
         const pollInterval = Math.max(500, options.intervalMs || 1500);
+        const maxWaitMsRaw = Number(options.maxWaitMs);
+        const maxWaitMs = Number.isFinite(maxWaitMsRaw) && maxWaitMsRaw > 0
+            ? maxWaitMsRaw
+            : (12 * 60 * 1000);
+        const startedAtMs = Date.now();
         let consecutiveUnknown = 0;
+        let consecutivePollErrors = 0;
         let everSawTracker = false;
         let unknownSinceMs = null;
         let lastProgressKey = '';
@@ -20299,6 +20477,16 @@
             return false;
         }
         while (true) {
+            const totalElapsedMs = Date.now() - startedAtMs;
+            if (totalElapsedMs >= maxWaitMs) {
+                const secs = Math.max(1, Math.round(totalElapsedMs / 1000));
+                onProgress?.({
+                    status: 'error',
+                    stage: 'timeout',
+                    detail: `Remote finalize timed out after ${secs}s. Retry Execute.`
+                });
+                return false;
+            }
             try {
                 if (executeProgressState && executeProgressState.cancelRequested) {
                     onProgress?.({ status: 'cancelled', stage: 'cancelled', detail: 'Cancelled by user.' });
@@ -20308,7 +20496,20 @@
             let response = null;
             try {
                 response = await fetch(statusUrl, { method: 'GET', cache: 'no-store' });
+                consecutivePollErrors = 0;
             } catch (err) {
+                consecutivePollErrors += 1;
+                if (consecutivePollErrors === 1 || consecutivePollErrors % 10 === 0) {
+                    reportExecuteNetworkFailure('repo.finalize.poll.exception', {
+                        reason: 'poll_fetch_exception',
+                        message: err?.message || String(err || ''),
+                        code: (err && (err.code ?? err.errno)) ? (err.code ?? err.errno) : undefined,
+                        name: err?.name || '',
+                        online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                        attempts: consecutivePollErrors,
+                        statusUrl,
+                    });
+                }
                 onProgress?.({ status: 'pending', stage: 'waiting', detail: `Finalize poll failed: ${err?.message || err}` });
                 await new Promise((resolve) => setTimeout(resolve, pollInterval));
                 continue;
@@ -20357,6 +20558,19 @@
                 if (consecutiveUnknown === 5) {
                     onProgress?.({ status: 'pending', stage: 'waiting', detail: 'Remote finalize tracker unavailable; still waiting…' });
                 }
+                if (!everSawTracker) {
+                    try {
+                        const ageMs = unknownSinceMs ? (Date.now() - unknownSinceMs) : 0;
+                        if (ageMs >= 60000) {
+                            onProgress?.({
+                                status: 'error',
+                                stage: 'waiting',
+                                detail: 'Remote finalize tracker never appeared (60s). Retry Execute.'
+                            });
+                            return false;
+                        }
+                    } catch (e) { }
+                }
                 // If we previously saw the tracker but it vanished, treat this as an error
                 // (likely a web UI restart clearing in-memory progress) instead of waiting forever.
                 try {
@@ -20368,6 +20582,14 @@
                 } catch (e) { }
             } else {
                 const detail = await extractResponseDetail(response);
+                reportExecuteNetworkFailure('repo.finalize.poll.non_ok', {
+                    reason: 'non_ok_response',
+                    status: response.status,
+                    statusText: response.statusText || '',
+                    message: detail || '',
+                    statusUrl,
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                });
                 onProgress?.({ status: 'error', detail: detail || `Finalize status failed (HTTP ${response.status})` });
                 return false;
             }
@@ -20478,6 +20700,15 @@
             try {
                 res = await fetch(RUN_CLI_URL, init);
             } catch (err) {
+                reportExecuteNetworkFailure('run.start.fetch.exception', {
+                    reason: 'fetch_exception',
+                    message: err?.message || String(err || ''),
+                    code: (err && (err.code ?? err.errno)) ? (err.code ?? err.errno) : undefined,
+                    name: err?.name || '',
+                    url: RUN_CLI_URL || '',
+                    online: (typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean') ? navigator.onLine : null,
+                    attempt: attempt + 1,
+                });
                 logRunRequestDebug(`Run request fetch failed: ${err?.message || err}`);
                 throw err;
             } finally {
@@ -21157,6 +21388,9 @@
         // Also re-enable dialog controls when progress modal completes/finishes.
         try { if (typeof window.setExecuteDialogControlsEnabled === 'function') window.setExecuteDialogControlsEnabled(true); } catch (e) { }
     }
+    const RUN_PROGRESS_LOG_MAX_LINES = 800;
+    let runProgressLogLineCount = 0;
+
     function runProgressLogLine(s) {
         const pre = document.getElementById('runProgressLog');
         if (!pre) return;
@@ -21172,10 +21406,19 @@
             const text = line + '\n';
             if (typeof pre.append === 'function') { pre.append(text); }
             else { pre.appendChild(document.createTextNode(text)); }
+            runProgressLogLineCount += 1;
+            while (runProgressLogLineCount > RUN_PROGRESS_LOG_MAX_LINES && pre.firstChild) {
+                pre.removeChild(pre.firstChild);
+                runProgressLogLineCount -= 1;
+            }
         } catch (e) { }
         dockLog(line, lvl);
         pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
-        handleExecuteProgressLog(line);
+        try {
+            handleExecuteProgressLog(line);
+        } catch (e) {
+            try { appendExecuteProgressLog(`[ui] execute log handler error: ${e?.message || e}`); } catch (_) { }
+        }
     }
 
     async function promptRunProgressConfirm(message, { title = 'Active CORE session(s) detected', confirmLabel = 'Kill sessions & retry', cancelLabel = 'Cancel' } = {}) {
@@ -21312,7 +21555,10 @@
             document.getElementById('runProgressBar').classList.add('progress-bar-animated');
             setRunProgressModeHint('');
             const logEl = document.getElementById('runProgressLog');
-            if (logEl) logEl.textContent = '';
+            if (logEl) {
+                logEl.textContent = '';
+                runProgressLogLineCount = 0;
+            }
             // Do NOT clear persistent log buffer; just re-render existing lines
             if (typeof renderDockLog === 'function') { renderDockLog(); }
             // Reset footer buttons to default state
@@ -21405,6 +21651,98 @@
         let lastFinalizeUploadLogged = null;
         let lastFinalizeResponseLogged = null;
         let lastFinalizeStageLogged = null;
+        const ensureCoreSessionsPreparedForExecute = async () => {
+            let coreCfg = null;
+            try {
+                coreCfg = getRunCoreConfig(true, scenarioIndexForRun);
+            } catch (e) {
+                coreCfg = null;
+            }
+            if (!coreCfg || typeof coreCfg !== 'object') {
+                appendExecuteDialogLog('CORE session precheck skipped: CORE config unavailable.');
+                return true;
+            }
+            appendExecuteDialogLog('Checking for active CORE sessions before execute…');
+            updateRunStatus('Checking CORE sessions…', 'Verifying no active session blocks this execute.');
+            let preResp;
+            let preData = null;
+            try {
+                preResp = await fetch('/api/test/core_sessions/prepare', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ core: coreCfg, cleanup: false }),
+                });
+                preData = await parseResponseJson(preResp);
+            } catch (e) {
+                appendExecuteDialogLog(`CORE session precheck failed: ${e?.message || e}`);
+                return true;
+            }
+            if (!preResp?.ok || !preData || preData.ok === false) {
+                const msg = (preData && (preData.error || preData.message))
+                    ? String(preData.error || preData.message)
+                    : `HTTP ${preResp?.status || 'unknown'}`;
+                appendExecuteDialogLog(`CORE session precheck unavailable (${msg}); continuing.`);
+                return true;
+            }
+            if (!preData.active) {
+                appendExecuteDialogLog('No active CORE sessions detected.');
+                return true;
+            }
+
+            const sessionIds = Array.isArray(preData.session_ids) ? preData.session_ids : [];
+            const sessionCount = Number(preData.session_count) || sessionIds.length || 0;
+            const advanced = (confirmResult && typeof confirmResult === 'object' && confirmResult.advanced && typeof confirmResult.advanced === 'object')
+                ? confirmResult.advanced
+                : ((advancedFromOpts && typeof advancedFromOpts === 'object') ? advancedFromOpts : {});
+            const autoCleanup = !!advanced?.autoKillSessions;
+            let proceedCleanup = autoCleanup;
+            if (!autoCleanup) {
+                const idsText = sessionIds.length ? sessionIds.map((sid) => `#${sid}`).join(', ') : 'unknown';
+                proceedCleanup = await promptRunProgressConfirm(
+                    `Active CORE session(s) detected (${sessionCount}).\nSessions: ${idsText}\n\nStop and clean them now before execute?`,
+                    {
+                        title: 'Active CORE session(s) detected',
+                        confirmLabel: 'Cleanup & continue',
+                        cancelLabel: 'Cancel execute',
+                    }
+                );
+            } else {
+                appendExecuteDialogLog('Active CORE sessions detected; auto-kill is enabled, cleaning now.');
+            }
+
+            if (!proceedCleanup) {
+                appendExecuteDialogLog('Execute cancelled: active CORE sessions were not cleaned.');
+                updateRunStatus('Execute cancelled', 'Active CORE session cleanup was declined.');
+                return false;
+            }
+
+            appendExecuteDialogLog('Cleaning active CORE sessions before execute…');
+            updateRunStatus('Cleaning CORE sessions…', 'Stopping/deleting active sessions and docker leftovers…');
+            let cleanupResp;
+            let cleanupData = null;
+            try {
+                cleanupResp = await fetch('/api/test/core_sessions/prepare', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ core: coreCfg, cleanup: true }),
+                });
+                cleanupData = await parseResponseJson(cleanupResp);
+            } catch (e) {
+                appendExecuteDialogLog(`CORE session cleanup failed: ${e?.message || e}`);
+                updateRunStatus('Cleanup failed', 'Unable to clean active CORE sessions.');
+                return false;
+            }
+            if (!cleanupResp?.ok || !cleanupData || cleanupData.ok === false) {
+                const msg = (cleanupData && (cleanupData.error || cleanupData.message))
+                    ? String(cleanupData.error || cleanupData.message)
+                    : `HTTP ${cleanupResp?.status || 'unknown'}`;
+                appendExecuteDialogLog(`CORE session cleanup failed: ${msg}`);
+                updateRunStatus('Cleanup failed', msg);
+                return false;
+            }
+            appendExecuteDialogLog('Active CORE sessions cleaned successfully.');
+            return true;
+        };
         const updateRunStatus = (status, meta) => {
             if (executeProgressState.active) {
                 setExecuteProgressStatus(status, meta);
@@ -21814,6 +22152,22 @@
             openRunProgress('Running CLI…');
             maybeShowLocalEmulationHint();
         }
+        {
+            const sessionsPrepared = await ensureCoreSessionsPreparedForExecute();
+            if (!sessionsPrepared) {
+                if (executeProgressState.active) {
+                    completeExecuteProgressPanel(false, 'Execute cancelled', 'Active CORE sessions were not cleaned.');
+                } else if (showProgressModal) {
+                    const bar = document.getElementById('runProgressBar');
+                    if (bar) {
+                        bar.classList.remove('progress-bar-animated');
+                        bar.textContent = 'Cancelled';
+                    }
+                    markRunProgressComplete();
+                }
+                return false;
+            }
+        }
         if (!updateRemoteRepo) {
             try {
                 appendExecuteDialogLog('Checking remote repository availability…');
@@ -21878,6 +22232,15 @@
                 });
                 if (!pushed) {
                     appendExecuteDialogLog('Repository upload failed; aborting run.');
+                    try {
+                        const lastDiag = window.__lastExecuteNetworkFailure;
+                        if (lastDiag && typeof lastDiag === 'object') {
+                            const diagText = _safeExecuteDiagJson(lastDiag);
+                            if (diagText) {
+                                appendExecuteDialogLog(`Latest network diagnostics: ${diagText}`);
+                            }
+                        }
+                    } catch (e) { }
                     updateRunStatus('Repository sync failed', 'Upload failed; canceling run.');
                     stopUploadHeartbeat();
                     if (executeProgressState.active) {
@@ -21908,6 +22271,15 @@
                 updateRemoteRepo = false;
             } catch (err) {
                 appendExecuteDialogLog(`Repository upload exception: ${err?.message || err}`);
+                try {
+                    const lastDiag = window.__lastExecuteNetworkFailure;
+                    if (lastDiag && typeof lastDiag === 'object') {
+                        const diagText = _safeExecuteDiagJson(lastDiag);
+                        if (diagText) {
+                            appendExecuteDialogLog(`Latest network diagnostics: ${diagText}`);
+                        }
+                    }
+                } catch (e) { }
                 updateRunStatus('Repository sync failed', 'Exception during upload.');
                 stopUploadHeartbeat();
                 if (executeProgressState.active) {
@@ -22116,9 +22488,6 @@
                 }
                 const line = ev.data || '';
                 runProgressLogLine(line);
-                if (executeProgressState && executeProgressState.active) {
-                    handleExecuteProgressLog(line);
-                }
             };
             runProgressEvtSrc.addEventListener('end', () => {
                 waitingForRemoteLogs = false;
@@ -22494,9 +22863,6 @@
                 }
                 const line = ev.data || '';
                 runProgressLogLine(line);
-                if (executeProgressState && executeProgressState.active) {
-                    handleExecuteProgressLog(line);
-                }
             };
             runProgressEvtSrc.addEventListener('end', () => { waitingForSeedLogs = false; try { runProgressEvtSrc.close(); } catch (e) { } try { localStorage.removeItem('coretg_active_run_id'); } catch (e) { } });
             // Poll status similar to runSyncWithModal

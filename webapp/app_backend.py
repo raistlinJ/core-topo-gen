@@ -4671,6 +4671,39 @@ def _coerce_bool(value: Any) -> bool:
     return False
 
 
+def _stale_core_veth_cleanup_enabled() -> bool:
+    """Whether to remove orphaned CORE-style host veth interfaces before execute.
+
+    Default: enabled. Disable with `CORETG_CLEAN_STALE_CORE_VETH=0/false/no/off`.
+    """
+    raw = os.environ.get('CORETG_CLEAN_STALE_CORE_VETH')
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {'0', 'false', 'no', 'off', ''}
+
+
+def _stale_core_veth_cleanup_command() -> str:
+    """Return a shell command that best-effort deletes orphaned CORE veth names.
+
+    Matches deterministic CORE interface naming patterns like:
+    - `beth39.0.1`
+    - `veth39.0.1`
+    """
+    return (
+        'sh -c "'
+        'ip -o link show | '
+        'cut -d: -f2 | '
+        'cut -d@ -f1 | '
+        'tr -d \\040 | '
+        'grep -E ^[bv]eth[0-9]+\\.[0-9]+\\.[0-9]+$ | '
+        'sort -u | '
+        'while IFS= read -r i; do '
+        '[ -n $i ] && ip link del $i >/dev/null 2>&1 || true; '
+        'done'
+        '"'
+    )
+
+
 def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[str, Any]:
     base = raw if isinstance(raw, dict) else {}
     nested = base.get('ssh') if isinstance(base.get('ssh'), dict) else {}
@@ -39612,8 +39645,36 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
              log_f.write(f"{log_prefix}ERROR: {msg}\n")
          except Exception:
              pass
-         _fail_run(msg, code=1)
+         _fail_run(msg, code=1, extra={'error_code': 'active_sessions_blocking'})
          return
+
+    if _stale_core_veth_cleanup_enabled():
+        try:
+            log_f.write(f"{log_prefix}Cleaning stale CORE host veth interfaces (best-effort)...\n")
+        except Exception:
+            pass
+        try:
+            cleanup_cmd = _stale_core_veth_cleanup_command()
+            rc, out_text, err_text = _exec_sudo(cleanup_cmd, timeout=25.0, stage='stale_veth_cleanup')
+            if rc != 0:
+                try:
+                    log_f.write(
+                        f"{log_prefix}WARN: stale veth cleanup exited {rc}; continuing. "
+                        f"stdout={_summarize_for_log((out_text or '').strip())} "
+                        f"stderr={_summarize_for_log((err_text or '').strip())}\n"
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                log_f.write(f"{log_prefix}WARN: stale veth cleanup failed: {exc}; continuing.\n")
+            except Exception:
+                pass
+    else:
+        try:
+            log_f.write(f"{log_prefix}Stale CORE host veth cleanup is disabled by env.\n")
+        except Exception:
+            pass
 
     # Prepare remote context and uploads
     import tempfile
@@ -40915,6 +40976,45 @@ def run_status(run_id: str):
         'forward_host': meta.get('forward_host'),
         'forward_port': meta.get('forward_port'),
     })
+
+
+@app.route('/api/client_exec_diag', methods=['POST'])
+def api_client_exec_diag():
+    """Receive browser-side execute diagnostics (network failures/timeouts).
+
+    This endpoint is best-effort and intentionally lightweight so the UI can
+    report client-side failures that do not always surface in backend run logs.
+    """
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({'ok': False, 'error': 'invalid payload'}), 400
+    try:
+        stage = str(payload.get('stage') or '').strip() or 'unknown'
+        reason = str(payload.get('reason') or '').strip() or 'unknown'
+        message = str(payload.get('message') or '').strip()
+        code = payload.get('code')
+        status = payload.get('status')
+        ready_state = payload.get('readyState')
+        run_id = str(payload.get('run_id') or '').strip()
+        url = str(payload.get('url') or payload.get('responseURL') or '').strip()
+        attempts = payload.get('attempts')
+        app.logger.error(
+            "[client-exec-diag] stage=%s reason=%s message=%s code=%s status=%s readyState=%s run_id=%s url=%s attempts=%s payload=%s",
+            stage,
+            reason,
+            message,
+            code,
+            status,
+            ready_state,
+            run_id,
+            url,
+            attempts,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+    return jsonify({'ok': True})
 
 
 @app.route('/upload_base', methods=['POST'])
@@ -42261,13 +42361,43 @@ def restart_core_daemon():
     try:
         app.logger.info('[core.daemon] Attempting restart via SSH')
         client = _open_ssh_client(core_cfg)
-        exit_code, _out, err = _exec_sudo('systemctl restart core-daemon', timeout=40.0, stage='core-daemon.restart', client=client)
+
+        def _sudo_exec(cmd: str, *, timeout: float = 40.0) -> tuple[int, str, str]:
+            sudo_password = core_cfg.get('ssh_password')
+            wrapped = f"sh -c 'timeout {int(max(5, timeout))}s {cmd.strip()}'"
+            sudo_cmd = f"sudo -S -p '' {wrapped}" if sudo_password else f"sudo -n {wrapped}"
+            stdin = stdout = stderr = None
+            try:
+                stdin, stdout, stderr = client.exec_command(sudo_cmd, timeout=timeout + 5.0, get_pty=True)
+                if sudo_password:
+                    try:
+                        stdin.write(str(sudo_password) + '\n')
+                        stdin.flush()
+                    except Exception:
+                        pass
+                out_bytes = stdout.read() if stdout else b''
+                err_bytes = stderr.read() if stderr else b''
+                try:
+                    code = stdout.channel.recv_exit_status() if (stdout and hasattr(stdout, 'channel')) else 0
+                except Exception:
+                    code = 0
+                out_text = out_bytes.decode('utf-8', 'ignore') if isinstance(out_bytes, (bytes, bytearray)) else str(out_bytes or '')
+                err_text = err_bytes.decode('utf-8', 'ignore') if isinstance(err_bytes, (bytes, bytearray)) else str(err_bytes or '')
+                return int(code), out_text, err_text
+            finally:
+                try:
+                    if stdin:
+                        stdin.close()
+                except Exception:
+                    pass
+
+        exit_code, _out, err = _sudo_exec('systemctl restart core-daemon', timeout=40.0)
         if exit_code != 0:
             err = (err or '').strip()
             return jsonify({'error': f'Restart failed (exit {exit_code}): {err}'}), 500
 
         # Check status briefly
-        chk_code, _, _ = _exec_sudo('systemctl is-active core-daemon', timeout=10.0, stage='core-daemon.check', client=client)
+        chk_code, _, _ = _sudo_exec('systemctl is-active core-daemon', timeout=10.0)
         if chk_code != 0:
              return jsonify({'error': 'Restart command succeeded but service is not active.'}), 500
 
@@ -42281,6 +42411,12 @@ def restart_core_daemon():
         if 'Authentication failed' in msg:
              msg = 'SSH authentication failed. Check your credentials in Scenarios > Config.'
         return jsonify({'error': msg}), 500
+    finally:
+        try:
+            if 'client' in locals() and client is not None:
+                client.close()
+        except Exception:
+            pass
 
 
 @app.route('/core/upload', methods=['POST'])
@@ -48673,6 +48809,155 @@ def _ensure_core_vm_idle_for_test(core_cfg: Dict[str, Any]) -> None:
         raise RuntimeError(f'Unable to verify CORE sessions: {errors[0]}')
     if sessions:
         raise RuntimeError('CORE VM has active session(s). Stop running scenario before testing.')
+
+
+@app.route('/api/test/core_sessions/prepare', methods=['POST'])
+def api_test_core_sessions_prepare():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    cleanup = bool(payload.get('cleanup'))
+
+    try:
+        core_payload = payload.get('core') if isinstance(payload, dict) else None
+        if not isinstance(core_payload, dict):
+            return jsonify({'ok': False, 'error': 'CORE VM SSH config required: missing core payload'}), 400
+        core_cfg = _merge_core_configs(core_payload, include_password=True)
+        if not core_cfg.get('host'):
+            core_cfg['host'] = core_cfg.get('ssh_host') or '127.0.0.1'
+        if not core_cfg.get('port'):
+            core_cfg['port'] = CORE_PORT
+        core_cfg = _require_core_ssh_credentials(core_cfg)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'CORE VM SSH config required: {exc}'}), 400
+
+    host = str(core_cfg.get('host') or '127.0.0.1')
+    try:
+        port = int(core_cfg.get('port') or CORE_PORT)
+    except Exception:
+        port = CORE_PORT
+
+    errors: list[str] = []
+    try:
+        sessions = _list_active_core_sessions(host, port, core_cfg, errors=errors, meta={})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Unable to verify CORE sessions: {exc}'}), 409
+    if errors:
+        return jsonify({'ok': False, 'error': f'Unable to verify CORE sessions: {errors[0]}'}), 409
+
+    session_ids: list[int] = []
+    for entry in sessions or []:
+        sid = entry.get('id') if isinstance(entry, dict) else None
+        if sid in (None, ''):
+            continue
+        try:
+            session_ids.append(int(str(sid).strip()))
+        except Exception:
+            continue
+    session_ids = list(dict.fromkeys(session_ids))
+
+    if not session_ids:
+        return jsonify({
+            'ok': True,
+            'active': False,
+            'session_count': 0,
+            'session_ids': [],
+            'cleaned': False,
+        }), 200
+
+    if not cleanup:
+        return jsonify({
+            'ok': True,
+            'active': True,
+            'session_count': len(session_ids),
+            'session_ids': session_ids,
+            'cleaned': False,
+        }), 200
+
+    stopped: list[int] = []
+    deleted: list[int] = []
+    action_errors: list[str] = []
+    for sid in session_ids:
+        try:
+            _execute_remote_core_session_action(core_cfg, 'stop', sid, logger=app.logger)
+            stopped.append(sid)
+        except Exception:
+            pass
+        try:
+            _execute_remote_core_session_action(core_cfg, 'delete', sid, logger=app.logger)
+            deleted.append(sid)
+        except Exception as exc:
+            action_errors.append(f'Failed cleaning session {sid}: {exc}')
+
+    cleanup_notes: list[str] = []
+    cleanup_containers = 0
+    cleanup_images = 0
+    try:
+        status_payload = _run_remote_python_json(
+            core_cfg,
+            _remote_docker_status_script(core_cfg.get('ssh_password')),
+            logger=app.logger,
+            label='docker.status(test prepare cleanup)',
+            timeout=60.0,
+        )
+        names: list[str] = []
+        if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+            for it in status_payload.get('items') or []:
+                if isinstance(it, dict) and it.get('name'):
+                    names.append(str(it.get('name')))
+        if names:
+            docker_cleanup_payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.cleanup(test prepare cleanup)',
+                timeout=120.0,
+            )
+            if isinstance(docker_cleanup_payload, dict) and isinstance(docker_cleanup_payload.get('results'), list):
+                cleanup_containers = len(docker_cleanup_payload.get('results') or [])
+        else:
+            cleanup_notes.append('no docker-compose node containers to cleanup')
+    except Exception as exc:
+        cleanup_notes.append(f'container cleanup skipped/failed: {exc}')
+
+    try:
+        image_cleanup_payload = _run_remote_python_json(
+            core_cfg,
+            _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+            logger=app.logger,
+            label='docker.wrapper_images.cleanup(test prepare cleanup)',
+            timeout=180.0,
+        )
+        if isinstance(image_cleanup_payload, dict) and isinstance(image_cleanup_payload.get('removed'), list):
+            cleanup_images = len(image_cleanup_payload.get('removed') or [])
+    except Exception as exc:
+        cleanup_notes.append(f'wrapper image cleanup skipped/failed: {exc}')
+
+    if action_errors:
+        return jsonify({
+            'ok': False,
+            'error': action_errors[0],
+            'active': True,
+            'session_count': len(session_ids),
+            'session_ids': session_ids,
+            'stopped': stopped,
+            'deleted': deleted,
+            'cleanup_notes': cleanup_notes,
+            'cleanup_containers': cleanup_containers,
+            'cleanup_images': cleanup_images,
+        }), 409
+
+    return jsonify({
+        'ok': True,
+        'active': True,
+        'cleaned': True,
+        'session_count': len(session_ids),
+        'session_ids': session_ids,
+        'stopped': stopped,
+        'deleted': deleted,
+        'cleanup_notes': cleanup_notes,
+        'cleanup_containers': cleanup_containers,
+        'cleanup_images': cleanup_images,
+    }), 200
 
 
 def _download_remote_tree(sftp: Any, remote_root: str, local_root: str, *, skip_names: Optional[set[str]] = None) -> int:

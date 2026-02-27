@@ -363,19 +363,30 @@ def main() -> int:
 
             run_id_before = page.evaluate("typeof runProgressRunId !== 'undefined' ? runProgressRunId : null")
 
-            # There are two possible prompt titles/confirm labels depending on where the
-            # active-session detection happens.
-            confirm_label = "Retry with cleanup" if prompt_kind == "blocked" else "Kill sessions & retry"
+            # There are multiple possible prompt confirm labels depending on where active-session
+            # detection occurs (precheck vs. blocked run retry paths).
+            if prompt_kind == "blocked":
+                confirm_labels = ["Retry with cleanup", "Cleanup & continue", "Kill sessions & retry"]
+            else:
+                confirm_labels = ["Cleanup & continue", "Kill sessions & retry", "Retry with cleanup"]
 
             # If we fell back to a native confirm dialog (no Bootstrap toast), the dialog handler
             # above will auto-accept, and there will be no clickable button.
             clicked = False
-            try:
-                page.wait_for_selector(f'button[data-role="confirm"]:has-text("{confirm_label}")', state="visible", timeout=15000)
-                page.click(f'button[data-role="confirm"]:has-text("{confirm_label}")')
-                clicked = True
-            except Exception:
-                clicked = False
+            clicked_label = None
+            for confirm_label in confirm_labels:
+                try:
+                    page.wait_for_selector(
+                        f'button[data-role="confirm"]:has-text("{confirm_label}")',
+                        state="visible",
+                        timeout=5000,
+                    )
+                    page.click(f'button[data-role="confirm"]:has-text("{confirm_label}")')
+                    clicked = True
+                    clicked_label = confirm_label
+                    break
+                except Exception:
+                    continue
 
             page.wait_for_function(
                 """
@@ -397,6 +408,8 @@ def main() -> int:
             detected_count = page.locator("text=Active CORE session(s) detected").count()
             print(f"prompt_seen=True kind={prompt_kind} blocked_count={blocked_count} detected_count={detected_count}")
             print(f"retry_click={'ok' if clicked else 'dialog_or_missing_button'}")
+            if clicked_label:
+                print(f"retry_click_label={clicked_label}")
             print(f"retry_run_id_before={run_id_before}")
             print(f"retry_run_id_after={run_id_after}")
             return 0

@@ -1329,6 +1329,60 @@
     await loadTestOutputs(runId);
   }
 
+  async function ensureCoreVmReadyForGenTest(coreCfg) {
+    if (!coreCfg || typeof coreCfg !== 'object') return true;
+
+    const requestOptions = (cleanup) => ({
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ core: coreCfg, cleanup: !!cleanup }),
+    });
+
+    const precheck = await fetchJson('/api/test/core_sessions/prepare', requestOptions(false));
+    if (!precheck || precheck.ok === false) {
+      throw new Error((precheck && precheck.error) ? precheck.error : 'Unable to verify CORE sessions.');
+    }
+    if (!precheck.active) {
+      return true;
+    }
+
+    const sessionCount = Number(precheck.session_count || 0) || 1;
+    const warningMessage = [
+      `A CORE session is currently running (${sessionCount} active).`,
+      '',
+      'To run this test, the active CORE session must be stopped and cleaned up.',
+      '',
+      'Warning: this may cause loss of current progress/data, and you will need to restart the scenario.',
+      '',
+      'Do you want to continue?',
+    ].join('\n');
+
+    let shouldCleanup = false;
+    if (typeof window.confirmWithModal === 'function') {
+      shouldCleanup = await window.confirmWithModal(
+        'Active CORE Session',
+        warningMessage,
+        'Stop & Cleanup',
+        'danger',
+      );
+    } else {
+      shouldCleanup = window.confirm(warningMessage);
+    }
+
+    if (!shouldCleanup) {
+      return false;
+    }
+
+    const cleanupResp = await fetchJson('/api/test/core_sessions/prepare', requestOptions(true));
+    if (!cleanupResp || cleanupResp.ok === false) {
+      throw new Error((cleanupResp && cleanupResp.error) ? cleanupResp.error : 'Failed to stop and clean up active CORE session(s).');
+    }
+    return true;
+  }
+
   async function runCurrentGenTest() {
     const btn = document.getElementById('genTestRunBtn');
     btn.disabled = true;
@@ -1338,6 +1392,21 @@
     setOutputsStatus(true, 'Starting generator…');
 
     setTestLogLine('[ui] preparing request…');
+
+    try {
+      const canProceed = await ensureCoreVmReadyForGenTest(genTestState.testCoreCfg || null);
+      if (!canProceed) {
+        setTestLogLine('[ui] Run cancelled.');
+        setOutputsStatus(false);
+        btn.disabled = false;
+        return;
+      }
+    } catch (e) {
+      setTestLogLine(`ERROR: ${String(e)}`);
+      setOutputsStatus(false);
+      btn.disabled = false;
+      return;
+    }
 
     const form = document.getElementById('genTestForm');
     const fd = new FormData(form);

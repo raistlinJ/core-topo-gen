@@ -441,6 +441,46 @@
     });
   }
 
+  async function _ensureCoreVmReadyForVulnTest(coreCfg) {
+    if (!coreCfg || typeof coreCfg !== 'object') return true;
+
+    const precheck = await _postJson('/api/test/core_sessions/prepare', { core: coreCfg, cleanup: false });
+    if (!precheck || precheck.ok === false) {
+      throw new Error((precheck && precheck.error) ? precheck.error : 'Unable to verify CORE sessions.');
+    }
+    if (!precheck.active) return true;
+
+    const sessionCount = Number(precheck.session_count || 0) || 1;
+    const warningMessage = [
+      `A CORE session is currently running (${sessionCount} active).`,
+      '',
+      'To run this test, the active CORE session must be stopped and cleaned up.',
+      '',
+      'Warning: this may cause loss of current progress/data, and you will need to restart the scenario.',
+      '',
+      'Do you want to continue?',
+    ].join('\n');
+
+    let shouldCleanup = false;
+    if (typeof window.confirmWithModal === 'function') {
+      shouldCleanup = await window.confirmWithModal(
+        'Active CORE Session',
+        warningMessage,
+        'Stop & Cleanup',
+        'danger',
+      );
+    } else {
+      shouldCleanup = window.confirm(warningMessage);
+    }
+    if (!shouldCleanup) return false;
+
+    const cleanupResp = await _postJson('/api/test/core_sessions/prepare', { core: coreCfg, cleanup: true });
+    if (!cleanupResp || cleanupResp.ok === false) {
+      throw new Error((cleanupResp && cleanupResp.error) ? cleanupResp.error : 'Failed to stop and clean up active CORE session(s).');
+    }
+    return true;
+  }
+
   function _isRequiredInput(inp) {
     if (!inp || typeof inp !== 'object') return false;
     if (Object.prototype.hasOwnProperty.call(inp, 'required')) {
@@ -699,6 +739,11 @@
       const coreCfg = _vulnCatalogState.testCoreCfg || null;
       if (!coreCfg) {
         throw new Error('CORE VM credentials required.');
+      }
+      const canProceed = await _ensureCoreVmReadyForVulnTest(coreCfg);
+      if (!canProceed) {
+        _appendLog('vulnTestLog', '[ui] Run cancelled.');
+        return;
       }
       let data = null;
       try {
