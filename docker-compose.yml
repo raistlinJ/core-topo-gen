@@ -8,6 +8,8 @@ services:
     environment:
       - CORE_HOST=${CORE_HOST:-host.docker.internal}
       - CORE_PORT=${CORE_PORT:-50051}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Persist state/artifacts on the host.
       - ./outputs:/app/outputs
@@ -15,6 +17,12 @@ services:
       - ./uploads:/app/uploads
     expose:
       - "9090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
     networks:
       - app_net
@@ -25,7 +33,8 @@ services:
       dockerfile: Dockerfile
     container_name: core-topo-gen-proxy
     depends_on:
-      - web
+      web:
+        condition: service_healthy
     ports:
       - "80:80"
       - "443:443"
