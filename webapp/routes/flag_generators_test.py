@@ -478,6 +478,7 @@ def register(
             proc = subprocess.Popen(
                 cmd,
                 cwd=repo_root,
+                stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=log_handle,
                 text=True,

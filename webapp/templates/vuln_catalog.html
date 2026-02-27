@@ -803,23 +803,34 @@
           _appendLog('vulnTestLog', line);
           try {
             if (line.startsWith('[remote] uploading')) {
-              _setText('vulnTestStatusText', 'Uploading files…');
+              _setText('vulnTestStatusText', 'Uploading files… (streaming logs)');
             } else if (line.startsWith('[upload] ')) {
               const m = line.match(/\((\d+)%\)/);
               if (m && m[1]) {
-                _setText('vulnTestStatusText', `Uploading files… (${m[1]}%)`);
+                _setText('vulnTestStatusText', `Uploading files… (${m[1]}%, streaming logs)`);
               }
             } else if (line.startsWith('[remote] compose:')) {
-              _setText('vulnTestStatusText', 'Starting docker compose…');
+              _setText('vulnTestStatusText', 'Starting docker compose… (streaming logs)');
             } else if (line.startsWith('[remote] docker compose up')) {
-              _setText('vulnTestStatusText', 'Running docker compose…');
+              _setText('vulnTestStatusText', 'Running docker compose… (streaming logs)');
             }
           } catch (e) {}
         }
       };
       es.addEventListener('end', () => {
+        _appendLog('vulnTestLog', '[ui] Stream ended; test is still active until you click Stop (OK/FAILED).');
+        if (_vulnCatalogState.activeTestRunId) {
+          _setText('vulnTestStatusText', 'Logs ended; awaiting your Stop action (OK/FAILED)…');
+        }
         try { es.close(); } catch (e) {}
       });
+      es.onerror = () => {
+        _appendLog('vulnTestLog', '[ui] Log stream disconnected; test may still be active. Use Stop when ready.');
+        if (_vulnCatalogState.activeTestRunId) {
+          _setText('vulnTestStatusText', 'Log stream disconnected; test still active until Stop…');
+        }
+        try { es.close(); } catch (e) {}
+      };
       try {
         const modalEl = _qs('vulnTestModal');
         if (modalEl) {
@@ -838,8 +849,11 @@
     } finally {
       try {
         const st = _qs('vulnTestStatus');
-        if (st) st.style.display = 'none';
-        _setText('vulnTestStatusText', 'Working…');
+        const stillRunning = !!_vulnCatalogState.activeTestRunId;
+        if (st) st.style.display = stillRunning ? '' : 'none';
+        if (!stillRunning) {
+          _setText('vulnTestStatusText', 'Working…');
+        }
       } catch (e) {}
       if (btn) {
         if (!started && !_vulnCatalogState.activeTestRunId) {

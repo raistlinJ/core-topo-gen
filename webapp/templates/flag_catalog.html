@@ -351,6 +351,9 @@
     outputsPollTimer: null,
     outputsLastSig: null,
     outputsStablePolls: 0,
+    runActive: false,
+    streamEndedAt: null,
+    completionLogged: false,
   };
 
   let pendingCleanupRunId = null;
@@ -464,6 +467,9 @@
     genTestState.current = null;
     genTestState.testBase = '/flag_generators_test';
     genTestState.savedUploads = {};
+    genTestState.runActive = false;
+    genTestState.streamEndedAt = null;
+    genTestState.completionLogged = false;
     clearTestLog();
     setOutputsHtml('<div class="text-muted">Waiting… press Run button.</div>');
     setOutputsStatus(false);
@@ -610,6 +616,9 @@
       setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
       setOutputsStatus(false);
       stopOutputsPolling();
+      genTestState.runActive = false;
+      const btn = document.getElementById('genTestRunBtn');
+      if (btn) btn.disabled = false;
       return;
     }
     if (data.ok === false) {
@@ -617,6 +626,9 @@
       setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
       setOutputsStatus(false);
       stopOutputsPolling();
+      genTestState.runActive = false;
+      const btn = document.getElementById('genTestRunBtn');
+      if (btn) btn.disabled = false;
       return;
     }
 
@@ -634,11 +646,19 @@
     const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
     const misc = Array.isArray(data.misc) ? data.misc : [];
     const hasAny = !!(inputs.length || outputs.length || misc.length);
+    const fileCount = inputs.length + outputs.length + misc.length;
+    const stableTarget = 3;
+    const finalizeGraceMs = 3000;
+    const streamGraceSatisfied = !genTestState.streamEndedAt || ((Date.now() - genTestState.streamEndedAt) >= finalizeGraceMs);
 
     if (!data.done) {
-      setOutputsStatus(true, 'Generating outputs…');
-    } else if (data.done && genTestState.outputsStablePolls < 1) {
-      setOutputsStatus(true, 'Finalizing file list…');
+      setOutputsStatus(true, `Generating outputs… (${fileCount} file${fileCount === 1 ? '' : 's'} so far)`);
+    } else if (data.done && (!streamGraceSatisfied || genTestState.outputsStablePolls < stableTarget)) {
+      const stableNow = Math.min(stableTarget, (genTestState.outputsStablePolls || 0) + 1);
+      setOutputsStatus(
+        true,
+        `Finalizing file list… (${fileCount} file${fileCount === 1 ? '' : 's'}, stable ${stableNow}/${stableTarget})`
+      );
     } else {
       setOutputsStatus(false);
     }
@@ -647,9 +667,16 @@
     if (hasAny || data.done) {
       await loadTestOutputs(runId);
     }
-    // Stop polling once the run is done and the file list is stable.
-    if (data.done && genTestState.outputsStablePolls >= 1) {
+    // Stop polling once the run is done, stream grace elapsed, and file list stayed stable.
+    if (data.done && streamGraceSatisfied && genTestState.outputsStablePolls >= stableTarget) {
       stopOutputsPolling();
+      genTestState.runActive = false;
+      if (!genTestState.completionLogged) {
+        setTestLogLine(`Completed. Final files ready (${fileCount}).`);
+        genTestState.completionLogged = true;
+      }
+      const btn = document.getElementById('genTestRunBtn');
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -1390,6 +1417,9 @@
     setOutputsHtml('<div class="text-muted">Waiting for outputs…</div>');
     stopOutputsPolling();
     setOutputsStatus(true, 'Starting generator…');
+    genTestState.runActive = false;
+    genTestState.streamEndedAt = null;
+    genTestState.completionLogged = false;
 
     setTestLogLine('[ui] preparing request…');
 
@@ -1421,6 +1451,7 @@
     if (!data || data.ok === false) {
       setTestLogLine(`ERROR: ${data && data.error ? data.error : 'Failed to start run'}`);
       setOutputsStatus(false);
+      genTestState.runActive = false;
       btn.disabled = false;
       return;
     }
@@ -1430,6 +1461,7 @@
     genTestState.savedUploads = (data && data.saved_uploads) ? data.saved_uploads : {};
     setTestLogLine(`[ui] run_id=${runId}`);
     setTestLogLine(`Started run ${runId}`);
+    genTestState.runActive = true;
 
     try {
       const saved = genTestState.savedUploads || {};
@@ -1465,10 +1497,10 @@
     es.addEventListener('end', async () => {
       try { es.close(); } catch (e) {}
       genTestState.eventSource = null;
-      setTestLogLine('Completed.');
+      genTestState.streamEndedAt = Date.now();
+      setTestLogLine('Stream ended; finalizing outputs…');
       await loadTestOutputsWithRetry(runId);
-      // Keep polling until the file list stabilizes.
-      btn.disabled = false;
+      // Keep polling until done+stable determines true completion.
     });
     es.onerror = () => {
       // Keep UI responsive; user can retry.
@@ -1477,7 +1509,6 @@
       genTestState.eventSource = null;
       // Keep polling outputs so links still appear.
       startOutputsPolling(runId);
-      btn.disabled = false;
     };
   }
 

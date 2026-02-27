@@ -49535,6 +49535,7 @@ def flag_generators_test_run():
         proc = subprocess.Popen(
             cmd,
             cwd=repo_root,
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=log_handle,
             text=True,
@@ -49848,6 +49849,7 @@ def flag_node_generators_test_run():
         proc = subprocess.Popen(
             cmd,
             cwd=repo_root,
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=log_handle,
             text=True,
