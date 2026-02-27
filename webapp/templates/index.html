@@ -883,6 +883,14 @@
                             <label class="form-check-label" for="executeAdvDockerCleanupBeforeRun">Remove old Docker
                                 containers/images before run</label>
                         </div>
+                        {% if webui_running_in_docker %}
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvDockerNukeAll" disabled>
+                            <label class="form-check-label text-muted" for="executeAdvDockerNukeAll">Delete all docker containers
+                                (disabled while Web UI runs in Docker)</label>
+                            <div class="form-text">Safety guard: this option is disabled to avoid removing the running Web UI container.</div>
+                        </div>
+                        {% else %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvDockerNukeAll">
                             <label class="form-check-label" for="executeAdvDockerNukeAll">Delete all docker containers
@@ -890,6 +898,7 @@
                             <div class="form-text">This will stop and remove all containers (does not remove images).
                             </div>
                         </div>
+                        {% endif %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvCheckCoreVersion">
                             <label class="form-check-label" for="executeAdvCheckCoreVersion">Check CORE version is

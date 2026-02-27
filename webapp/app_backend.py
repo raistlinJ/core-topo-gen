@@ -10096,6 +10096,31 @@ def _set_current_user(user: dict | None) -> None:
         session.pop('user', None)
 
 
+def _webui_running_in_docker() -> bool:
+    try:
+        force = str(os.getenv('CORETG_RUNNING_IN_DOCKER') or '').strip().lower()
+        if force in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+    except Exception:
+        pass
+    try:
+        if os.path.exists('/.dockerenv'):
+            return True
+    except Exception:
+        pass
+    for probe in ('/proc/1/cgroup', '/proc/self/cgroup'):
+        try:
+            if not os.path.exists(probe):
+                continue
+            with open(probe, 'r', encoding='utf-8', errors='ignore') as f:
+                blob = (f.read() or '').lower()
+            if any(tok in blob for tok in ('docker', 'containerd', 'kubepods', 'podman')):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 @app.before_request
 def _inject_current_user() -> None:
     try:
@@ -10188,6 +10213,11 @@ def _inject_nav_participant_link() -> dict:
 @app.context_processor
 def _inject_ui_view_state() -> dict:
     return {'ui_view_mode': getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)}
+
+
+@app.context_processor
+def _inject_runtime_flags() -> dict:
+    return {'webui_running_in_docker': _webui_running_in_docker()}
 
 
 def set_ui_view_mode():
@@ -34680,6 +34710,12 @@ def run_cli():
     docker_remove_all_containers = _coerce_bool(
         request.form.get('docker_remove_all_containers')
     ) or _coerce_bool(request.form.get('docker_nuke_all'))
+    if _webui_running_in_docker() and docker_remove_all_containers:
+        docker_remove_all_containers = False
+        try:
+            app.logger.warning('[sync] Ignoring docker_remove_all_containers request because web UI is running in Docker')
+        except Exception:
+            pass
     scenario_index_hint: Optional[int] = None
     try:
         raw_index = request.form.get('scenario_index')
@@ -38867,6 +38903,12 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     docker_remove_conflicts = job_spec.get('docker_remove_conflicts')
     docker_cleanup_before_run = job_spec.get('docker_cleanup_before_run')
     docker_remove_all_containers = job_spec.get('docker_remove_all_containers')
+    if _webui_running_in_docker() and docker_remove_all_containers:
+        docker_remove_all_containers = False
+        try:
+            app.logger.warning('[async] Background run %s: forced docker_remove_all_containers=False (web UI in Docker)', run_id)
+        except Exception:
+            pass
 
     # Ensure FlowState inject_files are backfilled into the XML before uploading/running.
     try:
@@ -40079,6 +40121,12 @@ def run_cli_async():
                 j.get('docker_remove_all_containers')
             ) or _coerce_bool(j.get('docker_nuke_all'))
             overwrite_existing_images = _coerce_bool(j.get('overwrite_existing_images'))
+        except Exception:
+            pass
+    if _webui_running_in_docker() and docker_remove_all_containers:
+        docker_remove_all_containers = False
+        try:
+            app.logger.warning('[async] Ignoring docker_remove_all_containers request because web UI is running in Docker')
         except Exception:
             pass
     if not xml_path:

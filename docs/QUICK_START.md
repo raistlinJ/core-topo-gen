@@ -20,6 +20,7 @@ docker compose up -d --build
 - Open `https://localhost`.
 - Verify HTTPS health: `curl -k https://localhost/healthz`
 - Stop the stack: `docker compose down`
+- Safety: in Execute → Advanced, `Delete all docker containers` is disabled when the Web UI is running in Docker.
 
 ## Launch the Web UI
 Run the backend directly for local development:
