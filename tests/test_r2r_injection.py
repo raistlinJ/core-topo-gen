@@ -1,53 +1,83 @@
-import sys, types, importlib, pytest
+from webapp import app_backend as backend
 
-# Obsolete test module: approval / preview edge injection path removed.
-pytest.skip("obsolete: approved_plan R2R edge injection removed in full_preview refactor", allow_module_level=True)
 
-def _install_core_stubs():
-    # Create package hierarchy core.api.grpc.wrappers
-    if 'core' not in sys.modules:
-        core_mod = types.ModuleType('core'); sys.modules['core'] = core_mod
-    if 'core.api' not in sys.modules:
-        api_mod = types.ModuleType('core.api'); sys.modules['core.api'] = api_mod
-    if 'core.api.grpc' not in sys.modules:
-        grpc_mod = types.ModuleType('core.api.grpc'); sys.modules['core.api.grpc'] = grpc_mod
-    if 'core.api.grpc.wrappers' not in sys.modules:
-        wrappers_mod = types.ModuleType('core.api.grpc.wrappers'); sys.modules['core.api.grpc.wrappers'] = wrappers_mod
-        class NodeType:
-            ROUTER='router'; SWITCH='switch'; DEFAULT='host'; HUB='hub'; EMANE='emane'
-        class Position:
-            def __init__(self, x=0, y=0): self.x=x; self.y=y
-        class Interface:
-            def __init__(self, id=0, name='', ip4='', ip4_mask=0, mac=''):
-                self.id=id; self.name=name; self.ip4=ip4; self.ip4_mask=ip4_mask; self.mac=mac
-        wrappers_mod.NodeType = NodeType
-        wrappers_mod.Position = Position
-        wrappers_mod.Interface = Interface
-    if 'core.api.grpc.client' not in sys.modules:
-        client_mod = types.ModuleType('core.api.grpc.client'); sys.modules['core.api.grpc.client'] = client_mod
-        class CoreGrpcClient: pass
-        client_mod.CoreGrpcClient = CoreGrpcClient
+def _base_preview():
+    return {
+        'routers': [
+            {'node_id': 10, 'name': 'r10', 'metadata': {}},
+            {'node_id': 11, 'name': 'r11', 'metadata': {}},
+        ],
+        'layout_positions': {'routers': {'10': {'x': 100, 'y': 200}}},
+    }
 
-class DummyCore:
-    def add_session(self):
-        class S:
-            def __init__(self):
-                self.nodes={}; self.links=[]
-            def add_node(self, nid, _type=None, position=None, name=None):
-                n=types.SimpleNamespace(id=nid, name=name or f'n{nid}', services=[], position=position)
-                self.nodes[nid]=n; return n
-            def add_link(self, *args, **kwargs):
-                if args and len(args)>=2:
-                    a=args[0]; b=args[1]
-                else:
-                    a=kwargs.get('node1') or kwargs.get('node1_id')
-                    b=kwargs.get('node2') or kwargs.get('node2_id')
-                if hasattr(a,'id'): a=a.id
-                if hasattr(b,'id'): b=b.id
-                pair=tuple(sorted((a,b)))
-                if pair not in self.links:
-                    self.links.append(pair)
-        return S()
 
-def test_r2r_preview_injection_respected():  # kept for historical reference
-    pass
+def test_wire_hitl_preview_routers_adds_r2r_preview_structures():
+    full_preview = _base_preview()
+    hitl_cfg = {
+        'scenario_key': 'scenario-a',
+        'interfaces': [
+            {
+                'name': 'eth0',
+                'ordinal': 0,
+                'interface_count': 1,
+                'prefix_len': 24,
+                'new_router_ip4': '10.99.0.2',
+                'existing_router_ip4': '10.99.0.1',
+                'link_network_cidr': '10.99.0.0/24',
+                'preview_router': {
+                    'node_id': 200,
+                    'name': 'hitl-r200',
+                    'metadata': {'hitl_preview': True, 'ordinal': 0, 'interface_count': 1},
+                },
+            }
+        ],
+    }
+
+    backend._wire_hitl_preview_routers(full_preview, hitl_cfg)
+
+    edges = full_preview.get('r2r_edges_preview') or []
+    links = full_preview.get('r2r_links_preview') or []
+    degree = full_preview.get('r2r_degree_preview') or {}
+
+    assert len(edges) == 1
+    assert len(links) == 1
+    assert links[0].get('hitl_preview') is True
+    assert links[0].get('subnet') == '10.99.0.0/24'
+    assert degree.get(200) == 1
+
+    iface = hitl_cfg['interfaces'][0]
+    preview_router = iface['preview_router']
+    peer_id = iface.get('peer_router_node_id')
+    assert isinstance(peer_id, int)
+    assert preview_router['metadata'].get('hitl_peer_wired') is True
+    assert preview_router['metadata'].get('peer_router_node_id') == peer_id
+    assert preview_router.get('r2r_interfaces', {}).get(str(peer_id)) == '10.99.0.2/24'
+
+
+def test_wire_hitl_preview_routers_is_idempotent_for_same_interface():
+    full_preview = _base_preview()
+    hitl_cfg = {
+        'scenario_key': 'scenario-a',
+        'interfaces': [
+            {
+                'name': 'eth0',
+                'ordinal': 0,
+                'interface_count': 1,
+                'prefix_len': 24,
+                'new_router_ip4': '10.99.0.2',
+                'existing_router_ip4': '10.99.0.1',
+                'link_network_cidr': '10.99.0.0/24',
+                'preview_router': {
+                    'node_id': 200,
+                    'name': 'hitl-r200',
+                    'metadata': {'hitl_preview': True, 'ordinal': 0, 'interface_count': 1},
+                },
+            }
+        ],
+    }
+
+    backend._wire_hitl_preview_routers(full_preview, hitl_cfg)
+    backend._wire_hitl_preview_routers(full_preview, hitl_cfg)
+
+    assert len(full_preview.get('r2r_edges_preview') or []) == 1
+    assert len(full_preview.get('r2r_links_preview') or []) == 1

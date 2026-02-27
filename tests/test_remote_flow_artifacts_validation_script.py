@@ -77,8 +77,6 @@ def test_remote_validator_resolves_relative_outputs_in_artifacts_and_outputs_dir
     assert node_item is not None
     assert node_item.get('outputs_missing') == []
     assert str(compose_path) in (node_item.get('outputs_checked') or [])
-<<<<<<< Updated upstream
-=======
 
 
 def test_listener_snapshot_script_includes_tcp_udp_and_ss_checks():
@@ -93,4 +91,3 @@ def test_listener_snapshot_script_includes_tcp_udp_and_ss_checks():
     assert '/proc/net/udp6' in script
     assert 'ss -lntu' in script
     assert 'docker-40' in script
->>>>>>> Stashed changes

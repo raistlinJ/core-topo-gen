@@ -75,6 +75,17 @@ def _load_core_cfg_from_secret(
     if preferred:
         candidate_ids.append(preferred)
 
+    hint_path = Path("outputs") / "flag_generators_test_core_hint.json"
+    try:
+        if hint_path.is_file():
+            hint_payload = json.loads(hint_path.read_text(encoding="utf-8"))
+            if isinstance(hint_payload, dict):
+                hinted_id = str(hint_payload.get("core_secret_id") or "").strip()
+                if hinted_id and hinted_id not in candidate_ids:
+                    candidate_ids.append(hinted_id)
+    except Exception:
+        pass
+
     secret_dir = Path("outputs/secrets/core")
     if secret_dir.is_dir():
         for p in sorted(secret_dir.glob("*.json")):
