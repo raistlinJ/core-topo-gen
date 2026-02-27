@@ -29,6 +29,34 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 
 View the WebUI images gallery [`docs/screenshots.md`](docs/screenshots.md).
 
+## Install
+- Prereqs: Python 3.10+ and [uv](https://docs.astral.sh/uv/)
+- Install dependencies:
+```bash
+uv sync --extra dev
+```
+- Run local Web UI:
+```bash
+uv run python webapp/app_backend.py
+```
+- Run HTTPS Web UI with Docker Compose:
+```bash
+docker compose up -d --build
+```
+- Open `https://localhost` and verify health:
+```bash
+curl -k https://localhost/healthz
+```
+- Stop Docker stack:
+```bash
+docker compose down
+```
+- Run CLI:
+```bash
+uv run python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
+```
+- More setup detail: [docs/QUICK_START.md](docs/QUICK_START.md).
+
 ## Guides
 - [Quick start](docs/QUICK_START.md)
 - [Full Preview workflow](docs/FULL_PREVIEW_WORKFLOW.md)
