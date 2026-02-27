@@ -49,6 +49,7 @@ from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file, Response, jsonify, session, g, has_request_context, abort
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -45678,15 +45679,14 @@ def _pick_vuln_csv_from_zip(zf: zipfile.ZipFile) -> str | None:
     return None
 
 
-def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str) -> dict:
+def _install_vuln_catalog_zip_file(*, zip_file_path: str, label: str, origin: str) -> dict:
     os.makedirs(_installed_vuln_catalogs_root(), exist_ok=True)
     catalog_id = _local_timestamp_safe() + '-' + secrets.token_hex(3)
     pack_dir = _vuln_catalog_pack_dir(catalog_id)
     os.makedirs(pack_dir, exist_ok=True)
 
     zip_path = _vuln_catalog_pack_zip_path(catalog_id)
-    with open(zip_path, 'wb') as f:
-        f.write(zip_bytes or b'')
+    shutil.copyfile(str(zip_file_path), zip_path)
 
     csv_rel_paths: list[str] = []
     compose_items: list[dict[str, Any]] = []
@@ -45789,6 +45789,21 @@ def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str
     return entry
 
 
+def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str) -> dict:
+    tmp_path = ''
+    try:
+        with tempfile.NamedTemporaryFile(prefix='vuln-catalog-', suffix='.zip', delete=False) as tmp:
+            tmp.write(zip_bytes or b'')
+            tmp_path = tmp.name
+        return _install_vuln_catalog_zip_file(zip_file_path=tmp_path, label=label, origin=origin)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 @app.route('/vuln_catalog_page')
 def vuln_catalog_page():
     _require_builder_or_admin()
@@ -45819,21 +45834,66 @@ def vuln_catalog_page():
 @app.route('/vuln_catalog_packs/upload', methods=['POST'])
 def vuln_catalog_packs_upload():
     _require_builder_or_admin()
-    f = request.files.get('zip_file')
     is_ajax = str(request.headers.get('X-Requested-With') or '').lower() == 'xmlhttprequest' or 'application/json' in str(request.headers.get('Accept') or '')
+    try:
+        f = request.files.get('zip_file')
+    except RequestEntityTooLarge:
+        msg = 'File too large for this server upload limit.'
+        if is_ajax:
+            return jsonify({'ok': False, 'error': msg}), 413
+        flash(msg)
+        return redirect(url_for('vuln_catalog_page'))
+
     if not f:
         if is_ajax:
             return jsonify({'ok': False, 'error': 'Missing zip_file'}), 400
         flash('Missing zip_file')
         return redirect(url_for('vuln_catalog_page'))
+
+    max_upload_bytes = 1024 * 1024 * 1024
     try:
-        data = f.read() or b''
+        max_upload_bytes = int(os.getenv('CORETG_VULN_PACK_MAX_BYTES') or max_upload_bytes)
+    except Exception:
+        max_upload_bytes = 1024 * 1024 * 1024
+    try:
+        req_len = request.content_length
+        if isinstance(req_len, int) and req_len > max_upload_bytes:
+            msg = f'File too large (max {max_upload_bytes // (1024 * 1024)}MB).'
+            if is_ajax:
+                return jsonify({'ok': False, 'error': msg}), 413
+            flash(msg)
+            return redirect(url_for('vuln_catalog_page'))
+    except Exception:
+        pass
+
+    try:
+        tmp_path = ''
+        try:
+            with tempfile.NamedTemporaryFile(prefix='vuln-upload-', suffix='.zip', delete=False) as tmp:
+                tmp_path = tmp.name
+            f.save(tmp_path)
+        except RequestEntityTooLarge:
+            msg = 'File too large for this server upload limit.'
+            if is_ajax:
+                return jsonify({'ok': False, 'error': msg}), 413
+            flash(msg)
+            return redirect(url_for('vuln_catalog_page'))
+
         label = secure_filename(getattr(f, 'filename', '') or '') or 'vuln-catalog'
-        entry = _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin='upload')
+        entry = _install_vuln_catalog_zip_file(zip_file_path=tmp_path, label=label, origin='upload')
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
         if is_ajax:
             return jsonify({'ok': True, 'message': 'Vulnerability catalog pack installed.', 'catalog_id': str(entry.get('id') or '')})
         flash('Vulnerability catalog pack installed.')
     except Exception as exc:
+        try:
+            if 'tmp_path' in locals() and tmp_path:
+                os.remove(tmp_path)
+        except Exception:
+            pass
         if is_ajax:
             return jsonify({'ok': False, 'error': f'Failed to install vulnerability catalog pack: {exc}'}), 400
         flash(f'Failed to install vulnerability catalog pack: {exc}')

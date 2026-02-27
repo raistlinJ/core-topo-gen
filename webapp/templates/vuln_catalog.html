@@ -1076,6 +1076,8 @@
         if (progressBar) {
           progressBar.classList.remove('progress-bar-animated');
           progressBar.classList.remove('progress-bar-striped');
+          progressBar.classList.remove('bg-success', 'bg-danger');
+          progressBar.classList.add(ok ? 'bg-success' : 'bg-danger');
         }
         if (resultPre) {
           const txt = (xhr.responseText || '').trim();
@@ -1085,8 +1087,21 @@
           }
         }
         if (closeBtn) closeBtn.style.display = 'inline-block';
-        // Refresh to show newly installed pack + flash messages.
-        setTimeout(() => { window.location.reload(); }, ok ? 700 : 1200);
+        if (!ok && xhr.status === 413 && progressText) {
+          progressText.textContent = 'Upload rejected: request too large (HTTP 413). Increase server upload limits and retry.';
+        }
+        if (ok) {
+          setTimeout(() => { window.location.reload(); }, 700);
+        }
+      };
+
+      xhr.onerror = () => {
+        if (progressText) progressText.textContent = 'Upload failed due to a network/proxy error.';
+        if (progressBar) {
+          progressBar.classList.remove('progress-bar-animated', 'progress-bar-striped', 'bg-success');
+          progressBar.classList.add('bg-danger');
+        }
+        if (closeBtn) closeBtn.style.display = 'inline-block';
       };
 
       xhr.send(fd);
