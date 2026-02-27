@@ -10,6 +10,26 @@ Both families share the same runtime output contract: a machine-readable `output
 AI prompt templates (copy/paste):
 - [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md)
 
+## 0) AI scaffolding quickstart
+
+If you are using AI to create generators, use this minimal handoff packet:
+
+- `manifest.yaml` (or at least `id`, `kind`, `runtime`, `inputs`, `artifacts`, `injects`, `hint_templates`)
+- scaffolded `generator.py`
+- expected artifact keys (`requires`, `optional_requires`, `produces`)
+- explicit statement of required vs optional runtime inputs
+
+Recommended prompt flow:
+
+1. Ask AI to update only `generator.py`.
+2. Ask AI to self-check output keys against manifest `artifacts.produces`.
+3. Ask AI to update `manifest.yaml` only if output keys changed.
+4. Run local `scripts/run_flag_generator.py` test.
+5. Run installed-pack Execute parity check.
+
+Use the copy/paste templates in [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md).
+If you are using desktop chat tools, follow [Using ChatGPT or Claude Desktop](AI_PROMPT_TEMPLATES.md#using-chatgpt-or-claude-desktop).
+
 ---
 
 ## 1) How generators are discovered
@@ -264,6 +284,10 @@ Use this checklist before shipping a generator pack:
 6. **Require explicit failure signals**
   - Non-zero exit on true failure.
   - Populate `outputs.json` only when outputs are valid.
+7. **Preserve CORE compose compatibility for node generators**
+  - Avoid `${...}` expressions in generated compose files.
+  - Prefer protocol/runtime designs that work without Docker default networking.
+  - Keep service script paths robust for relative chmod behavior.
 
 ### AI scaffolding prompt addendum
 

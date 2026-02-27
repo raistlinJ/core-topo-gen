@@ -20,6 +20,20 @@ How to use:
 6. Test with `python scripts/run_flag_generator.py ...`.
 
 See [docs/GENERATOR_AUTHORING.md](docs/GENERATOR_AUTHORING.md) for a full tutorial.
+Use [docs/AI_PROMPT_TEMPLATES.md](docs/AI_PROMPT_TEMPLATES.md) for copy/paste AI scaffolding prompts.
+
+## AI scaffold handoff checklist
+
+When asking AI to author from these templates, include:
+
+- generator kind (`flag-generator` or `flag-node-generator`)
+- target source `id`
+- current `manifest.yaml`
+- scaffolded `generator.py`
+- exact required vs optional inputs
+- exact `artifacts.produces` keys
+
+Ask AI to output only the target file(s), then run local + installed-pack parity tests.
 
 ## Parity checklist (Test vs Execute)
 

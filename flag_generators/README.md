@@ -14,6 +14,16 @@ Each generator should:
 - Keep shared imports (`json`, `sys`, etc.) at module scope when using nested helpers.
 - Be validated in both local Test and full Execute paths before release.
 
+For modern authoring, prefer manifest-based scaffolding and AI templates:
+- [docs/AI_PROMPT_TEMPLATES.md](../docs/AI_PROMPT_TEMPLATES.md)
+- [docs/GENERATOR_AUTHORING.md](../docs/GENERATOR_AUTHORING.md)
+
+Minimum parity checklist:
+- `outputs.json` includes `generator_id` and `Flag(flag_id)`
+- `outputs.json.outputs` keys match manifest `artifacts.produces`
+- optional inputs are explicitly marked `required: false` in manifest
+- no runtime dependence on internet/package-manager success
+
 Current stubs emit:
 
 ```json

@@ -2,6 +2,11 @@
 
 A **flag generator** is a runnable workload (currently `docker-compose`) that produces *information/capability* needed to reach the next node(s) in an Attack Flow.
 
+For AI-assisted authoring templates and scaffolding workflow, start with:
+- [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md)
+- [Node-generator starter message](AI_PROMPT_TEMPLATES.md#starter-message-flag-node-generator-copypaste)
+- [docs/GENERATOR_AUTHORING.md](GENERATOR_AUTHORING.md)
+
 The Flow system treats each generator as a small contract:
 
 - **inputs**: runtime config fields defined in `manifest.yaml` (`inputs[]`). These are not artifacts; `required: false` marks them optional.
@@ -112,6 +117,15 @@ To reduce Test-vs-Execute drift, enforce these constraints when generating code 
 	- generator Test endpoint run (local)
 	- generator Test endpoint run (remote CORE VM, when CORE credentials are provided in the UI)
 	- full Execute run (remote CORE path)
+
+## Practical build loop (generator + node-generator)
+
+1. Define manifest inputs/artifacts first.
+2. Generate or update `generator.py` with AI using strict templates.
+3. Verify `outputs.json.outputs` keys exactly match `artifacts.produces`.
+4. Verify `injects` entries resolve to real files (when used).
+5. Validate locally with `scripts/run_flag_generator.py`.
+6. Validate installed-pack Test and Execute parity.
 
 Remote Test note:
 - The Flag Catalog Test flow can run `scripts/run_flag_generator.py` on the CORE VM via SSH.
