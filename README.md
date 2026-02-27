@@ -47,6 +47,7 @@ docker compose up -d --build
 ```bash
 curl -k https://localhost/healthz
 ```
+- In host-network mode, nginx serves `80/443` and the web app is bound to `127.0.0.1:9090` (not externally exposed).
 - Safety: in Execute → Advanced, `Delete all docker containers` is disabled when the Web UI is running in Docker.
 - Stop Docker stack:
 ```bash

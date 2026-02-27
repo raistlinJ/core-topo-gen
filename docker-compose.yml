@@ -9,6 +9,8 @@ services:
     environment:
       - CORE_HOST=${CORE_HOST:-host.docker.internal}
       - CORE_PORT=${CORE_PORT:-50051}
+      - CORETG_HOST=127.0.0.1
+      - WEBAPP_PORT=9090
     extra_hosts:
       - "host.docker.internal:host-gateway"
     dns:
@@ -37,14 +39,10 @@ services:
     depends_on:
       web:
         condition: service_healthy
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/certs:/etc/nginx/certs
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: host
     environment:
       - CERT_DAYS=${CERT_DAYS:-365}
       - CERT_SUBJECT=${CERT_SUBJECT:-/CN=localhost}
@@ -53,8 +51,6 @@ services:
       - ${CORETG_DNS_1:-1.1.1.1}
       - ${CORETG_DNS_2:-8.8.8.8}
     restart: unless-stopped
-    networks:
-      - app_net
 
 networks:
   app_net:
