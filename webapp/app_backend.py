@@ -2910,9 +2910,20 @@ def _push_repo_to_remote_via_sftp_delta(
         payload = json.dumps(new_manifest, ensure_ascii=False, separators=(',', ':'))
         try:
             if client is not None:
+                write_manifest_py = (
+                    "import os,sys; "
+                    "p=sys.argv[1]; "
+                    "tmp=p+'.tmp'; "
+                    "open(tmp,'w',encoding='utf-8').write(sys.argv[2]); "
+                    "os.replace(tmp,p)"
+                )
+                manifest_cmd = (
+                    f"python3 -c {shlex.quote(write_manifest_py)} "
+                    f"{shlex.quote(str(manifest_remote_path))} {shlex.quote(payload)}"
+                )
                 _exec_ssh_command(
                     client,
-                    f"python3 -c {shlex.quote('import os,sys; p=sys.argv[1]; tmp=p+\".tmp\"; open(tmp,\"w\",encoding=\"utf-8\").write(sys.argv[2]); os.replace(tmp,p)')} {shlex.quote(str(manifest_remote_path))} {shlex.quote(payload)}",
+                    manifest_cmd,
                     timeout=float(os.getenv('CORETG_REMOTE_MANIFEST_WRITE_TIMEOUT_S', '20') or 20.0),
                     cancel_check=(lambda: _is_repo_push_cancel_requested(progress_id)) if progress_id else None,
                     check=False,
