@@ -6,8 +6,8 @@ ctf:
 
 artifacts:
   types:
-    network.ip: {}
-    filesystem.file: {}
-    credential.pair: {}
+    Knowledge(ip): {}
+    File(path): {}
+    Credential(user, password): {}
 
 challenges: []

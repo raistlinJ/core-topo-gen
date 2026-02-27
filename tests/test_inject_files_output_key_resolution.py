@@ -12,11 +12,11 @@ def test_inject_files_can_reference_output_artifact_key(tmp_path: Path):
     (out_dir / "artifacts" / "challenge").write_text("bin", encoding="utf-8")
 
     (out_dir / "outputs.json").write_text(
-        json.dumps({"outputs": {"filesystem.file": "artifacts/challenge"}}),
+        json.dumps({"outputs": {"File(path)": "artifacts/challenge"}}),
         encoding="utf-8",
     )
 
-    expanded = rfg.expand_inject_files_from_outputs(out_dir, ["filesystem.file"])
+    expanded = rfg.expand_inject_files_from_outputs(out_dir, ["File(path)"])
     assert expanded == ["artifacts/challenge"]
 
     injected_dir = rfg._stage_injected_dir(out_dir, expanded)

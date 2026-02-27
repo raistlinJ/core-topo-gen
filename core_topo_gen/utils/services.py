@@ -420,9 +420,16 @@ def set_node_services(session: object, node_id: int, services: List[str], node_o
 
 def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> Dict[int, List[str]]:
     node_services: Dict[int, List[str]] = {}
+    service_host_types = {NodeType.DEFAULT}
+    try:
+        docker_type = getattr(NodeType, "DOCKER", None)
+        if docker_type is not None:
+            service_host_types.add(docker_type)
+    except Exception:
+        pass
     host_nodes = [
         n for n in nodes
-        if map_role_to_node_type(n.role) == NodeType.DEFAULT and "router" not in n.role.lower()
+        if map_role_to_node_type(n.role) in service_host_types and "router" not in n.role.lower()
     ]
     if not host_nodes:
         return node_services

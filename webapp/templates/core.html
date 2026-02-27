@@ -4,7 +4,8 @@
 {% block header_icon %}<i class="bi bi-diagram-3-fill fs-4"></i>{% endblock %}
 {% block header_title %}CORE Sessions & Topologies{% endblock %}
 {% block header_right_extra %}
-{% set current_role = (current_user.role|default('')|lower) if (current_user is defined and current_user.is_authenticated) else '' %}
+{% set current_role = (current_user.role|default('')|lower) if (current_user is defined and
+current_user.is_authenticated) else '' %}
 {% set hide_daemon_badge = is_builder_view or current_role == 'builder' %}
 <div class="d-flex align-items-center gap-3 small flex-wrap justify-content-end">
   <div class="d-flex align-items-center gap-2">
@@ -20,65 +21,233 @@
     <button class="btn btn-sm btn-outline-light" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
   {% if not hide_daemon_badge %}
-  <div class="text-white-50 small" id="coreDaemonBadge">Daemon: <span id="coreDaemonHostPort">{{ host }}:{{ port }}</span></div>
+  <div class="text-white-50 small" id="coreDaemonBadge">Daemon: <span id="coreDaemonHostPort">{{ host }}:{{ port
+      }}</span></div>
   {% endif %}
 </div>
 {% endblock %}
 {% block extra_head %}
 <style>
-  body { padding-bottom: 0; }
-  #coreLayoutRow { min-height: calc(100vh - 200px); }
-  @media (max-width: 992px) {
-    #coreLayoutRow { min-height: 0; }
+  body {
+    padding-bottom: 0;
   }
-  th.actions-col, td.actions-col { white-space: nowrap; }
-  th.col-check, td.col-check { width: 2rem; text-align: center; }
+
+  #coreLayoutRow {
+    min-height: calc(100vh - 200px);
+  }
+
+  @media (max-width: 992px) {
+    #coreLayoutRow {
+      min-height: 0;
+    }
+  }
+
+  th.actions-col,
+  td.actions-col {
+    white-space: nowrap;
+  }
+
+  th.col-check,
+  td.col-check {
+    width: 2rem;
+    text-align: center;
+  }
+
   /* File column: fixed width + horizontal scroll inside the cell */
-  th.filename-col, td.filename-col { overflow: hidden; }
-  .filename-scroll { max-width: 100%; display:block; overflow-x:auto; overflow-y:hidden; white-space:nowrap; }
+  th.filename-col,
+  td.filename-col {
+    overflow: hidden;
+  }
 
-  #sessionsTable { table-layout: fixed; }
-  #sessionsTable th, #sessionsTable td { padding: .3rem .35rem; }
-  #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 12rem; white-space: nowrap; }
-  #sessionsTable th.col-id, #sessionsTable td.col-id { width: 7rem; white-space: nowrap; text-align: center; }
-  #sessionsTable th.col-file, #sessionsTable td.col-file { width: 28rem; max-width: 28rem; }
-  #sessionsTable th.col-hitl, #sessionsTable td.col-hitl { width: 16rem; white-space: nowrap; }
-  #sessionsTable th.actions-col, #sessionsTable td.actions-col { width: 18rem; }
+  .filename-scroll {
+    max-width: 100%;
+    display: block;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+  }
 
-  #xmlsTable { table-layout: fixed; }
-  #xmlsTable th.filename-col, #xmlsTable td.filename-col { width: 26rem; max-width: 26rem; }
-  #xmlsTable th.actions-col, #xmlsTable td.actions-col { width: 14rem; }
-  #xmlsTable thead th:nth-child(3), #xmlsTable tbody td:nth-child(3) { width: 5rem; text-align: center; white-space: nowrap; }
-  .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
-  .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
+  #sessionsTable {
+    table-layout: fixed;
+  }
+
+  #sessionsTable th,
+  #sessionsTable td {
+    padding: .3rem .35rem;
+  }
+
+  #sessionsTable th.col-scenario,
+  #sessionsTable td.col-scenario {
+    width: 12rem;
+    white-space: nowrap;
+  }
+
+  #sessionsTable th.col-id,
+  #sessionsTable td.col-id {
+    width: 7rem;
+    white-space: nowrap;
+    text-align: center;
+  }
+
+  #sessionsTable th.col-file,
+  #sessionsTable td.col-file {
+    width: 28rem;
+    max-width: 28rem;
+  }
+
+  #sessionsTable th.col-hitl,
+  #sessionsTable td.col-hitl {
+    width: 16rem;
+    white-space: nowrap;
+  }
+
+  #sessionsTable th.actions-col,
+  #sessionsTable td.actions-col {
+    width: 18rem;
+  }
+
+  #xmlsTable {
+    table-layout: fixed;
+  }
+
+  #xmlsTable th.filename-col,
+  #xmlsTable td.filename-col {
+    width: 26rem;
+    max-width: 26rem;
+  }
+
+  #xmlsTable th.actions-col,
+  #xmlsTable td.actions-col {
+    width: 14rem;
+  }
+
+  #xmlsTable thead th:nth-child(3),
+  #xmlsTable tbody td:nth-child(3) {
+    width: 5rem;
+    text-align: center;
+    white-space: nowrap;
+  }
+
+  .actions-col .btn {
+    padding: .15rem .3rem;
+    line-height: 1;
+    vertical-align: middle;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .actions-col .btn i,
+  .actions-col .btn .bi {
+    font-size: .95em;
+    line-height: 1;
+    display: block;
+  }
+
   /* Bootstrap Icons glyphs are not optically centered equally; nudge info icon to match the other action icons. */
-  .actions-col .btn .bi-info-circle { transform: translateY(0.05em); }
-  .actions-col .actions-wrap { display: inline-flex; align-items: center; gap: 2px; }
-  .actions-col .actions-wrap > a { display: inline-flex; align-items: center; }
-  .actions-col .actions-wrap > form { display: inline-flex; align-items: center; margin: 0; }
+  .actions-col .btn .bi-info-circle {
+    transform: translateY(0.05em);
+  }
+
+  .actions-col .actions-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .actions-col .actions-wrap>a {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .actions-col .actions-wrap>form {
+    display: inline-flex;
+    align-items: center;
+    margin: 0;
+  }
 
   /* Scenario list indicator */
-  .scenario-active-dot { font-size: .55rem; line-height: 1; vertical-align: middle; }
-  .scenario-item-dot { font-size: .55rem; line-height: 1; vertical-align: middle; }
+  .scenario-active-dot {
+    font-size: .55rem;
+    line-height: 1;
+    vertical-align: middle;
+  }
+
+  .scenario-item-dot {
+    font-size: .55rem;
+    line-height: 1;
+    vertical-align: middle;
+  }
+
   /* Inline loading bar */
-  #dataLoadingBar { height:4px; position:relative; margin-bottom:.5rem; overflow:hidden; border-radius:2px; background:rgba(0,0,0,0.08); }
-  #dataLoadingBar.d-none { display:none !important; }
-  #dataLoadingBar .bar { position:absolute; top:0; bottom:0; width:30%; background:linear-gradient(90deg,#0d6efd,#66b2ff); animation: coreLoadingBar 1.1s ease-in-out infinite; }
-  @keyframes coreLoadingBar { 0% { transform: translateX(-120%); } 50% { transform: translateX(30%); } 100% { transform: translateX(220%); } }
+  #dataLoadingBar {
+    height: 4px;
+    position: relative;
+    margin-bottom: .5rem;
+    overflow: hidden;
+    border-radius: 2px;
+    background: rgba(0, 0, 0, 0.08);
+  }
+
+  #dataLoadingBar.d-none {
+    display: none !important;
+  }
+
+  #dataLoadingBar .bar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 30%;
+    background: linear-gradient(90deg, #0d6efd, #66b2ff);
+    animation: coreLoadingBar 1.1s ease-in-out infinite;
+  }
+
+  @keyframes coreLoadingBar {
+    0% {
+      transform: translateX(-120%);
+    }
+
+    50% {
+      transform: translateX(30%);
+    }
+
+    100% {
+      transform: translateX(220%);
+    }
+  }
+
   /* Skeleton row style (optional future) */
-  .skeleton-cell { position:relative; overflow:hidden; background:linear-gradient(90deg,#e9ecef 0%,#f8f9fa 40%,#e9ecef 80%); background-size:200% 100%; animation:skeletonPulse 1.2s linear infinite; color:transparent; }
-  @keyframes skeletonPulse { 0% { background-position:0 0; } 100% { background-position:-200% 0; } }
+  .skeleton-cell {
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(90deg, #e9ecef 0%, #f8f9fa 40%, #e9ecef 80%);
+    background-size: 200% 100%;
+    animation: skeletonPulse 1.2s linear infinite;
+    color: transparent;
+  }
+
+  @keyframes skeletonPulse {
+    0% {
+      background-position: 0 0;
+    }
+
+    100% {
+      background-position: -200% 0;
+    }
+  }
 </style>
 {% endblock %}
 {% block nav_right_extra %}{% endblock %}
 {% block content %}
 {% set scenario_filter = request.args.get('scenario', '').strip() if request else '' %}
 {% if scenario_filter %}
-  {% set core_modal_href = url_for('index', core_modal=1, scenario=scenario_filter) %}
+{% set core_modal_href = url_for('index', core_modal=1, scenario=scenario_filter) %}
 {% else %}
-  {% set core_modal_href = url_for('index', core_modal=1) %}
+{% set core_modal_href = url_for('index', core_modal=1) %}
 {% endif %}
-<div id="dataLoadingBar" class="d-none"><div class="bar"></div></div>
+<div id="dataLoadingBar" class="d-none">
+  <div class="bar"></div>
+</div>
 
 <!-- Loading modal for slow CORE details navigation -->
 <div class="modal fade" id="coreDetailsLoadingModal" tabindex="-1" aria-hidden="true">
@@ -110,90 +279,96 @@
 </div>
 {% set has_core_errors = core_errors|default([])|length > 0 %}
 <div id="coreVmBannerContainer">
-{% if core_vm_configured and core_vm_summary and not has_core_errors %}
-<div class="alert alert-success" role="status">
-  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
-    <div class="flex-grow-1">
-      <div class="d-flex flex-wrap align-items-center gap-2">
-        <span class="fw-bold">CORE VM connected</span>
-        <span>
-          {% if not is_builder_view %}
+  {% if core_vm_configured and core_vm_summary and not has_core_errors %}
+  <div class="alert alert-success" role="status">
+    <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+      <div class="flex-grow-1">
+        <div class="d-flex flex-wrap align-items-center gap-2">
+          <span class="fw-bold">CORE VM connected</span>
+          <span>
+            {% if not is_builder_view %}
             {{ core_vm_summary.label }}{% if core_vm_summary.node %}
-              <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
+            <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
             {% endif %}
-          {% else %}
+            {% else %}
             CORE VM managed by admin
-          {% endif %}
-        </span>
+            {% endif %}
+          </span>
+        </div>
+        {% if not is_builder_view %}
+        <div class="small text-muted">
+          gRPC {{ core_vm_summary.host }}:{{ core_vm_summary.port }} •
+          SSH {{ core_vm_summary.ssh_username or 'unknown' }}@{{ core_vm_summary.ssh_host }}:{{ core_vm_summary.ssh_port
+          }}
+        </div>
+        {% endif %}
       </div>
       {% if not is_builder_view %}
-      <div class="small text-muted">
-        gRPC {{ core_vm_summary.host }}:{{ core_vm_summary.port }} •
-        SSH {{ core_vm_summary.ssh_username or 'unknown' }}@{{ core_vm_summary.ssh_host }}:{{ core_vm_summary.ssh_port }}
-      </div>
+      <a class="btn btn-sm btn-dark" id="coreVmActionLink" href="{{ core_modal_href }}">Change CORE VM</a>
+      {% else %}
+      <span class="badge text-bg-secondary">Admin managed</span>
       {% endif %}
     </div>
-    {% if not is_builder_view %}
-    <a class="btn btn-sm btn-dark" id="coreVmActionLink" href="{{ core_modal_href }}">Change CORE VM</a>
-    {% else %}
-    <span class="badge text-bg-secondary">Admin managed</span>
-    {% endif %}
   </div>
-</div>
-{% elif core_vm_configured and core_vm_summary %}
-<div class="alert alert-warning" role="status">
-  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
-    <div class="flex-grow-1">
-      <div class="d-flex flex-wrap align-items-center gap-2">
-        <span class="fw-bold">CORE VM assigned, but connection issues detected</span>
-        <span>
-          {% if not is_builder_view %}
+  {% elif core_vm_configured and core_vm_summary %}
+  <div class="alert alert-warning" role="status">
+    <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+      <div class="flex-grow-1">
+        <div class="d-flex flex-wrap align-items-center gap-2">
+          <span class="fw-bold">CORE VM assigned, but connection issues detected</span>
+          <span>
+            {% if not is_builder_view %}
             {{ core_vm_summary.label }}{% if core_vm_summary.node %}
-              <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
+            <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
             {% endif %}
-          {% else %}
+            {% else %}
             Admin-managed CORE VM
-          {% endif %}
-        </span>
+            {% endif %}
+          </span>
+        </div>
+        <div class="small text-muted">Resolve the errors above and re-validate the CORE connection.</div>
       </div>
-      <div class="small text-muted">Resolve the errors above and re-validate the CORE connection.</div>
+      {% if not is_builder_view %}
+      <a class="btn btn-sm btn-outline-dark" id="coreVmActionLink" href="{{ core_modal_href }}">Review CORE VM</a>
+      {% else %}
+      <span class="badge text-bg-secondary">Contact admin</span>
+      {% endif %}
     </div>
+  </div>
+  {% else %}
+  <div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-3" role="status">
+    <span class="fw-semibold">No CORE VM configured</span>
     {% if not is_builder_view %}
-    <a class="btn btn-sm btn-outline-dark" id="coreVmActionLink" href="{{ core_modal_href }}">Review CORE VM</a>
+    <a class="btn btn-sm btn-outline-primary" id="coreVmActionLink" href="{{ core_modal_href }}">Select CORE VM</a>
     {% else %}
-    <span class="badge text-bg-secondary">Contact admin</span>
+    <span class="text-muted small">Contact an admin to assign a CORE VM.</span>
     {% endif %}
   </div>
-</div>
-{% else %}
-<div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-3" role="status">
-  <span class="fw-semibold">No CORE VM configured</span>
-  {% if not is_builder_view %}
-  <a class="btn btn-sm btn-outline-primary" id="coreVmActionLink" href="{{ core_modal_href }}">Select CORE VM</a>
-  {% else %}
-  <span class="text-muted small">Contact an admin to assign a CORE VM.</span>
   {% endif %}
-</div>
-{% endif %}
 </div>
 <div class="row g-3 align-items-stretch" id="coreLayoutRow">
   <div class="col-12 col-lg-3 d-flex">
     <div class="card shadow-sm flex-fill d-flex flex-column">
       <div class="card-header d-flex justify-content-between align-items-center">
         <span class="fw-bold">Scenarios</span>
-        <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="coreScenarioFilterClear" type="button">Clear</button>
+        <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}"
+          id="coreScenarioFilterClear" type="button">Clear</button>
       </div>
       <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="coreScenarioList" style="min-height:0;">
         {% if scenarios %}
-          {% for s in scenarios %}
-          <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">
-            <span class="scenario-name">{{ s }}</span>
-            <span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span>
-            <span class="scenario-item-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-warning"></i></span>
-          </button>
-          {% endfor %}
+        {% for s in scenarios %}
+        <button type="button"
+          class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}"
+          data-scen-name="{{ s }}">
+          <span class="scenario-name">{{ s }}</span>
+          <span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i
+              class="bi bi-circle-fill text-success"></i></span>
+          <span class="scenario-item-dot d-none ms-1" aria-hidden="true"><i
+              class="bi bi-circle-fill text-warning"></i></span>
+        </button>
+        {% endfor %}
         {% else %}
-          <div class="p-3 text-muted small">No scenarios yet</div>
+        <div class="p-3 text-muted small">No scenarios yet</div>
         {% endif %}
       </div>
     </div>
@@ -205,8 +380,10 @@
           <div class="card-header py-2 d-flex justify-content-between align-items-center">
             <strong class="mb-0">Active Sessions</strong>
             <div class="d-flex align-items-center gap-2">
-              <input id="sessionsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
-              <button class="btn btn-sm btn-outline-danger" id="sessionsDeleteBtn" type="button" title="Delete Selected" disabled>
+              <input id="sessionsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..."
+                style="width: 12rem;">
+              <button class="btn btn-sm btn-outline-danger" id="sessionsDeleteBtn" type="button" title="Delete Selected"
+                disabled>
                 <i class="bi bi-trash"></i> Selected
               </button>
               <small class="text-muted ms-2">via gRPC</small>
@@ -234,8 +411,10 @@
           <div class="card-header py-2 d-flex justify-content-between align-items-center">
             <strong class="mb-0">Saved XML Topologies</strong>
             <div class="d-flex align-items-center gap-2">
-              <input id="xmlsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
-              <button class="btn btn-sm btn-outline-danger" id="xmlsDeleteBtn" type="button" title="Delete Selected" disabled>
+              <input id="xmlsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..."
+                style="width: 12rem;">
+              <button class="btn btn-sm btn-outline-danger" id="xmlsDeleteBtn" type="button" title="Delete Selected"
+                disabled>
                 <i class="bi bi-trash"></i> Selected
               </button>
               <small class="text-muted ms-2">on disk</small>
@@ -262,7 +441,8 @@
             <strong class="mb-0">Docker Compose (per-node)</strong>
             <div class="d-flex gap-2 align-items-center">
               <button class="btn btn-sm btn-outline-secondary" id="dockerRefreshBtn" type="button">Refresh</button>
-              <button class="btn btn-sm btn-outline-danger" id="dockerCleanupBtn" type="button">Clean Stale Containers</button>
+              <button class="btn btn-sm btn-outline-danger" id="dockerCleanupBtn" type="button">Clean Stale
+                Containers</button>
             </div>
           </div>
           <div class="table-responsive" style="max-height:40vh; overflow-y:auto; overflow-x:auto;">
@@ -312,26 +492,26 @@
 {% block extra_scripts %}
 <script>
   // Server-injected: scenarioNorm -> hasParticipantUrl
-  let participantUrlFlags = {{ participant_url_flags|tojson }};
-  function normalizeScenarioNorm(raw){
+  let participantUrlFlags = {{ participant_url_flags| tojson }};
+  function normalizeScenarioNorm(raw) {
     return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
   }
 
-(function(){
-  let auto = true;
-  let timer = null;
-  let tabVisible = true;
-  let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
-  const coreDataBaseUrl = "{{ url_for('core_data') }}";
-  const isBuilderView = {{ 'true' if is_builder_view else 'false' }};
-  let scenarioNamesCache = {{ (scenarios or [])|tojson }};
-  const initialScenarioFilter = {{ (active_scenario or '')|tojson }};
+  (function () {
+    let auto = true;
+    let timer = null;
+    let tabVisible = true;
+    let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
+    const coreDataBaseUrl = "{{ url_for('core_data') }}";
+    const isBuilderView = {{ 'true' if is_builder_view else 'false' }};
+  let scenarioNamesCache = {{ (scenarios or[])| tojson }};
+  const initialScenarioFilter = {{ (active_scenario or '')| tojson }};
   let scenarioFilter = initialScenarioFilter || null;
-  const participantDetailsBaseUrl = {{ url_for('participant_ui_details_api')|tojson }};
+  const participantDetailsBaseUrl = {{ url_for('participant_ui_details_api') | tojson }};
   let lastParticipantScenarioKey = null;
-  const initialCoreErrors = {{ (core_errors or [])|tojson }};
-  const initialGrpcCommand = {{ (core_grpc_command or '')|tojson }};
-  const initialCoreLogs = {{ (core_log_entries or [])|tojson }};
+  const initialCoreErrors = {{ (core_errors or[])| tojson }};
+  const initialGrpcCommand = {{ (core_grpc_command or '')| tojson }};
+  const initialCoreLogs = {{ (core_log_entries or[])| tojson }};
   let lastGrpcCommand = initialGrpcCommand || null;
   const sessionsTable = document.getElementById('sessionsTable');
   const sessionsTBody = sessionsTable?.querySelector('tbody');
@@ -364,11 +544,11 @@
     sessions: 'coreSelectedSessions',
     masterSessions: 'coreMasterSessionsAll'
   };
-  function loadJsonArray(key){
-    try { const raw = localStorage.getItem(key); if(!raw) return []; const arr = JSON.parse(raw); return Array.isArray(arr)? arr: []; } catch(e){ return []; }
+  function loadJsonArray(key) {
+    try { const raw = localStorage.getItem(key); if (!raw) return []; const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : []; } catch (e) { return []; }
   }
-  function loadBool(key){
-    try { const raw = localStorage.getItem(key); return raw === 'true'; } catch(e){ return false; }
+  function loadBool(key) {
+    try { const raw = localStorage.getItem(key); return raw === 'true'; } catch (e) { return false; }
   }
   const selectedXmlPaths = new Set(loadJsonArray(LS_KEYS.xmls));
   let xmlsMasterSelectAll = loadBool(LS_KEYS.masterXmls);
@@ -379,39 +559,39 @@
   let sessionsAutoReapply = true;
   // Timestamp of last manual header toggle (used if we want throttling)
   let lastHeaderToggleTs = 0;
-  function persistSelections(){
+  function persistSelections() {
     try {
       localStorage.setItem(LS_KEYS.xmls, JSON.stringify(Array.from(selectedXmlPaths)));
-      localStorage.setItem(LS_KEYS.masterXmls, xmlsMasterSelectAll ? 'true':'false');
+      localStorage.setItem(LS_KEYS.masterXmls, xmlsMasterSelectAll ? 'true' : 'false');
       localStorage.setItem(LS_KEYS.sessions, JSON.stringify(Array.from(selectedSessionIds)));
-      localStorage.setItem(LS_KEYS.masterSessions, sessionsMasterSelectAll ? 'true':'false');
-    } catch(e) {}
+      localStorage.setItem(LS_KEYS.masterSessions, sessionsMasterSelectAll ? 'true' : 'false');
+    } catch (e) { }
   }
 
-  function dockLog(level, message){
+  function dockLog(level, message) {
     const lvl = (level || 'INFO').toString().toUpperCase();
     const msg = message != null ? String(message) : '';
-    if(typeof window.logLine === 'function'){
+    if (typeof window.logLine === 'function') {
       window.logLine(lvl, msg);
     } else {
-      try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: msg } })); } catch(_e) {}
+      try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: msg } })); } catch (_e) { }
     }
   }
 
-  function defaultScenarioName(){
+  function defaultScenarioName() {
     return (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length) ? String(scenarioNamesCache[0]) : null;
   }
 
-  function ensureScenarioSelected(){
-    if(scenarioFilter) return;
+  function ensureScenarioSelected() {
+    if (scenarioFilter) return;
     const def = defaultScenarioName();
-    if(def) scenarioFilter = def;
+    if (def) scenarioFilter = def;
   }
 
-  function renderCoreVmBanner(payload){
+  function renderCoreVmBanner(payload) {
     const container = document.getElementById('coreVmBannerContainer');
-    if(!container) return;
-    if(isBuilderView) return;
+    if (!container) return;
+    if (isBuilderView) return;
 
     const errs = Array.isArray(payload?.errors) ? payload.errors : [];
     const hasErrs = errs.length > 0;
@@ -419,7 +599,7 @@
     const summary = (payload && payload.core_vm_summary && typeof payload.core_vm_summary === 'object') ? payload.core_vm_summary : {};
     const href = (payload && typeof payload.core_modal_href === 'string') ? payload.core_modal_href : '';
 
-    if(configured && summary && !hasErrs){
+    if (configured && summary && !hasErrs) {
       const label = esc(summary.label || 'CORE VM');
       const node = summary.node ? ` <span class="text-muted">• Node ${esc(summary.node)}</span>` : '';
       const grpc = (summary.host && summary.port) ? `gRPC ${esc(summary.host)}:${esc(summary.port)}` : '';
@@ -444,7 +624,7 @@
       return;
     }
 
-    if(configured && summary){
+    if (configured && summary) {
       const label = esc(summary.label || 'CORE VM');
       const node = summary.node ? ` <span class="text-muted">• Node ${esc(summary.node)}</span>` : '';
       container.innerHTML = `
@@ -470,23 +650,23 @@
 </div>`;
   }
 
-  function buildCoreDataUrl(opts){
+  function buildCoreDataUrl(opts) {
     ensureScenarioSelected();
-    if(!scenarioFilter) return coreDataBaseUrl;
+    if (!scenarioFilter) return coreDataBaseUrl;
     const params = new URLSearchParams();
     params.set('scenario', scenarioFilter);
-    if(opts && opts.includeXmls === false){
+    if (opts && opts.includeXmls === false) {
       params.set('include_xmls', '0');
-    } else if(opts && opts.includeXmls === true){
+    } else if (opts && opts.includeXmls === true) {
       params.set('include_xmls', '1');
     }
     const sep = coreDataBaseUrl.includes('?') ? '&' : '?';
     return `${coreDataBaseUrl}${sep}${params.toString()}`;
   }
 
-  function updateCoreScenarioQueryParam(){
+  function updateCoreScenarioQueryParam() {
     const url = new URL(window.location.href);
-    if(scenarioFilter){
+    if (scenarioFilter) {
       url.searchParams.set('scenario', scenarioFilter);
     } else {
       url.searchParams.delete('scenario');
@@ -494,13 +674,13 @@
     window.history.replaceState({}, '', url.toString());
   }
 
-  function updateCoreScenarioControls(){
-    if(scenarioClearBtn){
+  function updateCoreScenarioControls() {
+    if (scenarioClearBtn) {
       const def = defaultScenarioName();
       const show = !!scenarioFilter && !!def && scenarioFilter !== def;
       scenarioClearBtn.classList.toggle('d-none', !show);
     }
-    if(!scenarioFilterList) return;
+    if (!scenarioFilterList) return;
     scenarioFilterList.querySelectorAll('[data-scen-name]').forEach(btn => {
       const name = btn.getAttribute('data-scen-name');
       const isActive = !!scenarioFilter && name === scenarioFilter;
@@ -510,29 +690,29 @@
     });
   }
 
-  function updateScenarioActiveDots(sessions, selectedScenarioName){
-    if(!scenarioFilterList) return;
+  function updateScenarioActiveDots(sessions, selectedScenarioName) {
+    if (!scenarioFilterList) return;
     const list = Array.isArray(sessions) ? sessions : [];
     const norm = (v) => (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
     const statusByNorm = {};
     const isRunningState = (raw) => {
       const st = (raw !== undefined && raw !== null) ? String(raw).trim().toLowerCase() : '';
-      if(!st) return false;
-      if(st === 'running') return true;
+      if (!st) return false;
+      if (st === 'running') return true;
       // Some CORE/pycore variants use alternate encodings.
-      if(st === 'state_running' || st === 'runtime' || st === 'run') return true;
+      if (st === 'state_running' || st === 'runtime' || st === 'run') return true;
       // Fall back to the same heuristic used by the start/stop toggle.
-      if(st.includes('shutdown')) return false;
+      if (st.includes('shutdown')) return false;
       return st.includes('run');
     };
 
     list.forEach(s => {
       const scenRaw = (s && (s.scenario_name || s.scenario || '')) ? String(s.scenario_name || s.scenario || '') : '';
       const scenNorm = norm(scenRaw);
-      if(!scenNorm) return;
+      if (!scenNorm) return;
       const entry = statusByNorm[scenNorm] || { any: false, running: false };
       entry.any = true;
-      if(isRunningState(s && s.state)) entry.running = true;
+      if (isRunningState(s && s.state)) entry.running = true;
       statusByNorm[scenNorm] = entry;
     });
 
@@ -541,7 +721,7 @@
     // selected scenario dot even when individual session entries lack a
     // reliable scenario_name.
     const selectedNorm = norm(selectedScenarioName || '');
-    if(selectedNorm){
+    if (selectedNorm) {
       const anyForSelected = list.length > 0;
       const runningForSelected = anyForSelected ? list.some(s => isRunningState(s && s.state)) : false;
       statusByNorm[selectedNorm] = { any: anyForSelected, running: runningForSelected };
@@ -555,7 +735,7 @@
     // Keep the selected scenario accurate even when responses are scoped:
     // if the response contains no sessions for the selected scenario, clear its cache.
     // Selected scenario is always updated (or cleared) from this response.
-    if(selectedNorm){
+    if (selectedNorm) {
       const selectedEntry = statusByNorm[selectedNorm] || { any: false, running: false };
       scenarioDotCache[selectedNorm] = { any: !!selectedEntry.any, running: !!selectedEntry.running };
     }
@@ -564,19 +744,19 @@
       const name = btn.getAttribute('data-scen-name') || '';
       const dot = btn.querySelector('.scenario-active-dot');
       const itemDot = btn.querySelector('.scenario-item-dot');
-      if(!dot && !itemDot) return;
+      if (!dot && !itemDot) return;
       const entry = scenarioDotCache[norm(name)] || { any: false, running: false };
       const showGreen = !!entry.running;
       const showYellow = (!!entry.any) && !entry.running;
-      if(dot) dot.classList.toggle('d-none', !showGreen);
-      if(itemDot) itemDot.classList.toggle('d-none', !showYellow);
+      if (dot) dot.classList.toggle('d-none', !showGreen);
+      if (itemDot) itemDot.classList.toggle('d-none', !showYellow);
     });
   }
 
-  function renderCoreErrors(errs){
+  function renderCoreErrors(errs) {
     const container = document.getElementById('coreErrorContainer');
-    if(!container) return;
-    if(!Array.isArray(errs) || errs.length === 0){
+    if (!container) return;
+    if (!Array.isArray(errs) || errs.length === 0) {
       container.innerHTML = '';
       return;
     }
@@ -588,10 +768,10 @@
       </div>`;
   }
 
-  function renderCoreScenarioButtons(){
-    if(!scenarioFilterList) return;
+  function renderCoreScenarioButtons() {
+    if (!scenarioFilterList) return;
     scenarioFilterList.innerHTML = '';
-    if(!Array.isArray(scenarioNamesCache) || scenarioNamesCache.length === 0){
+    if (!Array.isArray(scenarioNamesCache) || scenarioNamesCache.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'p-3 text-muted small';
       empty.textContent = 'No scenarios yet';
@@ -607,11 +787,11 @@
       btn.className = 'list-group-item list-group-item-action py-1 text-start';
       btn.dataset.scenName = name;
       btn.innerHTML = `<span class="scenario-name">${esc(name)}</span><span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span><span class="scenario-item-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-warning"></i></span>`;
-      if(scenarioFilter && name === scenarioFilter){
-        btn.classList.add('active','bg-primary','text-white');
+      if (scenarioFilter && name === scenarioFilter) {
+        btn.classList.add('active', 'bg-primary', 'text-white');
       }
       btn.addEventListener('click', async () => {
-        if(scenarioFilter === name) return; // never allow "All" by deselecting
+        if (scenarioFilter === name) return; // never allow "All" by deselecting
         await setCoreScenarioFilter(name);
       });
       scenarioFilterList.appendChild(btn);
@@ -619,7 +799,7 @@
     updateCoreScenarioControls();
   }
 
-  async function setCoreScenarioFilter(value){
+  async function setCoreScenarioFilter(value) {
     scenarioFilter = value || defaultScenarioName() || null;
     updateCoreScenarioQueryParam();
     updateCoreScenarioControls();
@@ -628,7 +808,7 @@
     await refresh();
   }
 
-  async function refreshParticipantNavForScenario(scenarioName){
+  async function refreshParticipantNavForScenario(scenarioName) {
     try {
       const scen = (scenarioName || '').toString().trim();
       if (typeof window.CORETG_PATCH_SCENARIO_NAV === 'function') {
@@ -669,14 +849,14 @@
   }
 
   let progressModalInstance = null;
-  function ensureProgressModal(){
-    if(!progressModalInstance){
+  function ensureProgressModal() {
+    if (!progressModalInstance) {
       const el = document.getElementById('progressModal');
-      if(el) progressModalInstance = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false });
+      if (el) progressModalInstance = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false });
     }
     return progressModalInstance;
   }
-  function openProgress(title, total){
+  function openProgress(title, total) {
     ensureProgressModal();
     document.getElementById('progressModalLabel').textContent = title || 'Processing…';
     document.getElementById('progressStatusText').textContent = `0 of ${total}`;
@@ -686,25 +866,43 @@
     document.getElementById('progressLog').textContent = '';
     progressModalInstance?.show();
   }
-  function updateProgress(done, total, msg){
-    const pct = total > 0 ? Math.round((done/total)*100) : 0;
+  function updateProgress(done, total, msg) {
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
     const bar = document.getElementById('progressBar');
     bar.style.width = pct + '%';
     bar.textContent = pct + '%';
     document.getElementById('progressStatusText').textContent = `${done} of ${total}`;
-    if(msg){
-      const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+    if (msg) {
+      const fmt = (typeof window.coretgFormatLogTs === 'function')
+        ? window.coretgFormatLogTs
+        : ((d) => {
+            try {
+              const pad2 = (n) => String(n).padStart(2, '0');
+              const pad3 = (n) => String(n).padStart(3, '0');
+              const yyyy = d.getFullYear();
+              const mm = pad2(d.getMonth() + 1);
+              const dd = pad2(d.getDate());
+              const hh = pad2(d.getHours());
+              const mi = pad2(d.getMinutes());
+              const ss = pad2(d.getSeconds());
+              const ms = pad3(d.getMilliseconds());
+              return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss},${ms}`;
+            } catch (e) {
+              return '';
+            }
+          });
+      const line = `[${fmt(new Date())}] ${msg}\n`;
       document.getElementById('progressLog').textContent += line;
-      try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: 'INFO', message: msg } })); } catch(e) {}
+      try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: 'INFO', message: msg } })); } catch (e) { }
     }
   }
-  function closeProgress(){ progressModalInstance?.hide(); }
+  function closeProgress() { progressModalInstance?.hide(); }
 
-  function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+  function esc(s) { return (s || '').toString().replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c])); }
 
-  function signatureForSessions(list){
+  function signatureForSessions(list) {
     try {
-      if(!Array.isArray(list)) return '';
+      if (!Array.isArray(list)) return '';
       const rows = list.map(s => {
         const sid = (s && (s.id ?? s.session_id));
         const sidText = (sid !== undefined && sid !== null) ? String(sid) : '';
@@ -718,14 +916,14 @@
         return [sidText, state, nodes, scen, file, dir, filename, hitl];
       });
       return JSON.stringify(rows);
-    } catch(e){
+    } catch (e) {
       return String(Math.random());
     }
   }
 
-  function signatureForXmls(list){
+  function signatureForXmls(list) {
     try {
-      if(!Array.isArray(list)) return '';
+      if (!Array.isArray(list)) return '';
       const rows = list.map(x => [
         x && x.path ? String(x.path) : '',
         x && x.name ? String(x.name) : '',
@@ -734,37 +932,37 @@
         (x && x.session_id !== undefined && x.session_id !== null) ? String(x.session_id) : '',
       ]);
       return JSON.stringify(rows);
-    } catch(e){
+    } catch (e) {
       return String(Math.random());
     }
   }
 
-  function signatureForScenarioDots(sessions, selectedScenarioName){
+  function signatureForScenarioDots(sessions, selectedScenarioName) {
     try {
       const list = Array.isArray(sessions) ? sessions : [];
       const norm = (v) => (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
       const status = {};
       const isRunningState = (raw) => {
         const st = (raw !== undefined && raw !== null) ? String(raw).trim().toLowerCase() : '';
-        if(!st) return false;
-        if(st === 'running') return true;
-        if(st === 'state_running' || st === 'runtime' || st === 'run') return true;
-        if(st.includes('shutdown')) return false;
+        if (!st) return false;
+        if (st === 'running') return true;
+        if (st === 'state_running' || st === 'runtime' || st === 'run') return true;
+        if (st.includes('shutdown')) return false;
         return st.includes('run');
       };
       list.forEach(s => {
         const scenRaw = (s && (s.scenario_name || s.scenario || '')) ? String(s.scenario_name || s.scenario || '') : '';
         const scenNorm = norm(scenRaw);
-        if(!scenNorm) return;
+        if (!scenNorm) return;
         const entry = status[scenNorm] || { any: false, running: false };
         entry.any = true;
-        if(isRunningState(s && s.state)) entry.running = true;
+        if (isRunningState(s && s.state)) entry.running = true;
         status[scenNorm] = entry;
       });
 
       // Apply scenario-filtered override for signature stability (see updateScenarioActiveDots).
       const selectedNorm = norm(selectedScenarioName || '');
-      if(selectedNorm){
+      if (selectedNorm) {
         const anyForSelected = list.length > 0;
         const runningForSelected = anyForSelected ? list.some(s => isRunningState(s && s.state)) : false;
         status[selectedNorm] = { any: anyForSelected, running: runningForSelected };
@@ -778,42 +976,42 @@
       const keys = Object.keys(merged).sort();
       const rows = keys.map(k => [k, merged[k].any ? 1 : 0, merged[k].running ? 1 : 0]);
       return JSON.stringify(rows);
-    } catch(e){
+    } catch (e) {
       return String(Math.random());
     }
   }
 
-  function basenameFromPath(p){
+  function basenameFromPath(p) {
     try {
       const raw = (p || '').toString();
-      if(!raw) return '';
+      if (!raw) return '';
       const parts = raw.split(/[/\\]/);
       return parts[parts.length - 1] || '';
-    } catch(e){
+    } catch (e) {
       return '';
     }
   }
 
-  function firstHitlIp(session){
+  function firstHitlIp(session) {
     try {
       const entries = Array.isArray(session?.hitl) ? session.hitl : [];
       const ips = [];
-      for(const entry of entries){
-        if(entry && Array.isArray(entry.ips)){
-          for(const ip of entry.ips){
+      for (const entry of entries) {
+        if (entry && Array.isArray(entry.ips)) {
+          for (const ip of entry.ips) {
             const v = (ip || '').toString().trim();
-            if(v) ips.push(v);
+            if (v) ips.push(v);
           }
         }
       }
       const uniq = Array.from(new Set(ips));
       return uniq.join(', ');
-    } catch(e){
+    } catch (e) {
       return '';
     }
   }
 
-  function buildSessionRow(s){
+  function buildSessionRow(s) {
     const sid = (s && (s.id ?? s.session_id))
     const sidText = sid !== undefined && sid !== null ? String(sid) : '';
     const scen = (s && (s.scenario_name || s.scenario || '')) ? String(s.scenario_name || s.scenario || '').trim() : '';
@@ -831,8 +1029,8 @@
 
     const detailsHrefBase = '{{ url_for('core_details') }}';
     const detailsParams = [];
-    if(sidText) detailsParams.push('session_id=' + encodeURIComponent(sidText));
-    if(scen) detailsParams.push('scenario_name=' + encodeURIComponent(scen));
+    if (sidText) detailsParams.push('session_id=' + encodeURIComponent(sidText));
+    if (scen) detailsParams.push('scenario_name=' + encodeURIComponent(scen));
     const detailsHref = detailsParams.length ? `${detailsHrefBase}?${detailsParams.join('&')}` : detailsHrefBase;
 
     const scenarioHidden = scenarioFilter ? `<input type="hidden" name="scenario" value="${esc(scenarioFilter)}">` : '';
@@ -879,17 +1077,17 @@
     </tr>`;
   }
 
-  function buildXmlRow(x){
+  function buildXmlRow(x) {
     const path = esc(x.path);
     const name = esc(x.name);
     const validBadge = x.valid ? '<span class="badge text-bg-success">yes</span>' : '<span class="badge text-bg-danger">no</span>';
-  const detailsHref = '{{ url_for('core_details') }}?path=' + encodeURIComponent(x.path);
+    const detailsHref = '{{ url_for('core_details') }}?path=' + encodeURIComponent(x.path);
     const startDisabled = x.valid ? '' : 'disabled';
-    const rowStr = `${name} ${path} ${x.valid? 'yes':'no'}`.toLowerCase();
+    const rowStr = `${name} ${path} ${x.valid ? 'yes' : 'no'}`.toLowerCase();
     if (xmlsFilterText && !rowStr.includes(xmlsFilterText)) return '';
     const scenarioHidden = scenarioFilter ? `<input type="hidden" name="scenario" value="${esc(scenarioFilter)}">` : '';
     return `<tr>
-      <td class="col-check"><input type="checkbox" class="row-select" data-type="xml" data-path="${path}" ${selectedXmlPaths.has(x.path)? 'checked':''}></td>
+      <td class="col-check"><input type="checkbox" class="row-select" data-type="xml" data-path="${path}" ${selectedXmlPaths.has(x.path) ? 'checked' : ''}></td>
       <td class="filename-col"><div class="filename-scroll" title="${path}">${name}</div></td>
       <td>${validBadge}</td>
       <td class="actions-col">
@@ -912,37 +1110,37 @@
   let isFetching = false;
   let firstLoadDone = false;
   const minLoadDisplayMs = 300;
-  function setLoading(on){
+  function setLoading(on) {
     const bar = document.getElementById('dataLoadingBar');
-    if(!bar) return;
-    if(on){ bar.classList.remove('d-none'); }
+    if (!bar) return;
+    if (on) { bar.classList.remove('d-none'); }
     else { bar.classList.add('d-none'); }
   }
-  async function refresh(opts){
-    if(isFetching) return; // avoid overlaps
+  async function refresh(opts) {
+    if (isFetching) return; // avoid overlaps
     isFetching = true;
     const startTs = performance.now();
     setLoading(true);
-    try{
+    try {
       corePollSeq += 1;
       const scenarioNow = scenarioFilter || null;
       const forceXmls = !!(opts && opts.forceXmls);
       const shouldIncludeXmls = forceXmls || (!firstLoadDone) || (scenarioNow !== lastXmlsScenario) || (corePollSeq % 6 === 0);
       const dataUrl = buildCoreDataUrl({ includeXmls: shouldIncludeXmls });
       dockLog('DEBUG', `[core] Refreshing core data from ${dataUrl}${scenarioFilter ? ` (scenario=${scenarioFilter})` : ''}`);
-      const res = await fetch(dataUrl, { cache:'no-store' });
-      if(!res.ok){
+      const res = await fetch(dataUrl, { cache: 'no-store' });
+      if (!res.ok) {
         dockLog('WARN', `[core] refresh failed (${res.status}) for ${dataUrl}`);
         return;
       }
       const data = await res.json();
-      if(Array.isArray(data.logs) && data.logs.length){
+      if (Array.isArray(data.logs) && data.logs.length) {
         data.logs.forEach(entry => {
-          if(!entry) return;
+          if (!entry) return;
           dockLog(entry.level || 'INFO', entry.message || '');
         });
       }
-      if(Array.isArray(data.errors)){
+      if (Array.isArray(data.errors)) {
         renderCoreErrors(data.errors);
       } else {
         renderCoreErrors([]);
@@ -950,29 +1148,45 @@
       try {
         renderCoreVmBanner(data);
         const daemon = document.getElementById('coreDaemonHostPort');
-        if(daemon && data.host && data.port){
+        if (daemon && data.host && data.port) {
           daemon.textContent = `${data.host}:${data.port}`;
         }
-      } catch(_e) {}
-      if(data.grpc_command && data.grpc_command !== lastGrpcCommand){
+
+        // Check for daemon down status
+        if (data.daemon_status === 'down') {
+          const tEl = document.getElementById('cdmTarget');
+          if (tEl) tEl.textContent = (data.host && data.port) ? `${data.host}:${data.port}` : 'unknown';
+
+          const modalEl = document.getElementById('coreDaemonModal');
+          if (modalEl) {
+            // Only auto-show if not explicitly dismissed/ignored in this session? 
+            // For now, standard behavior: just show if not visible.
+            if (!modalEl.classList.contains('show') && !modalEl.dataset.ignored) {
+              const inst = (window.bootstrap && window.bootstrap.Modal) ? bootstrap.Modal.getOrCreateInstance(modalEl) : null;
+              inst?.show();
+            }
+          }
+        }
+      } catch (_e) { }
+      if (data.grpc_command && data.grpc_command !== lastGrpcCommand) {
         dockLog('INFO', `[core] gRPC command: ${data.grpc_command}`);
         lastGrpcCommand = data.grpc_command;
       }
       const serverScenario = (data.active_scenario || '').trim();
-      if(serverScenario){
+      if (serverScenario) {
         // Only accept serverScenario if it matches the current selection (or if we had none).
         // This avoids UI flipping back to the first scenario if the backend defaults.
         const norm = (v) => (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
-        if(!scenarioFilter || norm(serverScenario) === norm(scenarioFilter)){
+        if (!scenarioFilter || norm(serverScenario) === norm(scenarioFilter)) {
           scenarioFilter = serverScenario;
         } else {
           dockLog('DEBUG', `[core] Ignoring server active_scenario=${serverScenario} (UI selected ${scenarioFilter})`);
         }
       } else {
         // Never allow an implicit "All" state if scenarios exist.
-        if(!scenarioFilter){
+        if (!scenarioFilter) {
           const first = (Array.isArray(data.scenarios) && data.scenarios.length) ? String(data.scenarios[0]) : null;
-          if(first) scenarioFilter = first;
+          if (first) scenarioFilter = first;
         }
       }
 
@@ -983,13 +1197,13 @@
           lastParticipantScenarioKey = key;
           refreshParticipantNavForScenario(scenarioFilter);
         }
-      } catch(e) {}
+      } catch (e) { }
 
-      if(Array.isArray(data.scenarios)){
+      if (Array.isArray(data.scenarios)) {
         const next = data.scenarios.map(v => String(v));
         const prev = Array.isArray(scenarioNamesCache) ? scenarioNamesCache.map(v => String(v)) : [];
         const same = (next.length === prev.length) && next.every((v, i) => v === prev[i]);
-        if(!same){
+        if (!same) {
           scenarioNamesCache = next;
           ensureScenarioSelected();
           renderCoreScenarioButtons();
@@ -998,7 +1212,7 @@
           updateCoreScenarioControls();
         }
         const nextDotSig = signatureForScenarioDots(data.sessions, scenarioFilter);
-        if(nextDotSig !== lastDotSig){
+        if (nextDotSig !== lastDotSig) {
           updateScenarioActiveDots(data.sessions, scenarioFilter);
           lastDotSig = nextDotSig;
         }
@@ -1006,20 +1220,20 @@
         ensureScenarioSelected();
         updateCoreScenarioControls();
         const nextDotSig = signatureForScenarioDots(data.sessions, scenarioFilter);
-        if(nextDotSig !== lastDotSig){
+        if (nextDotSig !== lastDotSig) {
           updateScenarioActiveDots(data.sessions, scenarioFilter);
           lastDotSig = nextDotSig;
         }
       }
       updateCoreScenarioQueryParam();
-      if(Array.isArray(data.sessions) && sessionsTBody){
+      if (Array.isArray(data.sessions) && sessionsTBody) {
         const nextSig = signatureForSessions(data.sessions);
-        if(nextSig !== lastSessionsSig){
+        if (nextSig !== lastSessionsSig) {
           latestSessionIds = new Set();
-          data.sessions.forEach(s=>{
+          data.sessions.forEach(s => {
             const sid = (s && (s.id ?? s.session_id));
             const sidText = sid !== undefined && sid !== null ? String(sid) : '';
-            if(sidText) latestSessionIds.add(sidText);
+            if (sidText) latestSessionIds.add(sidText);
           });
           sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
           dockLog('DEBUG', `[core] Sessions updated (${data.sessions.length} items)`);
@@ -1030,9 +1244,9 @@
           dockLog('DEBUG', `[core] Sessions unchanged (${data.sessions.length} items)`);
         }
       }
-      if(Array.isArray(data.xmls) && xmlsTBody){
+      if (Array.isArray(data.xmls) && xmlsTBody) {
         const nextSig = signatureForXmls(data.xmls);
-        if(nextSig !== lastXmlsSig){
+        if (nextSig !== lastXmlsSig) {
           xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
           bindXmlSelectionHandlers();
           if (xmlsMasterSelectAll && xmlsAutoReapply) applyXmlMasterSelectAll();
@@ -1047,90 +1261,90 @@
       // (or on first load). Manual refresh via the button is always available.
       const dockerScenario = scenarioFilter || null;
       const shouldRefreshDocker = (!firstLoadDone) || (dockerScenario !== lastDockerScenario);
-      if(shouldRefreshDocker){
+      if (shouldRefreshDocker) {
         lastDockerScenario = dockerScenario;
         await refreshDocker();
       }
-    }catch(e){ dockLog('ERROR', `[core] refresh error: ${e}`); }
+    } catch (e) { dockLog('ERROR', `[core] refresh error: ${e}`); }
     finally {
       const elapsed = performance.now() - startTs;
       const remain = elapsed < minLoadDisplayMs ? (minLoadDisplayMs - elapsed) : 0;
-      setTimeout(()=> { setLoading(false); isFetching=false; firstLoadDone=true; }, remain);
+      setTimeout(() => { setLoading(false); isFetching = false; firstLoadDone = true; }, remain);
     }
   }
 
   // Show a "Loading" progress modal when navigating to core_details.
-  (function bindCoreDetailsLoading(){
-    function shouldInterceptClick(ev){
-      if(!ev) return false;
-      if(ev.defaultPrevented) return false;
+  (function bindCoreDetailsLoading() {
+    function shouldInterceptClick(ev) {
+      if (!ev) return false;
+      if (ev.defaultPrevented) return false;
       // Respect new-tab / new-window gestures.
-      if(ev.button !== 0) return false;
-      if(ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
+      if (ev.button !== 0) return false;
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
       return true;
     }
-    function showLoadingModal(){
+    function showLoadingModal() {
       try {
         const el = document.getElementById('coreDetailsLoadingModal');
-        if(!el) return null;
-        if(window.bootstrap && window.bootstrap.Modal){
+        if (!el) return null;
+        if (window.bootstrap && window.bootstrap.Modal) {
           const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
           inst.show();
           return inst;
         }
-      } catch(e) {}
+      } catch (e) { }
       return null;
     }
-    document.addEventListener('click', (ev)=>{
+    document.addEventListener('click', (ev) => {
       try {
         const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
-        if(!a) return;
+        if (!a) return;
         const href = a.getAttribute('href') || '';
-        if(!href) return;
-        if(href.indexOf('{{ url_for('core_details') }}') === -1 && href.indexOf('/core/details') === -1) return;
-        if(!shouldInterceptClick(ev)) return;
+        if (!href) return;
+        if (href.indexOf('{{ url_for('core_details') }}') === -1 && href.indexOf('/core/details') === -1) return;
+        if (!shouldInterceptClick(ev)) return;
         ev.preventDefault();
         showLoadingModal();
         // Give the browser a moment to paint the modal before navigating.
-        requestAnimationFrame(()=>{ setTimeout(()=>{ window.location.assign(href); }, 50); });
-      } catch(e) {}
+        requestAnimationFrame(() => { setTimeout(() => { window.location.assign(href); }, 50); });
+      } catch (e) { }
     }, true);
   })();
 
-  function schedule(){
-    if(timer) clearTimeout(timer);
-    if(typeof document !== 'undefined'){
-      try { tabVisible = !document.hidden; } catch(e) { tabVisible = true; }
+  function schedule() {
+    if (timer) clearTimeout(timer);
+    if (typeof document !== 'undefined') {
+      try { tabVisible = !document.hidden; } catch (e) { tabVisible = true; }
     }
-    if(!auto || !tabVisible){
+    if (!auto || !tabVisible) {
       setLoading(false);
       return;
     }
     // Show loading bar immediately upon scheduling next cycle (visual immediacy)
     setLoading(true);
-    timer = setTimeout(async ()=>{ await refresh(); schedule(); }, intervalMs);
+    timer = setTimeout(async () => { await refresh(); schedule(); }, intervalMs);
   }
 
   // Pause polling when the tab is hidden (saves network/CPU). Resume when visible.
   try {
-    if(typeof document !== 'undefined'){
+    if (typeof document !== 'undefined') {
       tabVisible = !document.hidden;
-      document.addEventListener('visibilitychange', ()=>{
-        try { tabVisible = !document.hidden; } catch(e) { tabVisible = true; }
-        if(!tabVisible){
-          if(timer) clearTimeout(timer);
+      document.addEventListener('visibilitychange', () => {
+        try { tabVisible = !document.hidden; } catch (e) { tabVisible = true; }
+        if (!tabVisible) {
+          if (timer) clearTimeout(timer);
           timer = null;
           setLoading(false);
           return;
         }
-        if(auto){
-          refresh().then(()=> schedule()).catch(()=> schedule());
+        if (auto) {
+          refresh().then(() => schedule()).catch(() => schedule());
         }
       });
     }
-  } catch(e) {}
+  } catch (e) { }
 
-  document.getElementById('toggleRefreshBtn')?.addEventListener('click', ()=>{
+  document.getElementById('toggleRefreshBtn')?.addEventListener('click', () => {
     auto = !auto;
     document.getElementById('toggleRefreshBtn').textContent = auto ? 'Pause' : 'Resume';
     document.getElementById('refreshStatus').textContent = auto ? 'auto' : 'paused';
@@ -1139,10 +1353,10 @@
 
   const sel = document.getElementById('refreshInterval');
   if (sel) {
-    if ([2000,5000,10000,30000,60000].includes(intervalMs)) {
+    if ([2000, 5000, 10000, 30000, 60000].includes(intervalMs)) {
       sel.value = String(intervalMs);
     }
-    sel.addEventListener('change', ()=>{
+    sel.addEventListener('change', () => {
       const v = parseInt(sel.value, 10);
       if (!isNaN(v) && v > 0) {
         intervalMs = v;
@@ -1154,9 +1368,9 @@
 
   // Show bar immediately on initial load, then kick first refresh now (not after interval)
   dockLog('INFO', `[core] CORE page initialized (scenario=${initialScenarioFilter || 'All'})`);
-  if(Array.isArray(initialCoreLogs) && initialCoreLogs.length){
+  if (Array.isArray(initialCoreLogs) && initialCoreLogs.length) {
     initialCoreLogs.forEach(entry => {
-      if(!entry) return;
+      if (!entry) return;
       dockLog(entry.level || 'INFO', entry.message || '');
     });
   }
@@ -1166,33 +1380,33 @@
     ensureScenarioSelected();
     updateCoreScenarioQueryParam();
     updateCoreScenarioControls();
-  } catch(_e) {}
+  } catch (_e) { }
   setLoading(true);
-  refresh().then(()=> schedule());
-  try { bindXmlSelectionHandlers(); } catch(e) {}
+  refresh().then(() => schedule());
+  try { bindXmlSelectionHandlers(); } catch (e) { }
 
-  function badge(ok, yes, no){ return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-secondary">${no}</span>`; }
-  function badgeWarn(ok, yes, no){ return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-danger">${no}</span>`; }
-  async function refreshDocker(){
-    if(!dockerTBody) return;
-    try{
+  function badge(ok, yes, no) { return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-secondary">${no}</span>`; }
+  function badgeWarn(ok, yes, no) { return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-danger">${no}</span>`; }
+  async function refreshDocker() {
+    if (!dockerTBody) return;
+    try {
       dockLog('DEBUG', '[core] Refreshing docker status');
       const url = scenarioFilter ? `/docker/status?scenario=${encodeURIComponent(scenarioFilter)}` : '/docker/status';
       const res = await fetch(url);
-      if(!res.ok){
+      if (!res.ok) {
         dockLog('WARN', `[core] docker refresh failed (${res.status})`);
         return;
       }
       const js = await res.json();
-      if(js && js.error){
+      if (js && js.error) {
         dockLog('WARN', `[core] docker status: ${js.error}`);
       }
-      const rows = (js.items||[]).map(it=>{
+      const rows = (js.items || []).map(it => {
         const file = badge(!!it.exists, 'yes', 'no');
         const pulled = badge(!!it.pulled, 'yes', 'no');
         const cont = it.container_exists ? badgeWarn(!!it.running, 'running', 'stopped') : '<span class="badge text-bg-secondary">none</span>';
-        const name = (it.name||'');
-        const comp = (it.compose||'');
+        const name = (it.name || '');
+        const comp = (it.compose || '');
         return `<tr>
           <td>${name}</td>
           <td><div class="filename-scroll" title="${comp}">${comp}</div></td>
@@ -1202,81 +1416,81 @@
         </tr>`;
       });
       dockerTBody.innerHTML = rows.join('\n');
-      dockLog('INFO', `[core] Docker table updated (${(js.items||[]).length} nodes)`);
-    }catch(e){ dockLog('ERROR', `[core] docker refresh error: ${e}`); }
+      dockLog('INFO', `[core] Docker table updated (${(js.items || []).length} nodes)`);
+    } catch (e) { dockLog('ERROR', `[core] docker refresh error: ${e}`); }
   }
   document.getElementById('dockerRefreshBtn')?.addEventListener('click', refreshDocker);
-  document.getElementById('dockerCleanupBtn')?.addEventListener('click', async ()=>{
-    if(!confirm('Stop and remove containers for all assigned docker nodes?')) return;
+  document.getElementById('dockerCleanupBtn')?.addEventListener('click', async () => {
+    if (!confirm('Stop and remove containers for all assigned docker nodes?')) return;
     openProgress('Cleaning stale containers…', 1);
-    try{
+    try {
       const url = scenarioFilter ? `/docker/cleanup?scenario=${encodeURIComponent(scenarioFilter)}` : '/docker/cleanup';
-      const res = await fetch(url, { method:'POST' });
-      if(res.ok){
-        updateProgress(1,1,'Cleanup done');
+      const res = await fetch(url, { method: 'POST' });
+      if (res.ok) {
+        updateProgress(1, 1, 'Cleanup done');
         dockLog('INFO', '[core] Docker cleanup completed');
         await refreshDocker();
       }
       else {
-        updateProgress(0,1,'Cleanup failed');
+        updateProgress(0, 1, 'Cleanup failed');
         dockLog('WARN', `[core] Docker cleanup failed (${res.status})`);
       }
-    }catch(e){ updateProgress(0,1,'Cleanup failed'); dockLog('ERROR', `[core] Docker cleanup error: ${e}`); }
-    finally{ closeProgress(); }
+    } catch (e) { updateProgress(0, 1, 'Cleanup failed'); dockLog('ERROR', `[core] Docker cleanup error: ${e}`); }
+    finally { closeProgress(); }
   });
 
-  scenarioClearBtn?.addEventListener('click', async ()=>{
+  scenarioClearBtn?.addEventListener('click', async () => {
     const def = defaultScenarioName();
-    if(!def) return;
+    if (!def) return;
     await setCoreScenarioFilter(def);
   });
   renderCoreScenarioButtons();
   ensureScenarioSelected();
   refreshParticipantNavForScenario(scenarioFilter);
   renderCoreErrors(initialCoreErrors);
-  if(initialGrpcCommand){
+  if (initialGrpcCommand) {
     dockLog('INFO', `[core] gRPC command: ${initialGrpcCommand}`);
   }
 
-  xmlsFilterInput?.addEventListener('input', ()=>{
+  xmlsFilterInput?.addEventListener('input', () => {
     xmlsFilterText = xmlsFilterInput.value.trim().toLowerCase();
     // Force XML payload for filter changes so we can re-render correctly.
     refresh({ forceXmls: true });
   });
 
-  sessionsFilterInput?.addEventListener('input', ()=>{
+  sessionsFilterInput?.addEventListener('input', () => {
     sessionsFilterText = sessionsFilterInput.value.trim().toLowerCase();
     refresh();
   });
 
-  function bindXmlSelectionHandlers(){
+  function bindXmlSelectionHandlers() {
     const table = xmlsTable;
     const checkAll = xmlsCheckAll;
     const deleteBtn = xmlsDeleteBtn;
     if (!table) return;
     const checkboxes = table.querySelectorAll('tbody input.row-select');
-    const updateSetsFromDom = ()=>{
-      if(!checkboxes || checkboxes.length===0){
-        if(checkAll){
+    const updateSetsFromDom = () => {
+      if (!checkboxes || checkboxes.length === 0) {
+        if (checkAll) {
           checkAll.indeterminate = false;
           checkAll.checked = false;
           // keep enabled even with zero rows
         }
-        if(deleteBtn) deleteBtn.disabled = true;
+        if (deleteBtn) deleteBtn.disabled = true;
         persistSelections();
         return;
       }
-      checkboxes.forEach(cb=>{
+      checkboxes.forEach(cb => {
         const p = cb.getAttribute('data-path');
-        if(!p) return;
-        if(cb.checked) selectedXmlPaths.add(p); else selectedXmlPaths.delete(p);
+        if (!p) return;
+        if (cb.checked) selectedXmlPaths.add(p); else selectedXmlPaths.delete(p);
       });
-      const anyChecked = (selectedXmlPaths.size>0);
-      if(deleteBtn){ deleteBtn.disabled = !anyChecked; }
+      const anyChecked = (selectedXmlPaths.size > 0);
+      if (deleteBtn) { deleteBtn.disabled = !anyChecked; }
       const total = checkboxes.length;
-      const checkedCount = Array.from(checkboxes).filter(cb=>cb.checked).length;
-      if(checkAll){
-        if(total === 0){
+      const checkedCount = Array.from(checkboxes).filter(cb => cb.checked).length;
+      if (checkAll) {
+        if (total === 0) {
           checkAll.indeterminate = false;
           checkAll.checked = false;
         } else {
@@ -1285,20 +1499,20 @@
             checkAll.indeterminate = false;
             checkAll.checked = true;
           } else {
-            checkAll.indeterminate = checkedCount>0 && checkedCount<total;
-            checkAll.checked = checkedCount===total;
+            checkAll.indeterminate = checkedCount > 0 && checkedCount < total;
+            checkAll.checked = checkedCount === total;
           }
         }
       }
       persistSelections();
     };
-    checkboxes.forEach(cb=> cb.addEventListener('change', ()=>{
+    checkboxes.forEach(cb => cb.addEventListener('change', () => {
       updateSetsFromDom();
       // If user manually unchecks any box while master select-all was active, disable master for that table
       const master = xmlsMasterSelectAll;
       if (master) {
-        const allChecked = Array.from(checkboxes).every(c=>c.checked);
-        if(!allChecked){
+        const allChecked = Array.from(checkboxes).every(c => c.checked);
+        if (!allChecked) {
           xmlsMasterSelectAll = false;
           // disable auto reapply for this table until user re-enables explicitly
           xmlsAutoReapply = false;
@@ -1306,17 +1520,17 @@
         }
       }
     }));
-    checkboxes.forEach(cb=>{
+    checkboxes.forEach(cb => {
       const p = cb.getAttribute('data-path');
-      if(p && selectedXmlPaths.has(p)) cb.checked = true;
+      if (p && selectedXmlPaths.has(p)) cb.checked = true;
     });
     updateSetsFromDom();
-    if(checkAll && !checkAll.dataset.selAllBound){
+    if (checkAll && !checkAll.dataset.selAllBound) {
       checkAll.dataset.selAllBound = '1';
-      checkAll.addEventListener('change', ()=>{
+      checkAll.addEventListener('change', () => {
         lastHeaderToggleTs = Date.now();
         const target = checkAll.checked;
-        if (target){
+        if (target) {
           xmlsMasterSelectAll = true;
           xmlsAutoReapply = true; // re-enable auto reapply when user explicitly selects all
           applyXmlMasterSelectAll();
@@ -1326,9 +1540,9 @@
           // Clear ALL selections (including those not currently visible due to filtering)
           selectedXmlPaths.clear();
           const rows = table.querySelectorAll('tbody input.row-select');
-          rows.forEach(cb=>{ cb.checked = false; });
+          rows.forEach(cb => { cb.checked = false; });
           // Reflect cleared state in UI (no indeterminate, unchecked)
-          if(checkAll){ checkAll.indeterminate = false; checkAll.checked = false; }
+          if (checkAll) { checkAll.indeterminate = false; checkAll.checked = false; }
           updateSetsFromDom(); // will persist cleared sets
         }
         persistSelections();
@@ -1336,57 +1550,57 @@
     }
   }
 
-  function bindSessionsSelectionHandlers(){
+  function bindSessionsSelectionHandlers() {
     const table = sessionsTable;
     const checkAll = sessionsCheckAll;
     const deleteBtn = sessionsDeleteBtn;
     if (!table) return;
     const checkboxes = table.querySelectorAll('tbody input.row-select[data-type="session"]');
 
-    const updateSetsFromDom = ()=>{
-      if(!checkboxes || checkboxes.length===0){
-        if(checkAll){
+    const updateSetsFromDom = () => {
+      if (!checkboxes || checkboxes.length === 0) {
+        if (checkAll) {
           checkAll.indeterminate = false;
           checkAll.checked = false;
         }
         // Prune selections only for sessions that no longer exist.
-        Array.from(selectedSessionIds).forEach(sid=>{ if(!latestSessionIds.has(sid)) selectedSessionIds.delete(sid); });
-        if(deleteBtn) deleteBtn.disabled = selectedSessionIds.size === 0;
+        Array.from(selectedSessionIds).forEach(sid => { if (!latestSessionIds.has(sid)) selectedSessionIds.delete(sid); });
+        if (deleteBtn) deleteBtn.disabled = selectedSessionIds.size === 0;
         persistSelections();
         return;
       }
 
       // Update selection set based on currently-visible rows.
-      checkboxes.forEach(cb=>{
+      checkboxes.forEach(cb => {
         const sid = cb.getAttribute('data-id');
-        if(!sid) return;
-        if(cb.checked) selectedSessionIds.add(sid); else selectedSessionIds.delete(sid);
+        if (!sid) return;
+        if (cb.checked) selectedSessionIds.add(sid); else selectedSessionIds.delete(sid);
       });
       // Prune selection for sessions that no longer exist (but keep selections for sessions hidden by filtering).
-      Array.from(selectedSessionIds).forEach(sid=>{ if(!latestSessionIds.has(sid)) selectedSessionIds.delete(sid); });
-      if(deleteBtn) deleteBtn.disabled = selectedSessionIds.size === 0;
+      Array.from(selectedSessionIds).forEach(sid => { if (!latestSessionIds.has(sid)) selectedSessionIds.delete(sid); });
+      if (deleteBtn) deleteBtn.disabled = selectedSessionIds.size === 0;
 
       const total = checkboxes.length;
-      const checkedCount = Array.from(checkboxes).filter(cb=>cb.checked).length;
-      if(checkAll){
+      const checkedCount = Array.from(checkboxes).filter(cb => cb.checked).length;
+      if (checkAll) {
         const master = sessionsMasterSelectAll;
         if (master) {
           checkAll.indeterminate = false;
           checkAll.checked = true;
         } else {
-          checkAll.indeterminate = checkedCount>0 && checkedCount<total;
-          checkAll.checked = checkedCount===total;
+          checkAll.indeterminate = checkedCount > 0 && checkedCount < total;
+          checkAll.checked = checkedCount === total;
         }
       }
       persistSelections();
     };
 
-    checkboxes.forEach(cb=> cb.addEventListener('change', ()=>{
+    checkboxes.forEach(cb => cb.addEventListener('change', () => {
       updateSetsFromDom();
       const master = sessionsMasterSelectAll;
       if (master) {
-        const allChecked = Array.from(checkboxes).every(c=>c.checked);
-        if(!allChecked){
+        const allChecked = Array.from(checkboxes).every(c => c.checked);
+        if (!allChecked) {
           sessionsMasterSelectAll = false;
           sessionsAutoReapply = false;
           updateSetsFromDom();
@@ -1395,19 +1609,19 @@
     }));
 
     // Reapply persisted selections for currently-visible rows.
-    checkboxes.forEach(cb=>{
+    checkboxes.forEach(cb => {
       const sid = cb.getAttribute('data-id');
-      if(sid && selectedSessionIds.has(sid)) cb.checked = true;
+      if (sid && selectedSessionIds.has(sid)) cb.checked = true;
     });
 
     updateSetsFromDom();
 
-    if(checkAll && !checkAll.dataset.selAllBound){
+    if (checkAll && !checkAll.dataset.selAllBound) {
       checkAll.dataset.selAllBound = '1';
-      checkAll.addEventListener('change', ()=>{
+      checkAll.addEventListener('change', () => {
         lastHeaderToggleTs = Date.now();
         const target = checkAll.checked;
-        if (target){
+        if (target) {
           sessionsMasterSelectAll = true;
           sessionsAutoReapply = true;
           applySessionsMasterSelectAll();
@@ -1416,73 +1630,73 @@
           sessionsAutoReapply = false;
           selectedSessionIds.clear();
           const rows = table.querySelectorAll('tbody input.row-select[data-type="session"]');
-          rows.forEach(cb=>{ cb.checked = false; });
-          if(checkAll){ checkAll.indeterminate = false; checkAll.checked = false; }
+          rows.forEach(cb => { cb.checked = false; });
+          if (checkAll) { checkAll.indeterminate = false; checkAll.checked = false; }
           persistSelections();
         }
       });
     }
   }
 
-  function applySessionsMasterSelectAll(){
+  function applySessionsMasterSelectAll() {
     const table = sessionsTable;
-    if(!table) return;
+    if (!table) return;
     const rows = table.querySelectorAll('tbody input.row-select[data-type="session"]');
-    rows.forEach(cb=>{ if(!cb.disabled) cb.checked = true; });
+    rows.forEach(cb => { if (!cb.disabled) cb.checked = true; });
     selectedSessionIds.clear();
-    rows.forEach(cb=>{ const sid = cb.getAttribute('data-id'); if(sid && cb.checked) selectedSessionIds.add(sid); });
+    rows.forEach(cb => { const sid = cb.getAttribute('data-id'); if (sid && cb.checked) selectedSessionIds.add(sid); });
     const checkAll = sessionsCheckAll;
-    if(checkAll){
+    if (checkAll) {
       checkAll.indeterminate = false;
       checkAll.checked = rows.length > 0;
     }
     persistSelections();
   }
 
-  function applyXmlMasterSelectAll(){
+  function applyXmlMasterSelectAll() {
     const table = xmlsTable;
-    if(!table) return;
+    if (!table) return;
     const rows = table.querySelectorAll('tbody input.row-select');
     // Mark all as checked (only current visible rows)
-    rows.forEach(cb=>{ cb.checked = true; });
+    rows.forEach(cb => { cb.checked = true; });
     // Update internal selection sets without rebinding handlers (avoid duplicate listeners)
     selectedXmlPaths.clear();
-    rows.forEach(cb=>{ const p = cb.getAttribute('data-path'); if(p) selectedXmlPaths.add(p); });
+    rows.forEach(cb => { const p = cb.getAttribute('data-path'); if (p) selectedXmlPaths.add(p); });
     // Reflect header & action button state
     const checkAll = xmlsCheckAll;
     const deleteBtn = xmlsDeleteBtn;
-    if(checkAll){
+    if (checkAll) {
       checkAll.indeterminate = false;
       checkAll.checked = rows.length > 0;
     }
-    if(deleteBtn){ deleteBtn.disabled = rows.length === 0; }
+    if (deleteBtn) { deleteBtn.disabled = rows.length === 0; }
     persistSelections();
   }
 
-  function appendScenarioField(fd){
-    if(!fd) return;
-    if(scenarioFilter && typeof scenarioFilter === 'string' && scenarioFilter.trim()){
+  function appendScenarioField(fd) {
+    if (!fd) return;
+    if (scenarioFilter && typeof scenarioFilter === 'string' && scenarioFilter.trim()) {
       fd.set('scenario', scenarioFilter.trim());
     }
   }
 
-  async function postForm(url, formData){
+  async function postForm(url, formData) {
     appendScenarioField(formData);
     const res = await fetch(url, { method: 'POST', body: formData });
     return res.ok;
   }
 
-  xmlsDeleteBtn?.addEventListener('click', async ()=>{
+  xmlsDeleteBtn?.addEventListener('click', async () => {
     const paths = Array.from(selectedXmlPaths);
-    if(paths.length===0) return;
-    if(!confirm(`Delete ${paths.length} selected file(s)?`)) return;
+    if (paths.length === 0) return;
+    if (!confirm(`Delete ${paths.length} selected file(s)?`)) return;
     openProgress(`Deleting ${paths.length} file(s)…`, paths.length);
     let done = 0;
-    for(const path of paths){
+    for (const path of paths) {
       const fd = new FormData();
       fd.append('path', path);
       const ok = await postForm("{{ url_for('core_delete') }}", fd);
-      if(ok){
+      if (ok) {
         selectedXmlPaths.delete(path);
         updateProgress(++done, paths.length, `Deleted ${path}`);
       } else {
@@ -1494,17 +1708,17 @@
     refresh();
   });
 
-  sessionsDeleteBtn?.addEventListener('click', async ()=>{
+  sessionsDeleteBtn?.addEventListener('click', async () => {
     const ids = Array.from(selectedSessionIds);
-    if(ids.length===0) return;
-    if(!confirm(`Delete ${ids.length} selected session(s)?`)) return;
+    if (ids.length === 0) return;
+    if (!confirm(`Delete ${ids.length} selected session(s)?`)) return;
     openProgress(`Deleting ${ids.length} session(s)…`, ids.length);
     let done = 0;
-    for(const id of ids){
+    for (const id of ids) {
       const fd = new FormData();
       fd.append('session_id', id);
       const ok = await postForm("{{ url_for('core_delete') }}", fd);
-      if(ok){
+      if (ok) {
         selectedSessionIds.delete(id);
         updateProgress(++done, ids.length, `Deleted session ${id}`);
       } else {
@@ -1522,76 +1736,121 @@
     startXml: "{{ url_for('core_start') }}",
     saveXml: "{{ url_for('core_save_xml') }}",
   };
-  function actionPathname(url){ try { return new URL(url, window.location.href).pathname; } catch(e){ return url; } }
-  function filenameFromContentDisposition(header){
-    if(!header) return null;
+  function actionPathname(url) { try { return new URL(url, window.location.href).pathname; } catch (e) { return url; } }
+  function filenameFromContentDisposition(header) {
+    if (!header) return null;
     const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(header);
-    if(match){
+    if (match) {
       const val = match[1] || match[2];
       try { return decodeURIComponent(val); } catch { return val; }
     }
     return null;
   }
-  function downloadBlob(blob, filename){
+  function downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = filename || 'download.xml';
     document.body.appendChild(a);
     a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 0);
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
   }
-  document.addEventListener('submit', async (ev)=>{
+  document.addEventListener('submit', async (ev) => {
     const form = ev.target;
-    if(!(form instanceof HTMLFormElement)) return;
+    if (!(form instanceof HTMLFormElement)) return;
     const p = actionPathname(form.action);
     const targets = [PATHS.stop, PATHS.startSession, PATHS.startXml, PATHS.saveXml];
-    if(!targets.includes(p)) return;
+    if (!targets.includes(p)) return;
     ev.preventDefault();
     const fd = new FormData(form);
     let title = 'Processing…';
-    if(p === PATHS.stop){
+    if (p === PATHS.stop) {
       const id = fd.get('session_id');
       title = `Stopping session ${id}…`;
-    } else if(p === PATHS.startSession){
+    } else if (p === PATHS.startSession) {
       const id = fd.get('session_id');
       title = `Starting session ${id}…`;
-    } else if(p === PATHS.saveXml){
+    } else if (p === PATHS.saveXml) {
       const id = fd.get('session_id');
       title = `Saving XML for session ${id}…`;
-    } else if(p === PATHS.startXml){
+    } else if (p === PATHS.startXml) {
       const path = fd.get('path');
       title = `Starting topology from ${path}…`;
     }
     openProgress(title, 1);
-    try{
-      if(p === PATHS.saveXml){
+    try {
+      if (p === PATHS.saveXml) {
         appendScenarioField(fd);
         const res = await fetch(p, { method: 'POST', body: fd });
-        if(res.ok){
+        if (res.ok) {
           const blob = await res.blob();
           const cd = res.headers.get('Content-Disposition');
-          const fname = filenameFromContentDisposition(cd) || `session-${fd.get('session_id')||'export'}.xml`;
+          const fname = filenameFromContentDisposition(cd) || `session-${fd.get('session_id') || 'export'}.xml`;
           downloadBlob(blob, fname);
-          updateProgress(1, 1, title.replace('…','') + ' done');
+          updateProgress(1, 1, title.replace('…', '') + ' done');
         } else {
-          updateProgress(0, 1, title.replace('…','') + ' failed');
+          updateProgress(0, 1, title.replace('…', '') + ' failed');
         }
       } else {
         const ok = await postForm(p, fd);
-        if(ok){
-          updateProgress(1, 1, title.replace('…','') + ' done');
+        if (ok) {
+          updateProgress(1, 1, title.replace('…', '') + ' done');
         } else {
-          updateProgress(0, 1, title.replace('…','') + ' failed');
+          updateProgress(0, 1, title.replace('…', '') + ' failed');
         }
       }
-    } catch(e){
-      updateProgress(0, 1, title.replace('…','') + ' failed');
+    } catch (e) {
+      updateProgress(0, 1, title.replace('…', '') + ' failed');
     } finally {
       closeProgress();
       refresh();
     }
   });
-})();
+
+  document.getElementById('cdmStartBtn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('cdmStartBtn');
+    if (!btn) return;
+    const spin = btn.querySelector('.spinner-border');
+    const errDiv = document.getElementById('cdmError');
+
+    btn.disabled = true;
+    if (spin) spin.classList.remove('d-none');
+    if (errDiv) {
+      errDiv.classList.add('d-none');
+      errDiv.textContent = '';
+    }
+
+    try {
+      const url = '/core/restart_core_daemon' + (scenarioFilter ? `?scenario=${encodeURIComponent(scenarioFilter)}` : '');
+      const res = await fetch(url, { method: 'POST' });
+
+      if (res.ok) {
+        const modalEl = document.getElementById('coreDaemonModal');
+        if (modalEl) modalEl.dataset.ignored = '1';
+
+        const inst = (window.bootstrap && window.bootstrap.Modal) ? bootstrap.Modal.getInstance(modalEl) : null;
+        inst?.hide();
+        setTimeout(() => {
+          if (modalEl) delete modalEl.dataset.ignored;
+          refresh();
+        }, 3000);
+      } else {
+        const data = await res.json();
+        if (errDiv) {
+          errDiv.textContent = data.error || 'Restart failed.';
+          errDiv.classList.remove('d-none');
+        }
+      }
+    } catch (e) {
+      if (errDiv) {
+        errDiv.textContent = 'Network error: ' + e.message;
+        errDiv.classList.remove('d-none');
+      }
+    } finally {
+      btn.disabled = false;
+      if (spin) spin.classList.add('d-none');
+    }
+  });
+}) ();
 </script>
 {% endblock %}

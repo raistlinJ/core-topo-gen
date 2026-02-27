@@ -78,6 +78,36 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
     if count_total > 0 and count_items_meta:
         for p,c,rm,re,sm,se,hmin,hmax in count_items_meta:
             items.append(RoutingInfo(protocol=p, factor=0.0, abs_count=c, r2r_mode=rm, r2r_edges=re, r2s_mode=sm, r2s_edges=se, r2s_hosts_min=hmin, r2s_hosts_max=hmax))
+
+    if count_total <= 0 and not weight_items:
+        fallback_count = 0
+        try:
+            total_planned_raw = (section.get("total_planned") or "").strip()
+            if total_planned_raw:
+                fallback_count = max(0, int(total_planned_raw))
+        except Exception:
+            fallback_count = 0
+
+        if fallback_count <= 0:
+            try:
+                min_enabled = str(section.get("node_count_min_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
+                max_enabled = str(section.get("node_count_max_enabled") or "").strip().lower() in {"1", "true", "yes", "on"}
+                min_val = int((section.get("node_count_min") or "0").strip() or 0) if min_enabled else 0
+                max_val = int((section.get("node_count_max") or "0").strip() or 0) if max_enabled else 0
+                min_val = max(0, min_val)
+                max_val = max(0, max_val)
+                if min_enabled and max_enabled and max_val and max_val < min_val:
+                    min_val, max_val = max_val, min_val
+                if min_enabled:
+                    fallback_count = min_val
+                elif max_enabled:
+                    fallback_count = max_val
+            except Exception:
+                fallback_count = 0
+
+        if fallback_count > 0:
+            items.append(RoutingInfo(protocol="Routing", factor=0.0, abs_count=fallback_count, r2r_mode="", r2r_edges=0, r2s_mode="", r2s_edges=0, r2s_hosts_min=0, r2s_hosts_max=0))
+
     if weight_items:
         for p,f,rm,re,sm,se,hmin,hmax in weight_items:
             items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=rm, r2r_edges=re, r2s_mode=sm, r2s_edges=se, r2s_hosts_min=hmin, r2s_hosts_max=hmax))

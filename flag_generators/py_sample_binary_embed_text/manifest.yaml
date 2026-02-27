@@ -12,20 +12,25 @@ inputs:
   - name: seed
     type: string
     required: false
-  - name: filesystem.file
+  - name: File(path)
     type: string
     required: false
-  - name: flag
+  - name: Flag(flag_id)
     type: text
     type: string
     sensitive: true
   - name: flag_prefix
     type: string
     required: false
+outputs:
+  - name: Flag(flag_id)
+    type: text
+  - name: File(path)
+    type: string
 artifacts:
   requires: []
   produces:
-    - flag
-    - filesystem.file
+    - Flag(flag_id)
+    - File(path)
 injects:
-  - filesystem.file
+  - File(path)

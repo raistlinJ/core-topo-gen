@@ -104,19 +104,20 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    artifacts_dir = out_dir / 'artifacts'
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # artifacts_dir = out_dir / 'artifacts'
+    # artifacts_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir = out_dir
 
     generator_id = str(cfg.get("generator_id") or "sample.binary_embed_text")
-    cfg_flag = str(cfg.get("flag") or "").strip()
+    cfg_flag = str(cfg.get("Flag(flag_id)") or "").strip()
     flag_value = cfg_flag or _derive_flag(seed, generator_id, os.environ.get("FLAG_PREFIX", "FLAG"))
 
     # Inputs (all optional):
-    # - filesystem.file (preferred): may be a filename or a relative path (e.g., artifacts/<name>)
+    # - File(path) (preferred): may be a filename or a relative path (e.g., artifacts/<name>)
     # - filename (legacy alias)
     # - bin_name/bin-name (legacy)
     cfg_filename_raw = str(
-        cfg.get("filesystem.file")
+        cfg.get("File(path)")
         or cfg.get("filename")
         or cfg.get("bin_name")
         or cfg.get("bin-name")
@@ -174,8 +175,8 @@ def main() -> int:
     outputs = {
         "generator_id": generator_id,
         "outputs": {
-            "flag": flag_value,
-            "filesystem.file": f"artifacts/{bin_name}",
+            "Flag(flag_id)": flag_value,
+            "File(path)": bin_name,
         },
     }
 

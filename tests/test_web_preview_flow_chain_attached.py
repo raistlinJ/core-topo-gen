@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import time
 import uuid
 
 from webapp import app_backend
@@ -61,46 +60,26 @@ def test_preview_full_attaches_latest_flow_chain_when_present():
                 "type": "docker",
             })
 
-        plan_payload = {
-            "full_preview": {"seed": full_preview1.get("seed")},
-            "metadata": {
-                "xml_path": xml_path,
-                "scenario": scenario,
-                "seed": full_preview1.get("seed"),
-                "flow": {
-                    "scenario": scenario,
-                    "length": len(chain),
-                    "chain": chain,
-                    "modified_at": "2026-01-06T00:00:00Z",
-                },
-            },
+        flow_meta = {
+            "scenario": scenario,
+            "length": len(chain),
+            "chain": chain,
+            "modified_at": "2026-01-06T00:00:00Z",
         }
-
-        plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f)
+        ok, err = app_backend._update_flow_state_in_xml(xml_path, scenario, flow_meta)
+        assert ok, err
 
         try:
-            # Second request: should attach the latest flow chain into full_preview metadata.
+            # Second request: should return flow metadata alongside full_preview.
             second = client.post("/api/plan/preview_full", json={"xml_path": xml_path, "scenario": scenario})
             assert second.status_code == 200
             payload2 = second.get_json() or {}
             assert payload2.get("ok"), payload2
 
-            full_preview2 = payload2.get("full_preview") or {}
-            md = full_preview2.get("metadata") or {}
-            flow = md.get("flow") or {}
+            flow = payload2.get("flow_meta") or {}
             assert flow.get("chain") == chain
-
-            # Back-compat alias is also present.
-            assert (full_preview2.get("flow") or {}).get("chain") == chain
         finally:
-            try:
-                os.remove(plan_path)
-            except Exception:
-                pass
+            pass
 
 
 def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
@@ -155,27 +134,15 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
         chain = [{"id": non_docker_id, "name": "bad-host", "type": "host"}]
         flag_assignments = [{"node_id": non_docker_id, "id": "dummy", "name": "dummy", "type": "flag-node-generator"}]
 
-        plan_payload = {
-            "full_preview": {"seed": full_preview1.get("seed")},
-            "metadata": {
-                "xml_path": xml_path,
-                "scenario": scenario,
-                "seed": full_preview1.get("seed"),
-                "flow": {
-                    "scenario": scenario,
-                    "length": 1,
-                    "chain": chain,
-                    "flag_assignments": flag_assignments,
-                    "modified_at": "2026-01-06T00:00:00Z",
-                },
-            },
+        flow_meta = {
+            "scenario": scenario,
+            "length": 1,
+            "chain": chain,
+            "flag_assignments": flag_assignments,
+            "modified_at": "2026-01-06T00:00:00Z",
         }
-
-        plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f)
+        ok, err = app_backend._update_flow_state_in_xml(xml_path, scenario, flow_meta)
+        assert ok, err
 
         try:
             second = client.post("/api/plan/preview_full", json={"xml_path": xml_path, "scenario": scenario})
@@ -183,9 +150,7 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
             payload2 = second.get_json() or {}
             assert payload2.get("ok"), payload2
 
-            full_preview2 = payload2.get("full_preview") or {}
-            md = full_preview2.get("metadata") or {}
-            flow = md.get("flow") or {}
+            flow = payload2.get("flow_meta") or {}
 
             repaired_chain = flow.get("chain") or []
             assert isinstance(repaired_chain, list) and repaired_chain
@@ -200,7 +165,4 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
             assert isinstance(fas, list) and fas
             assert str((fas[0] or {}).get("node_id") or "") == repaired_id
         finally:
-            try:
-                os.remove(plan_path)
-            except Exception:
-                pass
+            pass

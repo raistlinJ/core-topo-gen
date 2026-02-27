@@ -11,8 +11,120 @@ from pathlib import Path
 from typing import Any
 
 
+def _docker_executable() -> str:
+    """Return a docker executable path.
+
+    In remote SSH runs (non-interactive shells), PATH may be minimal and
+    `shutil.which('docker')` can fail even when docker exists at /usr/bin/docker.
+    """
+    try:
+        exe = shutil.which('docker')
+        if exe:
+            return exe
+    except Exception:
+        pass
+    for cand in ('/usr/bin/docker', '/usr/local/bin/docker', '/bin/docker', '/snap/bin/docker'):
+        try:
+            if os.path.exists(cand) and os.access(cand, os.X_OK):
+                return cand
+        except Exception:
+            continue
+    return 'docker'
+
+
 def repo_root_from_here() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _docker_use_sudo() -> bool:
+    flag = str(os.getenv('CORETG_DOCKER_USE_SUDO') or '').strip().lower()
+    return flag in ('1', 'true', 'yes', 'y', 'on')
+
+
+def _docker_sudo_password() -> str | None:
+    pw = os.getenv('CORETG_DOCKER_SUDO_PASSWORD')
+    if pw is None:
+        return None
+    pw = str(pw).rstrip('\n')
+    return pw if pw else None
+
+
+def _wrap_docker_cmd(cmd: list[str]) -> tuple[list[str], str | None]:
+    if not cmd:
+        return cmd, None
+    try:
+        is_docker = os.path.basename(str(cmd[0])) == 'docker'
+    except Exception:
+        is_docker = False
+    if not is_docker:
+        return cmd, None
+    use_sudo = _docker_use_sudo() or (_docker_sudo_password() is not None)
+    if not use_sudo:
+        return cmd, None
+    pw = _docker_sudo_password()
+    if pw is None:
+        return ['sudo', '-n', '-E'] + cmd, None
+    # Use a blank prompt to avoid emitting "[sudo] password for ..." into logs.
+    # Use -k to force a password read (so we can supply via stdin reliably).
+    return ['sudo', '-E', '-S', '-p', '', '-k'] + cmd, (pw + '\n')
+
+
+def _fix_output_permissions(out_dir: Path) -> None:
+    try:
+        target = out_dir.resolve()
+    except Exception:
+        target = out_dir
+    try:
+        for root, dirnames, filenames in os.walk(target):
+            for d in dirnames:
+                try:
+                    os.chmod(os.path.join(root, d), 0o775)
+                except Exception:
+                    pass
+            for f in filenames:
+                try:
+                    os.chmod(os.path.join(root, f), 0o664)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        uid = os.getuid()
+        gid = os.getgid()
+    except Exception:
+        uid = None
+        gid = None
+
+    if uid is None or gid is None:
+        return
+
+    try:
+        for root, dirnames, filenames in os.walk(target):
+            for d in dirnames:
+                try:
+                    os.chown(os.path.join(root, d), uid, gid)
+                except Exception:
+                    pass
+            for f in filenames:
+                try:
+                    os.chown(os.path.join(root, f), uid, gid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # If files are root-owned, local chmod/chown may fail; try sudo when password is available.
+    try:
+        sudo_pw = _docker_sudo_password()
+        if not sudo_pw:
+            return
+        cmd = ['sudo', '-S', 'chown', '-R', f"{uid}:{gid}", str(target)]
+        subprocess.run(cmd, input=(sudo_pw + '\n'), text=True, capture_output=True, check=False)
+        cmd = ['sudo', '-S', 'chmod', '-R', 'u+rwX,g+rwX', str(target)]
+        subprocess.run(cmd, input=(sudo_pw + '\n'), text=True, capture_output=True, check=False)
+    except Exception:
+        pass
 
 
 def _norm_inject_path(raw: str) -> str:
@@ -98,7 +210,7 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
     if not cleaned:
         return None
 
-    injected_dir = (out_dir / 'injected').resolve()
+    injected_dir = (out_dir / 'injects').resolve()
     injected_dir.mkdir(parents=True, exist_ok=True)
 
     # Rebuild injected dir from scratch to guarantee no extra files remain.
@@ -111,19 +223,23 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
         except Exception:
             pass
 
-    artifacts_dir = (out_dir / 'artifacts').resolve()
-
     missing: list[str] = []
     for rel in cleaned:
         dest = (injected_dir / rel).resolve()
         try:
-            src1 = (artifacts_dir / rel).resolve()
-            src2 = (out_dir / rel).resolve()
-            src = None
-            if src1.exists():
-                src = src1
-            elif src2.exists():
-                src = src2
+            # Sourcing from canonical generator out directory.
+            # Prefer direct relative path first, then common artifacts-prefixed forms.
+            candidates: list[Path] = [
+                (out_dir / rel).resolve(),
+                (out_dir / 'artifacts' / rel).resolve(),
+            ]
+            rel_norm = str(rel or '').replace('\\', '/').lstrip('/')
+            if rel_norm.startswith('artifacts/'):
+                tail = rel_norm.split('artifacts/', 1)[1].lstrip('/')
+                if tail:
+                    candidates.append((out_dir / tail).resolve())
+                    candidates.append((out_dir / 'artifacts' / tail).resolve())
+            src = next((c for c in candidates if c.exists()), None)
             if src is None:
                 missing.append(rel)
                 continue
@@ -136,11 +252,60 @@ def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
         # hint.txt is commonly materialized after generator execution (e.g., by Flow)
         # and may not exist at staging time.
         if missing_set != {'hint.txt'}:
-            print(f"[inject_files] warning: missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+            summary = f"missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}"
+            print(f"[inject_files] error: {summary}")
+            raise FileNotFoundError(f"inject_files staging failed: {summary}")
     return injected_dir
 
 
-def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, inject_files: list[str]) -> None:
+def _validate_injected_sources_exist(out_dir: Path, inject_files: list[str]) -> None:
+    """Validate that inject source files produced by a generator exist.
+
+    This is a generation-time validation only. It does NOT pre-stage files or
+    rewrite compose mounts.
+    """
+    cleaned = []
+    for raw in inject_files or []:
+        src_raw, _dest = _split_inject_spec(str(raw))
+        p = _norm_inject_path(str(src_raw))
+        if p:
+            cleaned.append(p)
+    cleaned = sorted(set(cleaned))
+    if not cleaned:
+        return
+
+    missing: list[str] = []
+    for rel in cleaned:
+        try:
+            candidates: list[Path] = [
+                (out_dir / rel).resolve(),
+                (out_dir / 'artifacts' / rel).resolve(),
+            ]
+            rel_norm = str(rel or '').replace('\\', '/').lstrip('/')
+            if rel_norm.startswith('artifacts/'):
+                tail = rel_norm.split('artifacts/', 1)[1].lstrip('/')
+                if tail:
+                    candidates.append((out_dir / tail).resolve())
+                    candidates.append((out_dir / 'artifacts' / tail).resolve())
+            found = any(c.exists() for c in candidates)
+            if not found:
+                missing.append(rel)
+        except Exception:
+            missing.append(rel)
+
+    if missing:
+        missing_set = set(missing)
+        if missing_set != {'hint.txt'}:
+            summary = f"missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}"
+            print(f"[inject_files] error: {summary}")
+            raise FileNotFoundError(f"inject_files validation failed: {summary}")
+
+
+def _rewrite_compose_injected_to_volume_copy(
+    out_dir: Path,
+    compose_path: Path,
+    inject_files: list[str],
+) -> Path | None:
     """Rewrite relative binds to named volumes and add an init-copy service.
 
     The init service copies allowlisted injected files into per-destination
@@ -150,17 +315,17 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         import yaml  # type: ignore
     except Exception:
         print('[inject_files] warning: PyYAML unavailable; cannot rewrite docker-compose.yml')
-        return
+        return None
 
     try:
         obj = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore')) or {}
     except Exception as exc:
         print(f"[inject_files] warning: failed to parse compose yaml: {exc}")
-        return
+        return None
 
     services = obj.get('services') if isinstance(obj, dict) else None
     if not isinstance(services, dict):
-        return
+        return None
 
     # Build inject mapping: normalized source -> dest_dir (default /tmp).
     inject_map: dict[str, str] = {}
@@ -173,7 +338,7 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         inject_map[src_norm] = dest_dir
 
     if not inject_map:
-        return
+        return None
 
     def _is_relative_bind_src(src: str) -> bool:
         s = (src or '').strip()
@@ -258,7 +423,7 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         svc['volumes'] = new_vols
 
     if not dest_to_volume:
-        return
+        return None
 
     # Add init-copy service to populate volumes.
     copy_service_name = 'inject_copy'
@@ -269,7 +434,8 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         copy_service_name = f"inject_copy_{i}"
 
     copy_vols: list[Any] = []
-    copy_vols.append('./injected:/src:ro')
+    # Source from canonical generator out directory.
+    copy_vols.append(f"{out_dir}:/src:ro")
     dest_mounts: dict[str, str] = {}
     for dest_dir, vol_name in dest_to_volume.items():
         slug = vol_name.replace('inject-', '')
@@ -296,7 +462,7 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
         cmds.append(f"cp -a \"/src/{src_escaped}\" \"{mount_path}/{dst_escaped}\" || true")
 
     if not cmds:
-        return
+        return None
 
     services[copy_service_name] = {
         'image': 'alpine:3.19',
@@ -328,8 +494,50 @@ def _rewrite_compose_injected_to_volume_copy(out_dir: Path, compose_path: Path, 
 
     try:
         compose_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
+        return compose_path
     except Exception as exc:
         print(f"[inject_files] warning: failed to write rewritten compose: {exc}")
+        return None
+
+
+def _rewrite_compose_host_network(compose_path: Path) -> None:
+    """Force docker-compose services/builds to use host networking."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        print('[compose] warning: PyYAML unavailable; cannot rewrite docker-compose.yml for host network')
+        return
+
+    try:
+        obj = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore')) or {}
+    except Exception as exc:
+        print(f"[compose] warning: failed to parse compose yaml for host network: {exc}")
+        return
+
+    if isinstance(obj, dict):
+        obj.pop('version', None)
+
+    services = obj.get('services') if isinstance(obj, dict) else None
+    if not isinstance(services, dict):
+        return
+
+    for _svc_name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        svc['network_mode'] = 'host'
+        svc.pop('networks', None)
+        build = svc.get('build')
+        if isinstance(build, dict):
+            build = dict(build)
+            build.setdefault('network', 'host')
+            svc['build'] = build
+        elif isinstance(build, str):
+            svc['build'] = {'context': build, 'network': 'host'}
+
+    try:
+        compose_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
+    except Exception as exc:
+        print(f"[compose] warning: failed to write host-network compose: {exc}")
 
 
 def find_generator(repo_root: Path, kind: str, generator_id: str) -> tuple[dict[str, Any], Path]:
@@ -418,8 +626,8 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
     expand it to the corresponding output value(s) when they look like paths.
 
     Example:
-        inject_files: ['filesystem.file']
-        outputs.json: {"outputs": {"filesystem.file": "artifacts/challenge"}}
+        inject_files: ['File(path)']
+        outputs.json: {"outputs": {"File(path)": "artifacts/challenge"}}
         -> expanded inject_files includes 'artifacts/challenge'
     """
     manifest = (out_dir / 'outputs.json').resolve()
@@ -435,9 +643,46 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
     if not isinstance(outputs, dict):
         return list(inject_files or [])
 
+    def _resolve_key_by_output_value_basename(key: str) -> tuple[str | None, Any]:
+        k = str(key or '').strip()
+        if not k:
+            return None, None
+        kl = k.lower()
+        try:
+            for out_key, out_val in outputs.items():
+                if isinstance(out_val, str):
+                    vv = out_val.strip()
+                    if not vv:
+                        continue
+                    base = vv.replace('\\', '/').split('/')[-1]
+                    if base and base.lower() == kl:
+                        return str(out_key), out_val
+                elif isinstance(out_val, list):
+                    for item in out_val:
+                        s = str(item or '').strip()
+                        if not s:
+                            continue
+                        base = s.replace('\\', '/').split('/')[-1]
+                        if base and base.lower() == kl:
+                            return str(out_key), out_val
+        except Exception:
+            return None, None
+        return None, None
+
     def _looks_like_path(s: str) -> bool:
         # Heuristic: treat slash-containing values as paths.
         return '/' in (s or '')
+
+    def _is_injectable_output_path(s: str) -> bool:
+        # Inject staging expects paths relative to out_dir/outputs (or artifacts/*).
+        # Absolute paths like "/exports" are typically metadata outputs (e.g. Directory)
+        # and are not files available for staging.
+        v = str(s or '').strip()
+        if not v:
+            return False
+        if v.startswith('/'):
+            return False
+        return _looks_like_path(v)
 
     out: list[str] = []
     for raw in inject_files or []:
@@ -445,21 +690,33 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
         key = str(src_raw or '').strip()
         if not key:
             continue
-        if key in outputs:
-            v = outputs.get(key)
+        output_lookup_key = key
+        v = outputs.get(output_lookup_key) if output_lookup_key in outputs else None
+        if v is None and key not in outputs and ('/' not in key):
+            # Back-compat: some older inject specs use bare filenames (e.g. "exports")
+            # while outputs declare path-valued facts. Try basename matching first.
+            matched_key, matched_val = _resolve_key_by_output_value_basename(key)
+            if matched_key is not None:
+                output_lookup_key = matched_key
+                v = matched_val
+
+        if output_lookup_key in outputs or v is not None:
             if isinstance(v, str):
                 vv = v.strip()
-                if vv and _looks_like_path(vv):
+                if vv and _is_injectable_output_path(vv):
                     if dest_raw:
                         out.append(f"{vv} -> {dest_raw}")
                     else:
                         out.append(vv)
                     continue
+                # Key resolved, but output is not an injectable file path.
+                # Skip instead of treating the key as a literal path.
+                continue
             if isinstance(v, list):
                 vals: list[str] = []
                 for item in v:
                     s = str(item or '').strip()
-                    if s and _looks_like_path(s):
+                    if s and _is_injectable_output_path(s):
                         vals.append(s)
                 if vals:
                     if dest_raw:
@@ -467,6 +724,8 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
                     else:
                         out.extend(vals)
                     continue
+                # Key resolved, but no injectable file paths in output list.
+                continue
             # If the output value doesn't look like a path, fall through and
             # treat the entry as a literal path.
         if dest_raw:
@@ -477,7 +736,57 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
 
 
 def run_cmd(cmd: list[str], workdir: Path, env: dict[str, str]) -> None:
-    subprocess.run(cmd, cwd=str(workdir), env={**os.environ, **env}, check=True)
+    try:
+        docker_timeout = float(os.getenv('CORETG_RUN_FLAG_GENERATOR_DOCKER_TIMEOUT', '180') or 180)
+    except Exception:
+        docker_timeout = 180
+    wrapped_cmd, stdin_data = _wrap_docker_cmd(cmd)
+    try:
+        p = subprocess.run(
+            wrapped_cmd,
+            cwd=str(workdir),
+            env={**os.environ, **env},
+            check=False,
+            text=True,
+            capture_output=True,
+            input=stdin_data,
+            timeout=docker_timeout if docker_timeout > 0 else None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(
+            f"docker command timed out after {docker_timeout:.0f}s: {' '.join(wrapped_cmd)}\n"
+            f"Hint: set CORETG_RUN_FLAG_GENERATOR_DOCKER_TIMEOUT to a higher value (seconds)."
+        ) from exc
+    out = (p.stdout or '').strip()
+    err = (p.stderr or '').strip()
+    if out:
+        print(out)
+    if err:
+        print(err)
+    if p.returncode != 0:
+        if out:
+            print(f"[cmd] stdout: {out[-1200:]}")
+        if err:
+            print(f"[cmd] stderr: {err[-1200:]}")
+        raise subprocess.CalledProcessError(p.returncode, wrapped_cmd, output=p.stdout, stderr=p.stderr)
+
+
+def run_cmd_capture(cmd: list[str], workdir: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    try:
+        docker_timeout = float(os.getenv('CORETG_RUN_FLAG_GENERATOR_DOCKER_TIMEOUT', '180') or 180)
+    except Exception:
+        docker_timeout = 180
+    wrapped_cmd, stdin_data = _wrap_docker_cmd(cmd)
+    return subprocess.run(
+        wrapped_cmd,
+        cwd=str(workdir),
+        env={**os.environ, **env},
+        check=False,
+        capture_output=True,
+        text=True,
+        input=stdin_data,
+        timeout=docker_timeout if docker_timeout > 0 else None,
+    )
 
 
 def slugify(value: str) -> str:
@@ -513,7 +822,7 @@ def run_compose(
     }
 
     cmd = [
-        "docker",
+        _docker_executable(),
         "compose",
         "-f",
         str(compose_path),
@@ -534,7 +843,7 @@ def run_compose(
         # Since each run uses a fresh project name, we must tear down explicitly
         # to avoid exhausting Docker's default address pools.
         down_cmd = [
-            "docker",
+            _docker_executable(),
             "compose",
             "-f",
             str(compose_path),
@@ -548,14 +857,7 @@ def run_compose(
         print(f"[cleanup] compose project={project}")
         print(f"[cleanup] running: {' '.join(down_cmd)}")
         try:
-            p = subprocess.run(
-                down_cmd,
-                cwd=str(source_dir),
-                env={**os.environ, **compose_env},
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            p = run_cmd_capture(down_cmd, source_dir, compose_env)
             print(f"[cleanup] compose down rc={p.returncode}")
             if p.returncode != 0:
                 err = (p.stderr or "").strip()
@@ -582,7 +884,8 @@ def main() -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    inputs_dir = out_dir / "inputs"
+    inputs_dir = out_dir / 'inputs'
+    outputs_dir = out_dir
     inputs_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -617,11 +920,14 @@ def main() -> int:
     # Write inputs config (mounted into compose at /inputs/config.json)
     config_path = inputs_dir / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
-    # Env: pass OUT_DIR and also config keys uppercased
     env = {"OUT_DIR": str(out_dir), "CONFIG_PATH": str(config_path)}
     for k, v in config.items():
-        env[str(k).upper()] = str(v)
+        raw_key = str(k).upper()
+        key = "".join([c if c.isalnum() else "_" for c in raw_key])
+        if key and not (key[0].isalpha() or key[0] == "_"):
+            key = f"VAR_{key}"
+        if key:
+            env[key] = str(v)
 
     # Allow generator definitions to include fixed env values.
     gen_env = gen.get("env")
@@ -644,6 +950,27 @@ def main() -> int:
         compose_file = str(compose.get("file") or "docker-compose.yml")
         service = str(compose.get("service") or "generator")
 
+        # Optional: force host networking (useful when docker bridge is disabled).
+        try:
+            use_host_network = str(os.getenv('CORETG_DOCKER_HOST_NETWORK') or '').strip().lower() in (
+                '1', 'true', 'yes', 'y', 'on'
+            )
+        except Exception:
+            use_host_network = False
+        if use_host_network:
+            try:
+                compose_src = (source_dir / compose_file).resolve()
+                if compose_src.exists():
+                    compose_out = (
+                        compose_src.parent
+                        / f"docker-compose.hostnet.{os.getpid()}_{int(time.time() * 1000)}.yml"
+                    ).resolve()
+                    compose_out.write_text(compose_src.read_text('utf-8', errors='ignore'), encoding='utf-8')
+                    _rewrite_compose_host_network(compose_out)
+                    compose_file = str(compose_out)
+            except Exception as exc:
+                print(f"[compose] warning: host-network rewrite failed: {exc}")
+
         run_compose(
             source_dir=source_dir,
             compose_file=compose_file,
@@ -658,15 +985,13 @@ def main() -> int:
             },
         )
 
-        # If this generator declares inject_files, stage and enforce that only
-        # staged files can be mounted into the generated compose container.
+        _fix_output_permissions(out_dir)
+
+        # Validate inject sources generated by this run, but do not pre-stage or
+        # rewrite compose during Generate/Resolve.
         expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
         expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)
-        injected_dir = _stage_injected_dir(out_dir, expanded_inject)
-        if injected_dir is not None:
-            compose_out = out_dir / 'docker-compose.yml'
-            if compose_out.exists():
-                _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
+        _validate_injected_sources_exist(out_dir, expanded_inject)
 
         manifest = out_dir / "outputs.json"
         if manifest.exists():
@@ -680,20 +1005,18 @@ def main() -> int:
         cmd = substitute_vars(build.get("cmd"), mapping)
         workdir = substitute_vars(build.get("workdir", "${source.path}"), mapping)
         run_cmd([str(x) for x in cmd], Path(str(workdir)), env)
+        _fix_output_permissions(out_dir)
 
     run = gen.get("run")
     if isinstance(run, dict) and isinstance(run.get("cmd"), list):
         cmd = substitute_vars(run.get("cmd"), mapping)
         workdir = substitute_vars(run.get("workdir", "${source.path}"), mapping)
         run_cmd([str(x) for x in cmd], Path(str(workdir)), env)
+        _fix_output_permissions(out_dir)
 
     expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
     expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)
-    injected_dir = _stage_injected_dir(out_dir, expanded_inject)
-    if injected_dir is not None:
-        compose_out = out_dir / 'docker-compose.yml'
-        if compose_out.exists():
-            _rewrite_compose_injected_to_volume_copy(out_dir, compose_out, expanded_inject)
+    _validate_injected_sources_exist(out_dir, expanded_inject)
 
     # Print manifest if present
     manifest = out_dir / "outputs.json"

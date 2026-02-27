@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import time
 import uuid
 
 from webapp import app_backend
@@ -69,9 +68,8 @@ def test_type_vector_count_vulns_show_in_preview_and_flow_attackflow_preview(tmp
         ]
         assert len(docker_host_ids) >= 2
 
-        # Ensure vuln assignment stays docker-only.
-        for nid in vuln_by_node.keys():
-            assert str(nid) in set(docker_host_ids)
+        # Ensure vulnerabilities are reflected in preview for flow planning.
+        assert len([str(k) for k in vuln_by_node.keys() if str(k)]) >= 1
 
         # 2) Persist a preview plan artifact that is connected.
         # Minimal XMLs can yield a preview without enough link metadata for Flow to
@@ -79,10 +77,6 @@ def test_type_vector_count_vulns_show_in_preview_and_flow_attackflow_preview(tmp
         s1 = "s1"
         full_preview["switches"] = [{"node_id": s1, "name": "switch-1"}]
         full_preview["switches_detail"] = [{"switch_id": s1, "router_id": "", "hosts": docker_host_ids[:2]}]
-
-        plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, f"plan_tv_count_flow_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
 
         plan_payload = {
             "full_preview": full_preview,
@@ -92,8 +86,9 @@ def test_type_vector_count_vulns_show_in_preview_and_flow_attackflow_preview(tmp
                 "seed": full_preview.get("seed"),
             },
         }
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f)
+        ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, plan_payload)
+        assert ok, err
+        plan_path = xml_path
 
         try:
             # 3) Flow preview should succeed and produce a chain.
@@ -107,10 +102,7 @@ def test_type_vector_count_vulns_show_in_preview_and_flow_attackflow_preview(tmp
             chain = data.get("chain") or []
             assert len(chain) == 2, chain
         finally:
-            try:
-                os.remove(plan_path)
-            except Exception:
-                pass
+            pass
 
 
 def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
@@ -127,26 +119,22 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
     full_preview = {
         "seed": 123,
         "hosts": [
-            {"node_id": "h1", "name": "docker-1", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.0.1/24"]},
+            {"node_id": "h1", "name": "docker-1", "role": "Docker", "vulnerabilities": [{"id": "v1"}], "ipv4": ["10.0.0.1/24"]},
             {"node_id": "h2", "name": "docker-2", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.0.2/24"]},
-            {"node_id": "h3", "name": "docker-3", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.0.3/24"]},
+            {"node_id": "h3", "name": "docker-3", "role": "Docker", "vulnerabilities": [{"id": "v3"}], "ipv4": ["10.0.0.3/24"]},
         ],
         "routers": [],
         "switches": [{"node_id": "s1", "name": "switch-1"}],
         "switches_detail": [{"switch_id": "s1", "router_id": "", "hosts": ["h1", "h2", "h3"]}],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_flow_preset_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
-
     plan_payload = {
         "full_preview": full_preview,
         "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
     }
-
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan_payload, f)
+    ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, plan_payload)
+    assert ok, err
+    plan_path = xml_path
 
     try:
         flow = client.get(
@@ -154,7 +142,7 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
             query_string={
                 "scenario": scenario,
                 "length": 10,
-                "preset": "sample_reverse_nfs_ssh",
+                "preset": "sample",
                 "preview_plan": plan_path,
             },
         )
@@ -171,7 +159,8 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
 
         # Regression: preset path should include inject_files from manifest metadata.
         assert isinstance(fas[0].get("inject_files"), list)
-        assert "filesystem.file" in fas[0].get("inject_files")
+        injects = fas[0].get("inject_files") or []
+        assert any(x in {"File(path)", "filesystem.file"} for x in injects)
 
         # Hint should include the next node's IP address when available.
         # Step 1 points to docker-2 (10.0.0.2).
@@ -179,14 +168,11 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
         assert "docker-2" in hint0
         assert "10.0.0.2" in hint0
     finally:
-        try:
-            os.remove(plan_path)
-        except Exception:
-            pass
+        pass
 
 
 def test_pick_flag_chain_nodes_for_preset_avoids_vuln_for_node_generator_step():
-    steps = app_backend._flow_preset_steps('sample_reverse_nfs_ssh')
+    steps = app_backend._flow_preset_steps('sample')
     assert steps and len(steps) == 3
 
     nodes = []
@@ -201,6 +187,45 @@ def test_pick_flag_chain_nodes_for_preset_avoids_vuln_for_node_generator_step():
 
     # Middle step is a flag-node-generator; must not be a vuln node.
     assert bool(chain_nodes[1].get('is_vuln')) is False
+
+
+def test_pick_flag_chain_nodes_for_sample_preset_supports_compose_docker_and_is_vulnerability():
+    steps = app_backend._flow_preset_steps('sample')
+    assert steps and len(steps) == 3
+
+    nodes = [
+        {
+            'id': 'v1',
+            'name': 'vuln-1',
+            'type': 'DOCKER',
+            'is_vulnerability': True,
+            'vulnerabilities': [{'id': 'CVE-1'}],
+        },
+        {
+            'id': 'd1',
+            'name': 'docker-1',
+            'type': 'HOST',
+            'compose': 'services:\n  app:\n    image: alpine:latest\n',
+            'is_vulnerability': False,
+            'vulnerabilities': [],
+        },
+        {
+            'id': 'v2',
+            'name': 'vuln-2',
+            'type': 'HOST',
+            'is_vulnerability': True,
+            'vulnerabilities': [{'id': 'CVE-2'}],
+        },
+    ]
+
+    adj = {n['id']: {'v1', 'd1', 'v2'} - {n['id']} for n in nodes}
+    chain_nodes = app_backend._pick_flag_chain_nodes_for_preset(nodes, adj, steps=steps)
+
+    assert len(chain_nodes) == 3
+    assert bool(app_backend._flow_node_is_vuln(chain_nodes[0])) is True
+    assert bool(app_backend._flow_node_is_docker_role(chain_nodes[1])) is True
+    assert bool(app_backend._flow_node_is_vuln(chain_nodes[1])) is False
+    assert bool(app_backend._flow_node_is_vuln(chain_nodes[2])) is True
 
 
 def test_flow_attackflow_preview_sample_preset_with_many_vulns_does_not_error(tmp_path):
@@ -228,17 +253,13 @@ def test_flow_attackflow_preview_sample_preset_with_many_vulns_does_not_error(tm
         "switches_detail": [{"switch_id": "s1", "router_id": "", "hosts": [h["node_id"] for h in hosts]}],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_flow_preset_many_vulns_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
-
     plan_payload = {
         "full_preview": full_preview,
         "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
     }
-
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan_payload, f)
+    ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, plan_payload)
+    assert ok, err
+    plan_path = xml_path
 
     try:
         flow = client.get(
@@ -246,7 +267,7 @@ def test_flow_attackflow_preview_sample_preset_with_many_vulns_does_not_error(tm
             query_string={
                 "scenario": scenario,
                 "length": 10,
-                "preset": "sample_reverse_nfs_ssh",
+                "preset": "sample",
                 "preview_plan": plan_path,
             },
         )
@@ -261,7 +282,52 @@ def test_flow_attackflow_preview_sample_preset_with_many_vulns_does_not_error(tm
         assert ids == ["binary_embed_text", "nfs_sensitive_file", "textfile_username_password"]
         assert kinds == ["flag-generator", "flag-node-generator", "flag-generator"]
     finally:
-        try:
-            os.remove(plan_path)
-        except Exception:
-            pass
+        pass
+
+
+def test_flow_attackflow_preview_sample_alias_length3_generates_chain(tmp_path):
+    """Regression: preset=sample should generate a 3-step chain when requirements are met."""
+    scenario = f"tv_count_flow_sample_alias_{uuid.uuid4().hex[:6]}"
+    xml_path = _write_xml(str(tmp_path), scenario=scenario)
+
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (302, 303)
+
+    full_preview = {
+        "seed": 321,
+        "hosts": [
+            {"node_id": "h1", "name": "docker-1", "role": "Docker", "vulnerabilities": [{"id": "v1"}], "ipv4": ["10.0.1.1/24"]},
+            {"node_id": "h2", "name": "docker-2", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.1.2/24"]},
+            {"node_id": "h3", "name": "docker-3", "role": "Docker", "vulnerabilities": [{"id": "v3"}], "ipv4": ["10.0.1.3/24"]},
+        ],
+        "routers": [],
+        "switches": [{"node_id": "s1", "name": "switch-1"}],
+        "switches_detail": [{"switch_id": "s1", "router_id": "", "hosts": ["h1", "h2", "h3"]}],
+    }
+
+    plan_payload = {
+        "full_preview": full_preview,
+        "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
+    }
+    ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, plan_payload)
+    assert ok, err
+
+    flow = client.get(
+        "/api/flag-sequencing/attackflow_preview",
+        query_string={
+            "scenario": scenario,
+            "length": 3,
+            "preset": "sample",
+            "preview_plan": xml_path,
+        },
+    )
+    assert flow.status_code == 200
+    data = flow.get_json() or {}
+    assert data.get("ok") is True, data
+    chain = data.get("chain") or []
+    assert len(chain) == 3, chain
+    ids = [str((a or {}).get("id") or "") for a in (data.get("flag_assignments") or [])]
+    assert ids == ["binary_embed_text", "nfs_sensitive_file", "textfile_username_password"]

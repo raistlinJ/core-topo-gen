@@ -1,0 +1,51 @@
+# CTF Fact Ontology Reference
+# Purpose: Canonical list of allowed Fact names and their intended meaning.
+
+NetworkAccess(src, dst, port)
+NetworkAccess(src, subnet)
+NetworkRoute(src, dst)
+Pivot(host)
+
+Shell(host)
+Shell(host, user)
+RootShell(host)
+CodeExecution(host)
+
+Credential(user)
+Credential(user, password)
+Credential(user, hash)
+Token(service)
+APIKey(service)
+
+File(path)
+File(host, path)
+Directory(host, path)
+PCAP(file)
+BackupArchive(file)
+
+Knowledge(value)
+Knowledge(type, value)
+Hostname(host)
+VHost(domain)
+Endpoint(path)
+Version(service)
+
+WebRCE(app)
+WebAuthBypass(app)
+UploadPrimitive(app)
+
+InternalNetwork(subnet)
+LateralMovement(from, to)
+PortForward(host, port)
+
+Vulnerability(host, type)
+Misconfiguration(service)
+ExposedSecret(service)
+
+Binary(binary_id)
+SourceCode(repo)
+EncryptedBlob(id)
+DecryptionKey(id)
+
+Flag(flag_id)
+PartialFlag(flag_id, part)

@@ -716,6 +716,8 @@ paths:
       description: >-
         Computes an ordered chain of eligible nodes (Docker/vulnerability candidates) from the latest
         preview plan and returns flag generator assignments plus validity metadata used by the Flow UI.
+        Flag-generators are placed on vulnerability nodes; flag-node-generators require non-vulnerability
+        Docker-role nodes. Initial/Goal facts (if persisted) are returned to steer sequencing.
 
         Note: legacy STIX/AttackFlow bundle export has been removed. The `download=1` query parameter
         returns HTTP 410.
@@ -846,6 +848,167 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: Preparation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/save_flow_substitutions:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Persist Flow substitutions and overrides
+      description: >-
+        Persists user-edited chain positions plus generator overrides into the canonical
+        per-scenario plan (plan_<scenario>.json). Used by the Flow UI “Save Overrides” action.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveFlowSubstitutionsRequest'
+      responses:
+        '200':
+          description: Persisted Flow substitutions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SaveFlowSubstitutionsResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Missing preview plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid chain or generator assignment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/upload_flow_input_file:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Upload a Flow input override file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - scenario
+                - file
+              properties:
+                scenario:
+                  type: string
+                step_index:
+                  type: string
+                  nullable: true
+                generator_id:
+                  type: string
+                  nullable: true
+                input_name:
+                  type: string
+                  nullable: true
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Upload result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  stored_path:
+                    type: string
+                  stored_filename:
+                    type: string
+                  original_filename:
+                    type: string
+                  input_name:
+                    type: string
+                  scenario:
+                    type: string
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: File too large.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/upload_flow_inject_file:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Upload a Flow inject override file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - scenario
+                - file
+              properties:
+                scenario:
+                  type: string
+                step_index:
+                  type: string
+                  nullable: true
+                generator_id:
+                  type: string
+                  nullable: true
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Upload result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  stored_path:
+                    type: string
+                  stored_filename:
+                    type: string
+                  original_filename:
+                    type: string
+                  inject_value:
+                    type: string
+                  scenario:
+                    type: string
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: File too large.
           content:
             application/json:
               schema:
@@ -2248,7 +2411,8 @@ components:
           additionalProperties: true
         fetched_at:
           type: string
-          format: date-time
+          description: Local timestamp string in `MM/DD/YY/HH/MM/SS` format.
+          example: "02/15/26/09/47/31"
           nullable: true
       required:
         - interfaces
@@ -2404,7 +2568,8 @@ components:
       properties:
         timestamp:
           type: string
-          format: date-time
+          description: Local timestamp string in `MM/DD/YY/HH/MM/SS` format.
+          example: "02/15/26/09/47/31"
         mode:
           type: string
           description: Execution mode (`sync` or `async`).
@@ -2525,6 +2690,8 @@ components:
             $ref: '#/components/schemas/DockerStatusItem'
         timestamp:
           type: integer
+          description: Unix epoch seconds when docker status was collected.
+          example: 1771148851
       required:
         - items
         - timestamp
@@ -2887,9 +3054,77 @@ components:
           nullable: true
       additionalProperties: true
 
+    FlowFactsOverride:
+      type: object
+      description: User-specified initial/goal facts override (artifacts + fields).
+      properties:
+        artifacts:
+          type: array
+          items:
+            type: string
+        fields:
+          type: array
+          items:
+            type: string
+      additionalProperties: true
+
     FlagAssignment:
       type: object
       description: Flag generator assignment metadata (best-effort, UI-oriented).
+      properties:
+        node_id:
+          type: string
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+          enum: ['flag-generator', 'flag-node-generator']
+        generator_catalog:
+          type: string
+          nullable: true
+        flag_generator:
+          type: string
+          nullable: true
+        config_overrides:
+          type: object
+          nullable: true
+          additionalProperties: true
+        output_overrides:
+          type: object
+          nullable: true
+          additionalProperties: true
+        inject_files_override:
+          type: array
+          items:
+            type: string
+        hint_overrides:
+          type: array
+          items:
+            type: string
+        flag_override:
+          type: string
+          nullable: true
+        resolved_inputs:
+          type: object
+          nullable: true
+          additionalProperties: true
+        resolved_outputs:
+          type: object
+          nullable: true
+          additionalProperties: true
+        flag_value:
+          type: string
+          nullable: true
+        inputs:
+          type: array
+          items:
+            type: string
+        outputs:
+          type: array
+          items:
+            type: string
       additionalProperties: true
 
     AttackflowPreviewResponse:
@@ -2933,6 +3168,17 @@ components:
         flags_enabled:
           type: boolean
           nullable: true
+        allow_node_duplicates:
+          type: boolean
+          nullable: true
+        initial_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+        goal_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+        flow_plan_path:
+          deprecated: true
+          nullable: true
+          description: Deprecated. The API now uses a single canonical plan file.
         warning:
           type: string
           nullable: true
@@ -2970,6 +3216,12 @@ components:
           type: string
           nullable: true
         best_effort:
+          type: boolean
+          nullable: true
+        allow_node_duplicates:
+          type: boolean
+          nullable: true
+        allow_duplicates:
           type: boolean
           nullable: true
         timeout_s:
@@ -3026,6 +3278,17 @@ components:
           type: object
           description: Attack Flow Builder .afb export document.
           additionalProperties: true
+        attack_graph:
+          type: object
+          description: Simple attack graph JSON derived from the chain.
+          additionalProperties: true
+        attack_graph_dot:
+          type: string
+          description: Graphviz DOT representation of the attack graph.
+        attack_graph_pdf_base64:
+          type: string
+          nullable: true
+          description: Base64-encoded PDF rendition of the attack graph (requires Graphviz dot).
         flow_valid:
           type: boolean
           nullable: true
@@ -3036,6 +3299,86 @@ components:
         flags_enabled:
           type: boolean
           nullable: true
+        initial_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+        goal_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+      additionalProperties: true
+
+    SaveFlowSubstitutionsRequest:
+      type: object
+      required:
+        - scenario
+        - chain_ids
+        - flag_assignments
+      properties:
+        scenario:
+          type: string
+        chain_ids:
+          type: array
+          items:
+            type: string
+        preview_plan:
+          type: string
+          nullable: true
+        allow_node_duplicates:
+          type: boolean
+          nullable: true
+        flag_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlagAssignment'
+        initial_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+        goal_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+      additionalProperties: true
+
+    SaveFlowSubstitutionsResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+          nullable: true
+        length:
+          type: integer
+          nullable: true
+        chain:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowChainNode'
+        flag_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlagAssignment'
+        flow_valid:
+          type: boolean
+          nullable: true
+        flow_errors:
+          type: array
+          items:
+            type: string
+        flags_enabled:
+          type: boolean
+          nullable: true
+        preview_plan_path:
+          type: string
+          nullable: true
+        flow_plan_path:
+          deprecated: true
+          nullable: true
+          description: Deprecated. The API now uses a single canonical plan file.
+        allow_node_duplicates:
+          type: boolean
+          nullable: true
+        initial_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
+        goal_facts:
+          $ref: '#/components/schemas/FlowFactsOverride'
       additionalProperties: true
     DataSourceSaveResponse:
       type: object

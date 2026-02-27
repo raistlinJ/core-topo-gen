@@ -32,7 +32,7 @@ def main() -> None:
     outputs = {
         "generator_id": "CHANGE_ME_PLUGIN_ID",
         "outputs": {
-            "flag": flag_value,
+            "Flag(flag_id)": flag_value,
             "example": "replace-me",
         },
     }

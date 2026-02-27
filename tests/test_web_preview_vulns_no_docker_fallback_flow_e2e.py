@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import time
 import uuid
 
 from webapp import app_backend
@@ -72,15 +71,13 @@ def test_vulns_show_in_preview_when_no_docker_hosts_and_flow_allows_vuln_nodes(t
         full_preview["switches"] = [{"node_id": s1, "name": "switch-1"}]
         full_preview["switches_detail"] = [{"switch_id": s1, "router_id": "", "hosts": vuln_host_ids[:2]}]
 
-        plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, f"plan_no_docker_vuln_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
         plan_payload = {
-            "full_preview": full_preview,
-            "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
+          "full_preview": full_preview,
+          "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
         }
-        with open(plan_path, "w", encoding="utf-8") as f:
-            json.dump(plan_payload, f)
+        ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, plan_payload)
+        assert ok, err
+        plan_path = xml_path
 
         try:
             flow = client.get(
@@ -102,7 +99,4 @@ def test_vulns_show_in_preview_when_no_docker_hosts_and_flow_allows_vuln_nodes(t
             assignments = data.get("flag_assignments") or []
             assert not [a for a in assignments if str(a.get("type") or "").strip() == "flag-node-generator"], assignments
         finally:
-            try:
-                os.remove(plan_path)
-            except Exception:
-                pass
+          pass

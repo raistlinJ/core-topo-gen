@@ -36,7 +36,7 @@ inputs: []
 artifacts:
   requires: []
   produces:
-    - filesystem.file
+        - File(path)
 injects: []
 """
 
@@ -100,7 +100,7 @@ inputs: []
 artifacts:
   requires: []
   produces:
-    - filesystem.file
+        - File(path)
 injects: []
 """
 
@@ -170,7 +170,7 @@ inputs: []
 artifacts:
   requires: []
   produces:
-    - filesystem.file
+        - File(path)
 injects: []
 """
     compose = """version: '3.8'
@@ -261,7 +261,7 @@ inputs: []
 artifacts:
   requires: []
   produces:
-    - filesystem.file
+        - File(path)
 injects: []
 """
     compose = """version: '3.8'
@@ -333,7 +333,7 @@ inputs: []
 artifacts:
   requires: []
   produces:
-    - filesystem.file
+        - File(path)
 injects: []
 """
     compose = """version: '3.8'

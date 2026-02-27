@@ -192,6 +192,40 @@
       return '';
     }
 
+    function nodeRoleNormalized(node){
+      try { return String(node?.type || node?.kind || node?.role || '').trim().toLowerCase(); } catch(e){ return ''; }
+    }
+
+    function routerLanCount(node){
+      if(!node) return 0;
+      const subnets = Array.isArray(node.subnets) ? node.subnets : [];
+      const subnetCount = subnets.filter(v => v && String(v).trim()).length;
+      if(subnetCount) return subnetCount;
+      const ifaces = Array.isArray(node.interfaces) ? node.interfaces : [];
+      const ifaceCount = ifaces.filter(iface => {
+        if(!iface || typeof iface !== 'object') return false;
+        const ip4 = (iface.ipv4 || iface.ip4 || '').toString().trim();
+        const ip6 = (iface.ipv6 || iface.ip6 || '').toString().trim();
+        return !!(ip4 || ip6);
+      }).length;
+      if(ifaceCount) return ifaceCount;
+      const ipv4s = Array.isArray(node.ipv4s) ? node.ipv4s.filter(v => v && String(v).trim()) : [];
+      if(ipv4s.length) return ipv4s.length;
+      return 0;
+    }
+
+    function primaryIpv4Label(node){
+      const ip = primaryIpv4(node);
+      const role = nodeRoleNormalized(node);
+      if(role.includes('switch')) return '';
+      if(role.includes('router')){
+        const total = routerLanCount(node);
+        const extra = total > 1 ? ` + ${total - 1}` : '';
+        return ip ? `${ip}${extra}` : '';
+      }
+      return ip;
+    }
+
     function labelFill(node){
       if(nodeIsHitl(node)) return '#000';
       return ((node?.type||'').toLowerCase()==='switch') ? '#000' : '#fff';
@@ -245,7 +279,7 @@
       const svc = (node?.services||[]).length;
       const base = 110 + Math.min(120, svc * 10);
       const nameLen = String(displayNameWithSequence(node) || '').length;
-      const ipLen = nodeIsHitl(node) ? 0 : String(primaryIpv4(node) || '').length;
+      const ipLen = nodeIsHitl(node) ? 0 : String(primaryIpv4Label(node) || '').length;
       // Heuristic text fit: ~6.4px per char at 10px font, plus padding.
       const textNeed = (Math.max(nameLen, ipLen) * 6.4) + 26;
       // Allow wider boxes so the IP line doesn't spill outside the node.
@@ -257,7 +291,7 @@
       const svc = (node?.services||[]).length;
       const base = 44 + Math.min(34, svc * 1.35);
       if(nodeIsHitl(node)) return base;
-      return base + (primaryIpv4(node) ? 14 : 0);
+      return base + (primaryIpv4Label(node) ? 14 : 0);
     }
 
     const linkCounts = new Array(nodes.length).fill(0); links.forEach(l => { linkCounts[l.source]++; linkCounts[l.target]++; });
@@ -905,7 +939,7 @@
       .attr('fill', d => labelFill(d))
       .text(d => {
         if(nodeIsHitl(d)) return '';
-        const ip = primaryIpv4(d);
+        const ip = primaryIpv4Label(d);
         return ip ? ip : '';
       });
 

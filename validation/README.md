@@ -21,7 +21,7 @@ Notes:
 
 ### Enumerated Helper Attributes (Added)
 
-To aid downstream tooling, several optional helper attributes were introduced (all optional; absence means legacy behavior):
+To aid downstream tooling, several optional helper attributes were introduced (all optional):
 
 Traffic Section:
 - `traffic_kind`: One of `Random`, `TCP`, `UDP`, `CUSTOM`. When present it SHOULD be consistent with (or a refinement of) the existing `selected` attribute. Use `CUSTOM` when a plugin or external script defines behavior beyond built‑in generators.

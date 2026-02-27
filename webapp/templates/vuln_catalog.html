@@ -136,6 +136,7 @@
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Description</th>
+                      <th style="width: 140px;">Validated</th>
                       <th>From Source</th>
                       <th style="width: 160px;">Actions</th>
                     </tr>
@@ -181,7 +182,6 @@
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">Test Vulnerability</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
         <div class="mb-2">
@@ -213,8 +213,49 @@
         </div>
       </div>
       <div class="modal-footer">
-        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+        <button type="button" class="btn btn-outline-secondary" id="vulnTestCloseBtn" data-bs-dismiss="modal">Cancel</button>
+        <span class="text-muted small d-none" id="vulnTestStoppingLabel"><span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Stopping, please wait...</span>
         <button type="button" class="btn btn-primary" id="vulnTestRunBtn">Run</button>
+        <button type="button" class="btn btn-outline-success" id="vulnTestStopOkBtn" style="display:none;">Stop (Success)</button>
+        <button type="button" class="btn btn-outline-danger" id="vulnTestStopFailBtn" style="display:none;">Stop (Fail)</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Vulnerability Test SSH Credentials Modal -->
+<div class="modal fade" id="vulnTestCredsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">CORE VM Credentials</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">SSH Host</label>
+          <input class="form-control" id="vulnTestCredsHost" placeholder="core-vm.example" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Port</label>
+          <input class="form-control" id="vulnTestCredsPort" type="number" value="22" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Username</label>
+          <input class="form-control" id="vulnTestCredsUser" />
+        </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Password</label>
+          <input class="form-control" id="vulnTestCredsPass" type="password" />
+        </div>
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" id="vulnTestCredsSave" checked>
+          <label class="form-check-label" for="vulnTestCredsSave">Save Credentials</label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="vulnTestCredsContinue">Continue</button>
       </div>
     </div>
   </div>
@@ -342,14 +383,38 @@
     }
   }
 
+  const _logBuffers = new Map();
+  const _logScheduled = new Set();
+  const _MAX_LOG_CHARS = 200000;
+
+  function _flushLog(id) {
+    const el = _qs(id);
+    if (!el) return;
+    const buf = _logBuffers.get(id);
+    if (!buf || !buf.length) return;
+    const shouldStick = _isNearBottom(el, 24);
+    const cur = el.textContent || '';
+    const next = cur ? (cur + '\n' + buf.join('\n')) : buf.join('\n');
+    el.textContent = next.length > _MAX_LOG_CHARS ? next.slice(-_MAX_LOG_CHARS) : next;
+    _logBuffers.set(id, []);
+    if (shouldStick) {
+      try { el.scrollTop = el.scrollHeight; } catch (e) {}
+    }
+  }
+
   function _appendLog(id, line) {
     const el = _qs(id);
     if (!el) return;
-    const shouldStick = _isNearBottom(el, 24);
-    const cur = el.textContent || '';
-    el.textContent = (cur ? (cur + '\n') : '') + String(line || '');
-    if (shouldStick) {
-      try { el.scrollTop = el.scrollHeight; } catch (e) {}
+    const text = String(line || '');
+    const buf = _logBuffers.get(id) || [];
+    buf.push(text);
+    _logBuffers.set(id, buf);
+    if (!_logScheduled.has(id)) {
+      _logScheduled.add(id);
+      requestAnimationFrame(() => {
+        _logScheduled.delete(id);
+        _flushLog(id);
+      });
     }
   }
 
@@ -374,6 +439,46 @@
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(payload || {}),
     });
+  }
+
+  async function _ensureCoreVmReadyForVulnTest(coreCfg) {
+    if (!coreCfg || typeof coreCfg !== 'object') return true;
+
+    const precheck = await _postJson('/api/test/core_sessions/prepare', { core: coreCfg, cleanup: false });
+    if (!precheck || precheck.ok === false) {
+      throw new Error((precheck && precheck.error) ? precheck.error : 'Unable to verify CORE sessions.');
+    }
+    if (!precheck.active) return true;
+
+    const sessionCount = Number(precheck.session_count || 0) || 1;
+    const warningMessage = [
+      `A CORE session is currently running (${sessionCount} active).`,
+      '',
+      'To run this test, the active CORE session must be stopped and cleaned up.',
+      '',
+      'Warning: this may cause loss of current progress/data, and you will need to restart the scenario.',
+      '',
+      'Do you want to continue?',
+    ].join('\n');
+
+    let shouldCleanup = false;
+    if (typeof window.confirmWithModal === 'function') {
+      shouldCleanup = await window.confirmWithModal(
+        'Active CORE Session',
+        warningMessage,
+        'Stop & Cleanup',
+        'danger',
+      );
+    } else {
+      shouldCleanup = window.confirm(warningMessage);
+    }
+    if (!shouldCleanup) return false;
+
+    const cleanupResp = await _postJson('/api/test/core_sessions/prepare', { core: coreCfg, cleanup: true });
+    if (!cleanupResp || cleanupResp.ok === false) {
+      throw new Error((cleanupResp && cleanupResp.error) ? cleanupResp.error : 'Failed to stop and clean up active CORE session(s).');
+    }
+    return true;
   }
 
   function _isRequiredInput(inp) {
@@ -481,6 +586,15 @@
         <td class="small">
           ${it.readme_url ? `<a href="${escapeHtml(it.readme_url)}" target="_blank" rel="noopener">README</a>` : '<span class="text-muted">—</span>'}
         </td>
+        <td class="small">
+          ${it.validated_incomplete === true
+            ? `<span class="badge text-bg-secondary">Incomplete</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+            : (it.validated_ok === true
+              ? `<span class="badge text-bg-success">Validated</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+              : (it.validated_ok === false
+                ? `<span class="badge text-bg-danger">Failed</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+                : '<span class="text-muted">—</span>'))}
+        </td>
         <td class="small">${escapeHtml(it.from_source || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
@@ -519,7 +633,7 @@
 
     if (!rows.length) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="5" class="text-muted">No vulnerabilities found.</td>`;
+      tr.innerHTML = `<td colspan="6" class="text-muted">No vulnerabilities found.</td>`;
       body.appendChild(tr);
     }
   }
@@ -574,24 +688,38 @@
       if (st) st.style.display = 'none';
       _setText('vulnTestStatusText', 'Working…');
       const btn = _qs('vulnTestRunBtn');
-      if (btn) btn.disabled = false;
+      if (btn) {
+        btn.disabled = false;
+        btn.style.display = '';
+      }
     } catch (e) {}
-    const modal = new bootstrap.Modal(_qs('vulnTestModal'));
+    const modal = new bootstrap.Modal(_qs('vulnTestModal'), { backdrop: 'static', keyboard: false });
     modal.show();
   }
 
   async function runVulnTest() {
     const it = _vulnCatalogState.selectedItem;
     if (!it) return;
+    if (_vulnCatalogState.activeTestRunId) {
+      _appendLog('vulnTestLog', '[ui] A test is already running. Stop it before starting another.');
+      return;
+    }
+    let started = false;
     const btn = _qs('vulnTestRunBtn');
-    if (btn) btn.disabled = true;
+    if (btn) {
+      btn.disabled = true;
+      btn.style.display = 'none';
+    }
+    const stopOkBtn = _qs('vulnTestStopOkBtn');
+    const stopFailBtn = _qs('vulnTestStopFailBtn');
+    const closeBtn = _qs('vulnTestCloseBtn');
     _setText('vulnTestLog', '');
     try {
       const res = _qs('vulnTestResult');
       if (res) res.innerHTML = '';
       const st = _qs('vulnTestStatus');
       if (st) st.style.display = '';
-      _setText('vulnTestStatusText', 'Running docker compose config…');
+      _setText('vulnTestStatusText', 'Starting docker compose…');
     } catch (e) {}
 
     _appendLog('vulnTestLog', `[ui] Testing #${it.id} (${it.name})…`);
@@ -608,22 +736,101 @@
       } catch (e) {}
 
       const inputs = _collectVulnTestInputs(it);
-      const data = await _postJson('/vuln_catalog_items/test', { item_id: it.id, inputs });
-      if (data && data.log) {
-        String(data.log).split('\n').forEach(line => _appendLog('vulnTestLog', line));
+      const coreCfg = _vulnCatalogState.testCoreCfg || null;
+      if (!coreCfg) {
+        throw new Error('CORE VM credentials required.');
       }
-      const ok = !!(data && data.ok);
+      const canProceed = await _ensureCoreVmReadyForVulnTest(coreCfg);
+      if (!canProceed) {
+        _appendLog('vulnTestLog', '[ui] Run cancelled.');
+        return;
+      }
+      let data = null;
       try {
-        const res = _qs('vulnTestResult');
-        if (res) {
-          res.innerHTML = ok
-            ? '<span class="badge text-bg-success">OK</span>'
-            : '<span class="badge text-bg-danger">FAILED</span>';
+        data = await _postJson('/vuln_catalog_items/test/start', { item_id: it.id, inputs, core: coreCfg });
+      } catch (e) {
+        const msg = String(e || '');
+        if (msg.includes('Another vulnerability test is already running')) {
+          const shouldStop = window.confirm('Another vulnerability test is already running. Stop it and start a new test?');
+          if (!shouldStop) throw e;
+          await _postJson('/vuln_catalog_items/test/stop_active', { ok: null });
+          await new Promise(r => setTimeout(r, 600));
+          data = await _postJson('/vuln_catalog_items/test/start', { item_id: it.id, inputs, core: coreCfg });
+        } else {
+          throw e;
+        }
+      }
+      if (data && data.replace_required) {
+        const imgs = Array.isArray(data.existing_images) ? data.existing_images : [];
+        const containers = Array.isArray(data.existing_containers) ? data.existing_containers : [];
+        const msg = [
+          'A matching image/container already exists on the CORE VM.',
+          imgs.length ? `Images: ${imgs.join(', ')}` : null,
+          containers.length ? `Containers: ${containers.join(', ')}` : null,
+          'Replace them and continue?'
+        ].filter(Boolean).join('\n');
+        const shouldReplace = window.confirm(msg);
+        if (!shouldReplace) {
+          _appendLog('vulnTestLog', '[ui] Replace cancelled by user.');
+          if (closeBtn) closeBtn.style.display = '';
+          return;
+        }
+        data = await _postJson('/vuln_catalog_items/test/start', { item_id: it.id, inputs, core: coreCfg, force_replace: true });
+      }
+      if (!data || data.ok !== true || !data.run_id) {
+        throw new Error((data && data.error) ? data.error : 'Failed to start test');
+      }
+      const runId = String(data.run_id);
+      _vulnCatalogState.activeTestRunId = runId;
+      started = true;
+      if (btn) btn.style.display = 'none';
+      if (stopOkBtn) stopOkBtn.style.display = '';
+      if (stopFailBtn) stopFailBtn.style.display = '';
+      if (closeBtn) closeBtn.style.display = 'none';
+      _setText('vulnTestStatusText', 'Running docker compose… (streaming logs)');
+
+      try {
+        if (_vulnCatalogState.activeTestStream) {
+          _vulnCatalogState.activeTestStream.close();
         }
       } catch (e) {}
-      _appendLog('vulnTestLog', ok ? '[ui] Result: OK' : '[ui] Result: FAILED');
+
+      const es = new EventSource('/stream/' + encodeURIComponent(runId));
+      _vulnCatalogState.activeTestStream = es;
+      es.onmessage = (ev) => {
+        if (ev && typeof ev.data === 'string') {
+          const line = ev.data;
+          _appendLog('vulnTestLog', line);
+          try {
+            if (line.startsWith('[remote] uploading')) {
+              _setText('vulnTestStatusText', 'Uploading files…');
+            } else if (line.startsWith('[upload] ')) {
+              const m = line.match(/\((\d+)%\)/);
+              if (m && m[1]) {
+                _setText('vulnTestStatusText', `Uploading files… (${m[1]}%)`);
+              }
+            } else if (line.startsWith('[remote] compose:')) {
+              _setText('vulnTestStatusText', 'Starting docker compose…');
+            } else if (line.startsWith('[remote] docker compose up')) {
+              _setText('vulnTestStatusText', 'Running docker compose…');
+            }
+          } catch (e) {}
+        }
+      };
+      es.addEventListener('end', () => {
+        try { es.close(); } catch (e) {}
+      });
+      try {
+        const modalEl = _qs('vulnTestModal');
+        if (modalEl) {
+          modalEl.addEventListener('hidden.bs.modal', () => {
+            if (_vulnCatalogState.activeTestRunId) stopVulnTest(null);
+          }, { once: true });
+        }
+      } catch (e) {}
     } catch (e) {
       _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+      if (closeBtn) closeBtn.style.display = '';
       try {
         const res = _qs('vulnTestResult');
         if (res) res.innerHTML = `<span class="badge text-bg-danger">ERROR</span> <span class="text-danger">${escapeHtml(String(e))}</span>`;
@@ -634,7 +841,169 @@
         if (st) st.style.display = 'none';
         _setText('vulnTestStatusText', 'Working…');
       } catch (e) {}
-      if (btn) btn.disabled = false;
+      if (btn) {
+        if (!started && !_vulnCatalogState.activeTestRunId) {
+          btn.disabled = false;
+          btn.style.display = '';
+        }
+      }
+    }
+  }
+
+  function _loadSavedVulnTestCreds() {
+    try {
+      const raw = localStorage.getItem('coretg_vuln_test_ssh');
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function _saveVulnTestCreds(creds) {
+    try {
+      localStorage.setItem('coretg_vuln_test_ssh', JSON.stringify(creds || {}));
+    } catch (e) {}
+  }
+
+  async function promptVulnTestCreds() {
+    return new Promise((resolve) => {
+      const modalEl = _qs('vulnTestCredsModal');
+      const hostEl = _qs('vulnTestCredsHost');
+      const portEl = _qs('vulnTestCredsPort');
+      const userEl = _qs('vulnTestCredsUser');
+      const passEl = _qs('vulnTestCredsPass');
+      const saveEl = _qs('vulnTestCredsSave');
+      const contBtn = _qs('vulnTestCredsContinue');
+      if (!modalEl) return resolve(null);
+
+      const saved = _loadSavedVulnTestCreds() || {};
+      if (hostEl) hostEl.value = saved.ssh_host || '';
+      if (portEl) portEl.value = saved.ssh_port || 22;
+      if (userEl) userEl.value = saved.ssh_username || '';
+      if (passEl) passEl.value = saved.ssh_password || '';
+      if (saveEl) saveEl.checked = saved.save !== false;
+
+      const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl)) : null;
+      const onHidden = () => {
+        try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+        resolve(null);
+      };
+      try { modalEl.addEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+
+      if (contBtn) {
+        contBtn.onclick = () => {
+          try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+          const creds = {
+            ssh_host: (hostEl && hostEl.value || '').trim(),
+            ssh_port: parseInt((portEl && portEl.value) || '22', 10) || 22,
+            ssh_username: (userEl && userEl.value || '').trim(),
+            ssh_password: (passEl && passEl.value || '').toString(),
+          };
+          const shouldSave = !!(saveEl && saveEl.checked);
+          if (shouldSave) _saveVulnTestCreds({ ...creds, save: true });
+          resolve(creds);
+          try { modalObj?.hide(); } catch (e) {}
+        };
+      }
+
+      try { modalObj?.show(); } catch (e) {}
+    });
+  }
+
+  let _vulnStopInFlight = false;
+  async function stopVulnTest(ok) {
+    if (_vulnStopInFlight) return;
+    const runId = _vulnCatalogState.activeTestRunId;
+    if (!runId) {
+      _appendLog('vulnTestLog', '[ui] No active test to stop.');
+      return;
+    }
+    const isIncomplete = (ok === null || ok === undefined);
+    _vulnStopInFlight = true;
+    let cleanupPending = false;
+    const btn = _qs('vulnTestRunBtn');
+    if (btn) btn.disabled = true;
+    const stopOkBtn = _qs('vulnTestStopOkBtn');
+    const stopFailBtn = _qs('vulnTestStopFailBtn');
+    const closeBtn = _qs('vulnTestCloseBtn');
+    const stoppingLabel = _qs('vulnTestStoppingLabel');
+    const logEl = _qs('vulnTestLog');
+    if (stopOkBtn) stopOkBtn.disabled = true;
+    if (stopFailBtn) stopFailBtn.disabled = true;
+    if (stoppingLabel) stoppingLabel.classList.remove('d-none');
+    if (closeBtn) closeBtn.style.display = 'none';
+    _appendLog('vulnTestLog', `[ui] Stopping test (${isIncomplete ? 'incomplete' : (ok ? 'success' : 'fail')})…`);
+    _appendLog('vulnTestLog', '[stop] User requested stop');
+    try {
+      setTimeout(() => {
+        try {
+          if (stoppingLabel && !stoppingLabel.classList.contains('d-none')) {
+            _appendLog('vulnTestLog', '[ui] Stop timed out after 10s; cleanup may not have completed.');
+            cleanupPending = false;
+            if (closeBtn) { closeBtn.textContent = 'Close'; closeBtn.style.display = ''; }
+            const modalEl = _qs('vulnTestModal');
+            const modalObj = (window.bootstrap && modalEl) ? bootstrap.Modal.getInstance(modalEl) : null;
+            try { modalObj?.hide(); } catch (e) {}
+          }
+        } catch (e) {}
+      }, 30000);
+    } catch (e) {}
+    try {
+      await _postJson('/vuln_catalog_items/test/stop', { run_id: runId, ok: (isIncomplete ? null : !!ok) });
+      cleanupPending = true;
+      try {
+        const res = _qs('vulnTestResult');
+        if (res) {
+          res.innerHTML = isIncomplete
+            ? '<span class="badge text-bg-secondary">INCOMPLETE</span>'
+            : (ok
+              ? '<span class="badge text-bg-success">OK</span>'
+              : '<span class="badge text-bg-danger">FAILED</span>');
+        }
+      } catch (e) {}
+      _appendLog('vulnTestLog', isIncomplete ? '[ui] Result: INCOMPLETE' : (ok ? '[ui] Result: OK' : '[ui] Result: FAILED'));
+      if (closeBtn) { closeBtn.textContent = 'Cancel'; closeBtn.style.display = 'none'; }
+      if (stoppingLabel) stoppingLabel.classList.remove('d-none');
+      try {
+        const poll = async () => {
+          const st = await _postJson('/vuln_catalog_items/test/status', { run_id: runId });
+          if (st && st.cleanup_done) {
+            cleanupPending = false;
+            if (closeBtn) closeBtn.textContent = 'Close';
+            if (stoppingLabel) stoppingLabel.classList.add('d-none');
+            if (closeBtn) closeBtn.style.display = '';
+            return;
+          }
+          setTimeout(poll, 1000);
+        };
+        setTimeout(poll, 500);
+      } catch (e) {}
+      try { await loadVulnCatalogItems(); } catch (e) {}
+    } catch (e) {
+      const msg = String(e || '');
+      if (msg.toLowerCase().includes('not found')) {
+        _appendLog('vulnTestLog', '[ui] Stop already completed.');
+      } else {
+        _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+      }
+    } finally {
+      try {
+        if (_vulnCatalogState.activeTestStream) _vulnCatalogState.activeTestStream.close();
+      } catch (e) {}
+      _vulnCatalogState.activeTestStream = null;
+      _vulnCatalogState.activeTestRunId = null;
+      if (stopOkBtn) { stopOkBtn.style.display = 'none'; stopOkBtn.disabled = false; }
+      if (stopFailBtn) { stopFailBtn.style.display = 'none'; stopFailBtn.disabled = false; }
+      if (!cleanupPending) {
+        if (closeBtn) closeBtn.style.display = '';
+        if (stoppingLabel) stoppingLabel.classList.add('d-none');
+        if (btn) { btn.disabled = false; btn.style.display = ''; }
+      }
+      try {
+        const st = _qs('vulnTestStatus');
+        if (st) st.style.display = 'none';
+      } catch (e) {}
+      _vulnStopInFlight = false;
     }
   }
 
@@ -732,7 +1101,28 @@
       try { await loadVulnCatalogItems(); } catch (e) { _setText('vulnCatalogMeta', String(e)); }
     });
     const runBtn = _qs('vulnTestRunBtn');
-    if (runBtn) runBtn.addEventListener('click', runVulnTest);
+    if (runBtn) runBtn.addEventListener('click', async () => {
+      const creds = await promptVulnTestCreds();
+      if (!creds) return;
+      _vulnCatalogState.testCoreCfg = creds;
+      await runVulnTest();
+    });
+    const stopOkBtn = _qs('vulnTestStopOkBtn');
+    if (stopOkBtn) stopOkBtn.addEventListener('click', () => stopVulnTest(true));
+    const stopFailBtn = _qs('vulnTestStopFailBtn');
+    if (stopFailBtn) stopFailBtn.addEventListener('click', () => stopVulnTest(false));
+
+    // Auto-cleanup if dialog is closed while test is running.
+    try {
+      const testModalEl = _qs('vulnTestModal');
+      if (testModalEl) {
+        testModalEl.addEventListener('hidden.bs.modal', () => {
+          if (_vulnCatalogState.activeTestRunId) {
+            stopVulnTest(false);
+          }
+        });
+      }
+    } catch (e) {}
   });
 </script>
 {% endblock %}

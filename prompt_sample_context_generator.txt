@@ -1,9 +1,48 @@
-sure; also, let's remove and recreate "Sample: Binary Embed Text (network.ip)" as "Sample: Binary Embed Text"
-Use our AI scaffold to create it.
-As inputs, it should have: (optional) filename, (optional) seed, and (optional) flag.
+Use this sample context when asking AI to scaffold a new generator.
 
-It will create an x64 binary file (named filename). If no filename is provided as input, it will be some random filename based on seed. The binary will have the flag embedded in it; so it can be found using, e.g., strings or a reverse engineering tool like ghidra.
+TYPE: <flag-generator | flag-node-generator>
+SOURCE_ID: <my_source_id>
 
-The output of this generator is the binary file (maybe we need to add file as a type/reserved if it's not there).
+Files I am providing:
+- manifest.yaml
+- generator.py (template scaffold)
+- optional docker-compose.yml
 
-Please auto generate description, hints, etc. for this generator.
+Generator behavior I want:
+<describe behavior>
+
+Runtime contract (strict):
+- Read /inputs/config.json
+- Write /outputs/outputs.json with:
+	{
+		"generator_id": "<stable string>",
+		"outputs": {
+			"Flag(flag_id)": "FLAG{...}",
+			"...": "..."
+		}
+	}
+- Deterministic outputs for same inputs
+- Exit non-zero on true failure with clear stderr message
+
+Manifest alignment (strict):
+- outputs.json.outputs keys must exactly match artifacts.produces
+- optional runtime inputs must be marked required: false
+- injects (if present) must resolve to real output files
+
+If TYPE is flag-node-generator:
+- Write /outputs/docker-compose.yml
+- Include File(path): "docker-compose.yml" in outputs.json
+
+CORE docker-node / compose restrictions (do not violate):
+- Avoid `${...}` in emitted docker-compose.yml (CORE may treat it as template syntax)
+- Do not rely on `ports:` for in-CORE reachability; peers use CORE node IP
+- Assume services may run with `network_mode: none` and no outbound internet
+
+Code style constraints:
+- Use Python standard library only unless explicitly asked otherwise
+- Keep imports (`json`, `sys`, etc.) at module scope
+- Do not use function-local imports in scopes with nested helpers
+
+Output format request to AI:
+- Reply with ONLY full updated generator.py
+- If I ask for docs too, output generator.py then manifest.yaml then README.md

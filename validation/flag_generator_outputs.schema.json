@@ -10,11 +10,14 @@
     "generator_id": {"type": "string", "minLength": 1},
     "outputs": {
       "type": "object",
-      "required": ["flag"],
+      "required": ["Flag(flag_id)"],
       "properties": {
-        "flag": {"type": "string", "minLength": 1}
+        "Flag(flag_id)": {"type": "string", "minLength": 1}
       },
-      "additionalProperties": true
+      "patternProperties": {
+        "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$": {}
+      },
+      "additionalProperties": false
     },
     "handoff": {
       "type": "object",

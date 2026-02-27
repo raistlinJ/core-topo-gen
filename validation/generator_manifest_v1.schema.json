@@ -80,9 +80,18 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "requires": {"type": "array", "items": {"type": "string"}},
-        "optional_requires": {"type": "array", "items": {"type": "string"}},
-        "produces": {"type": "array"}
+        "requires": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$"}
+        },
+        "optional_requires": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$"}
+        },
+        "produces": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$"}
+        }
       }
     },
     "hint_template": {"type": "string"},

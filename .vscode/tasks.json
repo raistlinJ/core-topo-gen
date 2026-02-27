@@ -87,13 +87,13 @@
 		{
 			"label": "Restart Web UI (9090) to pick up changes",
 			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\" && for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9090/healthz >/dev/null 2>&1 && echo 'healthz ok' && exit 0; sleep 0.2; done; echo 'healthz failed' >&2; tail -n 120 outputs/logs/webui-9090.log | cat >&2; exit 7",
 			"isBackground": false
 		},
 		{
 			"label": "Healthz after restart",
 			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"command": "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9090/healthz && echo && exit 0; sleep 0.2; done; echo 'healthz failed' >&2; exit 7",
 			"isBackground": false
 		},
 		{
@@ -245,6 +245,192 @@
 			"label": "Healthz 9090 after README styling",
 			"type": "shell",
 			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI (9090) no healthcheck",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && lsof -ti:9090 | xargs kill -9 2>/dev/null; sleep 0.5; mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 &",
+			"isBackground": false
+		},
+		{
+			"label": "Start Web UI (9090) simple",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 &",
+			"isBackground": false
+		},
+		{
+			"label": "Smoke UI Execute Retry Prompt",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && out=/tmp/ui_execute_retry_smoke_task_prompt.txt && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py > \"$out\" 2>&1; code=$?; if [ \"$code\" -eq 0 ]; then echo 'SMOKE_UI_EXECUTE_RETRY_PROMPT=PASS'; (grep -E 'SMOKE_|prompt_seen=|retry_|run_id=' \"$out\" | tail -n 40 || true); else echo \"SMOKE_UI_EXECUTE_RETRY_PROMPT=FAIL EXIT_CODE=$code\"; rr=$(grep -m1 '^run_result=' \"$out\" || true); if [ -n \"$rr\" ]; then echo \"${rr:0:240}\"; fi; if ! (grep -E 'error=|run_error=|on_error=|prompt_seen=|retry_|SMOKE_|Traceback|Exception' \"$out\" | tail -n 80); then tail -n 60 \"$out\"; fi; fi; exit $code",
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"clear": true,
+				"panel": "dedicated",
+				"reveal": "always"
+			}
+		},
+		{
+			"label": "Restart + Smoke UI Execute Retry Prompt",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && lsof -ti:9090 | xargs kill -9 2>/dev/null; sleep 0.5; mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & sleep 1; curl -fsS http://127.0.0.1:9090/healthz >/dev/null && out=/tmp/ui_execute_retry_smoke_task_restart.txt && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py > \"$out\" 2>&1; code=$?; if [ \"$code\" -eq 0 ]; then echo 'RESTART_SMOKE_UI_EXECUTE_RETRY_PROMPT=PASS'; (grep -E 'SMOKE_|prompt_seen=|retry_|run_id=' \"$out\" | tail -n 40 || true); else echo \"RESTART_SMOKE_UI_EXECUTE_RETRY_PROMPT=FAIL EXIT_CODE=$code\"; rr=$(grep -m1 '^run_result=' \"$out\" || true); if [ -n \"$rr\" ]; then echo \"${rr:0:240}\"; fi; if ! (grep -E 'error=|run_error=|on_error=|prompt_seen=|retry_|SMOKE_|Traceback|Exception' \"$out\" | tail -n 80); then tail -n 60 \"$out\"; fi; fi; exit $code",
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"clear": true,
+				"panel": "dedicated",
+				"reveal": "always"
+			}
+		},
+		{
+			"label": "Check 9090 listener",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && lsof -nP -iTCP:9090 -sTCP:LISTEN",
+			"isBackground": false
+		},
+		{
+			"label": "Run execute retry smoke",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && out=/tmp/ui_execute_retry_smoke_task.txt && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/ui_execute_retry_smoke.py > \"$out\" 2>&1; code=$?; if [ \"$code\" -eq 0 ]; then echo 'SMOKE_UI_EXECUTE_RETRY=PASS'; (grep -E 'SMOKE_|prompt_seen=|retry_|run_id=' \"$out\" | tail -n 40 || true); else echo \"SMOKE_UI_EXECUTE_RETRY=FAIL EXIT_CODE=$code\"; rr=$(grep -m1 '^run_result=' \"$out\" || true); if [ -n \"$rr\" ]; then echo \"${rr:0:240}\"; fi; if ! (grep -E 'error=|run_error=|on_error=|prompt_seen=|retry_|SMOKE_|Traceback|Exception' \"$out\" | tail -n 80); then tail -n 60 \"$out\"; fi; fi; exit $code",
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"clear": true,
+				"panel": "dedicated",
+				"reveal": "always"
+			}
+		},
+		{
+			"label": "pytest: flow copy test",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_flow_generate_validate_execute_copy.py::test_generate_validate_execute_flow_copy_for_both_generator_kinds",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: flow copy test (after indent fix)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_flow_generate_validate_execute_copy.py::test_generate_validate_execute_flow_copy_for_both_generator_kinds",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: flow copy test (fallback inject abs)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_flow_generate_validate_execute_copy.py::test_generate_validate_execute_flow_copy_for_both_generator_kinds",
+			"isBackground": false
+		},
+		{
+			"label": "run tmp flow repro",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python scripts/_tmp_flow_copy_repro.py",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (venv312)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (captured)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full.txt 2>&1; code=$?; tail -n 60 /tmp/pytest_full.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: new compose alias regression",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_compose_service_name_alias.py",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: compose alias regression (captured)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_compose_service_name_alias.py > /tmp/pytest_alias.txt 2>&1; code=$?; tail -n 40 /tmp/pytest_alias.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite after compose alias",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full2.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full2.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: failing docker_compose_metadata regression",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_docker_compose_metadata.py::test_prepare_compose_for_assignments_records_compose_path > /tmp/pytest_dcmeta.txt 2>&1; code=$?; tail -n 60 /tmp/pytest_dcmeta.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (post compose alias fix)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full3.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full3.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (wrapper timeout tweak)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full4.txt 2>&1; code=$?; tail -n 30 /tmp/pytest_full4.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (runtime timeout tweak)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full5.txt 2>&1; code=$?; tail -n 20 /tmp/pytest_full5.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (journalctl diag)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full6.txt 2>&1; code=$?; tail -n 20 /tmp/pytest_full6.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false
+		},
+		{
+			"label": "Verify installed NFS nodegen output",
+			"type": "shell",
+			"command": "/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python scripts/run_flag_generator.py --kind flag-node-generator --generator-id nfs_sensitive_file --out-dir /tmp/coretg-nodegen-nfs-verify --config '{\"seed\":\"seed\",\"node_name\":\"docker-5\",\"flag_prefix\":\"FLAG\",\"nfs_port\":2049}' --repo-root /Users/jcacosta/Documents/core-topo-gen && echo '--- COMPOSE ---' && sed -n '1,120p' /tmp/coretg-nodegen-nfs-verify/outputs/docker-compose.yml | cat && echo '--- GREP ---' && grep -n 'nfs-ganesha|ganesha\\.conf|nfs-server-alpine' /tmp/coretg-nodegen-nfs-verify/outputs/docker-compose.yml || true",
+			"isBackground": false
+		},
+		{
+			"label": "live: sample preset len3 check",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && latest_xml=$(ls -1t outputs/scenarios-*/NewScenario12.xml 2>/dev/null | head -n 1) && echo XML=$latest_xml && curl -s -c /tmp/coretg.cookies -b /tmp/coretg.cookies http://127.0.0.1:9090/login >/dev/null && curl -s -L -c /tmp/coretg.cookies -b /tmp/coretg.cookies -d 'username=coreadmin&password=coreadmin' -H 'Content-Type: application/x-www-form-urlencoded' http://127.0.0.1:9090/login >/dev/null && curl -s -w \"\\nHTTP_STATUS=%{http_code}\\n\" -G -b /tmp/coretg.cookies --data-urlencode \"scenario=NewScenario12\" --data-urlencode \"xml_path=$latest_xml\" --data-urlencode \"length=3\" --data-urlencode \"preset=sample\" --data-urlencode \"prefer_flow=1\" http://127.0.0.1:9090/api/flag-sequencing/attackflow_preview > /tmp/flow_sample3_live.txt && python -c \"import json,re,pathlib; p=pathlib.Path('/tmp/flow_sample3_live.txt').read_text(errors='ignore'); m=re.search(r'\\nHTTP_STATUS=(\\d+)\\s*$',p); status=(m.group(1) if m else 'NA'); body=(p[:m.start()] if m else p); print('status',status,'body_len',len(body)); d=json.loads(body); print('ok',d.get('ok'),'length',d.get('length'),'requested',d.get('requested_length'),'chain_len',len(d.get('chain') or []),'error',d.get('error')); print('ids',[str((a or {}).get('id') or '') for a in (d.get('flag_assignments') or [])])\"",
+			"isBackground": false
+		},
+		{
+			"label": "smoke: core session dialog flow",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_core_session_dialog_smoke.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke: core session dialog flow (retry)",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_core_session_dialog_smoke.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "debug: core session dialog functions",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_core_session_dialog_debug.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "smoke: capture real dialogs",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_capture_real_dialogs.py"
+			],
 			"isBackground": false
 		}
 	]

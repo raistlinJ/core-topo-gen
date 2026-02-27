@@ -23,12 +23,13 @@ inputs:
     required: false
     default: 2049
 artifacts:
-  requires: []
+  requires:
+    - Knowledge(ip)
   produces:
-    - flag
-    - credential.pair
-    - compose_path
-    - nfs_port
-    - nfs_export
+    - Flag(flag_id)
+    - Credential(user, password)
+    - File(path)
+    - PortForward(host, port)
+    - Directory(host, path)
 injects:
   - exports

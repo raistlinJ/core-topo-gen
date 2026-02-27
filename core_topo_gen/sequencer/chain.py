@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .facts import load_fact_ontology, validate_fact_ref
+
 
 try:
     import yaml  # type: ignore
@@ -74,6 +76,7 @@ def validate_chain_doc(doc: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, 
         return False, errors, norm
 
     seen_ids: set[str] = set()
+    fact_ontology = load_fact_ontology()
     for idx, ch in enumerate(challenges):
         if not isinstance(ch, dict):
             errors.append(f"challenges[{idx}] must be a mapping")
@@ -121,6 +124,10 @@ def validate_chain_doc(doc: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, 
             art = str(r.get("artifact") or "").strip()
             if not art:
                 errors.append(f"challenges[{idx}].requires[{r_i}] missing artifact")
+            else:
+                fact_err = validate_fact_ref(art, ontology=fact_ontology)
+                if fact_err:
+                    errors.append(f"challenges[{idx}].requires[{r_i}].artifact {fact_err}")
             src = r.get("source")
             if src is not None and not isinstance(src, str):
                 errors.append(f"challenges[{idx}].requires[{r_i}].source must be a string")
@@ -135,6 +142,10 @@ def validate_chain_doc(doc: Dict[str, Any]) -> Tuple[bool, List[str], Dict[str, 
                 errors.append(f"challenges[{idx}].produces[{p_i}] missing name")
             if not art:
                 errors.append(f"challenges[{idx}].produces[{p_i}] missing artifact")
+            else:
+                fact_err = validate_fact_ref(art, ontology=fact_ontology)
+                if fact_err:
+                    errors.append(f"challenges[{idx}].produces[{p_i}].artifact {fact_err}")
 
     ok = not errors
     return ok, errors, norm

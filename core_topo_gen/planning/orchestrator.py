@@ -39,7 +39,7 @@ def compute_full_plan(
     role_counts, node_breakdown = compute_node_plan(density_base, weight_items, count_items)
 
     # --- Vulnerabilities ---
-    vuln_density, vuln_items_xml = parse_vulnerabilities_info(xml_path, scenario)
+    vuln_density, vuln_items_xml, vuln_flag_type = parse_vulnerabilities_info(xml_path, scenario)
     vuln_items: List[VulnerabilityItem] = []
     for it in (vuln_items_xml or []):
         if not hasattr(it, 'get'):
@@ -145,6 +145,7 @@ def compute_full_plan(
         'routing_items': routing_items,  # raw objects for downstream preview builder
         'service_plan': service_plan,
         'vulnerability_plan': vulnerability_plan,
+        'vulnerability_flag_type': vuln_flag_type,
         'segmentation_plan': segmentation_plan,
         'traffic_plan': traffic_plan_out,
         # raw items for build path reuse (not all JSON-serializable; caller should sanitize if emitting)

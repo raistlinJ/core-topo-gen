@@ -899,11 +899,10 @@ def attach_hitl_rj45_nodes(
             target_node_id = None
         target_is_router = bool(target_node_id is not None and target_node_id in router_node_ids)
         if target_is_router and rj_link_ips is None:
-            rj_link_seed = f"{raw_name}|router-{target_node_id}|rj45"
             rj_link_ips = _compute_hitl_link_ips_unique(
                 scenario_key,
-                rj_link_seed,
-                idx + len(interfaces),
+                raw_name,
+                idx,
                 used_hitl_link_networks,
             )
         iface_peer_id = _next_iface_id(target_node, iface_id_cache)

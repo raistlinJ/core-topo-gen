@@ -35,8 +35,17 @@
               <ul class="mb-0">
                 <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in <span class="font-monospace">manifest.yaml</span>.</li>
                 <li>For file outputs: write under <span class="font-monospace">/outputs/artifacts/...</span> and reference in <span class="font-monospace">outputs.json</span> as <span class="font-monospace">artifacts/&lt;name&gt;</span>.</li>
-                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">filesystem.file</span>) in <span class="font-monospace">manifest.yaml</span> under <span class="font-monospace">injects</span>.</li>
+                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">File(path)</span>) in <span class="font-monospace">manifest.yaml</span> under <span class="font-monospace">injects</span>.</li>
               </ul>
+            </div>
+            <div class="mt-2">
+              <div class="fw-semibold">Examples</div>
+              <div class="small text-muted">
+                <div>Artifacts: <span class="font-monospace">requires: [Knowledge(ip)]</span> → <span class="font-monospace">produces: [Credential(user, password), Flag(flag_id)]</span></div>
+                <div>Injects: <span class="font-monospace">injects: [File(path)]</span></div>
+                <div>Hint template: <span class="font-monospace">Next: {{ '{{OUTPUT.Knowledge(ip)}}' }}</span></div>
+                <div>outputs.json: <span class="font-monospace">{"outputs": {"Flag(flag_id)": "FLAG{...}", "File(path)": "artifacts/creds.txt"}}</span></div>
+              </div>
             </div>
           </div>
 
@@ -97,7 +106,7 @@
               <button class="btn btn-sm btn-outline-primary" type="button" id="gbInjAddBtn"><i class="bi bi-plus-circle"></i> Add inject_files</button>
               <button class="btn btn-sm btn-outline-secondary" type="button" id="gbInjClearBtn">Clear</button>
             </div>
-            <div class="form-text">Artifacts staged into scenarios under <code>injected/</code>. Prefer output keys (e.g. <code>filesystem.file</code>).</div>
+            <div class="form-text">Artifacts staged into scenarios under <code>injected/</code>. Prefer output keys (e.g. <code>File(path)</code>).</div>
             <div class="mt-2" id="gbInjectFilesList"></div>
           </div>
 

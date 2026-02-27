@@ -17,7 +17,13 @@ dependencies = [
   "Werkzeug==3.0.3",
   "PyYAML==6.0.2",
   "psutil==5.9.8",
+  "proxmoxer>=2.0.1",
+  "requests>=2.31.0",
+  "cryptography>=42.0.0",
+  "paramiko>=3.4.0",
   "jsonschema>=4.21.1",
+  "Markdown>=3.6",
+  "bleach>=6.1.0",
 ]
 
 [project.optional-dependencies]

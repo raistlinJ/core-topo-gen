@@ -69,7 +69,7 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 : JSON body `{ "scenarios": [...], "active_index"?: int }`. Returns `{ "ok": true, "result_path": ".../scenarios.xml" }` on success or `{ "ok": false, "error": "..." }` with HTTP 400/500 on failure.
 
 `GET /api/host_interfaces`
-: Returns `{ "interfaces": [...] }` describing host NICs on the web host (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs. Primarily a legacy/debug fallback when CORE credentials are not configured.
+: Returns `{ "interfaces": [...] }` describing host NICs on the web host (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs.
 
 `POST /api/host_interfaces`
 : JSON body `{ "core_secret_id": "...", "core_vm": { "vm_key": "node::vmid", "vm_name": "...", "vm_node": "...", "vmid": "...", "interfaces": [...] }, "include_down"?: bool }`. Enumerates network interfaces from the selected CORE VM over SSH using stored credentials. Response `{ "success": true, "interfaces": [...], "source": "core_vm", "metadata": { ... }, "fetched_at": "<iso8601>" }` includes Proxmox VM/interface metadata when MAC addresses match the supplied `core_vm.interfaces`. Only physical adapters (those backed by `/sys/class/net/<iface>/device`) are returned. Errors return `{ "success": false, "error": "..." }` with HTTP 4xx/5xx.
@@ -146,8 +146,11 @@ Generates a deterministic planning preview without starting a CORE session.
 These endpoints power the **Flow** page (Flag Sequencing) in the Web UI.
 
 Important notes:
-- **STIX/AttackFlow bundle export has been removed.** Legacy STIX endpoints now return HTTP `410 Gone`.
+- **STIX/AttackFlow bundle export has been removed.** STIX endpoints return HTTP `410 Gone`.
 - The supported export format is **Attack Flow Builder native `.afb`**.
+- **Eligibility rules:** `flag-generators` are placed on vulnerability nodes only; `flag-node-generators` require non-vulnerability Docker-role nodes.
+- **Initial Facts / Goal Facts:** Flow accepts optional `initial_facts` and `goal_facts` overrides (artifacts + fields). Flag facts (`Flag(...)`) are filtered out.
+- **Sequencing algorithm:** Goal-aware scoring with pruning/backtracking (bounded by a 30s timeout) is used to select feasible generator assignments.
 
 `GET /api/flag-sequencing/attackflow_preview`
 : Returns a chain preview derived from the latest preview plan for the scenario. Response includes `chain`, `flag_assignments`, and validity metadata (`flow_valid`, `flow_errors`, `flags_enabled`).
@@ -157,6 +160,7 @@ Common query params:
 - `length=<int>` (default 5)
 - `preset=<name>` (optional; forces a fixed chain)
 - `best_effort=1` (optional; clamps to available eligible nodes)
+- `debug_dag=1` (optional; include sequencing DAG diagnostics)
 
 `POST /api/flag-sequencing/prepare_preview_for_execute`
 : Resolves hint placeholders and materializes generator outputs for a chain (used for “Resolve hint values…” in the Flow UI).
@@ -168,9 +172,10 @@ Request JSON (typical):
 	"length": 5,
 	"preset": "",
 	"chain_ids": ["n1", "n2"],
-	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
+	"preview_plan": "/abs/path/to/outputs/plans/plan_<scenario>.json",
 	"mode": "hint",
 	"best_effort": true,
+	"allow_node_duplicates": false,
 	"timeout_s": 30
 }
 ```
@@ -186,7 +191,47 @@ Request JSON:
 }
 ```
 
-Response JSON includes `afb` (the export document) plus `flag_assignments` and validity metadata.
+Response JSON includes:
+- `afb` (an OpenChart DiagramViewExport document)
+- `attack_graph` (simple node/edge JSON derived from the chain)
+- `attack_graph_dot` (Graphviz DOT for the attack graph)
+- `attack_graph_pdf_base64` (base64-encoded PDF; requires Graphviz `dot`)
+- `flag_assignments` and validity metadata
+
+`POST /api/flag-sequencing/save_flow_substitutions`
+: Persists a user-edited chain + generator overrides into the canonical per-scenario plan `outputs/plans/plan_<scenario>.json`.
+
+Request JSON (typical):
+```json
+{
+	"scenario": "My Scenario",
+	"chain_ids": ["n1", "n2"],
+	"preview_plan": "/abs/path/to/outputs/plans/plan_<scenario>.json",
+	"allow_node_duplicates": false,
+	"flag_assignments": [
+		{
+			"node_id": "n1",
+			"id": "123",
+			"config_overrides": {"host_ip": "10.0.0.5"},
+			"output_overrides": {"Credential(user)": "alice"},
+			"inject_files_override": ["File(path) -> /opt/bin"],
+			"hint_overrides": ["Next: ..."],
+			"flag_override": "FLAG{OVERRIDE}",
+			"resolved_inputs": {"host_ip": "10.0.0.5"},
+			"resolved_outputs": {"Credential(user)": "alice"},
+			"flag_value": "FLAG{OVERRIDE}"
+		}
+	],
+	"initial_facts": {"artifacts": ["Knowledge(ip)"], "fields": ["host_ip"]},
+	"goal_facts": {"artifacts": ["Credential(user,password)"], "fields": []}
+}
+```
+
+`POST /api/flag-sequencing/upload_flow_input_file`
+: Uploads a file for a generator input override. Returns a stored file path to reference in `config_overrides`.
+
+`POST /api/flag-sequencing/upload_flow_inject_file`
+: Uploads a file for `inject_files_override`. Returns an `inject_value` token (`upload:<abs_path>`) that can be used in the override list.
 
 Deprecated endpoints (removed):
 - `POST /api/flag-sequencing/bundle_from_chain` → returns `410 Gone`
@@ -216,24 +261,24 @@ Example request:
 	"name": "SSH Credentials",
 	"description": "Emits deterministic SSH credentials.",
 	"requires": [
-		{"artifact": "ssh.username", "optional": true},
-		{"artifact": "ssh.password", "optional": false}
+		{"artifact": "Credential(user)", "optional": true},
+		{"artifact": "Credential(user, password)", "optional": false}
 	],
 	"optional_requires": [],
-	"produces": ["flag", "ssh_username", "ssh_password"],
+	"produces": ["Flag(flag_id)", "Credential(user)", "Credential(user, password)"],
 	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
-	"hint_templates": ["Next: SSH using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"],
-	"inject_files": ["filesystem.file"],
+	"hint_templates": ["Next: SSH using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}"],
+	"inject_files": ["File(path)"],
 	"compose_text": "(optional full docker-compose.yml override)",
 	"readme_text": "(optional full README.md override)"
 }
 ```
 
 Notes:
-- `requires` must be a list of objects `{ artifact, optional }`.
-- `inputs` is a list of runtime input definitions (name/type/required/etc) written into `manifest.yaml`.
+- `requires` must be a list of objects `{ artifact, optional }`; items with `optional: true` are written into `artifacts.optional_requires` in the manifest.
+- `inputs` is a boolean flag map for standard runtime fields (e.g., `seed`, `secret`, `node_name`, `flag_prefix`). The scaffold converts these into `manifest.yaml` inputs with required defaults (`seed`/`secret`/`node_name` required, `flag_prefix` optional).
 - `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
-- Optional destination directory syntax: `inject_files: ["filesystem.file -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
+- Optional destination directory syntax: `inject_files: ["File(path) -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
 
 `POST /api/generators/scaffold_zip`
 : Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.
@@ -296,6 +341,44 @@ Important behavior:
 `GET /flag_node_generators_data`
 : Returns `{ "generators": [...], "errors": [...] }` for installed flag-node-generators (manifest-based).
 
+### Generator Tests (Flag Catalog)
+
+These endpoints back the **Test** button in the Flag Catalog UI. Tests can run either:
+- locally (inside the webapp host), or
+- remotely on a CORE VM (via SSH) when the request includes a `core` JSON payload.
+
+`POST /flag_generators_test/run`
+: Multipart form (text + file uploads).
+	- Required field: `generator_id`
+	- Optional field: `core` (JSON string containing SSH/gRPC config; when present, the generator runs on the CORE VM)
+	- Additional fields: generator-declared input names (from manifest `inputs[]`)
+
+Returns `{ ok, run_id, saved_uploads }`.
+
+`POST /flag_node_generators_test/run`
+: Same as `/flag_generators_test/run`, but runs a `flag-node-generator`.
+
+Artifacts/logs for generator tests:
+
+`GET /flag_generators_test/outputs/<run_id>`
+: Returns `{ ok, inputs, outputs, misc, done, returncode }` for the run directory.
+
+`GET /flag_generators_test/download/<run_id>?p=<rel_path>`
+: Downloads a file under the run directory.
+
+`GET /flag_node_generators_test/outputs/<run_id>`
+: Same as flag generator outputs, for node-generator runs.
+
+`GET /flag_node_generators_test/download/<run_id>?p=<rel_path>`
+: Downloads a file under the node-generator run directory.
+
+`POST /flag_node_generators_test/cleanup/<run_id>`
+: Deletes the run artifacts (scoped to `outputs/`).
+
+Parity note:
+- Generator tests exercise `scripts/run_flag_generator.py` directly.
+- They validate generator output/inject staging, but do not start a full CORE topology session.
+
 ### Run Execution & Reports
 
 `POST /run_cli`
@@ -325,6 +408,12 @@ Important behavior:
 	"full_scenario_path": null
 }
 ```
+
+When a run completes and validation finds issues, `validation_summary.error_logs` includes downloadable `.log` artifacts (for example `docker_not_running.log`, `injects_missing.log`, and `run_output.log`) with `url` fields that point to `/download_report?path=...`.
+
+Parity note:
+- Generator Test endpoints and Execute should be treated as complementary checks.
+- Authors should validate both local Test and full Execute paths before considering a generator pack production-ready.
 
 `GET /stream/<run_id>`
 : Server-Sent Events (SSE) endpoint streaming live CLI log lines for async runs.
@@ -450,6 +539,27 @@ Important behavior:
 
 `POST /vuln_catalog_packs/delete/<catalog_id>`
 : Deletes the selected catalog pack.
+
+### Vulnerability Catalog Item Tests
+
+These endpoints back the **Test** action in the Vuln-Catalog UI. When CORE VM credentials are provided, the test runs on the CORE VM and performs an offline-friendly preflight (build wrapper images, pull pull-only images, create containers with `--no-start`, then start with `--no-build`).
+
+`POST /vuln_catalog_items/test/start`
+: JSON body containing:
+	- `item_id` (int)
+	- `core` (object): CORE VM SSH/gRPC config (required)
+	- `force_replace` (bool, optional): remove existing conflicting images/containers on the CORE VM
+
+Returns `{ ok, run_id }` on success, or `{ ok: true, replace_required: true, existing_images, existing_containers }` when replacement confirmation is required.
+
+`POST /vuln_catalog_items/test/status`
+: JSON `{ run_id }` returning `{ ok, done, cleanup_started, cleanup_done }`.
+
+`POST /vuln_catalog_items/test/stop`
+: JSON `{ run_id, ok?: true|false|null }` to stop and cleanup the remote compose. `ok=null` marks the validation status as incomplete.
+
+`POST /vuln_catalog_items/test/stop_active`
+: Stops the currently running vulnerability test (if any) with `{ ok?: true|false|null }`.
 
 `POST /vuln_compose/status`
 : JSON `{ "items": [{ "Name": "Node1", "Path": "...", "compose"?: "docker-compose.yml" }] }`. Returns `{ "items": [...], "log": [...] }` with compose availability and Docker pull state.
@@ -580,8 +690,6 @@ meta = parse_planning_metadata("outputs/scenarios-123/scenarios.xml", "Scenario 
 print(meta["node_info"]["combined_nodes"])
 ```
 
-- The legacy `core_topo_gen.parsers.xml_parser` module was removed in 2025-10; import section-specific parsers instead.
-- When attributes are absent (legacy XML), parsing gracefully recomputes approximate values.
 
 ### Experimental Sections (Services / Traffic / Segmentation)
 

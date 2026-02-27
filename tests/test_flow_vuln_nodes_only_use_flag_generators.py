@@ -21,7 +21,7 @@ def test_flow_vuln_nodes_only_use_flag_generators(monkeypatch: pytest.MonkeyPatc
         "id": "fg1",
         "name": "FlagGen",
         "inputs": [],
-        "outputs": [{"name": "flag", "required": False}],
+        "outputs": [{"name": "Flag(flag_id)", "required": False}],
         "hint_template": "Next: {{NEXT_NODE_ID}}",
         "language": "python",
         "_source_name": "test",

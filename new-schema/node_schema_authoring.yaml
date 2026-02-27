@@ -1,0 +1,75 @@
+# Node Authoring Schema (YAML)
+# Purpose: Canonical, human- and AI-friendly schema for defining challenge nodes.
+# This is what you give to an LLM when you say: “Generate a new node”.
+# Prioritizes readability and intent over strict validation.
+#
+# Used by:
+# - AI prompt outputs
+# - Humans authoring new node templates
+# - Documentation / examples
+
+# -----------------------------
+# Identity (required)
+# -----------------------------
+node_id: "<stable_node_id>"
+template: "<template_id>"
+version: "<semver>"
+
+# -----------------------------
+# Human-facing metadata (optional but recommended)
+# -----------------------------
+metadata:
+  name: "<short display name>"
+  description: "<one or two sentences describing the challenge>"
+  category: [web, pwn, crypto, recon, pivot, misc]
+  difficulty: 1
+  tags: ["tag1", "tag2"]
+
+# -----------------------------
+# Logical constraints / outputs (required)
+# Facts are semantic capabilities or artifacts for sequencing.
+# -----------------------------
+logic:
+  requires:
+    - name: "<FactName>"
+      args: ["arg1", "arg2"]
+  optional_requires:
+    - name: "<FactName>"
+      args: ["arg1", "arg2"]
+  provides:
+    - name: "<FactName>"
+      args: ["arg1", "arg2"]
+
+# -----------------------------
+# Deployment intent (required)
+# -----------------------------
+deployment:
+  container:
+    image: "<container_image>"
+    exposed_ports:
+      - "80/tcp"
+    entrypoint: "<entrypoint>"
+    command: "<command>"
+  injected:
+    - "/path/in/container"
+  secrets:
+    - "<secret_name>"
+  volumes:
+    - source: "<host_or_named_volume>"
+      target: "/path/in/container"
+      readonly: true
+
+# -----------------------------
+# Runtime behavior (optional)
+# -----------------------------
+runtime:
+  generates:
+    - "<ArtifactName>"
+  side_effects:
+    - "<EffectName>"
+
+# -----------------------------
+# Flags (optional)
+# -----------------------------
+flags:
+  - "<flag_id>"

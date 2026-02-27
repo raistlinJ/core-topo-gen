@@ -1,0 +1,156 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Node Authoring Schema",
+  "description": "Validation schema for AI- or human-generated challenge nodes",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["node_id", "template", "logic", "deployment"],
+  "properties": {
+    "node_id": { "type": "string" },
+    "template": { "type": "string" },
+    "version": { "type": "string" },
+
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "category": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "difficulty": { "type": "integer", "minimum": 0 },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+
+    "logic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requires", "provides"],
+      "properties": {
+        "requires": { "$ref": "#/definitions/facts" },
+        "optional_requires": { "$ref": "#/definitions/facts" },
+        "provides": { "$ref": "#/definitions/facts" }
+      }
+    },
+
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "container": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": { "type": "string" },
+            "exposed_ports": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "entrypoint": { "type": "string" },
+            "command": { "type": "string" }
+          }
+        },
+        "injected": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "secrets": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "volumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["source", "target"],
+            "additionalProperties": false,
+            "properties": {
+              "source": { "type": "string" },
+              "target": { "type": "string" },
+              "readonly": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generates": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "side_effects": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+
+    "flags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "NetworkAccess",
+              "NetworkRoute",
+              "Pivot",
+              "Shell",
+              "RootShell",
+              "CodeExecution",
+              "Credential",
+              "Token",
+              "APIKey",
+              "File",
+              "Directory",
+              "PCAP",
+              "BackupArchive",
+              "Knowledge",
+              "Hostname",
+              "VHost",
+              "Endpoint",
+              "Version",
+              "WebRCE",
+              "WebAuthBypass",
+              "UploadPrimitive",
+              "InternalNetwork",
+              "LateralMovement",
+              "PortForward",
+              "Vulnerability",
+              "Misconfiguration",
+              "ExposedSecret",
+              "Binary",
+              "SourceCode",
+              "EncryptedBlob",
+              "DecryptionKey",
+              "Flag",
+              "PartialFlag"
+            ]
+          },
+          "args": {
+            "type": "array",
+            "items": { "type": ["string", "number"] }
+          }
+        }
+      }
+    }
+  }
+}

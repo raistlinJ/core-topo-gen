@@ -1,0 +1,31 @@
+services:
+  jboss:
+    container_name: n1
+    image: vulhub/jboss:as-6.1.0
+    tty: true
+    network_mode: none
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: '1'
+    working_dir: /
+    entrypoint:
+      - bash
+      - -lc
+      - |
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+
+        # Install minimal tooling required by CORE services.
+        if ! command -v ip >/dev/null 2>&1; then
+          apt-get update -y || true
+          apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true
+          rm -rf /var/lib/apt/lists/* || true
+        fi
+
+        exec "$@"
+    command:
+      - /opt/jboss/bin/run.sh
+      - -b
+      - 0.0.0.0

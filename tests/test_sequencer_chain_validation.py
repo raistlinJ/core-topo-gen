@@ -21,14 +21,14 @@ def test_chain_requires_must_be_produced_before_use():
             {
                 "challenge_id": "step2",
                 "kind": "flag-generator",
-                "requires": [{"artifact": "network.ip"}],
-                "produces": [{"name": "creds", "artifact": "credential.pair"}],
+                "requires": [{"artifact": "Knowledge(ip)"}],
+                "produces": [{"name": "creds", "artifact": "Credential(user, password)"}],
                 "generator": {"plugin": "x"},
             },
             {
                 "challenge_id": "step1",
                 "kind": "flag-generator",
-                "produces": [{"name": "ip", "artifact": "network.ip"}],
+                "produces": [{"name": "ip", "artifact": "Knowledge(ip)"}],
                 "generator": {"plugin": "y"},
             },
         ]
@@ -39,7 +39,7 @@ def test_chain_requires_must_be_produced_before_use():
 
     ok2, errors2 = validate_linear_chain(norm)
     assert not ok2
-    assert any("requires network.ip" in e for e in errors2)
+    assert any("requires Knowledge(ip)" in e for e in errors2)
 
 
 def test_chain_requires_with_source_must_match_that_producer():
@@ -48,13 +48,13 @@ def test_chain_requires_with_source_must_match_that_producer():
             {
                 "challenge_id": "a",
                 "kind": "flag-generator",
-                "produces": [{"name": "x", "artifact": "network.ip"}],
+                "produces": [{"name": "x", "artifact": "Knowledge(ip)"}],
                 "generator": {"plugin": "x"},
             },
             {
                 "challenge_id": "b",
                 "kind": "flag-generator",
-                "requires": [{"artifact": "network.ip", "source": "c"}],
+                "requires": [{"artifact": "Knowledge(ip)", "source": "c"}],
                 "generator": {"plugin": "y"},
             },
         ]

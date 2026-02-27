@@ -10,6 +10,8 @@ import subprocess
 import time
 import sys
 import select
+import os
+import json
 
 try:  # pragma: no cover - offline mode exercised via CLI tests
     from core.api.grpc import client  # type: ignore
@@ -214,6 +216,17 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     except Exception:
         strict_pull = False
 
+    # IMPORTANT: `docker build --pull` forces registry metadata fetches, which can
+    # fail on restricted/offline CORE VMs or hit Docker Hub rate limits even when
+    # the base image is already present locally. Keep pulls strict for *pull-only*
+    # services, but default builds to NOT forcing pull unless explicitly enabled.
+    build_pull = False
+    try:
+        raw = str(os.getenv('CORETG_DOCKER_BUILD_PULL') or '').strip().lower()
+        build_pull = raw in ('1', 'true', 'yes', 'y', 'on')
+    except Exception:
+        build_pull = False
+
     def _run(args: List[str], timeout: int) -> tuple[int, str]:
         returncode = 1
         tail = ''
@@ -260,6 +273,7 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     # `docker compose pull` fails for buildable services with scenario-scoped tags
     # (e.g., `coretg/scenarios-...`) because those are expected to be built locally.
     pull_services: List[str] = []
+    wrapper_builds: List[tuple[str, str, str]] = []  # (service, image, context)
     try:
         import yaml  # type: ignore
 
@@ -270,18 +284,71 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
             for svc_name, svc in services.items():
                 if not isinstance(svc, dict):
                     continue
+                image = str(svc.get('image') or '').strip()
+                labels = svc.get('labels') if isinstance(svc.get('labels'), dict) else {}
+
+                # Wrapper strategy: compose may omit `build:` to prevent core-daemon from
+                # building during scenario startup. In that case, host-side preflight must
+                # build the wrapper image using label-provided context.
+                try:
+                    ctx = str(labels.get('coretg.wrapper_build_context') or '').strip()
+                except Exception:
+                    ctx = ''
+                if image.startswith('coretg/') and image.endswith(':iproute2') and ctx:
+                    wrapper_builds.append((str(svc_name), image, ctx))
+                    # Do NOT include in pull services; it's a local-only tag.
+                    continue
+
+                # Buildable services are handled by build phase.
                 if svc.get('build'):
                     continue
+
+                # Local-only tags should not be pulled.
+                if image.startswith('coretg/'):
+                    continue
+                try:
+                    if str(svc.get('pull_policy') or '').strip().lower() == 'never':
+                        continue
+                except Exception:
+                    pass
                 # pull-only service
                 pull_services.append(str(svc_name))
     except Exception:
         # If parsing fails, fall back to best-effort pulls with flags that avoid buildables when available.
         pull_services = []
 
+    # Track whether we successfully built anything.
+    built_any = False
+
+    # Build wrapper images declared via labels (no `build:` stanza) first.
+    # This ensures core-daemon will not attempt to build/pull when it later starts nodes.
+    try:
+        compose_dir = os.path.dirname(os.path.abspath(compose_path))
+        for svc_name, image, ctx in wrapper_builds:
+            df_path = os.path.join(ctx, 'Dockerfile')
+            if not os.path.isabs(df_path):
+                df_path = os.path.abspath(df_path)
+            ctx_path = ctx
+            if not os.path.isabs(ctx_path):
+                ctx_path = os.path.join(compose_dir, ctx_path)
+            try:
+                logger.info('[docker-node] preflight wrapper build service=%s image=%s context=%s dockerfile=%s', svc_name, image, ctx_path, df_path)
+            except Exception:
+                pass
+
+            args = docker_cmd + ['build', '--network', 'host']
+            if build_pull:
+                args.append('--pull')
+            args += ['-t', image, '-f', df_path, ctx_path]
+            rc, _tail = _run(args, timeout=1800)
+            if rc == 0:
+                built_any = True
+    except Exception:
+        pass
+
     # Build any services that declare a `build:` stanza using host networking.
     # This avoids reliance on Docker's default bridge network (which may be disabled
     # on CORE VMs) and prevents apt/apk installs from failing due to missing DNS.
-    built_any = False
     try:
         import yaml  # type: ignore
 
@@ -328,7 +395,10 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 except Exception:
                     pass
 
-                args = docker_cmd + ['build', '--network', 'host', '--pull', '-t', image, '-f', df_path, ctx_path]
+                args = docker_cmd + ['build', '--network', 'host']
+                if build_pull:
+                    args.append('--pull')
+                args += ['-t', image, '-f', df_path, ctx_path]
                 rc, _tail = _run(args, timeout=1800)
                 if rc == 0:
                     built_any = True
@@ -337,7 +407,10 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
 
     if not built_any:
         # Fallback: let compose handle builds (best-effort). This will pull base images.
-        _run(compose_base + ['build', '--pull'], timeout=1200)
+        build_args = compose_base + ['build']
+        if build_pull:
+            build_args.append('--pull')
+        _run(build_args, timeout=1200)
 
     # Pull only non-build services (if any). This avoids pulling scenario-scoped build targets.
     if pull_services:
@@ -367,10 +440,220 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     else:
         _run(compose_base + ['up', '--no-start'], timeout=600)
 
+    # IMPORTANT: Some CORE daemon versions start Docker nodes immediately during add_node()
+    # and then attempt to read `/proc/<pid>/environ` for the container PID. If the container
+    # is not running yet (or exited quickly), Docker reports PID=0 and CORE errors on
+    # `cat /proc/0/environ`.
+    #
+    # Mitigation: start the target compose service here (host-side) and wait until the
+    # container PID is non-zero before allowing CORE to proceed.
+    try:
+        import yaml  # type: ignore
+
+        target_service = None
+        with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+            compose_obj = yaml.safe_load(fh)  # type: ignore
+        services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
+        if isinstance(services, dict) and services:
+            if node_name in services:
+                target_service = node_name
+            else:
+                # Fall back to first service key; docker compose will include dependencies.
+                try:
+                    target_service = str(next(iter(services.keys())))
+                except Exception:
+                    target_service = None
+
+        if target_service:
+            # Never build here; wrapper images should already be built above.
+            rc, tail = _run(compose_base + ['up', '-d', '--no-build', str(target_service)], timeout=900)
+            if strict_pull and rc != 0:
+                raise RuntimeError(f"docker compose up -d failed (node={node_name} svc={target_service} rc={rc})\n{tail}".strip())
+
+            # Best-effort: wait for PID to be non-zero.
+            # Container name should match node_name when `container_name` is set (our default).
+            # If not, this still helps in many cases because CORE uses the node name.
+            inspect_name = node_name
+            for _ in range(12):
+                try:
+                    rc2, tail2 = _run(docker_cmd + ['inspect', '--format', '{{.State.Pid}} {{.State.Status}}', inspect_name], timeout=20)
+                    if rc2 == 0:
+                        parts = (tail2 or '').strip().split()
+                        if parts:
+                            try:
+                                pid = int(parts[0])
+                            except Exception:
+                                pid = 0
+                            if pid and pid > 0:
+                                break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+    except Exception as exc:
+        if strict_pull:
+            raise
+        try:
+            logger.warning('[docker-node] preflight start/wait skipped node=%s err=%s', node_name, exc)
+        except Exception:
+            pass
+
     try:
         logger.info('[docker-node] preflight done node=%s elapsed_ms=%s', node_name, int((time.time() - start) * 1000))
     except Exception:
         pass
+
+
+def _resolve_compose_interpolations(text: str) -> str:
+    """Resolve docker-compose `${VAR}` interpolation patterns to plain literals.
+
+    CORE treats compose files as Mako templates, which conflicts with docker-compose
+    env interpolation syntax `${...}`. Our earlier approach wrapped `${...}` into a
+    Mako-safe string, but that can produce docker-compose-invalid interpolation
+    (e.g. `${"${HOSTNAME}"}`) and break `docker compose pull`.
+
+    This resolver removes `${...}` tokens entirely by substituting values from the
+    current environment (and defaults when provided). This is intended to run on
+    the CORE host where docker compose preflight executes.
+
+    Notes:
+    - `${VAR}` -> env(VAR) or ''
+    - `${VAR:-default}` -> env(VAR) if set and non-empty else default
+    - `${VAR-default}` -> env(VAR) if set else default
+    - `${VAR:?msg}` / `${VAR?msg}` -> env(VAR) or '' (best-effort)
+    - `${VAR:+alt}` / `${VAR+alt}` -> alt when set (best-effort)
+    """
+    import re as _re
+
+    if not text or '${' not in text:
+        return text
+
+    def _hostname_default() -> str:
+        try:
+            import socket as _socket
+
+            return str(_socket.gethostname() or '')
+        except Exception:
+            return ''
+
+    def _resolve_expr(expr: str) -> str:
+        raw = str(expr or '')
+        inner = raw.strip()
+
+        # Unwrap our previous wrapper form `${"${VAR}"}` -> treat as `${VAR}`.
+        if '${' in inner and '}' in inner:
+            m_inner = _re.search(r'\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*([:\-\?\+].*)?\s*\}', inner)
+            if m_inner:
+                inner = (m_inner.group(1) or '') + (m_inner.group(2) or '')
+                inner = inner.strip()
+
+        m = _re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*(.*)$', inner)
+        if not m:
+            return ''
+        var = str(m.group(1) or '').strip()
+        tail = str(m.group(2) or '')
+
+        # Parse operator and default/alt clause.
+        op = None
+        arg = ''
+        for cand in (':-', ':-', ':-', ':?', ':+', '-', '?', '+'):
+            # keep longer operators first via explicit checks
+            pass
+        if tail.startswith(':-'):
+            op = ':-'
+            arg = tail[2:]
+        elif tail.startswith(':?'):
+            op = ':?'
+            arg = tail[2:]
+        elif tail.startswith(':+'):
+            op = ':+'
+            arg = tail[2:]
+        elif tail.startswith('-'):
+            op = '-'
+            arg = tail[1:]
+        elif tail.startswith('?'):
+            op = '?'
+            arg = tail[1:]
+        elif tail.startswith('+'):
+            op = '+'
+            arg = tail[1:]
+        arg = arg.lstrip() if arg else ''
+
+        try:
+            is_set = var in os.environ
+            val = os.environ.get(var)
+        except Exception:
+            is_set = False
+            val = None
+        val_str = str(val) if val is not None else ''
+        nonempty = bool(val_str)
+
+        if op is None:
+            if is_set:
+                return val_str
+            # Provide a sensible default for HOSTNAME (compose commonly references it).
+            if var == 'HOSTNAME':
+                return _hostname_default()
+            return ''
+
+        if op == ':-':
+            return val_str if nonempty else str(arg)
+        if op == '-':
+            return val_str if is_set else str(arg)
+        if op == ':?':
+            return val_str if nonempty else ''
+        if op == '?':
+            return val_str if is_set else ''
+        if op == ':+':
+            return str(arg) if nonempty else ''
+        if op == '+':
+            return str(arg) if is_set else ''
+        return val_str
+
+    out = text
+
+    # Mako hazard: docker-compose uses `$${VAR}` to escape a literal `$`.
+    # Mako will still parse `${VAR}` starting at the second `$` and raise NameError.
+    # Rewrite to `$VAR` (no braces) so shells inside the container can expand it.
+    try:
+        out = _re.sub(r'\$\$\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}', r'$\1', out)
+    except Exception:
+        pass
+
+    # First, unwrap wrapper forms used to make `${...}` Mako-safe.
+    #
+    # Examples seen in the wild:
+    #   ${"${VAR}"}
+    #   ${"${VAR:-default}"}
+    #   ${'${VAR}'}
+    #   ${\"${HOSTNAME}\"}   (when wrappers appear inside a quoted YAML scalar)
+    #
+    # Without unwrapping first, a naive `${...}` regex matches only up to the *inner* `}`
+    # and leaves garbage like `"}:"}` which breaks YAML.
+    wrapper_re = _re.compile(r"\$\{\s*(?:\\)?(['\"])\s*\$\{([^}]*)\}\s*(?:\\)?\1\s*\}")
+    for _ in range(5):
+        out2 = wrapper_re.sub(lambda m: '${' + str(m.group(2) or '') + '}', out)
+        if out2 == out:
+            break
+        out = out2
+
+    # Replace patterns iteratively in case defaults contain nested patterns.
+    token_re = _re.compile(r'(?<!\$)\$\{([^}]*)\}')
+    for _ in range(3):
+        if '${' not in out:
+            break
+        out2 = token_re.sub(lambda m: _resolve_expr(m.group(1) or ''), out)
+        if out2 == out:
+            break
+        out = out2
+
+    # Final safety: remove any remaining `${...}` tokens so core-daemon Mako
+    # rendering cannot fail.
+    try:
+        if '${' in out:
+            out = _re.sub(r'\$\{[^}]*\}', '', out)
+    except Exception:
+        pass
+    return out
 
 
 def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str, str]]) -> None:
@@ -383,6 +666,12 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
     (default start=True), and /tmp/vulns may contain stale files from earlier runs.
     """
     try:
+        strict_pull = False
+        try:
+            strict_pull = str(os.getenv('CORETG_DOCKER_STRICT_PULL') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        except Exception:
+            strict_pull = False
+
         if not node_name:
             return
         if node_name in _PREPARED_DOCKER_NODE_COMPOSES:
@@ -436,8 +725,9 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
 
             prepare_compose_for_assignments({node_name: rec}, out_base=out_base)
         except Exception as exc:
-            # Non-fatal: CORE may still succeed if compose is already sanitized,
-            # but log so users can diagnose why docker nodes didn't get rewritten.
+            if strict_pull:
+                raise
+            # Non-fatal in non-strict mode.
             try:
                 logger.warning("[vuln-node] compose preparation failed for node=%s (%s)", node_name, exc)
             except Exception:
@@ -450,18 +740,17 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
             if os.path.exists(out_path):
                 with open(out_path, 'r', encoding='utf-8', errors='ignore') as fh:
                     txt = fh.read()
-                # Escape only unescaped `${` occurrences.
                 import re as _re
-                # CORE writes rendered compose using a shell `printf "..."`.
-                # Backslash escapes like `\n` inside the content can be interpreted
-                # mid-line, which corrupts YAML indentation. Pre-escape each `\` to
-                # `\\\\` (i.e., 4 backslashes) so the written file keeps a literal `\`.
-                fixed = txt.replace('\\', '\\\\' * 2)
-                # Escape only unescaped `${` occurrences.
-                fixed = _re.sub(r'(?<!\$)\$\{', '$${', fixed)
+                fixed = _resolve_compose_interpolations(txt)
                 # CORE writes rendered compose using a shell `printf "..."`, so unescaped
                 # percent signs are treated as format directives. Escape single `%` to `%%`.
                 fixed = _re.sub(r'(?<!%)%(?!%)', '%%', fixed)
+                # If any `${...}` survive, docker compose will likely fail; keep visible.
+                if '${' in fixed:
+                    try:
+                        logger.warning('[docker-node] unresolved ${...} interpolation remains in compose node=%s path=%s', node_name, out_path)
+                    except Exception:
+                        pass
                 if fixed != txt:
                     with open(out_path, 'w', encoding='utf-8') as fh:
                         fh.write(fixed)
@@ -481,10 +770,6 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
         except Exception as exc:
             # When strict pull mode is enabled (used by the Web UI Execute flow), treat
             # preflight failures as fatal so the run is cancelled and the user sees the error.
-            try:
-                strict_pull = str(os.getenv('CORETG_DOCKER_STRICT_PULL') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-            except Exception:
-                strict_pull = False
             if strict_pull:
                 raise
             try:
@@ -492,6 +777,12 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
             except Exception:
                 pass
     except Exception:
+        try:
+            strict_pull2 = str(os.getenv('CORETG_DOCKER_STRICT_PULL') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        except Exception:
+            strict_pull2 = False
+        if strict_pull2:
+            raise
         return
 
 
@@ -522,6 +813,333 @@ def _docker_default_route_enabled() -> bool:
     return val not in ('0', 'false', 'False', '')
 
 
+def _docker_traffic_service_enabled() -> bool:
+    """Whether Docker nodes should keep CORE's Traffic service.
+
+    Default is OFF for Docker nodes because some CORE service templates execute
+    relative file paths (for example `runtraffic.sh`) that can fail on
+    compose-based images with non-root working directories.
+    Enable explicitly with CORETG_DOCKER_ADD_TRAFFIC=1/true.
+    """
+    val = os.getenv('CORETG_DOCKER_ADD_TRAFFIC')
+    if val is None:
+        return False
+    return str(val).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def _session_add_node(
+    session: object,
+    node_id: int,
+    *,
+    node_type: object,
+    position: object = None,
+    name: str | None = None,
+    start: bool | None = None,
+    extra_kwargs: dict[str, Any] | None = None,
+):
+    """Best-effort wrapper around CORE session.add_node.
+
+    Some CORE setups start Docker nodes immediately during add_node() which makes it
+    impossible to swap compose metadata after topology build (e.g., flag-node-generator
+    generated compose). When supported, passing start=False delays node startup until
+    session start.
+    """
+    base_kwargs: dict[str, Any] = {'_type': node_type}
+    if position is not None:
+        base_kwargs['position'] = position
+    if name is not None:
+        base_kwargs['name'] = name
+
+    kwargs: dict[str, Any] = dict(base_kwargs)
+    if extra_kwargs:
+        try:
+            for k, v in dict(extra_kwargs).items():
+                if v is None:
+                    continue
+                kwargs[k] = v
+        except Exception:
+            # If merge fails, fall back to base kwargs.
+            kwargs = dict(base_kwargs)
+
+    def _call(call_kwargs: dict[str, Any]):
+        """Invoke session.add_node() in a version-tolerant way.
+
+        CORE's Python client API has varied across releases:
+        - some versions reject unknown kwargs (compose/start)
+        - some expose positional-only parameters
+        - some rename parameters (_type vs type vs _class, etc.)
+
+        If we get this wrong, we can silently drop docker-compose/options metadata and end up
+        with "vanilla" Docker nodes. Use signature binding to construct a compatible call.
+        """
+        try:
+            import inspect
+
+            # session is often wrapped (logging proxy, retry proxy). Those wrappers typically expose
+            # (*args, **kwargs) signatures, which defeats filtering/binding. Unwrap to the real CORE
+            # Session object for signature inspection.
+            sess_for_sig: Any = session
+            for _ in range(10):
+                try:
+                    inner = getattr(sess_for_sig, "_target", None)
+                except Exception:
+                    inner = None
+                if inner is None or inner is sess_for_sig:
+                    break
+                sess_for_sig = inner
+
+            fn = getattr(sess_for_sig, "add_node", None)
+            if fn is None:
+                return session.add_node(node_id, **call_kwargs)
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.values())
+            allowed = {p.name for p in params}
+
+            # Build a few alias variants to accommodate different parameter names.
+            base = dict(call_kwargs)
+            variants: list[dict[str, Any]] = [base]
+
+            def _alias(src: str, dest: str) -> None:
+                if src in base and dest not in base:
+                    d = dict(base)
+                    d[dest] = d.pop(src)
+                    variants.append(d)
+
+            # Type aliases across versions.
+            _alias("_type", "type")
+            _alias("_type", "_class")
+            _alias("type", "_type")
+            _alias("type", "_class")
+            _alias("_class", "_type")
+            _alias("_class", "type")
+
+            # ID aliases (rare, but some wrappers use _id/id).
+            # We still prefer passing node_id positionally when possible.
+            id_aliases = ("node_id", "_id", "id")
+
+            def _try_bind(*args: Any, **kwargs: Any):
+                try:
+                    return sig.bind_partial(*args, **kwargs)
+                except TypeError:
+                    return None
+
+            for kw in variants:
+                # First try: node_id passed positionally (most common modern API).
+                bound = _try_bind(node_id, **kw)
+                if bound is not None:
+                    return session.add_node(*bound.args, **bound.kwargs)
+
+                # Second try: node_id passed by keyword under common aliases.
+                for id_name in id_aliases:
+                    if id_name in allowed:
+                        kw2 = dict(kw)
+                        kw2[id_name] = node_id
+                        bound = _try_bind(**kw2)
+                        if bound is not None:
+                            return session.add_node(*bound.args, **bound.kwargs)
+
+                # Third try: filter unknown kwargs by signature names and try again.
+                if allowed:
+                    filtered = {k: v for k, v in kw.items() if k in allowed}
+                    bound = _try_bind(node_id, **filtered)
+                    if bound is not None:
+                        return session.add_node(*bound.args, **bound.kwargs)
+                    for id_name in id_aliases:
+                        if id_name in allowed:
+                            filtered2 = dict(filtered)
+                            filtered2[id_name] = node_id
+                            bound = _try_bind(**filtered2)
+                            if bound is not None:
+                                return session.add_node(*bound.args, **bound.kwargs)
+
+            # As a last resort, attempt the original call; let the underlying error surface.
+            return session.add_node(node_id, **call_kwargs)
+        except Exception:
+            return session.add_node(node_id, **call_kwargs)
+
+    if start is None:
+        try:
+            return _call(kwargs)
+        except TypeError:
+            # Some wrapper versions reject docker-specific kwargs at add_node.
+            if extra_kwargs:
+                return _call(base_kwargs)
+            raise
+    # Try common kwarg spellings across wrapper versions.
+    for key in ('start', 'start_node', '_start'):
+        try:
+            return _call({**kwargs, key: bool(start)})
+        except TypeError:
+            if extra_kwargs:
+                try:
+                    return _call({**base_kwargs, key: bool(start)})
+                except TypeError:
+                    continue
+            continue
+    try:
+        return _call(kwargs)
+    except TypeError:
+        if extra_kwargs:
+            return _call(base_kwargs)
+        raise
+
+
+def _docker_compose_service_for_record(compose_path: str, rec: Optional[Dict[str, str]]) -> str | None:
+    """Pick a compose service name for a docker-compose-based CORE Docker node.
+
+    If we can't validate available services, return None to avoid passing an invalid
+    compose_name (CORE may treat it as an error).
+    """
+    try:
+        requested = None
+        if isinstance(rec, dict):
+            requested = rec.get('compose_service') or rec.get('compose_service_name')
+        requested = str(requested).strip() if requested is not None else ''
+        requested = requested or None
+    except Exception:
+        requested = None
+
+    def _parse_services(path: str) -> tuple[list[str], dict]:
+        p = str(path or '').strip()
+        if not p or not os.path.exists(p):
+            return [], {}
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return [], {}
+        try:
+            with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+                obj = yaml.safe_load(fh) or {}
+            services = obj.get('services') if isinstance(obj, dict) else None
+            if isinstance(services, dict):
+                out: list[str] = []
+                for k in services.keys():
+                    kk = str(k or '').strip()
+                    if kk:
+                        out.append(kk)
+                return out, obj if isinstance(obj, dict) else {}
+        except Exception:
+            return [], {}
+        return [], {}
+
+    services, obj = _parse_services(compose_path)
+    if requested and services:
+        return requested if requested in services else None
+    if requested and not services:
+        return None
+
+    if not services:
+        return None
+
+    # Heuristic selection: avoid short-lived init/migrate services (e.g. airflow-init) that
+    # exit immediately. CORE's DockerNode startup reads `/proc/<pid>/environ`; for an exited
+    # container Docker reports PID=0, causing `/proc/0/environ` errors.
+    try:
+        svc_map = obj.get('services') if isinstance(obj, dict) else None
+        if not isinstance(svc_map, dict) or not svc_map:
+            return services[0]
+
+        infra_tokens = {
+            'db', 'database', 'postgres', 'postgresql', 'mysql', 'mariadb', 'redis', 'memcached',
+            'mongo', 'mongodb', 'rabbit', 'rabbitmq', 'zookeeper', 'kafka', 'etcd',
+            'elasticsearch', 'kibana', 'logstash',
+        }
+        app_tokens = {
+            'web', 'webserver', 'server', 'app', 'api', 'ui', 'frontend', 'nginx', 'apache', 'http',
+            'gunicorn', 'uwsgi',
+        }
+        init_tokens = {
+            'init', 'setup', 'bootstrap', 'migrate', 'migration', 'seed', 'upgrade',
+            'initdb',
+        }
+
+        def _score(name: str, svc: object) -> int:
+            key_l = str(name or '').strip().lower()
+            score = 0
+            try:
+                if isinstance(svc, dict):
+                    if svc.get('ports'):
+                        score += 40
+                    if svc.get('expose'):
+                        score += 10
+                    cmd = svc.get('command')
+                    if cmd is not None:
+                        cmd_l = str(cmd).lower()
+                        if any(t in cmd_l for t in ('web', 'webserver', 'server', 'gunicorn', 'uwsgi')):
+                            score += 15
+                        if any(t in cmd_l for t in ('init', 'migrate', 'upgrade', 'seed', 'initdb')):
+                            score -= 25
+                    try:
+                        rp = str(svc.get('restart') or '').strip().lower()
+                        if rp in ('no', 'false', '0'):
+                            score -= 20
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if any(t in key_l for t in infra_tokens):
+                score -= 50
+            if any(t in key_l for t in init_tokens):
+                score -= 30
+            if any(t in key_l for t in app_tokens):
+                score += 20
+            score -= min(len(key_l), 40) // 10
+            return score
+
+        best = services[0]
+        best_s = None
+        for k in services:
+            s = _score(k, svc_map.get(k))
+            if best_s is None or s > best_s:
+                best = k
+                best_s = s
+        return best
+    except Exception:
+        return services[0]
+
+
+def _docker_node_add_node_kwargs(node_name: str, rec: Optional[Dict[str, str]]) -> dict[str, Any]:
+    """Best-effort kwargs to pass to session.add_node() for Docker nodes.
+
+    Rationale: some CORE deployments start Docker nodes immediately during add_node().
+    If compose metadata is applied only after add_node(), the container may come up with
+    a default keepalive (eg sleep infinity).
+    """
+    n = str(node_name or '').strip()
+    if not n:
+        return {}
+    compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
+    compose_name = _docker_compose_service_for_record(compose_path, rec)
+
+    options_obj = SimpleNamespace()
+    try:
+        setattr(options_obj, 'compose', compose_path)
+    except Exception:
+        pass
+    if compose_name:
+        try:
+            setattr(options_obj, 'compose_name', str(compose_name))
+        except Exception:
+            pass
+    try:
+        setattr(options_obj, 'image', "")
+    except Exception:
+        pass
+    try:
+        setattr(options_obj, 'type', "")
+    except Exception:
+        pass
+
+    return {
+        # Different wrapper versions accept these in different places.
+        'compose': compose_path,
+        'compose_name': str(compose_name) if compose_name else None,
+        'image': "",
+        'options': options_obj,
+    }
+
+
 def _is_docker_node_type(node_type: object) -> bool:
     try:
         return hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER")
@@ -531,12 +1149,16 @@ def _is_docker_node_type(node_type: object) -> bool:
 
 def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
     """Ensure DefaultRoute service is present on a DOCKER node (best-effort)."""
-    if not _docker_default_route_enabled():
-        return
-    try:
-        ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
-    except Exception:
-        pass
+    if _docker_default_route_enabled():
+        try:
+            ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
+        except Exception:
+            pass
+    if not _docker_traffic_service_enabled():
+        try:
+            remove_service(session, getattr(node_obj, 'id'), "Traffic", node_obj=node_obj)
+        except Exception:
+            pass
 
 
 def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[object], *, context: str) -> None:
@@ -545,7 +1167,8 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
     Rationale: some build paths call set_node_services() later (eg distribution) which can overwrite
     earlier service additions. This final pass makes DefaultRoute a last-write-wins policy for Docker.
     """
-    if not _docker_default_route_enabled():
+    add_default_route = _docker_default_route_enabled()
+    if not add_default_route:
         return
     for node in node_objs:
         try:
@@ -555,22 +1178,22 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
             node_type = getattr(node, 'type', None)
             if not _is_docker_node_type(node_type) and getattr(node, 'model', None) != 'docker':
                 continue
-            try:
-                ensure_service(session, node_id, "DefaultRoute", node_obj=node)
-            except Exception:
-                continue
-            try:
-                if not has_service(session, node_id, "DefaultRoute", node_obj=node):
-                    logger.info(
-                        "DefaultRoute not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
-                        "this can be a CORE service readback limitation for Docker nodes",
-                        node_id,
-                        getattr(node, 'name', None),
-                        context,
-                    )
-            except Exception:
-                # Some CORE wrappers cannot reliably read back services; don't fail the build.
-                pass
+            if add_default_route:
+                try:
+                    ensure_service(session, node_id, "DefaultRoute", node_obj=node)
+                except Exception:
+                    continue
+                try:
+                    if not has_service(session, node_id, "DefaultRoute", node_obj=node):
+                        logger.info(
+                            "DefaultRoute not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
+                            "this can be a CORE service readback limitation for Docker nodes",
+                            node_id,
+                            getattr(node, 'name', None),
+                            context,
+                        )
+                except Exception:
+                    pass
         except Exception:
             continue
 
@@ -814,7 +1437,25 @@ def _make_safe_link_tracker():
             # When we can introspect a link list, confirm the link actually exists.
             present = _session_has_link(session_obj, key)
             if present is False:
-                raise RuntimeError('add_link reported success but link not present in session.links')
+                # CORE gRPC can be eventually consistent: add_link may return success, but
+                # the session.links view updates slightly later. Retry briefly before failing.
+                try:
+                    import time as _time
+
+                    for _i in range(10):
+                        _time.sleep(0.05)
+                        present2 = _session_has_link(session_obj, key)
+                        if present2 is True:
+                            present = True
+                            break
+                        if present2 is None:
+                            # Can't introspect; stop verifying.
+                            present = None
+                            break
+                except Exception:
+                    pass
+                if present is False:
+                    raise RuntimeError('add_link reported success but link not present in session.links')
 
             if GRPC_TRACE:
                 try:
@@ -922,9 +1563,11 @@ def _apply_docker_compose_meta(node, rec, session=None):
         default_per_node = f"/tmp/vulns/docker-compose-{n}.yml"
 
         compose_path = None
+        source_compose_hint = None
         try:
             if rec and isinstance(rec, dict):
                 compose_path = rec.get('compose_path')
+                source_compose_hint = str(compose_path or '').strip() or None
                 logger.info(
                     "[vuln-node] metadata lookup node=%s compose_path=%s record_keys=%s",
                     n,
@@ -988,17 +1631,128 @@ def _apply_docker_compose_meta(node, rec, session=None):
                 n,
                 compose_path,
             )
+        def _first_compose_service_name(compose_file: str) -> str | None:
+            p = str(compose_file or '').strip()
+            if not p or not os.path.exists(p):
+                return None
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                return None
+            try:
+                with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+                    obj = yaml.safe_load(fh) or {}
+                services = obj.get('services') if isinstance(obj, dict) else None
+                if isinstance(services, dict):
+                    for key in services.keys():
+                        k = str(key or '').strip()
+                        if k:
+                            return k
+            except Exception:
+                return None
+            return None
+
+        def _compose_service_names(compose_file: str) -> set[str]:
+            p = str(compose_file or '').strip()
+            if not p or not os.path.exists(p):
+                return set()
+            try:
+                import yaml  # type: ignore
+            except Exception:
+                return set()
+            try:
+                with open(p, 'r', encoding='utf-8', errors='ignore') as fh:
+                    text = fh.read()
+                obj = yaml.safe_load(text) or {}
+                services = obj.get('services') if isinstance(obj, dict) else None
+                if isinstance(services, dict):
+                    out: set[str] = set()
+                    for key in services.keys():
+                        k = str(key or '').strip()
+                        if k:
+                            out.add(k)
+                    if out:
+                        return out
+                # Fallback text parse for partially-invalid YAML: collect first-level keys
+                # under `services:` by indentation.
+                out_text: set[str] = set()
+                in_services = False
+                services_indent = None
+                for line in text.splitlines():
+                    if not in_services:
+                        m = re.match(r'^(\s*)services\s*:\s*$', line)
+                        if m:
+                            in_services = True
+                            services_indent = len(m.group(1) or '')
+                        continue
+                    if not line.strip() or line.lstrip().startswith('#'):
+                        continue
+                    indent = len(line) - len(line.lstrip(' '))
+                    if services_indent is not None and indent <= services_indent:
+                        break
+                    m = re.match(r'^\s*([A-Za-z0-9_.-]+)\s*:\s*(?:#.*)?$', line)
+                    if m and indent > (services_indent or 0):
+                        out_text.add(str(m.group(1) or '').strip())
+                return {name for name in out_text if name}
+            except Exception:
+                return set()
+            return set()
+
+        # Defensive final pass: ensure Mako-sensitive `${...}` does not leak into
+        # the compose file that CORE daemon will render.
+        try:
+            if compose_path and os.path.exists(compose_path):
+                with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                    _txt = fh.read()
+                import re as _re
+                _fixed = _resolve_compose_interpolations(_txt)
+                if _fixed != _txt:
+                    with open(compose_path, 'w', encoding='utf-8') as fh:
+                        fh.write(_fixed)
+                    try:
+                        logger.info("[vuln-node] compose re-sanitized for mako vars node=%s path=%s", n, compose_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         vname = None
+        service_names = _compose_service_names(compose_path) or _compose_service_names(source_compose_hint or '')
         try:
             if rec:
-                vname = rec.get('Name') or rec.get('name') or rec.get('Title') or rec.get('title')
+                # Prefer explicit compose service name when available.
+                vname = rec.get('compose_service') or rec.get('compose_service_name')
+                if vname is not None:
+                    vname = str(vname).strip() or None
+                if vname and not service_names:
+                    try:
+                        logger.warning(
+                            "[vuln-node] compose services unavailable node=%s requested=%s; omitting compose_name",
+                            n,
+                            vname,
+                        )
+                    except Exception:
+                        pass
+                    vname = None
+                if vname and service_names and vname not in service_names:
+                    try:
+                        logger.warning(
+                            "[vuln-node] compose service mismatch node=%s requested=%s available=%s; falling back",
+                            n,
+                            vname,
+                            sorted(service_names),
+                        )
+                    except Exception:
+                        pass
+                    vname = None
+                if not vname and service_names:
+                    vname = _first_compose_service_name(compose_path) or _first_compose_service_name(source_compose_hint or '')
         except Exception:
             vname = None
-        if not vname:
-            try:
-                vname = n
-            except Exception:
-                vname = None
+        if not vname and service_names:
+            vname = _first_compose_service_name(compose_path) or _first_compose_service_name(source_compose_hint or '')
+        if vname and service_names and vname not in service_names:
+            vname = None
         try:
             logger.debug("[vuln-node] node=%s existing compose attr=%s", n, getattr(node, 'compose', None))
         except Exception:
@@ -1178,6 +1932,27 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
             return None
         flow_flag = meta.get('flow_flag')
         if not isinstance(flow_flag, dict):
+            # Flow can also pass assignments via env (CORETG_FLOW_ASSIGNMENTS_JSON) when
+            # running remote. In that case, host metadata may not include flow_flag.
+            try:
+                node_id = str(hdata.get('node_id') or hdata.get('id') or '').strip()
+            except Exception:
+                node_id = ''
+            if node_id:
+                try:
+                    assigns = _flow_assignments_from_env()
+                except Exception:
+                    assigns = []
+                match = None
+                for fa in assigns or []:
+                    if not isinstance(fa, dict):
+                        continue
+                    if str(fa.get('node_id') or '').strip() == node_id:
+                        match = fa
+                        break
+                if isinstance(match, dict):
+                    flow_flag = match
+        if not isinstance(flow_flag, dict):
             return None
         ftype = str(flow_flag.get('type') or '').strip().lower()
         # Legacy behavior: Flow may inject a docker-compose based flag package.
@@ -1203,10 +1978,42 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                 rec['HintText'] = hint_text
             return rec
 
-        # New behavior: flag-generators do NOT create new nodes/services.
+        # New behavior: flag-node-generators DO create a per-node docker-compose.yml
+        # intended to run on the next node.
+        if ftype == 'flag-node-generator':
+            run_dir = str(flow_flag.get('run_dir') or flow_flag.get('artifacts_dir') or '').strip()
+            if not run_dir:
+                return None
+            if not os.path.isabs(run_dir):
+                try:
+                    run_dir = os.path.abspath(os.path.join(_repo_root_path(), run_dir))
+                except Exception:
+                    pass
+            # Most node-generators emit docker-compose.yml at the run dir root.
+            cand = os.path.join(run_dir, 'docker-compose.yml')
+            if not os.path.exists(cand):
+                # Fallback: some generators may write to an outputs/ subdir.
+                cand2 = os.path.join(run_dir, 'outputs', 'docker-compose.yml')
+                if os.path.exists(cand2):
+                    cand = cand2
+            if not os.path.exists(cand):
+                return None
+            name = str(flow_flag.get('generator_name') or flow_flag.get('name') or flow_flag.get('generator_id') or '').strip() or 'flag-node-generator'
+            hint_text = str(flow_flag.get('hint') or '').strip()
+            rec_ng: Dict[str, str] = {
+                'Type': 'docker-compose',
+                'Name': name,
+                'Path': str(cand),
+                'Vector': 'flag-nodegen',
+            }
+            if hint_text:
+                rec_ng['HintText'] = hint_text
+            return rec_ng
+
+        # flag-generators do NOT create new nodes/services.
         # They generate artifacts that should be inserted into an existing docker node.
         if ftype == 'flag-generator':
-            artifacts_dir = str(flow_flag.get('mount_dir') or flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+            artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
             if not artifacts_dir:
                 return None
             if not os.path.isabs(artifacts_dir):
@@ -1214,13 +2021,39 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                     artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
                 except Exception:
                     pass
+            
+            # Check for outputs/ subdirectory (new standard)
+            try:
+                outputs_sub = os.path.join(artifacts_dir, 'outputs')
+                if os.path.isdir(outputs_sub):
+                    artifacts_dir = outputs_sub
+            except Exception:
+                pass
             hint_text = str(flow_flag.get('hint') or '').strip()
+            mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
+
+            inject_source_dir = str(flow_flag.get('inject_source_dir') or '').strip() or artifacts_dir
+            # Many Flow runs store file outputs under <run_dir>/artifacts/.
+            # Prefer that as the inject source root so inject specs like "artifacts/x"
+            # normalize to "x" and exist on disk.
+            try:
+                if inject_source_dir and os.path.basename(inject_source_dir.rstrip('/')) != 'artifacts':
+                    cand = os.path.join(inject_source_dir, 'artifacts')
+                    if os.path.isdir(cand):
+                        inject_source_dir = cand
+            except Exception:
+                pass
             rec2: Dict[str, str] = {
                 **_standard_docker_compose_record(),
                 'Vector': 'flag',
                 # Extra fields consumed by prepare_compose_for_assignments to mount artifacts.
                 'ArtifactsDir': artifacts_dir,
-                'ArtifactsMountPath': '/flow_artifacts',
+                'ArtifactsMountPath': mount_path,
+                # Inject files (copy into container at runtime).
+                'InjectFiles': flow_flag.get('inject_files') or [],
+                'InjectSourceDir': inject_source_dir,
+                'OutputsManifest': str(flow_flag.get('outputs_manifest') or ''),
+                'RunDir': str(flow_flag.get('run_dir') or ''),
             }
             if hint_text:
                 rec2['HintText'] = hint_text
@@ -1245,11 +2078,13 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
             return None
         flow_flag = meta.get('flow_flag')
         if not isinstance(flow_flag, dict):
-            return None
+            return _flow_flag_artifacts_overlay_from_env(hdata)
         ftype = str(flow_flag.get('type') or '').strip().lower()
+        # Only flag-generators inject artifacts into an existing docker-compose.
+        # flag-node-generators are expected to provide their own docker-compose.yml.
         if ftype != 'flag-generator':
             return None
-        artifacts_dir = str(flow_flag.get('mount_dir') or flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+        artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
         if not artifacts_dir:
             return None
         if not os.path.isabs(artifacts_dir):
@@ -1257,13 +2092,116 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
                 artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
             except Exception:
                 pass
+
+        # Check for outputs/ subdirectory (new standard)
+        try:
+            outputs_sub = os.path.join(artifacts_dir, 'outputs')
+            if os.path.isdir(outputs_sub):
+                artifacts_dir = outputs_sub
+        except Exception:
+            pass
         hint_text = str(flow_flag.get('hint') or '').strip()
+        mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
+        inject_source_dir = str(flow_flag.get('inject_source_dir') or '').strip() or artifacts_dir
+        try:
+            if inject_source_dir and os.path.basename(inject_source_dir.rstrip('/')) != 'artifacts':
+                cand = os.path.join(inject_source_dir, 'artifacts')
+                if os.path.isdir(cand):
+                    inject_source_dir = cand
+        except Exception:
+            pass
         overlay: Dict[str, str] = {
             'ArtifactsDir': artifacts_dir,
-            'ArtifactsMountPath': '/flow_artifacts',
+            'ArtifactsMountPath': mount_path,
+            'InjectFiles': flow_flag.get('inject_files') or [],
+            'InjectSourceDir': inject_source_dir,
+            'OutputsManifest': str(flow_flag.get('outputs_manifest') or ''),
+            'RunDir': str(flow_flag.get('run_dir') or ''),
         }
         if hint_text:
             overlay['HintText'] = hint_text
+        return overlay
+    except Exception:
+        return None
+
+
+_FLOW_ASSIGNMENTS_CACHE: list[dict[str, Any]] | None = None
+
+
+def _flow_assignments_from_env() -> list[dict[str, Any]]:
+    global _FLOW_ASSIGNMENTS_CACHE
+    if _FLOW_ASSIGNMENTS_CACHE is not None:
+        return _FLOW_ASSIGNMENTS_CACHE
+    raw = os.environ.get('CORETG_FLOW_ASSIGNMENTS_JSON') or ''
+    if not raw:
+        _FLOW_ASSIGNMENTS_CACHE = []
+        return _FLOW_ASSIGNMENTS_CACHE
+    try:
+        data = json.loads(raw)
+        _FLOW_ASSIGNMENTS_CACHE = data if isinstance(data, list) else []
+    except Exception:
+        _FLOW_ASSIGNMENTS_CACHE = []
+    return _FLOW_ASSIGNMENTS_CACHE
+
+
+def _flow_flag_artifacts_overlay_from_env(hdata: Any) -> Optional[Dict[str, str]]:
+    try:
+        if not isinstance(hdata, dict):
+            return None
+        node_id = str(hdata.get('node_id') or hdata.get('id') or '').strip()
+        if not node_id:
+            return None
+        assigns = _flow_assignments_from_env()
+        if not assigns:
+            return None
+        match = None
+        for fa in assigns:
+            if not isinstance(fa, dict):
+                continue
+            if str(fa.get('node_id') or '').strip() == node_id:
+                match = fa
+                break
+        if not match:
+            return None
+        try:
+            ftype = str(match.get('type') or '').strip().lower()
+        except Exception:
+            ftype = ''
+        if ftype != 'flag-generator':
+            return None
+        artifacts_dir = str(match.get('artifacts_dir') or match.get('run_dir') or '').strip()
+        if not artifacts_dir:
+            return None
+        if not os.path.isabs(artifacts_dir):
+            try:
+                artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
+            except Exception:
+                pass
+        
+        # Check for outputs/ subdirectory (new standard)
+        try:
+            outputs_sub = os.path.join(artifacts_dir, 'outputs')
+            if os.path.isdir(outputs_sub):
+                artifacts_dir = outputs_sub
+        except Exception:
+            pass
+        mount_path = '/flow_artifacts'
+        inject_source_dir = str(match.get('inject_source_dir') or '').strip() or artifacts_dir
+        try:
+            if inject_source_dir and os.path.basename(inject_source_dir.rstrip('/')) != 'artifacts':
+                cand = os.path.join(inject_source_dir, 'artifacts')
+                if os.path.isdir(cand):
+                    inject_source_dir = cand
+        except Exception:
+            pass
+        overlay: Dict[str, str] = {
+            'ArtifactsDir': artifacts_dir,
+            'ArtifactsMountPath': mount_path,
+            'InjectFiles': match.get('inject_files') or [],
+            'InjectSourceDir': inject_source_dir,
+            'OutputsManifest': str(match.get('outputs_manifest') or ''),
+            'RunDir': str(match.get('run_dir') or ''),
+        }
         return overlay
     except Exception:
         return None
@@ -1306,7 +2244,7 @@ def build_star_from_roles(core,
     existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "switch", _type_desc(NodeType.SWITCH), cx, cy)
     switch_pos = Position(x=cx, y=cy)
-    switch = session.add_node(1, _type=NodeType.SWITCH, position=switch_pos)
+    switch = _session_add_node(session, 1, node_type=NodeType.SWITCH, position=switch_pos)
     _log_add_node_result(session, switch, 1, NodeType.SWITCH, "switch", position=switch_pos)
     try:
         setattr(switch, "model", "switch")
@@ -1348,41 +2286,51 @@ def build_star_from_roles(core,
         node_type = map_role_to_node_type(role)
         node_name = f"{role.lower()}-{idx+1}"
 
-        # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+        host_slot_idx += 1
+        slot_key = f"slot-{host_slot_idx}"
+        is_docker_node = _is_docker_node_type(node_type)
+        is_explicit_docker = is_docker_node and role.lower() == 'docker'
+        # Apply docker slot plan for any host slot (overrides default template when present).
         try:
-            if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                docker_by_name.setdefault(node_name, _standard_docker_compose_record())
-                _apply_mount_overlays(docker_by_name.get(node_name))
-                created_docker += 1
-        except Exception:
-            pass
-        # If this role would be a DEFAULT host, check slot plan to possibly make it a DOCKER node
-        if node_type == NodeType.DEFAULT:
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
-            try:
-                if docker_slot_plan and slot_key in docker_slot_plan:
+            if docker_slot_plan and slot_key in docker_slot_plan:
+                if not is_docker_node:
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
-                        docker_by_name[node_name] = docker_slot_plan[slot_key]
-                        _apply_mount_overlays(docker_by_name.get(node_name))
+                        is_docker_node = True
                         created_docker += 1
-                        docker_slots_used.add(slot_key)
                     else:
-                        logger.warning("NodeType.DOCKER not available in this CORE build; cannot create docker nodes even though a slot plan exists")
-            except Exception:
-                pass
+                        logger.warning("NodeType.DOCKER not available in this CORE build; cannot apply docker slot plan")
+                if is_docker_node:
+                    docker_by_name[node_name] = docker_slot_plan[slot_key]
+                    _apply_mount_overlays(docker_by_name.get(node_name))
+                    docker_slots_used.add(slot_key)
+        except Exception:
+            pass
+        # Explicit Docker role: ensure we count it and have a compose record.
+        if is_explicit_docker:
+            created_docker += 1
+        if is_docker_node and node_name not in docker_by_name:
+            docker_by_name.setdefault(node_name, _standard_docker_compose_record())
+            _apply_mount_overlays(docker_by_name.get(node_name))
 
         # Prepare per-node compose file BEFORE creating the docker node.
         # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
-        try:
-            if _is_docker_node_type(node_type):
-                _ensure_docker_node_compose_prepared(node_name, docker_by_name.get(node_name))
-        except Exception:
-            pass
+        if _is_docker_node_type(node_type):
+            _ensure_docker_node_compose_prepared(node_name, docker_by_name.get(node_name))
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, node_name, _type_desc(node_type), x, y)
         node_position = Position(x=x, y=y)
-        node = session.add_node(node_id, _type=node_type, position=node_position, name=node_name)
+        add_node_extra = None
+        if _is_docker_node_type(node_type):
+            add_node_extra = _docker_node_add_node_kwargs(node_name, docker_by_name.get(node_name))
+        node = _session_add_node(
+            session,
+            node_id,
+            node_type=node_type,
+            position=node_position,
+            name=node_name,
+            start=False if _is_docker_node_type(node_type) else None,
+            extra_kwargs=add_node_extra,
+        )
         # set model for better XML typing
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
@@ -1572,7 +2520,7 @@ def build_multi_switch_topology(core,
     cx, cy = 800, 800
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "agg-sw", _type_desc(NodeType.SWITCH), cx, cy)
     agg_position = Position(x=cx, y=cy)
-    agg = session.add_node(1, _type=NodeType.SWITCH, position=agg_position, name="agg-sw")
+    agg = _session_add_node(session, 1, node_type=NodeType.SWITCH, position=agg_position, name="agg-sw")
     _log_add_node_result(session, agg, 1, NodeType.SWITCH, "agg-sw", position=agg_position)
     try:
         setattr(agg, "model", "switch")
@@ -1597,7 +2545,7 @@ def build_multi_switch_topology(core,
         node_id = i + 2
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, f"sw-{i+1}", _type_desc(NodeType.SWITCH), x, y)
         sw_position = Position(x=x, y=y)
-        sw = session.add_node(node_id, _type=NodeType.SWITCH, position=sw_position, name=f"sw-{i+1}")
+        sw = _session_add_node(session, node_id, node_type=NodeType.SWITCH, position=sw_position, name=f"sw-{i+1}")
         _log_add_node_result(session, sw, node_id, NodeType.SWITCH, f"sw-{i+1}", position=sw_position)
         switch_ids.append(sw.id)
         # link access switch to aggregation with explicit interfaces for clarity in saved XML
@@ -1663,38 +2611,47 @@ def build_multi_switch_topology(core,
         node_type = map_role_to_node_type(role)
         name = f"{role.lower()}-{idx+1}"
 
-        # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+        host_slot_idx += 1
+        slot_key = f"slot-{host_slot_idx}"
+        is_docker_node = _is_docker_node_type(node_type)
+        is_explicit_docker = is_docker_node and role.lower() == 'docker'
         try:
-            if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                docker_by_name.setdefault(name, _standard_docker_compose_record())
-                _apply_mount_overlays(docker_by_name.get(name))
-                created_docker += 1
-        except Exception:
-            pass
-        if node_type == NodeType.DEFAULT:
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
-            try:
-                if docker_slot_plan and slot_key in docker_slot_plan:
+            if docker_slot_plan and slot_key in docker_slot_plan:
+                if not is_docker_node:
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
-                        docker_by_name[name] = docker_slot_plan[slot_key]
-                        _apply_mount_overlays(docker_by_name.get(name))
+                        is_docker_node = True
                         created_docker += 1
                     else:
                         logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on multi-switch")
-            except Exception:
-                pass
-
-        # Prepare per-node compose file BEFORE creating the docker node.
-        try:
-            if _is_docker_node_type(node_type):
-                _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+                if is_docker_node:
+                    docker_by_name[name] = docker_slot_plan[slot_key]
+                    _apply_mount_overlays(docker_by_name.get(name))
         except Exception:
             pass
+        if is_explicit_docker:
+            created_docker += 1
+        if is_docker_node and name not in docker_by_name:
+            docker_by_name.setdefault(name, _standard_docker_compose_record())
+            _apply_mount_overlays(docker_by_name.get(name))
+
+        # Prepare per-node compose file BEFORE creating the docker node.
+        if _is_docker_node_type(node_type):
+            _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", next_id, name, _type_desc(node_type), x, y)
         node_position = Position(x=x, y=y)
-        node = session.add_node(next_id, _type=node_type, position=node_position, name=name)
+        add_node_extra = None
+        if _is_docker_node_type(node_type):
+            add_node_extra = _docker_node_add_node_kwargs(name, docker_by_name.get(name))
+        node = _session_add_node(
+            session,
+            next_id,
+            node_type=node_type,
+            position=node_position,
+            name=name,
+            start=False if _is_docker_node_type(node_type) else None,
+            extra_kwargs=add_node_extra,
+        )
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                 setattr(node, "model", "docker")
@@ -2093,7 +3050,7 @@ def _try_build_segmented_topology_from_preview(
         logger.info("[preview] add_router id=%s name=%s pos=(%s,%s)", rid, name, x, y)
         router_position = Position(x=x, y=y)
         rtype = _router_node_type()
-        node = session.add_node(rid, _type=rtype, position=router_position, name=name)
+        node = _session_add_node(session, rid, node_type=rtype, position=router_position, name=name)
         _log_add_node_result(session, node, rid, rtype, name, position=router_position)
         mark_node_as_router(node, session)
         try:
@@ -2167,60 +3124,76 @@ def _try_build_segmented_topology_from_preview(
             y = int(base_y + radius * math.sin(angle))
         name = str(hdata.get('name') or f"host-{hid}")
 
-        # Increment slot index for every host that could potentially be in the slot plan.
-        # This ensures slot keys remain synchronized with the preview plan (which counts all hosts).
-        was_default_for_slot_plan = (node_type == NodeType.DEFAULT)
-        if was_default_for_slot_plan or (_is_docker_node_type(node_type) and str(role).lower() == 'docker'):
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
-        else:
-            slot_key = None
+        host_slot_idx += 1
+        slot_key = f"slot-{host_slot_idx}"
+        is_docker_node = _is_docker_node_type(node_type)
+        is_explicit_docker = is_docker_node and str(role).lower() == 'docker'
 
-        # Explicit Docker role: attach compose metadata so compose files can be prepared later.
-        # If Flow injected a flag compose reference into host metadata, prefer that over the standard template.
-        if _is_docker_node_type(node_type) and str(role).lower() == 'docker':
-            try:
-                flow_rec = _flow_flag_record_from_host_metadata(hdata)
-                if flow_rec:
-                    docker_by_name[name] = flow_rec
-                else:
-                    docker_by_name.setdefault(name, _standard_docker_compose_record())
-                _apply_mount_overlays(docker_by_name.get(name))
-                created_docker += 1
-                # Mark slot as used if this explicit Docker host has a slot key
-                if slot_key and docker_slot_plan and slot_key in docker_slot_plan:
-                    docker_slots_used.add(slot_key)
-            except Exception:
-                pass
-
-        # If this would be a DEFAULT host, allow the docker slot plan to override it.
-        if was_default_for_slot_plan and slot_key:
-            try:
-                if docker_slot_plan and slot_key in docker_slot_plan:
+        # Apply docker slot plan for any host slot (overrides default template when present).
+        try:
+            if docker_slot_plan and slot_key in docker_slot_plan:
+                if not is_docker_node:
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
-                        base_rec = docker_slot_plan[slot_key]
-                        overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
-                        docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
-                        _apply_mount_overlays(docker_by_name.get(name))
+                        is_docker_node = True
                         created_docker += 1
-                        docker_slots_used.add(slot_key)
                     else:
                         logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan during preview realization")
-            except Exception:
-                pass
-
-        # Prepare per-node compose file BEFORE creating the docker node.
-        # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
-        try:
-            if _is_docker_node_type(node_type):
-                _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+                if is_docker_node:
+                    # IMPORTANT: slot-plan docker-compose records (e.g., vulnerabilities) must remain
+                    # the base record. Flow flag-generators should only overlay artifacts/injects,
+                    # not replace the compose stack with the standard ubuntu template.
+                    base_rec = docker_slot_plan[slot_key]
+                    overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+                    docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
+                    _apply_mount_overlays(docker_by_name.get(name))
+                    docker_slots_used.add(slot_key)
         except Exception:
             pass
 
+        # Explicit Docker role: attach compose metadata so compose files can be prepared later.
+        # If Flow injected a flag compose reference into host metadata, prefer that over the standard template.
+        if is_explicit_docker:
+            try:
+                created_docker += 1
+                if name not in docker_by_name:
+                    flow_rec = _flow_flag_record_from_host_metadata(hdata)
+                    if flow_rec:
+                        docker_by_name[name] = flow_rec
+                    else:
+                        base_rec = _standard_docker_compose_record()
+                        overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+                        docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
+                    _apply_mount_overlays(docker_by_name.get(name))
+            except Exception:
+                pass
+
+        if is_docker_node and name not in docker_by_name:
+            flow_rec = _flow_flag_record_from_host_metadata(hdata)
+            base_rec = flow_rec or _standard_docker_compose_record()
+            overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+            docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
+            _apply_mount_overlays(docker_by_name.get(name))
+
+        # Prepare per-node compose file BEFORE creating the docker node.
+        # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
+        if _is_docker_node_type(node_type):
+            _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+
         logger.info("[preview] add_host id=%s name=%s type=%s pos=(%s,%s)", hid, name, _type_desc(node_type), x, y)
         host_position = Position(x=x, y=y)
-        host_node = session.add_node(hid, _type=node_type, position=host_position, name=name)
+        add_node_extra = None
+        if _is_docker_node_type(node_type):
+            add_node_extra = _docker_node_add_node_kwargs(name, docker_by_name.get(name))
+        host_node = _session_add_node(
+            session,
+            hid,
+            node_type=node_type,
+            position=host_position,
+            name=name,
+            start=False if _is_docker_node_type(node_type) else None,
+            extra_kwargs=add_node_extra,
+        )
         _log_add_node_result(session, host_node, hid, node_type, name, position=host_position)
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
@@ -2310,7 +3283,7 @@ def _try_build_segmented_topology_from_preview(
         switch_name = switch_name_map.get(sid) or f"rsw-{router_id}-{idx+1}"
         logger.info("[preview] add_switch id=%s name=%s pos=(%s,%s)", sid, switch_name, sx, sy)
         sw_position = Position(x=sx, y=sy)
-        sw_node = session.add_node(sid, _type=NodeType.SWITCH, position=sw_position, name=switch_name)
+        sw_node = _session_add_node(session, sid, node_type=NodeType.SWITCH, position=sw_position, name=switch_name)
         _log_add_node_result(session, sw_node, sid, NodeType.SWITCH, switch_name, position=sw_position)
         try:
             setattr(sw_node, "model", "switch")
@@ -2925,7 +3898,7 @@ def build_segmented_topology(core,
         rtype = _router_node_type()
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, f"router-{i+1}", _type_desc(rtype), x, y)
         router_position = Position(x=x, y=y)
-        node = session.add_node(node_id, _type=rtype, position=router_position, name=f"router-{i+1}")
+        node = _session_add_node(session, node_id, node_type=rtype, position=router_position, name=f"router-{i+1}")
         _log_add_node_result(session, node, node_id, rtype, f"router-{i+1}", position=router_position)
         logger.debug("Added router id=%s at (%s,%s)", node.id, x, y)
         mark_node_as_router(node, session)
@@ -3371,40 +4344,49 @@ def build_segmented_topology(core,
             node_type = map_role_to_node_type(role)
             name = f"{role.lower()}-{ridx+1}-1"
 
-            # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+            host_slot_idx += 1
+            slot_key = f"slot-{host_slot_idx}"
+            is_docker_node = _is_docker_node_type(node_type)
+            is_explicit_docker = is_docker_node and role.lower() == 'docker'
             try:
-                if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                    docker_by_name.setdefault(name, _standard_docker_compose_record())
-                    _apply_mount_overlays(docker_by_name.get(name))
-                    created_docker += 1
-            except Exception:
-                pass
-            if node_type == NodeType.DEFAULT:
-                host_slot_idx += 1
-                slot_key = f"slot-{host_slot_idx}"
-                try:
-                    if docker_slot_plan and slot_key in docker_slot_plan:
+                if docker_slot_plan and slot_key in docker_slot_plan:
+                    if not is_docker_node:
                         if hasattr(NodeType, "DOCKER"):
                             node_type = getattr(NodeType, "DOCKER")
-                            docker_by_name[name] = docker_slot_plan[slot_key]
-                            _apply_mount_overlays(docker_by_name.get(name))
+                            is_docker_node = True
                             created_docker += 1
-                            docker_slots_used.add(slot_key)
                         else:
                             logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (single-host)")
-                except Exception:
-                    pass
+                    if is_docker_node:
+                        docker_by_name[name] = docker_slot_plan[slot_key]
+                        _apply_mount_overlays(docker_by_name.get(name))
+                        docker_slots_used.add(slot_key)
+            except Exception:
+                pass
+            if is_explicit_docker:
+                created_docker += 1
+            if is_docker_node and name not in docker_by_name:
+                docker_by_name.setdefault(name, _standard_docker_compose_record())
+                _apply_mount_overlays(docker_by_name.get(name))
 
             # Prepare per-node compose file BEFORE creating the docker node.
             # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
-            try:
-                if _is_docker_node_type(node_type):
-                    _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
-            except Exception:
-                pass
+            if _is_docker_node_type(node_type):
+                _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
             logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
             host_position = Position(x=x, y=y)
-            host = session.add_node(node_id_counter, _type=node_type, position=host_position, name=name)
+            add_node_extra = None
+            if _is_docker_node_type(node_type):
+                add_node_extra = _docker_node_add_node_kwargs(name, docker_by_name.get(name))
+            host = _session_add_node(
+                session,
+                node_id_counter,
+                node_type=node_type,
+                position=host_position,
+                name=name,
+                start=False if _is_docker_node_type(node_type) else None,
+                extra_kwargs=add_node_extra,
+            )
             try:
                 if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                     setattr(host, "model", "docker")
@@ -3489,40 +4471,49 @@ def build_segmented_topology(core,
                 node_type = map_role_to_node_type(role)
                 name = f"{role.lower()}-{ridx+1}-{j+1}"
 
-                # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+                host_slot_idx += 1
+                slot_key = f"slot-{host_slot_idx}"
+                is_docker_node = _is_docker_node_type(node_type)
+                is_explicit_docker = is_docker_node and role.lower() == 'docker'
                 try:
-                    if _is_docker_node_type(node_type) and role.lower() == 'docker':
-                        docker_by_name.setdefault(name, _standard_docker_compose_record())
-                        _apply_mount_overlays(docker_by_name.get(name))
-                        created_docker += 1
-                except Exception:
-                    pass
-                if node_type == NodeType.DEFAULT:
-                    host_slot_idx += 1
-                    slot_key = f"slot-{host_slot_idx}"
-                    try:
-                        if docker_slot_plan and slot_key in docker_slot_plan:
+                    if docker_slot_plan and slot_key in docker_slot_plan:
+                        if not is_docker_node:
                             if hasattr(NodeType, "DOCKER"):
                                 node_type = getattr(NodeType, "DOCKER")
-                                docker_by_name[name] = docker_slot_plan[slot_key]
-                                _apply_mount_overlays(docker_by_name.get(name))
+                                is_docker_node = True
                                 created_docker += 1
-                                docker_slots_used.add(slot_key)
                             else:
                                 logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (multi-host deferred)")
-                    except Exception:
-                        pass
+                        if is_docker_node:
+                            docker_by_name[name] = docker_slot_plan[slot_key]
+                            _apply_mount_overlays(docker_by_name.get(name))
+                            docker_slots_used.add(slot_key)
+                except Exception:
+                    pass
+                if is_explicit_docker:
+                    created_docker += 1
+                if is_docker_node and name not in docker_by_name:
+                    docker_by_name.setdefault(name, _standard_docker_compose_record())
+                    _apply_mount_overlays(docker_by_name.get(name))
 
                 # Prepare per-node compose file BEFORE creating the docker node.
                 # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
-                try:
-                    if _is_docker_node_type(node_type):
-                        _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
-                except Exception:
-                    pass
+                if _is_docker_node_type(node_type):
+                    _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
                 logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
                 host_position = Position(x=x, y=y)
-                host = session.add_node(node_id_counter, _type=node_type, position=host_position, name=name)
+                add_node_extra = None
+                if _is_docker_node_type(node_type):
+                    add_node_extra = _docker_node_add_node_kwargs(name, docker_by_name.get(name))
+                host = _session_add_node(
+                    session,
+                    node_id_counter,
+                    node_type=node_type,
+                    position=host_position,
+                    name=name,
+                    start=False if _is_docker_node_type(node_type) else None,
+                    extra_kwargs=add_node_extra,
+                )
                 try:
                     if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                         setattr(host, "model", "docker")
@@ -3743,7 +4734,7 @@ def build_segmented_topology(core,
                 name = switch_name_map.get(switch_id) or detail.get('name') or f"rsw-{router_id}-{offset_idx}"
                 logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", switch_id, name, _type_desc(NodeType.SWITCH), sx, sy)
                 sw_position = Position(x=sx, y=sy)
-                sw_node = session.add_node(switch_id, _type=NodeType.SWITCH, position=sw_position, name=name)
+                sw_node = _session_add_node(session, switch_id, node_type=NodeType.SWITCH, position=sw_position, name=name)
                 _log_add_node_result(session, sw_node, switch_id, NodeType.SWITCH, name, position=sw_position)
                 try:
                     setattr(sw_node, 'model', 'switch')
@@ -4057,7 +5048,7 @@ def build_segmented_topology(core,
                     sx = int(rx + random.randint(30, 70)); sy = int(ry + random.randint(30, 70))
                     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"lan-{rid}", _type_desc(NodeType.SWITCH), sx, sy)
                     lan_position = Position(x=sx, y=sy)
-                    lan_sw = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=lan_position, name=f"lan-{rid}")
+                    lan_sw = _session_add_node(session, node_id_counter, node_type=NodeType.SWITCH, position=lan_position, name=f"lan-{rid}")
                     _log_add_node_result(session, lan_sw, node_id_counter, NodeType.SWITCH, f"lan-{rid}", position=lan_position)
                     try: setattr(lan_sw, 'model', 'switch')
                     except Exception: pass

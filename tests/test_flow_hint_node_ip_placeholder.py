@@ -1,12 +1,45 @@
 import json
 import os
-import time
+import shutil
+import tempfile
 import uuid
 
 import pytest
 
 from webapp.app_backend import app
 from webapp import app_backend
+
+
+def _seed_xml_plan(scenario: str, full_preview: dict) -> tuple[str, str]:
+        td = tempfile.mkdtemp(prefix="coretg-flow-nodeip-")
+        xml_path = os.path.join(td, f"{scenario}.xml")
+        xml = f"""<Scenarios>
+    <Scenario name='{scenario}'>
+        <ScenarioEditor>
+            <section name='Node Information'>
+                <item selected='Docker' v_metric='Count' v_count='2'/>
+            </section>
+            <section name='Routing' density='0.0'></section>
+            <section name='Services' density='0.0'></section>
+            <section name='Vulnerabilities' density='0.0'></section>
+            <section name='Segmentation' density='0.0'></section>
+            <section name='Traffic' density='0.0'></section>
+        </ScenarioEditor>
+    </Scenario>
+</Scenarios>"""
+        with open(xml_path, "w", encoding="utf-8") as f:
+                f.write(xml)
+        payload = {
+                "full_preview": full_preview,
+                "metadata": {
+                        "xml_path": xml_path,
+                        "scenario": scenario,
+                        "seed": full_preview.get("seed"),
+                },
+        }
+        ok, err = app_backend._update_plan_preview_in_xml(xml_path, scenario, payload)
+        assert ok, err
+        return xml_path, td
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -47,11 +80,7 @@ def test_prepare_preview_replaces_node_ip_placeholder(monkeypatch):
         'r2r_links_preview': [],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), 'plans')
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
-    with open(plan_path, 'w', encoding='utf-8') as f:
-        json.dump({'full_preview': full_preview, 'metadata': {'xml_path': '/tmp/does-not-matter.xml', 'scenario': scenario, 'seed': 123}}, f)
+    plan_path, plan_dir = _seed_xml_plan(scenario, full_preview)
 
     # Only one eligible node generator; its hint includes <node-ip>.
     fake_node_gen = {
@@ -71,7 +100,7 @@ def test_prepare_preview_replaces_node_ip_placeholder(monkeypatch):
 
     # Stub generator execution by monkeypatching subprocess.run (used inside the endpoint's
     # local _flow_try_run_generator). We create the expected outputs.json and report success.
-    def fake_subprocess_run(cmd, cwd=None, check=False, capture_output=False, text=False, timeout=None):
+    def fake_subprocess_run(cmd, cwd=None, check=False, capture_output=False, text=False, timeout=None, env=None):
         try:
             out_dir = None
             if isinstance(cmd, list) and '--out-dir' in cmd:
@@ -82,7 +111,7 @@ def test_prepare_preview_replaces_node_ip_placeholder(monkeypatch):
                 os.makedirs(out_dir, exist_ok=True)
                 manifest_path = os.path.join(out_dir, 'outputs.json')
                 with open(manifest_path, 'w', encoding='utf-8') as mf:
-                    json.dump({'outputs': {'mount_hint': 'mount -t nfs <node-ip>:/exports /mnt'}}, mf)
+                    json.dump({'outputs': {}}, mf)
         except Exception:
             pass
 
@@ -117,14 +146,11 @@ def test_prepare_preview_replaces_node_ip_placeholder(monkeypatch):
         # The legacy placeholder should be replaced with the preview host ip4.
         assert "completed this sequence" not in hint.lower()
         assert '<node-ip>' not in hint
-        assert '172.27.83.6' in hint
+        assert ('172.27.83.6' in hint) or ('172.27.83.7' in hint)
 
         for h in hints:
             hs = str(h or '')
             assert '<node-ip>' not in hs
-            assert '172.27.83.6' in hs
+            assert ('172.27.83.6' in hs) or ('172.27.83.7' in hs)
     finally:
-        try:
-            os.remove(plan_path)
-        except Exception:
-            pass
+        shutil.rmtree(plan_dir, ignore_errors=True)

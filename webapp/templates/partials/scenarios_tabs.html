@@ -30,11 +30,6 @@
         title="Generate a full preview for the selected scenario"
       >Preview</a>
     </li>
-    {% if nav_participant_url %}
-    <li class="nav-item">
-      <a class="nav-link" href="{{ url_for('participant_ui_page', scenario=scenario_tab) if scenario_tab else url_for('participant_ui_page') }}" title="Participant-UI">Participant-UI</a>
-    </li>
-    {% endif %}
   </ul>
 
   {# Defaults used by JS; Preview tab can override with live editor state. #}
@@ -49,12 +44,17 @@
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="button">Save XML</button>
         <button id="downloadXmlBtn" class="btn btn-outline-info px-4 py-2 shadow-sm" type="button" {% if not preview_xml_path %}disabled title="Save XML first"{% endif %}>Download XML</button>
       {% endif %}
-      <button id="scenariosExecuteBtn" class="btn btn-success px-4 py-2 shadow-sm" type="button">{% if scenarios_active_tab == 'preview' %}Execute{% else %}Preview{% endif %}</button>
+      <button
+        id="scenariosExecuteBtn"
+        class="btn btn-success px-4 py-2 shadow-sm"
+        type="button"
+        {% if scenarios_active_tab == 'topology' %}data-coretg-action="continue" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Flag Sequencing"{% elif scenarios_active_tab == 'connection-setup' %}data-coretg-action="continue-topology" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Topology"{% endif %}
+      >{% if scenarios_active_tab == 'preview' %}Execute{% elif scenarios_active_tab in ['topology', 'connection-setup'] %}Continue{% else %}Preview{% endif %}</button>
     </div>
   </div>
 </div>
 
-<!-- Progress overlay for long-running Save XML work (e.g., checking vuln readiness) -->
+<!-- Progress overlay for long-running Save XML work -->
 <div id="coretgProgressOverlay" style="display:none; position:fixed; inset:0; z-index: 4000; background: rgba(0,0,0,0.35); align-items:center; justify-content:center;">
   <div style="width: min(560px, calc(100vw - 24px)); background:#fff; border-radius:14px; padding:16px 16px 14px 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.25);">
     <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
@@ -67,21 +67,22 @@
     <div style="margin-top:12px; height:10px; background: rgba(0,0,0,0.10); border-radius: 999px; overflow:hidden;">
       <div id="coretgProgressBar" style="height: 100%; width: 0%; background: #0d6efd; border-radius: 999px;"></div>
     </div>
-    <div style="margin-top:10px; font-size:12px; color: rgba(0,0,0,0.55);">This may take a moment while checking Docker images.</div>
+    <div style="margin-top:10px; font-size:12px; color: rgba(0,0,0,0.55);">This may take a moment while preparing scenario data.</div>
   </div>
 </div>
 
 <script>
 (function(){
-  const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
-  const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
-  const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_project_active_idx_map_v1';
-  const LATEST_XML_BY_SCENARIO_STORAGE_KEY = 'coretg_latest_xml_by_scenario_v1';
-  const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v1';
-  const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
-  const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v1';
-  const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v1';
-  const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v1';
+  const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v3';
+  const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key_v3';
+  const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_project_active_idx_map_v3';
+  const LATEST_XML_BY_SCENARIO_STORAGE_KEY = 'coretg_latest_xml_by_scenario_v3';
+  const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v3';
+  const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v3';
+  const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v3';
+  const TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY = 'coretg_topology_signature_by_scenario_v3';
+  const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v3';
+  const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v3';
 
   function getActiveTabName(){
     try {
@@ -111,6 +112,14 @@
         btn.setAttribute('title', 'Continue to Flag Sequencing');
         return;
       }
+      if (m === 'continue-topology') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue-topology';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.disabled = false;
+        btn.setAttribute('title', 'Continue to Topology');
+        return;
+      }
       // default: return to normal label
       btn.dataset.coretgAction = '';
       btn.dataset.coretgScenario = '';
@@ -119,7 +128,19 @@
       btn.removeAttribute('title');
       // Let other logic decide enablement; only fix the label here.
       const activeTab = getActiveTabName();
-      btn.textContent = (activeTab === 'preview') ? 'Execute' : 'Preview';
+      if (activeTab === 'topology') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.setAttribute('title', 'Continue to Flag Sequencing');
+      } else if (activeTab === 'connection-setup') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue-topology';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.setAttribute('title', 'Continue to Topology');
+      } else {
+        btn.textContent = (activeTab === 'preview') ? 'Execute' : 'Preview';
+      }
     } catch (e) {}
   }
 
@@ -220,38 +241,50 @@
     return readJsonFromLocalStorage(FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY, {});
   }
 
-  function getPreviewPlanPathForScenario(scenarioName){
+  function readTopologySignatureMap(){
+    return readJsonFromLocalStorage(TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function getTopologySignatureForScenario(scenarioName){
     try {
       const key = normalizeScenarioKey(scenarioName);
-      if (!key) return '';
-      const map = readPreviewPlanMap();
+      if (!key) return null;
+      const map = readTopologySignatureMap();
       const entry = (map && typeof map === 'object') ? map[key] : null;
-      const path = entry && typeof entry === 'object' ? (entry.preview_plan_path || entry.previewPlanPath || '') : '';
-      return (path || '').toString().trim();
+      const sig = entry && typeof entry === 'object' ? (entry.signature ?? null) : null;
+      return (typeof sig === 'string' && sig) ? sig : null;
     } catch (e) {
-      return '';
+      return null;
     }
+  }
+
+  function setTopologySignatureForScenario(scenarioName, signature){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return;
+      if (!signature || typeof signature !== 'string') return;
+      const map = readTopologySignatureMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        signature: signature,
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
+  }
+
+  function getPreviewPlanPathForScenario(scenarioName){
+    return '';
   }
 
   function setPreviewPlanPathForScenario(scenarioName, previewPlanPath){
     try {
       const key = normalizeScenarioKey(scenarioName);
-      const path = (previewPlanPath || '').toString().trim();
       if (!key) return;
       const map = readPreviewPlanMap();
       const next = (map && typeof map === 'object') ? map : {};
-
-      // Allow clearing the stored preview plan.
-      if (!path) {
-        try { delete next[key]; } catch (e) {}
-        localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
-        return;
-      }
-      next[key] = {
-        scenario: (scenarioName || '').toString().trim(),
-        preview_plan_path: path,
-        updated_at: Date.now(),
-      };
+      try { delete next[key]; } catch (e) {}
       localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
     } catch (e) {}
   }
@@ -541,6 +574,12 @@
   function syncScenarioTabLinks(scenarioName){
     try {
       const scen = (scenarioName || '').toString().trim();
+      let xmlPath = '';
+      try {
+        if (scen && typeof getLatestXmlPathForScenario === 'function') {
+          xmlPath = (getLatestXmlPathForScenario(scen) || '').toString().trim();
+        }
+      } catch (e) { xmlPath = ''; }
 
       // Keep shared hidden field in sync for Preview handoff logic.
       try {
@@ -557,6 +596,11 @@
           const url = new URL(href, window.location.origin);
           if (scen) url.searchParams.set('scenario', scen);
           else url.searchParams.delete('scenario');
+          if (xmlPath && (url.pathname.includes('/scenarios/flag-sequencing') || url.pathname.includes('/scenarios/preview'))){
+            url.searchParams.set('xml_path', xmlPath);
+          } else if (url.pathname.includes('/scenarios/flag-sequencing') || url.pathname.includes('/scenarios/preview')) {
+            url.searchParams.delete('xml_path');
+          }
           const next = url.pathname + (url.search ? url.search : '') + (url.hash || '');
           a.setAttribute('href', next);
         } catch (e) {
@@ -589,8 +633,23 @@
       const preset = (entry.preset || '').toString();
       const length = Number.isFinite(+entry.length) ? (+entry.length) : null;
       const chain_ids = Array.isArray(entry.chain_ids) ? entry.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
-      if (!chain_ids.length) return null;
-      return { scenario, preset, length: length || chain_ids.length, chain_ids };
+      const flow_enabled = (entry.flow_enabled === true) ? true : (entry.flow_enabled === false ? false : undefined);
+      if (!chain_ids.length && flow_enabled !== false) return null;
+      const flag_assignments = Array.isArray(entry.flag_assignments) ? entry.flag_assignments : null;
+      const allow_node_duplicates = !!entry.allow_node_duplicates;
+      const initial_facts = entry.initial_facts || null;
+      const goal_facts = entry.goal_facts || null;
+      return {
+        scenario,
+        preset,
+        length: length || chain_ids.length,
+        chain_ids,
+        flag_assignments,
+        allow_node_duplicates,
+        initial_facts,
+        goal_facts,
+        flow_enabled,
+      };
     } catch (e) {
       return null;
     }
@@ -608,6 +667,11 @@
         preset: (s.preset || '').toString(),
         length: Number.isFinite(+s.length) ? (+s.length) : null,
         chain_ids: Array.isArray(s.chain_ids) ? s.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [],
+        flag_assignments: Array.isArray(s.flag_assignments) ? s.flag_assignments : null,
+        allow_node_duplicates: !!s.allow_node_duplicates,
+        initial_facts: s.initial_facts || null,
+        goal_facts: s.goal_facts || null,
+        flow_enabled: (s.flow_enabled === true) ? true : (s.flow_enabled === false ? false : undefined),
         updated_at: Date.now(),
       };
       localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));
@@ -689,8 +753,19 @@
         const core = (typeof window.getCoreConfig === 'function') ? window.getCoreConfig(true) : (window.state.core || null);
         const project_key_hint = (window.currentProjectKey || '').toString().trim();
         const scenario_query = (typeof window.resolveScenarioQueryHint === 'function') ? window.resolveScenarioQueryHint() : '';
+        const scenariosOut = Array.isArray(window.state.scenarios) ? window.state.scenarios.map(s => (s && typeof s === 'object') ? s : {}) : [];
+        try {
+          if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
+            scenariosOut.forEach((sc) => {
+              const nm = (sc && sc.name) ? String(sc.name).trim() : '';
+              if(!nm) return;
+              const flowState = window.coretgGetSavedFlowStateForScenario(nm);
+              if(flowState) sc.flow_state = flowState;
+            });
+          }
+        } catch (e) {}
         return {
-          scenarios: window.state.scenarios,
+          scenarios: scenariosOut,
           core: core,
           active_index,
           project_key_hint,
@@ -700,7 +775,17 @@
     } catch (e) {}
 
     const snap = getCurrentProjectSnapshot();
-    const scenarios = Array.isArray(snap?.scenarios) ? snap.scenarios : [];
+    const scenarios = Array.isArray(snap?.scenarios) ? snap.scenarios.map(s => (s && typeof s === 'object') ? s : {}) : [];
+    try {
+      if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
+        scenarios.forEach((sc) => {
+          const nm = (sc && sc.name) ? String(sc.name).trim() : '';
+          if(!nm) return;
+          const flowState = window.coretgGetSavedFlowStateForScenario(nm);
+          if(flowState) sc.flow_state = flowState;
+        });
+      }
+    } catch (e) {}
     const core = (snap && typeof snap === 'object') ? (snap.core || null) : null;
     const active_index = Number.isInteger(snap?.active_index) ? snap.active_index : null;
     const project_key_hint = (snap && typeof snap === 'object' && snap.project_key_hint) ? String(snap.project_key_hint) : '';
@@ -708,9 +793,106 @@
     return { scenarios, core, active_index, project_key_hint, scenario_query };
   }
 
-  async function saveXmlViaApi(){
+  function buildTopologySignature(payload){
+    try {
+      if (!payload || typeof payload !== 'object') return null;
+      const cloned = JSON.parse(JSON.stringify(payload));
+      const seedMap = {};
+      if (cloned && Array.isArray(cloned.scenarios)) {
+        cloned.scenarios.forEach((sc) => {
+          if (!sc || typeof sc !== 'object') return;
+          try { delete sc.flow_state; } catch (e) {}
+          try { delete sc.plan_preview; } catch (e) {}
+          try { delete sc.planPreview; } catch (e) {}
+          try { delete sc.preview_plan; } catch (e) {}
+          try { delete sc.previewPlan; } catch (e) {}
+          try { delete sc.preview_plan_path; } catch (e) {}
+          try { delete sc.previewPlanPath; } catch (e) {}
+          try { delete sc.full_preview; } catch (e) {}
+          try { delete sc.fullPreview; } catch (e) {}
+          try { delete sc.preview; } catch (e) {}
+          try {
+            const nm = sc.name ? String(sc.name).trim() : '';
+            if (nm) {
+              const seedVal = getSeedForScenario(nm);
+              seedMap[nm] = seedVal !== null && seedVal !== undefined ? seedVal : null;
+            }
+          } catch (e) {}
+        });
+      }
+      return JSON.stringify({
+        scenarios: cloned.scenarios || [],
+        core: cloned.core || null,
+        active_index: cloned.active_index ?? null,
+        seeds: seedMap,
+      });
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function saveXmlViaApi(opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
+    const persistPreviewPlan = (options.persistPreviewPlan !== false) && (options.skipPreviewPlan !== true);
     let progressShown = false;
     let hideTimer = null;
+    const logInfoSafe = (msg) => {
+      try {
+        if (typeof window.logInfo === 'function') window.logInfo(msg);
+        else if (typeof logInfo === 'function') logInfo(msg);
+      } catch (e) {}
+    };
+    const logWarnSafe = (msg) => {
+      try {
+        if (typeof window.logWarn === 'function') window.logWarn(msg);
+        else if (typeof logWarn === 'function') logWarn(msg);
+      } catch (e) {}
+    };
+    const isAutosaveXmlPath = (value) => {
+      if (!value || typeof value !== 'string') return false;
+      const normalized = value.replace(/\\/g, '/');
+      return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+    };
+    const applyScenarioSavedPaths = (pathMap) => {
+      try {
+        if (!pathMap || !window.state || !Array.isArray(window.state.scenarios)) return;
+        const scenarios = window.state.scenarios;
+        if (Array.isArray(pathMap)) {
+          window.state.saved_xml_paths_by_index = pathMap.slice();
+          scenarios.forEach((scen, idx) => {
+            if (!scen || typeof scen !== 'object') return;
+            const path = (pathMap[idx] || '').toString().trim();
+            if (!path || !path.endsWith('.xml') || isAutosaveXmlPath(path)) return;
+            scen.saved_xml_path = path;
+          });
+          return;
+        }
+        if (typeof pathMap !== 'object') return;
+        const lookup = new Map();
+        Object.entries(pathMap).forEach(([key, val]) => {
+          const nameKey = normalizeScenarioKey(key || '');
+          const path = (typeof val === 'string') ? val.trim() : '';
+          if (nameKey && path && path.endsWith('.xml') && !isAutosaveXmlPath(path)) {
+            lookup.set(nameKey, path);
+          }
+        });
+        if (!lookup.size) return;
+        const indexPaths = Array.isArray(window.state.saved_xml_paths_by_index)
+          ? window.state.saved_xml_paths_by_index.slice()
+          : [];
+        scenarios.forEach((scen, idx) => {
+          if (!scen || typeof scen !== 'object') return;
+          const nameKey = normalizeScenarioKey(scen.name || '');
+          if (!nameKey || !lookup.has(nameKey)) return;
+          const path = lookup.get(nameKey);
+          scen.saved_xml_path = path;
+          indexPaths[idx] = path;
+        });
+        if (indexPaths.length) {
+          window.state.saved_xml_paths_by_index = indexPaths;
+        }
+      } catch (e) {}
+    };
     const safeHideProgress = (immediate) => {
       try {
         if (!progressShown || typeof window.coretgHideProgress !== 'function') return;
@@ -731,6 +913,16 @@
     } catch (e) {}
 
     try {
+
+    try {
+      const scen = resolveScenarioNameForSave();
+      logInfoSafe(`[xml-save] Save requested via API${scen ? ` (scenario: ${scen})` : ''}`);
+    } catch (e) {}
+    try {
+      if (typeof window.refreshXmlDockPreview === 'function') {
+        window.refreshXmlDockPreview({ force: true, preferSavedPath: true, awaitReady: true, reason: 'save-start' });
+      }
+    } catch (e) {}
 
     // If we're on the Topology page, we can concretize directly against live in-memory state.
     try {
@@ -805,6 +997,24 @@
     } catch (e) {}
 
     const payload = buildSaveXmlApiPayload();
+    const scenarioNameForSig = resolveScenarioNameForSave();
+    const topologySignature = buildTopologySignature(payload);
+    let topologyChanged = null;
+    try {
+      if (typeof previewState !== 'undefined' && previewState && typeof previewState.dirty === 'boolean') {
+        topologyChanged = !!previewState.dirty;
+      }
+    } catch (e) {}
+    if (topologyChanged === null) {
+      try {
+        const prevSig = scenarioNameForSig ? getTopologySignatureForScenario(scenarioNameForSig) : null;
+        if (prevSig && topologySignature) {
+          topologyChanged = prevSig !== topologySignature;
+        } else {
+          topologyChanged = false;
+        }
+      } catch (e) { topologyChanged = false; }
+    }
     if (!Array.isArray(payload.scenarios) || !payload.scenarios.length) {
       throw new Error('No scenarios available to save.');
     }
@@ -818,11 +1028,24 @@
     const xmlPath = (data && data.result_path) ? String(data.result_path) : '';
     if (!xmlPath) throw new Error('Save succeeded but returned no result_path.');
 
+    try { logInfoSafe(`[xml-save] save_xml_api ok; result_path=${xmlPath}`); } catch (e) {}
+    if (data && data.scenario_paths_by_index) {
+      try { applyScenarioSavedPaths(data.scenario_paths_by_index); } catch (e) {}
+      try { logInfoSafe('[xml-save] Applied per-scenario saved XML paths (by index)'); } catch (e) {}
+    }
+    if (data && data.scenario_paths) {
+      try { applyScenarioSavedPaths(data.scenario_paths); } catch (e) {}
+      try { logInfoSafe('[xml-save] Applied per-scenario saved XML paths (by name)'); } catch (e) {}
+    }
+
     // Remember the latest saved XML path for this scenario so other tabs (Preview/Flow)
     // can refer to the same snapshot.
     try {
       const scenarioName = resolveScenarioNameForSave();
-      if (scenarioName) setLatestXmlPathForScenario(scenarioName, xmlPath);
+      if (scenarioName) {
+        setLatestXmlPathForScenario(scenarioName, xmlPath);
+        try { syncScenarioTabLinks(scenarioName); } catch (e) {}
+      }
     } catch (e) {}
 
     // Topology workflow: after saving from Topology, turn the fixed "Preview" button into "Continue"
@@ -845,50 +1068,88 @@
       if (scenarioName) ensureSeedForScenario(scenarioName);
     } catch (e) {}
 
-    // Always persist a fresh preview plan after Save XML so the Preview tab cannot
-    // display stale cached results from an older XML snapshot.
-    try {
+    if (persistPreviewPlan) {
+      // Always persist a fresh flow plan after Save XML so Preview/Flow stay aligned
+      // and cannot display stale cached results from an older XML snapshot.
       try {
-        if (typeof window.coretgUpdateProgress === 'function') {
-          window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting preview plan…', percent: 95 });
-        }
-      } catch (e) {}
-      const scenarioName = resolveScenarioNameForSave();
-      if (scenarioName && typeof window.coretgPostJson === 'function') {
-        let seed = null;
         try {
-          if (typeof window.coretgGetSeedForScenario === 'function') {
-            seed = window.coretgGetSeedForScenario(scenarioName);
-          }
-        } catch (e) { seed = null; }
-
-        const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', {
-          xml_path: xmlPath,
-          scenario: scenarioName,
-          seed,
-        });
-
-        try {
-          if (persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
-            window.coretgSetSeedForScenario(scenarioName, persisted.seed);
+          if (typeof window.coretgUpdateProgress === 'function') {
+            window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting flow plan…', percent: 95 });
           }
         } catch (e) {}
+        const scenarioName = resolveScenarioNameForSave();
+        const postFn = (typeof window.coretgPostJson === 'function') ? window.coretgPostJson : postJson;
+        if (scenarioName && typeof postFn === 'function') {
+          let seed = null;
+          try {
+            if (typeof window.coretgGetSeedForScenario === 'function') {
+              seed = window.coretgGetSeedForScenario(scenarioName);
+            }
+          } catch (e) { seed = null; }
 
-        const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
-        if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
-          window.coretgSetPreviewPlanPathForScenario(scenarioName, previewPlan);
+          const persisted = await postFn('/api/plan/persist_flow_plan', {
+            xml_path: xmlPath,
+            scenario: scenarioName,
+            seed,
+          });
+
+          try {
+            if (persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
+              window.coretgSetSeedForScenario(scenarioName, persisted.seed);
+            }
+          } catch (e) {}
+
+          const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
+          if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scenarioName, previewPlan);
+          }
+          try { logInfoSafe(`[xml-save] Persisted flow plan for scenario ${scenarioName}`); } catch (e) {}
+        } else {
+          try { logWarnSafe('[xml-save] Skipped flow plan persistence (scenario or postJson unavailable)'); } catch (e) {}
+        }
+      } catch (e) {
+        // Best-effort: if flow-plan persistence failed, clear any stored plan path so
+        // Preview will fall back to re-rendering from the latest XML path.
+        try {
+          const scenarioName = resolveScenarioNameForSave();
+          if (scenarioName && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scenarioName, '');
+          }
+        } catch (_) {}
+      }
+    }
+
+    // If a saved Flag Sequencing chain exists, persist it against the latest preview plan.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      const flowState = (scenarioName && typeof window.coretgGetSavedFlowStateForScenario === 'function')
+        ? window.coretgGetSavedFlowStateForScenario(scenarioName)
+        : null;
+      if (scenarioName && flowState && Array.isArray(flowState.chain_ids) && flowState.chain_ids.length) {
+        const chain_ids = flowState.chain_ids;
+        const flag_assignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : null;
+        const fallback_assignments = !flag_assignments ? chain_ids.map((nid) => ({ node_id: String(nid || ''), id: '' })) : null;
+        const previewPlan = (typeof window.coretgGetPreviewPlanPathForScenario === 'function')
+          ? window.coretgGetPreviewPlanPathForScenario(scenarioName)
+          : '';
+        if ((flag_assignments || fallback_assignments) && previewPlan && typeof window.coretgPostJson === 'function') {
+          await window.coretgPostJson('/api/flag-sequencing/save_flow_substitutions', {
+            scenario: scenarioName,
+            chain_ids,
+            preview_plan: previewPlan,
+            flag_assignments: flag_assignments || fallback_assignments,
+            allow_node_duplicates: !!flowState.allow_node_duplicates,
+            initial_facts: flowState.initial_facts || null,
+            goal_facts: flowState.goal_facts || null,
+          });
+          try {
+            if (typeof window.coretgSetFlowDirtyForScenario === 'function') {
+              window.coretgSetFlowDirtyForScenario(scenarioName, false);
+            }
+          } catch (_) {}
         }
       }
-    } catch (e) {
-      // Best-effort: if preview-plan persistence failed, clear any stored preview plan
-      // path so Preview will fall back to re-rendering from the latest XML path.
-      try {
-        const scenarioName = resolveScenarioNameForSave();
-        if (scenarioName && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
-          window.coretgSetPreviewPlanPathForScenario(scenarioName, '');
-        }
-      } catch (_) {}
-    }
+    } catch (e) {}
 
     // If a saved Flag Sequencing chain exists for this scenario, changing and saving
     // topology/VM settings can make the chain stale. Mark it dirty so Preview can
@@ -900,9 +1161,17 @@
         const flowState = (typeof window.coretgGetSavedFlowStateForScenario === 'function')
           ? window.coretgGetSavedFlowStateForScenario(scenarioName)
           : null;
-        if (flowState && typeof flowState === 'object') {
+        if (flowState && typeof flowState === 'object' && topologyChanged === true) {
           setFlowDirtyForScenario(scenarioName, true, 'topology_saved_after_flow', xmlPath);
         }
+      }
+    } catch (e) {}
+
+    // Record the latest topology signature for this scenario.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      if (scenarioName && topologySignature) {
+        setTopologySignatureForScenario(scenarioName, topologySignature);
       }
     } catch (e) {}
 
@@ -938,9 +1207,29 @@
         window.coretgUpdateProgress({ title: 'Saving XML', message: 'Done.', percent: 100 });
       }
     } catch (e) {}
+    try {
+      if (typeof window.refreshXmlDockPreview === 'function') {
+        window.refreshXmlDockPreview({ force: true, preferSavedPath: true, reason: 'save-complete' });
+      }
+    } catch (e) {}
+    try {
+      if (window.previewState && typeof window.previewState === 'object') {
+        window.previewState.xmlSaved = true;
+        window.previewState.dirty = false;
+      }
+      if (typeof window.setXmlPreviewSavedSignature === 'function' && typeof window.buildXmlPreviewSignature === 'function') {
+        window.setXmlPreviewSavedSignature(window.buildXmlPreviewSignature());
+      } else if (typeof window.noteXmlPreviewSavedSignature === 'function') {
+        window.noteXmlPreviewSavedSignature();
+      }
+      if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+        window.coretgAllowUnsavedNavOnce();
+      }
+    } catch (e) {}
     safeHideProgress(false);
     return xmlPath;
     } catch (err) {
+      try { logWarnSafe(`[xml-save] Save failed: ${err?.message || err}`); } catch (e) {}
       safeHideProgress(true);
       throw err;
     }
@@ -957,6 +1246,11 @@
         const msg = 'Topology was saved after a Flag Sequencing chain was created for this scenario.\n\nOpen Flag Sequencing to review/update the chain before Preview?';
         const goFlow = confirm(msg);
         if (goFlow) {
+          try {
+            if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+              window.coretgAllowUnsavedNavOnce();
+            }
+          } catch (e) {}
           window.location.href = '/scenarios/flag-sequencing?scenario=' + encodeURIComponent(scenario);
           return;
         }
@@ -965,6 +1259,11 @@
 
     const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
     const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '');
+    try {
+      if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+        window.coretgAllowUnsavedNavOnce();
+      }
+    } catch (e) {}
     window.location.href = url;
   }
 

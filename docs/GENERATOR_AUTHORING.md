@@ -10,6 +10,26 @@ Both families share the same runtime output contract: a machine-readable `output
 AI prompt templates (copy/paste):
 - [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md)
 
+## 0) AI scaffolding quickstart
+
+If you are using AI to create generators, use this minimal handoff packet:
+
+- `manifest.yaml` (or at least `id`, `kind`, `runtime`, `inputs`, `artifacts`, `injects`, `hint_templates`)
+- scaffolded `generator.py`
+- expected artifact keys (`requires`, `optional_requires`, `produces`)
+- explicit statement of required vs optional runtime inputs
+
+Recommended prompt flow:
+
+1. Ask AI to update only `generator.py`.
+2. Ask AI to self-check output keys against manifest `artifacts.produces`.
+3. Ask AI to update `manifest.yaml` only if output keys changed.
+4. Run local `scripts/run_flag_generator.py` test.
+5. Run installed-pack Execute parity check.
+
+Use the copy/paste templates in [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md).
+If you are using desktop chat tools, follow [Using ChatGPT or Claude Desktop](AI_PROMPT_TEMPLATES.md#using-chatgpt-or-claude-desktop).
+
 ---
 
 ## 1) How generators are discovered
@@ -66,17 +86,18 @@ inputs:
 
 artifacts:
   requires: []
+  optional_requires: []
   produces:
-    - flag
-    - ssh.username
-    - ssh.password
+    - Flag(flag_id)
+    - Credential(user)
+    - Credential(user, password)
 
 hint_templates:
-  - "Next: use {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"
+  - "Next: use {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}"
 
 # If you produce files/binaries that should be safe to mount into other containers.
 injects:
-  - filesystem.file
+  - File(path)
 
 # Optional fixed env vars passed to the runtime.
 env:
@@ -85,8 +106,8 @@ env:
 
 Notes:
 - `kind` must be `flag-generator` or `flag-node-generator`.
-- `inputs` is a list of input descriptors (used by UI forms and Flow).
-- `artifacts.requires` / `artifacts.produces` drive Flow dependency chaining.
+- `inputs` is a list of input descriptors (used by UI forms and Flow). If `required` is omitted, it defaults to `true`.
+- `artifacts.requires` / `artifacts.optional_requires` / `artifacts.produces` drive Flow dependency chaining.
 
 ### Input types (mandatory convention)
 Generator input `type` values are normalized to a small canonical set. If your manifest omits `type` or uses an unknown value, it **falls back to** `string`.
@@ -134,7 +155,7 @@ Minimum valid `outputs.json`:
 {
   "generator_id": "<some string>",
   "outputs": {
-    "flag": "FLAG{...}"
+    "Flag(flag_id)": "FLAG{...}"
   }
 }
 ```
@@ -143,6 +164,9 @@ Practical guidance on `generator_id`:
 - The schema requires it, but it is currently treated as provenance/metadata.
 - If your generator can know the invoked generator ID, write that.
 - Otherwise, writing your source manifest ID is acceptable.
+
+Notes:
+- `outputs.json.outputs.Flag(flag_id)` is **required** by the schema.
 
 ---
 
@@ -159,12 +183,12 @@ How it works:
 `injects` entries can be:
 
 - A relative path like `artifacts/my_binary` (prefix `artifacts/` is optional), or
-- An **output artifact key** like `filesystem.file` which is resolved via `outputs.json.outputs`.
+- An **output artifact key** like `File(path)` which is resolved via `outputs.json.outputs`.
 
 Optional destination directory syntax:
 
 - `artifacts/my_binary -> /opt/bin`
-- `filesystem.file => /var/tmp`
+- `File(path) => /var/tmp`
 
 If no destination is provided (or it fails validation), files default to `/tmp`.
 
@@ -181,14 +205,18 @@ Flow substitutions include:
 
 - `{{THIS_NODE_NAME}}`, `{{THIS_NODE_ID}}`
 - `{{NEXT_NODE_NAME}}`, `{{NEXT_NODE_ID}}`
+- `{{NEXT_NODE_IP}}` (when available)
 - `{{SCENARIO}}`
 - `{{OUTPUT.<key>}}` where `<key>` comes from `outputs.json.outputs`
 
 Example:
 
 ```
-Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}
+Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}
 ```
+
+Note:
+- Flow will automatically append an IP to `{{NEXT_NODE_NAME}}` when a next-node IP is known, even if `{{NEXT_NODE_IP}}` is not explicitly present.
 
 ---
 
@@ -224,6 +252,48 @@ python scripts/run_flag_generator.py \
 cat /tmp/nodegen_test/docker-compose.yml
 cat /tmp/nodegen_test/outputs.json
 ```
+
+### Test/Execute parity checklist (important)
+
+When a generator passes in the UI **Test** button but fails during **Execute**, it is usually a runtime-parity issue.
+
+Use this checklist before shipping a generator pack:
+
+1. **Run from installed source, not only repo-local**
+  - Install the pack via the Web UI and re-test from installed generators.
+  - Execute uses installed generators as source-of-truth in normal workflows.
+
+2. **Avoid function-local imports in code that defines nested helpers**
+  - In Python, `import json` / `import sys` inside a function can create closure shadowing issues for nested functions.
+  - Prefer module-level imports for `json`, `sys`, and other shared modules.
+
+3. **Do not rely on internet/package-manager availability at runtime**
+  - Keep runtime resilient if `apt/apk/dnf/yum` is unavailable.
+  - Treat package installation as best-effort, not a hard dependency for basic generator output.
+
+4. **Keep runtime paths deterministic**
+  - Write outputs under `/outputs` and reference artifacts relative to `outputs.json`.
+  - For injectables, emit stable artifact paths and use manifest `injects` keys that resolve to real files.
+
+5. **Validate both execution modes when possible**
+  - UI Test run (local web process)
+  - UI Test run (remote CORE VM via SSH, when configured)
+  - Full Execute run (remote CORE path)
+  - Compare logs if behavior diverges.
+
+6. **Require explicit failure signals**
+  - Non-zero exit on true failure.
+  - Populate `outputs.json` only when outputs are valid.
+7. **Preserve CORE compose compatibility for node generators**
+  - Avoid `${...}` expressions in generated compose files.
+  - Prefer protocol/runtime designs that work without Docker default networking.
+  - Keep service script paths robust for relative chmod behavior.
+
+### AI scaffolding prompt addendum
+
+If you use AI to scaffold a generator, include this in your prompt:
+
+> Generate a manifest-based generator that is parity-safe between local Test and remote Execute. Use module-level imports only (no function-local `import json/sys` in enclosing scopes with nested helpers), avoid hard dependency on internet/package-manager availability, write deterministic `/outputs/outputs.json`, and ensure `injects` paths resolve to real files. Include a quick local run command and an installed-pack verification checklist.
 
 ---
 
