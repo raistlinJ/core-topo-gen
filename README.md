@@ -44,14 +44,14 @@ View the WebUI images gallery [`docs/screenshots.md`](docs/screenshots.md).
 
 ### Prerequisites
 - Python 3.10+ (3.11 recommended)
+- [uv](https://docs.astral.sh/uv/)
 - [CORE](https://www.nrl.navy.mil/Our-Work/Areas-of-Research/CORE/) 9.2 or newer with `core-daemon` running
 - Docker (optional) for nginx reverse proxy or vulnerability compose targets
 
 ### Install dependencies
+Using **uv**:
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync --extra dev
 ```
 
 ### Launch the Web UI
@@ -65,8 +65,9 @@ docker compose up -d --build
 - HITL editor note: the “Attach to” dropdown offers `Existing Router`, `Existing Switch`, or `New Router`. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
 
 ### Run the CLI
+With **uv**:
 ```bash
-python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
+uv run python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
 ```
 Popular options:
 - `--scenario NAME` pick a specific scenario entry
@@ -221,3 +222,8 @@ These are general constraints that affect generator authoring and “docker vuln
 
 ## Contributing
 Pull requests and issue reports are welcome! Please run the relevant pytest targets (`pytest -q`) before submitting changes and keep documentation up to date when behaviour changes.
+
+If using uv, run tests with:
+```bash
+uv run pytest -q
+```
