@@ -33,5 +33,6 @@ def test_ensure_default_route_for_docker_prunes_traffic(monkeypatch):
 
     topology._ensure_default_route_for_docker(object(), _Node())
 
-    assert ("ensure", 34, "DefaultRoute") in calls
+    assert ("remove", 34, "DefaultRoute") in calls
+    assert ("ensure", 34, "DockerDefaultRoute") in calls
     assert ("remove", 34, "Traffic") in calls

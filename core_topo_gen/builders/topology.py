@@ -813,6 +813,15 @@ def _docker_default_route_enabled() -> bool:
     return val not in ('0', 'false', 'False', '')
 
 
+def _docker_default_route_service_name() -> str:
+    """Service name to use for Docker node default route management."""
+    raw = os.getenv('CORETG_DOCKER_DEFAULT_ROUTE_SERVICE')
+    if raw is None:
+        return 'DockerDefaultRoute'
+    name = str(raw).strip()
+    return name if name else 'DockerDefaultRoute'
+
+
 def _docker_traffic_service_enabled() -> bool:
     """Whether Docker nodes should keep CORE's Traffic service.
 
@@ -1149,9 +1158,14 @@ def _is_docker_node_type(node_type: object) -> bool:
 
 def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
     """Ensure DefaultRoute service is present on a DOCKER node (best-effort)."""
+    route_service = _docker_default_route_service_name()
     if _docker_default_route_enabled():
         try:
-            ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
+            remove_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
+        except Exception:
+            pass
+        try:
+            ensure_service(session, getattr(node_obj, 'id'), route_service, node_obj=node_obj)
         except Exception:
             pass
     if not _docker_traffic_service_enabled():
@@ -1168,6 +1182,7 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
     earlier service additions. This final pass makes DefaultRoute a last-write-wins policy for Docker.
     """
     add_default_route = _docker_default_route_enabled()
+    route_service = _docker_default_route_service_name()
     if not add_default_route:
         return
     for node in node_objs:
@@ -1180,14 +1195,19 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
                 continue
             if add_default_route:
                 try:
-                    ensure_service(session, node_id, "DefaultRoute", node_obj=node)
+                    remove_service(session, node_id, "DefaultRoute", node_obj=node)
+                except Exception:
+                    pass
+                try:
+                    ensure_service(session, node_id, route_service, node_obj=node)
                 except Exception:
                     continue
                 try:
-                    if not has_service(session, node_id, "DefaultRoute", node_obj=node):
+                    if not has_service(session, node_id, route_service, node_obj=node):
                         logger.info(
-                            "DefaultRoute not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
+                            "%s not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
                             "this can be a CORE service readback limitation for Docker nodes",
+                            route_service,
                             node_id,
                             getattr(node, 'name', None),
                             context,

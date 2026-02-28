@@ -17190,6 +17190,20 @@
         return li;
     }
 
+    function normalizeExecuteRunErrorMessage(value) {
+        try {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            const lower = raw.toLowerCase();
+            if (lower.includes('did not reach runtime') && lower.includes('state=configuration')) {
+                return 'CORE session stayed in "configuration"';
+            }
+            return raw;
+        } catch (e) {
+            return String(value || '').trim();
+        }
+    }
+
     function renderExecuteSummary(success) {
         ensureExecuteSummaryElements();
         if (!executeSummaryListEl || !executeSummaryStatusEl) return;
@@ -17232,8 +17246,8 @@
         }
         const runReturnCode = Number.isFinite(Number(runStatus?.returncode)) ? Number(runStatus.returncode) : null;
         const runFailed = (success === false) || (runReturnCode !== null && runReturnCode !== 0);
-        const runError = (runStatus?.error || summary.error || '').toString().trim();
-        const runErrorDetail = (runStatus?.error_detail || '').toString().trim();
+        const runError = normalizeExecuteRunErrorMessage(runStatus?.error || summary.error || '');
+        const runErrorDetail = normalizeExecuteRunErrorMessage(runStatus?.error_detail || '');
         const runFailureDetails = [];
         if (runError) runFailureDetails.push(runError);
         if (runErrorDetail && runErrorDetail !== runError) runFailureDetails.push(runErrorDetail);
@@ -17442,8 +17456,10 @@
         lines.push('CORE TopoGen Execute Summary');
         if (runFailed) {
             lines.push('Run status: FAILED during initialization/execution');
-            if (runStatus?.error) lines.push(`Run error: ${runStatus.error}`);
-            if (runStatus?.error_detail) lines.push(`Run detail: ${runStatus.error_detail}`);
+            const runError = normalizeExecuteRunErrorMessage(runStatus?.error || '');
+            const runDetail = normalizeExecuteRunErrorMessage(runStatus?.error_detail || '');
+            if (runError) lines.push(`Run error: ${runError}`);
+            if (runDetail) lines.push(`Run detail: ${runDetail}`);
             if (runStatus?.error_code) lines.push(`Run code: ${runStatus.error_code}`);
             lines.push(`Return code: ${runReturnCode}`);
         }
@@ -22515,11 +22531,24 @@
                 }
                 const line = ev.data || '';
                 runProgressLogLine(line);
+                try {
+                    const m = /Process finished with exit code\s+(-?\d+)/i.exec(String(line || ''));
+                    if (m) {
+                        const rc = Number(m[1]);
+                        if (Number.isFinite(rc)) {
+                            const statusText = rc === 0 ? 'Scenario started' : 'Finished with errors';
+                            const metaText = `Process finished with exit code ${rc}`;
+                            updateRunStatus(statusText, metaText);
+                            markRunProgressComplete();
+                        }
+                    }
+                } catch (e) { }
             };
             runProgressEvtSrc.addEventListener('end', () => {
                 waitingForRemoteLogs = false;
                 try { runProgressEvtSrc.close(); } catch (e) { }
                 try { localStorage.removeItem('coretg_active_run_id'); } catch (e) { }
+                try { markRunProgressComplete(); } catch (e) { }
                 logInfo('Run (modal) ended');
             });
             // Poll for completion and update meta

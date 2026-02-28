@@ -8529,7 +8529,7 @@
       }
 
       setStatus('Starting async execution…', false);
-      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario, flow_enabled: !!flowEnabled });
+      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, scenario, flow_enabled: !!flowEnabled });
       const runId = runData && runData.run_id ? String(runData.run_id) : '';
       if (runId) {
         setStatus('Run started: ' + runId + ' (see Core/Reports pages).', false);

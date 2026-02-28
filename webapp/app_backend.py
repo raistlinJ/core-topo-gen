@@ -5912,6 +5912,7 @@ def _install_custom_services_to_core_vm(
     *,
     sudo_password: str | None,
     logger: logging.Logger,
+    core_cfg: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Copy repo-provided CORE custom services to the remote CORE VM.
 
@@ -5976,16 +5977,154 @@ def _install_custom_services_to_core_vm(
                 pass
 
     # Discover the remote core.services directory (where CORE loads service modules).
-    probe = (
-        "python3 -c \"import os, core.services; print(os.path.dirname(core.services.__file__))\" 2>/dev/null "
-        "|| python -c \"import os, core.services; print(os.path.dirname(core.services.__file__))\" 2>/dev/null"
-    )
-    code, out, err = _exec(f"sh -c {shlex.quote(probe)}", timeout=20.0)
-    services_dir = (out or '').strip().splitlines()[-1].strip() if (out or '').strip() else ''
-    if not services_dir:
-        raise RuntimeError(f'Failed to locate remote core.services directory (probe exit={code}): {(err or out or "").strip()}')
+    candidates: list[str] = []
+    try:
+        if core_cfg:
+            for cand in _candidate_remote_python_interpreters(core_cfg):
+                c = str(cand or '').strip()
+                if c and c not in candidates:
+                    candidates.append(c)
+    except Exception:
+        pass
+    for c in ('core-python', '/opt/core/venv/bin/python', 'python3', 'python'):
+        if c not in candidates:
+            candidates.append(c)
 
-    logger.info('[core] Installing custom services into %s', services_dir)
+    services_dirs: list[str] = []
+    core_conf_custom_services_dirs: list[str] = []
+    core_conf_custom_services_lines: list[str] = []
+    core_conf_readable: Optional[bool] = None
+    core_conf_path: Optional[str] = None
+
+    def _parse_core_conf_custom_services_dirs(raw_text: str) -> list[str]:
+        out: list[str] = []
+        if not raw_text:
+            return out
+        try:
+            lines = str(raw_text or '').splitlines()
+        except Exception:
+            return out
+        for line in lines:
+            txt = str(line or '').strip()
+            if not txt:
+                continue
+            if txt.startswith('__CORECONF_'):
+                continue
+            if '=' in txt:
+                _lhs, rhs = txt.split('=', 1)
+            else:
+                rhs = txt
+            rhs = rhs.strip().strip('"').strip("'")
+            if not rhs:
+                continue
+            cleaned = rhs.strip()
+            if cleaned.startswith('[') and cleaned.endswith(']'):
+                cleaned = cleaned[1:-1].strip()
+            parts = [p.strip().strip('"').strip("'") for p in re.split(r'[,;:]', cleaned)]
+            for p in parts:
+                if not p:
+                    continue
+                p = os.path.expandvars(p)
+                base_name = os.path.basename(p.rstrip('/'))
+                if base_name.lower() == 'core.conf' or p.lower().endswith('.conf'):
+                    continue
+                if p.startswith('~'):
+                    # Use shell expansion on remote at install-time; keep here for de-dupe readability.
+                    pass
+                if p not in out:
+                    out.append(p)
+        return out
+    probe_details: list[str] = []
+    last_code: Optional[int] = None
+    last_err = ''
+    for interp in candidates:
+        probe = f"timeout 15s {shlex.quote(interp)} -c \"import os, core.services; print(os.path.dirname(core.services.__file__))\""
+        code, out, err = _exec(f"sh -c {shlex.quote(probe)}", timeout=20.0)
+        last_code = code
+        out_text = (out or '').strip()
+        err_text = (err or '').strip()
+        probe_details.append(
+            f"{interp}:exit={code},stdout={_summarize_for_log(out_text, limit=120)},stderr={_summarize_for_log(err_text, limit=120)}"
+        )
+        if code == 0 and out_text:
+            cand_dir = out_text.splitlines()[-1].strip()
+            if cand_dir and cand_dir not in services_dirs:
+                services_dirs.append(cand_dir)
+        if err_text or out_text:
+            last_err = err_text or out_text
+
+    # Also include custom service directories configured in core.conf.
+    # Prefer /opt/core/etc/core.conf (CORE install layout), then fallback to /etc/core/core.conf.
+    try:
+        conf_probe_cmd = (
+            "conf=''; "
+            "if [ -r /opt/core/etc/core.conf ]; then conf='/opt/core/etc/core.conf'; "
+            "elif [ -r /etc/core/core.conf ]; then conf='/etc/core/core.conf'; fi; "
+            "if [ -n \"$conf\" ]; then "
+            "echo '__CORECONF_PATH__='$conf; "
+            "echo '__CORECONF_READABLE__=1'; "
+            "grep -Ei '^[[:space:]]*(custom_services|custom_services_dir|custom_service_dir|custom_services_dirs)[[:space:]]*=' \"$conf\" || true; "
+            "else echo '__CORECONF_READABLE__=0'; "
+            "fi"
+        )
+        conf_code, conf_out, conf_err = _exec(f"sh -c {shlex.quote(conf_probe_cmd)}", timeout=12.0)
+        for raw_line in str(conf_out or '').splitlines():
+            normalized = str(raw_line or '').strip()
+            if normalized.startswith('__CORECONF_PATH__='):
+                path_val = normalized.split('=', 1)[1].strip()
+                core_conf_path = path_val or None
+                continue
+            if normalized == '__CORECONF_READABLE__=1':
+                core_conf_readable = True
+                continue
+            if normalized == '__CORECONF_READABLE__=0':
+                core_conf_readable = False
+                continue
+            if normalized and normalized not in core_conf_custom_services_lines:
+                core_conf_custom_services_lines.append(normalized)
+        if core_conf_readable is None:
+            if core_conf_custom_services_lines:
+                core_conf_readable = True
+            elif conf_code == 0:
+                core_conf_readable = False
+        conf_dirs = _parse_core_conf_custom_services_dirs(conf_out or '')
+        for conf_dir in conf_dirs:
+            if conf_dir and conf_dir not in core_conf_custom_services_dirs:
+                core_conf_custom_services_dirs.append(conf_dir)
+        for conf_dir in conf_dirs:
+            if conf_dir and conf_dir not in services_dirs:
+                services_dirs.append(conf_dir)
+        if conf_code != 0 and (conf_err or conf_out):
+            logger.debug('[core] core.conf custom_services probe non-fatal: %s', (conf_err or conf_out).strip())
+    except Exception:
+        pass
+
+    # Also include the active core-daemon runtime services path when available.
+    try:
+        daemon_probe = (
+            "pid=$(pgrep -x core-daemon 2>/dev/null | head -n1 || true); "
+            "if [ -n \"$pid\" ]; then "
+            "cwd=$(readlink -f /proc/$pid/cwd 2>/dev/null || true); "
+            "if [ -n \"$cwd\" ] && [ -d \"$cwd/core/services\" ]; then echo \"$cwd/core/services\"; fi; "
+            "fi"
+        )
+        d_code, d_out, d_err = _exec(f"sh -c {shlex.quote(daemon_probe)}", timeout=10.0)
+        d_path = str(d_out or '').strip().splitlines()[-1].strip() if str(d_out or '').strip() else ''
+        if d_path and d_path not in services_dirs:
+            services_dirs.append(d_path)
+        if d_code != 0 and (d_err or d_out):
+            logger.debug('[core] daemon services-path probe non-fatal: %s', (d_err or d_out).strip())
+    except Exception:
+        pass
+
+    if not services_dirs:
+        raise RuntimeError(
+            "Failed to locate remote core.services directory "
+            f"(probe exit={last_code if last_code is not None else 'n/a'}): "
+            f"{_summarize_for_log(last_err, limit=240)} | probes={'; '.join(probe_details[-6:])}"
+        )
+
+    logger.info('[core] Installing custom services into %s', ', '.join(services_dirs))
 
     # Upload files to a temp directory first.
     tmp_dir = '/tmp/coretg_custom_services'
@@ -6003,11 +6142,15 @@ def _install_custom_services_to_core_vm(
         except Exception:
             pass
 
-    # Install into core.services directory.
-    install_cmd = f"install -m 0644 {tmp_dir}/*.py {shlex.quote(services_dir)}/"
-    code, out, err = _sudo(install_cmd, timeout=45.0)
-    if code != 0:
-        raise RuntimeError(f'Failed installing custom services (exit={code}): {(err or out or "").strip()}')
+    # Install into all discovered core.services directories.
+    install_failures: list[str] = []
+    for services_dir in services_dirs:
+        install_cmd = f"mkdir -p {shlex.quote(services_dir)} && install -m 0644 {tmp_dir}/*.py {shlex.quote(services_dir)}/"
+        code, out, err = _sudo(install_cmd, timeout=45.0)
+        if code != 0:
+            install_failures.append(f"{services_dir}: exit={code} detail={(err or out or '').strip()}")
+    if install_failures:
+        raise RuntimeError('Failed installing custom services: ' + ' | '.join(install_failures))
 
     # Restart (or start) core-daemon.
     restart_cmd = "systemctl restart core-daemon || systemctl start core-daemon"
@@ -6100,29 +6243,45 @@ def _install_custom_services_to_core_vm(
         """
     ).strip()
 
-    verify_cmd_py3 = textwrap.dedent(
-        f"""
-        cat <<'PY' | python3 -
-        {verify_script}
-        PY
-        """
-    ).strip()
-    verify_cmd_py = textwrap.dedent(
-        f"""
-        cat <<'PY' | python -
-        {verify_script}
-        PY
-        """
-    ).strip()
-    verify_cmd = f"{verify_cmd_py3} 2>/dev/null || {verify_cmd_py}"
-    code, out, err = _exec(f"sh -c {shlex.quote(verify_cmd)}", timeout=35.0)
+    verify_b64 = base64.b64encode(verify_script.encode('utf-8')).decode('ascii')
+    verify_exec = (
+        "import base64; "
+        f"exec(compile(base64.b64decode('{verify_b64}').decode('utf-8'), '<coretg-services-verify>', 'exec'))"
+    )
+    candidates: list[str] = []
+    try:
+        if core_cfg:
+            candidates = _candidate_remote_python_interpreters(core_cfg)
+    except Exception:
+        candidates = []
+    for c in ('core-python', '/opt/core/venv/bin/python', 'python3', 'python'):
+        if c not in candidates:
+            candidates.append(c)
+
+    code = 1
+    out = ''
+    err = ''
     marker = '::SERVICESCHECK::'
     payload_line = ''
-    for line in (out or '').splitlines():
-        if marker in line:
-            payload_line = line.strip()
+    probe_errors: list[str] = []
+    for interp in candidates:
+        verify_cmd = f"timeout 35s {shlex.quote(interp)} -c {shlex.quote(verify_exec)}"
+        code, out, err = _exec(f"sh -c {shlex.quote(verify_cmd)}", timeout=40.0)
+        for line in (out or '').splitlines():
+            if marker in line:
+                payload_line = line.strip()
+                break
+        if payload_line:
+            break
+        probe_errors.append(
+            f"{interp}:exit={code},stdout={_summarize_for_log((out or '').strip(), limit=120)},stderr={_summarize_for_log((err or '').strip(), limit=120)}"
+        )
     if not payload_line:
-        raise RuntimeError(f'Custom services verification did not produce expected output (exit={code}): {(err or out or "").strip()}')
+        detail = '; '.join(probe_errors[-6:])
+        raise RuntimeError(
+            "Custom services verification did not produce expected output "
+            f"(exit={code}): {(err or out or '').strip()} | probes={detail}"
+        )
     try:
         verify_payload = json.loads(payload_line.split(marker, 1)[1])
     except Exception as exc:
@@ -6131,11 +6290,106 @@ def _install_custom_services_to_core_vm(
         raise RuntimeError(f'Custom services failed CORE discovery verification: {json.dumps(verify_payload, indent=2)}')
 
     return {
-        'services_dir': services_dir,
+        'services_dir': services_dirs[0] if services_dirs else None,
+        'services_dirs': services_dirs,
+        'core_conf_path': core_conf_path,
+        'core_conf_readable': core_conf_readable,
+        'core_conf_custom_services_dirs': core_conf_custom_services_dirs,
+        'core_conf_custom_services_lines': core_conf_custom_services_lines,
         'modules': module_names,
         'service_names': verify_payload.get('custom_service_names') if isinstance(verify_payload, dict) else None,
         'module_service_names': verify_payload.get('module_service_names') if isinstance(verify_payload, dict) else None,
     }
+
+
+def _remote_core_service_names(
+    ssh_client: Any,
+    *,
+    timeout: float = 25.0,
+    core_cfg: Optional[Dict[str, Any]] = None,
+) -> set[str]:
+    """Best-effort discovery of CORE service names available on a remote host."""
+    script = textwrap.dedent(
+        """
+        import importlib
+        import inspect
+        import json
+        import pkgutil
+        import core.services
+        try:
+            from core.services.base import CoreService  # type: ignore
+        except Exception:
+            from core.services.coreservices import CoreService  # type: ignore
+        names = set()
+        for m in pkgutil.iter_modules(core.services.__path__):
+            n = getattr(m, 'name', None)
+            if not n:
+                continue
+            try:
+                mod = importlib.import_module(f"core.services.{n}")
+            except Exception:
+                continue
+            for _name, obj in inspect.getmembers(mod, inspect.isclass):
+                try:
+                    ok = issubclass(obj, CoreService) and obj is not CoreService
+                except Exception:
+                    continue
+                if not ok:
+                    continue
+                svc = getattr(obj, 'name', None)
+                if isinstance(svc, str) and svc.strip():
+                    names.add(svc.strip())
+        print('::SERVICENAMES::' + json.dumps(sorted(names)))
+        """
+    ).strip()
+    script_b64 = base64.b64encode(script.encode('utf-8')).decode('ascii')
+    exec_b64 = (
+        "import base64; "
+        f"exec(compile(base64.b64decode('{script_b64}').decode('utf-8'), '<coretg-services-list>', 'exec'))"
+    )
+    candidates: list[str] = []
+    try:
+        if core_cfg:
+            candidates = _candidate_remote_python_interpreters(core_cfg)
+    except Exception:
+        candidates = []
+    for c in ('core-python', '/opt/core/venv/bin/python', 'python3', 'python'):
+        if c not in candidates:
+            candidates.append(c)
+
+    out_text = ''
+    for interp in candidates:
+        cmd = f"timeout {int(max(5, timeout))}s {shlex.quote(interp)} -c {shlex.quote(exec_b64)}"
+        stdin = stdout = stderr = None
+        try:
+            stdin, stdout, stderr = ssh_client.exec_command(f"sh -c {shlex.quote(cmd)}", timeout=timeout, get_pty=True)
+            out = stdout.read() if stdout else b''
+            err = stderr.read() if stderr else b''
+            rc = stdout.channel.recv_exit_status() if (stdout and hasattr(stdout, 'channel')) else 0
+            out_text = out.decode('utf-8', 'ignore') if isinstance(out, (bytes, bytearray)) else str(out or '')
+            _err_text = err.decode('utf-8', 'ignore') if isinstance(err, (bytes, bytearray)) else str(err or '')
+            if rc == 0 and '::SERVICENAMES::' in out_text:
+                break
+        except Exception:
+            continue
+        finally:
+            try:
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+    marker = '::SERVICENAMES::'
+    payload = ''
+    for line in (out_text or '').splitlines():
+        if marker in line:
+            payload = line.split(marker, 1)[1].strip()
+    if not payload:
+        return set()
+    try:
+        arr = json.loads(payload)
+    except Exception:
+        return set()
+    return {str(x).strip() for x in (arr or []) if str(x).strip()}
 
 
 def _ensure_remote_core_daemon_ready(
@@ -17819,14 +18073,13 @@ def api_flow_attackflow_preview():
         return 0.0
 
     # Planner owns preview plan generation; this endpoint only reads plans.
-
-    # If we loaded a preview plan (topology) but the user has a saved Flow chain,
-    # merge that Flow metadata into this payload so saved chain/assignments still apply.
+    # Canonicalize flow state from XML so readers do not diverge on metadata.flow.
     try:
-        meta0 = payload.get('metadata') if isinstance(payload, dict) else None
-        flow0 = (meta0 or {}).get('flow') if isinstance(meta0, dict) else None
-        if (not ignore_saved_flow) and (not isinstance(flow0, dict)):
-            _attach_latest_flow_into_plan_payload(payload, scenario=(scenario_label or scenario_norm))
+        _canonicalize_payload_flow_from_xml(
+            payload,
+            xml_path=preview_plan_path,
+            scenario_label=(scenario_label or scenario_norm),
+        )
     except Exception:
         pass
 
@@ -17841,6 +18094,10 @@ def api_flow_attackflow_preview():
             meta = payload.get('metadata') if isinstance(payload, dict) else None
             flow_meta = meta.get('flow') if isinstance(meta, dict) else None
             saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
+            if (not isinstance(saved_chain, list)) or (not saved_chain):
+                chain_ids_xml = flow_meta.get('chain_ids') if isinstance(flow_meta, dict) else None
+                if isinstance(chain_ids_xml, list) and chain_ids_xml:
+                    saved_chain = [{'id': str(x or '').strip()} for x in chain_ids_xml if str(x or '').strip()]
             saved_ids: list[str] = []
             if isinstance(saved_chain, list) and saved_chain:
                 for entry in saved_chain:
@@ -18009,135 +18266,15 @@ def api_flow_attackflow_preview():
     except Exception:
         flow_state_from_xml = None
     try:
-        meta = payload.get('metadata') if isinstance(payload, dict) else None
-        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
-        saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
-        if (not flag_assignments) and (not ignore_saved_flow) and isinstance(saved_assignments, list) and saved_assignments:
-            # Saved assignments are persisted positionally, aligned to the saved chain.
-            # Do not re-key by node_id; chains may intentionally contain duplicates.
-            try:
-                desired_len = len(chain_nodes or [])
-            except Exception:
-                desired_len = 0
-            if desired_len and len(saved_assignments) >= desired_len:
-                ordered: list[dict[str, Any]] = []
-                for i in range(desired_len):
-                    a = saved_assignments[i]
-                    if not isinstance(a, dict):
-                        ordered.append({})
-                        continue
-                    a2 = dict(a)
-                    try:
-                        a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
-                    except Exception:
-                        pass
-                    ordered.append(a2)
-                if all(isinstance(a, dict) and str(a.get('id') or '').strip() for a in ordered):
-                    flag_assignments = ordered
-                    try:
-                        flag_assignments = _flow_enrich_saved_flag_assignments(
-                            flag_assignments,
-                            chain_nodes,
-                            scenario_label=(scenario_label or scenario_norm),
-                        )
-                    except Exception:
-                        pass
-                    # Validate saved assignments against node eligibility (vuln vs docker).
-                    # If incompatible, discard and recompute assignments.
-                    try:
-                        try:
-                            gens_enabled, _ = _flag_generators_from_enabled_sources()
-                        except Exception:
-                            gens_enabled = []
-                        try:
-                            node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
-                        except Exception:
-                            node_gens_enabled = []
-                        flag_gen_ids: set[str] = set()
-                        node_gen_ids: set[str] = set()
-                        for g in (gens_enabled or []):
-                            if isinstance(g, dict):
-                                gid = str(g.get('id') or '').strip()
-                                if gid:
-                                    flag_gen_ids.add(gid)
-                        for g in (node_gens_enabled or []):
-                            if isinstance(g, dict):
-                                gid = str(g.get('id') or '').strip()
-                                if gid:
-                                    node_gen_ids.add(gid)
-
-                        vuln_ids: set[str] = set()
-                        try:
-                            hosts = preview.get('hosts') if isinstance(preview, dict) else None
-                            if isinstance(hosts, list):
-                                for h in hosts:
-                                    if not isinstance(h, dict):
-                                        continue
-                                    hid = str(h.get('node_id') or '').strip()
-                                    if not hid:
-                                        continue
-                                    vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
-                                    if vulns:
-                                        vuln_ids.add(hid)
-                        except Exception:
-                            vuln_ids = set()
-
-                        def _infer_kind(a: dict[str, Any]) -> str:
-                            try:
-                                k = str(a.get('type') or '').strip()
-                                if k:
-                                    return k
-                            except Exception:
-                                pass
-                            try:
-                                cat = str(a.get('generator_catalog') or '').strip().lower()
-                                if cat == 'flag_node_generators':
-                                    return 'flag-node-generator'
-                                if cat == 'flag_generators':
-                                    return 'flag-generator'
-                            except Exception:
-                                pass
-                            gid = str(a.get('id') or a.get('generator_id') or '').strip()
-                            if gid:
-                                if gid in node_gen_ids:
-                                    return 'flag-node-generator'
-                                if gid in flag_gen_ids:
-                                    return 'flag-generator'
-                            return ''
-
-                        invalid = False
-                        for i, a in enumerate(flag_assignments or []):
-                            if i >= len(chain_nodes):
-                                break
-                            node = chain_nodes[i] if i < len(chain_nodes) else {}
-                            if not isinstance(node, dict):
-                                continue
-                            nid = str(node.get('id') or '').strip()
-                            is_vuln_node = bool(node.get('is_vuln')) or bool(node.get('vulnerabilities')) or (nid in vuln_ids)
-                            is_docker_node = _flow_node_is_docker_role(node)
-                            kind = _infer_kind(a)
-                            if kind == 'flag-generator' and not is_vuln_node:
-                                invalid = True
-                                break
-                            if kind == 'flag-node-generator' and not (is_docker_node and (not is_vuln_node)):
-                                invalid = True
-                                break
-                        if invalid:
-                            flag_assignments = []
-                    except Exception:
-                        pass
+        # XML FlowState is the canonical source; no metadata.flow fallback.
+        pass
     except Exception:
         flag_assignments = []
 
     initial_facts_override: dict[str, list[str]] | None = None
     goal_facts_override: dict[str, list[str]] | None = None
     try:
-        flow_for_facts = None
-        if flow_state_from_xml and isinstance(flow_state_from_xml, dict):
-            flow_for_facts = flow_state_from_xml
-        if flow_for_facts is None:
-            meta_for_facts = payload.get('metadata') if isinstance(payload, dict) else None
-            flow_for_facts = meta_for_facts.get('flow') if isinstance(meta_for_facts, dict) else None
+        flow_for_facts = flow_state_from_xml if isinstance(flow_state_from_xml, dict) else None
         if isinstance(flow_for_facts, dict):
             initial_facts_override = _flow_normalize_fact_override(flow_for_facts.get('initial_facts'))
             goal_facts_override = _flow_normalize_fact_override(flow_for_facts.get('goal_facts'))
@@ -18725,6 +18862,11 @@ def api_flow_sequence_preview_plan():
         payload = _load_preview_payload_from_path(preview_plan_path, scenario_norm)
         if not isinstance(payload, dict):
             return jsonify({'ok': False, 'error': 'Preview plan not embedded in XML.'}), 422
+        _canonicalize_payload_flow_from_xml(
+            payload,
+            xml_path=preview_plan_path,
+            scenario_label=(scenario_label or scenario_norm),
+        )
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 422
 
@@ -19175,7 +19317,11 @@ def api_flow_prepare_preview_for_execute():
         payload = _load_preview_payload_from_path(base_plan_path, scenario_norm)
         if not isinstance(payload, dict):
             return jsonify({'ok': False, 'error': 'Preview plan not embedded in XML. Save XML with Preview first.'}), 404
-        meta = payload.get('metadata') if isinstance(payload, dict) else {}
+        meta, flow_state_for_prepare = _canonicalize_payload_flow_from_xml(
+            payload,
+            xml_path=base_plan_path,
+            scenario_label=(scenario_label or scenario_norm),
+        )
         preview = payload.get('full_preview') if isinstance(payload, dict) else None
         if not isinstance(preview, dict):
             return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
@@ -19222,8 +19368,12 @@ def api_flow_prepare_preview_for_execute():
         chain_ids_in = j.get('chain_ids')
         if (not chain_ids_in) and (not preset_steps):
             try:
-                flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+                flow_meta = flow_state_for_prepare if isinstance(flow_state_for_prepare, dict) else None
                 saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
+                if (not isinstance(saved_chain, list)) or (not saved_chain):
+                    chain_ids_xml = flow_meta.get('chain_ids') if isinstance(flow_meta, dict) else None
+                    if isinstance(chain_ids_xml, list) and chain_ids_xml:
+                        saved_chain = [{'id': str(x or '').strip()} for x in chain_ids_xml if str(x or '').strip()]
                 saved_ids: list[str] = []
                 if isinstance(saved_chain, list) and saved_chain:
                     for entry in saved_chain:
@@ -19539,7 +19689,7 @@ def api_flow_prepare_preview_for_execute():
     # Prefer saved Flow assignments if the caller passed a plan payload that
     # already includes metadata.flow) and it fully covers this chain.
     try:
-        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+        flow_meta = flow_state_for_prepare if isinstance(flow_state_for_prepare, dict) else None
         saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
         if isinstance(saved_assignments, list) and saved_assignments:
             # Saved assignments are persisted positionally, aligned with the saved chain.
@@ -32918,6 +33068,41 @@ def _read_flow_state_from_xml_path(xml_path: str, scenario_label: str | None) ->
     except Exception:
         return None
 
+
+def _canonicalize_payload_flow_from_xml(
+    payload: dict[str, Any] | None,
+    *,
+    xml_path: str,
+    scenario_label: str | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Force payload metadata.flow to mirror XML FlowState (single source of truth).
+
+    Returns (metadata_dict, flow_state_dict_or_none).
+    """
+    meta: dict[str, Any] = {}
+    if isinstance(payload, dict) and isinstance(payload.get('metadata'), dict):
+        try:
+            meta = dict(payload.get('metadata') or {})
+        except Exception:
+            meta = {}
+
+    flow_state = _flow_state_from_xml_path(xml_path, scenario_label)
+    if isinstance(flow_state, dict):
+        try:
+            meta['flow'] = dict(flow_state)
+        except Exception:
+            meta['flow'] = flow_state
+    else:
+        try:
+            if 'flow' in meta:
+                meta.pop('flow', None)
+        except Exception:
+            pass
+
+    if isinstance(payload, dict):
+        payload['metadata'] = meta
+    return meta, (flow_state if isinstance(flow_state, dict) else None)
+
     scenario_norm = _normalize_scenario_label(scenario_label or '')
     scen_el = None
     try:
@@ -38454,6 +38639,27 @@ def _validate_session_nodes_and_injects(
                 return p
             return d or p
 
+        def _second_chance_container_state(name: str) -> Dict[str, Any] | None:
+            try:
+                payload2 = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_injects_status_script(
+                        containers=[name],
+                        sudo_password=core_cfg.get('ssh_password'),
+                        inject_dirs=inject_dirs,
+                        max_find=50,
+                    ),
+                    logger=app.logger,
+                    label='docker.exec.injects_status.recheck',
+                    timeout=45.0,
+                )
+                items2 = payload2.get('items') if isinstance(payload2, dict) else None
+                if isinstance(items2, list) and items2 and isinstance(items2[0], dict):
+                    return items2[0]
+            except Exception:
+                return None
+            return None
+
         if inject_expected_by_node:
             inject_dirs = sorted({d for paths in inject_expected_by_node.values() for p in paths if p.startswith('/') for d in (_safe_inject_dir(p),) if d})
         else:
@@ -38503,9 +38709,27 @@ def _validate_session_nodes_and_injects(
                         err_text = str(it.get('state_error') or '').strip()
                         status_norm = status_text.lower()
                         startup_pending = bool(status_norm == 'created' and (exit_code_int in (None, 0)) and not err_text)
+                        if not startup_pending:
+                            it2 = _second_chance_container_state(name)
+                            if isinstance(it2, dict):
+                                if bool(it2.get('running')):
+                                    summary['docker_running'].append(name)
+                                    summary['injects_detail'].append(f"{name}: startup recovered after recheck")
+                                    continue
+                                status2 = str(it2.get('state_status') or '').strip().lower()
+                                exit2 = it2.get('state_exit_code')
+                                err2 = str(it2.get('state_error') or '').strip()
+                                try:
+                                    exit2_int = int(exit2) if exit2 is not None and str(exit2).strip() != '' else None
+                                except Exception:
+                                    exit2_int = None
+                                if status2 in {'created', 'restarting'}:
+                                    startup_pending = True
+                                elif status2 == 'exited' and (exit2_int in (0, 1, 137, 143)) and (not err2):
+                                    startup_pending = True
                         if startup_pending:
                             summary['docker_start_pending'].append(name)
-                            summary['injects_detail'].append(f"{name}: startup pending (created)")
+                            summary['injects_detail'].append(f"{name}: startup pending ({status_norm or 'created'})")
                         else:
                             summary['docker_not_running'].append(name)
                             nr_detail: Dict[str, Any] = {'container': name}
@@ -40114,6 +40338,73 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         _fail_run(f"Failed to ensure core-daemon is ready: {exc}", code=1)
         return
 
+    try:
+        required_custom_services = {"DockerDefaultRoute"}
+        install_custom_services_on_execute = bool(core_cfg.get('install_custom_services', True))
+        discovered = _remote_core_service_names(remote_client, core_cfg=core_cfg)
+        missing = sorted([name for name in required_custom_services if name not in discovered])
+        if install_custom_services_on_execute:
+            try:
+                if missing:
+                    log_f.write(f"{log_prefix}Missing custom services on CORE VM ({', '.join(missing)}); installing now...\n")
+                else:
+                    log_f.write(f"{log_prefix}Ensuring custom services are installed on CORE VM...\n")
+            except Exception:
+                pass
+            install_meta = _install_custom_services_to_core_vm(
+                remote_client,
+                sudo_password=core_cfg.get('ssh_password'),
+                logger=app.logger,
+                core_cfg=core_cfg,
+            )
+            try:
+                targets = install_meta.get('services_dirs') or []
+                if targets:
+                    log_f.write(f"{log_prefix}Custom services install targets: {', '.join([str(t) for t in targets])}\n")
+                conf_targets = install_meta.get('core_conf_custom_services_dirs') or []
+                if conf_targets:
+                    log_f.write(f"{log_prefix}core.conf custom_services dirs: {', '.join([str(t) for t in conf_targets])}\n")
+                else:
+                    log_f.write(f"{log_prefix}core.conf custom_services dirs: none found\n")
+                conf_readable = install_meta.get('core_conf_readable')
+                conf_path = str(install_meta.get('core_conf_path') or '').strip()
+                if conf_path:
+                    log_f.write(f"{log_prefix}core.conf path used: {conf_path}\n")
+                else:
+                    log_f.write(f"{log_prefix}core.conf path used: not found\n")
+                if conf_readable is True:
+                    log_f.write(f"{log_prefix}core.conf readable: yes\n")
+                elif conf_readable is False:
+                    log_f.write(f"{log_prefix}core.conf readable: no\n")
+                else:
+                    log_f.write(f"{log_prefix}core.conf readable: unknown\n")
+                conf_lines = install_meta.get('core_conf_custom_services_lines') or []
+                if conf_lines:
+                    log_f.write(f"{log_prefix}core.conf matching entries: {' | '.join([str(x) for x in conf_lines])}\n")
+                else:
+                    log_f.write(f"{log_prefix}core.conf matching entries: none found\n")
+            except Exception:
+                pass
+            discovered = _remote_core_service_names(remote_client, core_cfg=core_cfg)
+            missing = sorted([name for name in required_custom_services if name not in discovered])
+        if missing:
+            _fail_run(
+                f"Required custom CORE service(s) missing on remote host: {', '.join(missing)}. "
+                "In the VM / Access page, open CORE Connection and enable 'Install custom services', then re-run Execute.",
+                code=1,
+                extra={'error_code': 'missing_custom_services', 'missing_services': missing},
+            )
+            return
+    except Exception as exc:
+        _fail_run(
+            "Failed validating/installing custom services on remote CORE host: "
+            f"{exc}. In the VM / Access page, open CORE Connection and enable "
+            "'Install custom services', then re-run Execute.",
+            code=1,
+            extra={'error_code': 'custom_services_install_failed'},
+        )
+        return
+
     _sanitize_remote_compose_templates()
 
     try:
@@ -40647,7 +40938,9 @@ def run_cli_async():
         except Exception:
             preview_plan_path = None
 
-    if not flow_enabled:
+    if flow_enabled:
+        preview_plan_path = xml_path
+    else:
         preview_plan_path = None
 
     # If no preview plan path was provided (or it was rejected), but the user has
@@ -44137,11 +44430,16 @@ def test_core():
                         ssh_client,
                         sudo_password=cfg.get('ssh_password'),
                         logger=app.logger,
+                        core_cfg=cfg,
                     )
                     app.logger.info(
-                        '[core] Custom services installed: modules=%s target=%s',
+                        '[core] Custom services installed: modules=%s targets=%s core_conf_path=%s core_conf_readable=%s core_conf_dirs=%s core_conf_lines=%s',
                         ','.join(install_meta.get('modules') or []),
-                        install_meta.get('services_dir'),
+                        ','.join([str(x) for x in (install_meta.get('services_dirs') or [install_meta.get('services_dir')]) if x]),
+                        install_meta.get('core_conf_path'),
+                        install_meta.get('core_conf_readable'),
+                        ','.join([str(x) for x in (install_meta.get('core_conf_custom_services_dirs') or []) if x]) or 'none',
+                        ' | '.join([str(x) for x in (install_meta.get('core_conf_custom_services_lines') or []) if x]) or 'none',
                     )
                     try:
                         time.sleep(1.0)

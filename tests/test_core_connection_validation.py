@@ -233,7 +233,7 @@ def test_test_core_install_custom_services_triggers_installer(client, monkeypatc
 
     installer_calls = []
 
-    def _fake_installer(ssh_client, *, sudo_password, logger):
+    def _fake_installer(ssh_client, *, sudo_password, logger, core_cfg=None):
         installer_calls.append({'ssh_client': ssh_client, 'sudo_password': sudo_password})
         return {'services_dir': '/opt/core/services', 'modules': ['TrafficService']}
 

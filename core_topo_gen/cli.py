@@ -516,12 +516,14 @@ def _wait_for_docker_running(
     *,
     timeout_s: float = 30.0,
     poll_s: float = 0.5,
+    log_every_s: float = 10.0,
 ) -> dict[str, Any]:
     names = [str(n).strip() for n in (names or []) if str(n).strip()]
     names = sorted(set(names))
     if not names:
         return {'total': 0, 'running': [], 'not_running': [], 'items': []}
     deadline = time.time() + max(0.1, float(timeout_s))
+    next_log_at = time.time() + max(1.0, float(log_every_s or 10.0))
     last_items: list[dict[str, Any]] = []
     while time.time() < deadline:
         items = [_docker_container_state(nm) for nm in names]
@@ -535,6 +537,26 @@ def _wait_for_docker_running(
                 not_running.append(it.get('name'))
         if not not_running:
             return {'total': len(names), 'running': running, 'not_running': [], 'items': items}
+        now = time.time()
+        if now >= next_log_at:
+            try:
+                pending_status = []
+                for it in items:
+                    if it.get('running') is True:
+                        continue
+                    nm = str(it.get('name') or '').strip()
+                    st = str(it.get('status') or '').strip() or 'unknown'
+                    pending_status.append(f"{nm}({st})")
+                if pending_status:
+                    logging.info(
+                        "Waiting for Docker runtime (%d/%d running): %s",
+                        len(running),
+                        len(names),
+                        ", ".join(pending_status[:8]),
+                    )
+            except Exception:
+                pass
+            next_log_at = now + max(1.0, float(log_every_s or 10.0))
         time.sleep(max(0.05, float(poll_s)))
     # timeout
     not_running2 = []
@@ -589,6 +611,35 @@ def _tail_core_daemon_journal(*, lines: int = 200, since_seconds: int = 300) -> 
     return out or None
 
 
+def _should_collect_core_daemon_runtime_diag(start_error: str | None) -> bool:
+    txt = str(start_error or '').strip().lower()
+    if not txt:
+        return False
+    return (
+        ('did not reach runtime' in txt)
+        or ('stayed in "configuration"' in txt)
+        or ('state=configuration' in txt)
+    )
+
+
+def _extract_core_daemon_runtime_hint(journal_tail: str) -> str | None:
+    try:
+        lines = [str(x or '').strip() for x in str(journal_tail or '').splitlines()]
+    except Exception:
+        return None
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return None
+
+    for ln in reversed(lines):
+        if 'service does not exist' in ln.lower():
+            return ln
+    for ln in reversed(lines):
+        if 'core.errors.coreerror:' in ln.lower():
+            return ln
+    return None
+
+
 def _get_core_session_state(core: Any, session_id: int) -> str:
     try:
         sessions = core.get_sessions() or []
@@ -605,8 +656,41 @@ def _get_core_session_state(core: Any, session_id: int) -> str:
     return ''
 
 
+def _latest_core_daemon_session_state(session_id: int, *, lines: int = 300, since_seconds: int = 90) -> str:
+    """Best-effort parse of latest core-daemon `session:set_state` for one session id."""
+    try:
+        tail = _tail_core_daemon_journal(lines=lines, since_seconds=since_seconds)
+    except Exception:
+        tail = None
+    if not tail:
+        return ''
+
+    sid = int(session_id)
+    latest = ''
+    pat = re.compile(r"changing\s+session\((\d+)\)\s+to\s+state\s+([A-Za-z0-9_.-]+)", re.IGNORECASE)
+    for raw in tail.splitlines():
+        line = str(raw or '').strip()
+        if not line:
+            continue
+        m = pat.search(line)
+        if not m:
+            continue
+        try:
+            line_sid = int(m.group(1))
+        except Exception:
+            continue
+        if line_sid != sid:
+            continue
+        latest = _core_state_str(m.group(2))
+    return latest
+
+
 def _wait_for_core_runtime(core: Any, session_id: int, *, timeout_s: float = 30.0, poll_s: float = 0.5) -> tuple[bool, str]:
-    deadline = time.time() + max(0.1, float(timeout_s))
+    effective_timeout = max(0.1, min(float(timeout_s), 40.0))
+    deadline = time.time() + effective_timeout
+    journal_poll_s = 5.0
+    next_journal_check = 0.0
+    next_progress_log = 0.0
     last_state = ''
     while time.time() < deadline:
         state = _get_core_session_state(core, session_id)
@@ -616,22 +700,41 @@ def _wait_for_core_runtime(core: Any, session_id: int, *, timeout_s: float = 30.
             return True, state
         if _is_shutdown_state(state):
             return False, state
-        time.sleep(max(0.05, float(poll_s)))
 
-    # Fallback (CORE VM): gRPC state readback can be flaky; trust core-daemon state transition log.
-    try:
-        tail = _tail_core_daemon_journal(lines=200, since_seconds=int(max(30.0, float(timeout_s))) + 120)
-        if tail:
-            needle = f"changing session({int(session_id)}) to state runtime_state"
-            for line in tail.splitlines():
-                ln = line.strip().lower().replace('-', '_').replace(' ', '_')
-                if needle in ln:
-                    return True, 'runtime_state'
-                # Accept uppercase original too (without normalization artifacts)
-                if f"changing session({int(session_id)}) to state runtime" in ln:
-                    return True, 'runtime'
-    except Exception:
-        pass
+        now = time.time()
+        if now >= next_progress_log:
+            try:
+                state_for_log = state or last_state or 'unknown'
+                remain = max(0.0, deadline - now)
+                logging.info(
+                    "CORE state check (session=%s): %s (%.1fs remaining)",
+                    int(session_id),
+                    state_for_log,
+                    remain,
+                )
+            except Exception:
+                pass
+            next_progress_log = now + journal_poll_s
+
+        if now >= next_journal_check:
+            try:
+                journal_state = _latest_core_daemon_session_state(
+                    int(session_id),
+                    lines=300,
+                    since_seconds=int(min(max(30.0, effective_timeout + 20.0), 180.0)),
+                )
+                if journal_state:
+                    last_state = journal_state
+                    if _is_runtime_state(journal_state):
+                        return True, journal_state
+                    if _is_shutdown_state(journal_state):
+                        return False, journal_state
+            except Exception:
+                pass
+            next_journal_check = now + journal_poll_s
+
+        time.sleep(max(0.05, min(float(poll_s), journal_poll_s)))
+
     return False, last_state
 
 
@@ -908,7 +1011,7 @@ def main():
         "--docker-wait-s",
         type=float,
         default=None,
-        help="Max seconds to wait for Docker containers to become running (default: 180; env: CORETG_DOCKER_WAIT_RUNNING_S)",
+        help="Max seconds to wait for Docker containers to become running (default: 45; env: CORETG_DOCKER_WAIT_RUNNING_S)",
     )
     ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible topology randomness")
     ap.add_argument("--preview", action="store_true", help="Parse and plan only; output plan summary JSON and exit 0")
@@ -2370,10 +2473,10 @@ def main():
         docker_wait_s = float(
             args.docker_wait_s
             if getattr(args, 'docker_wait_s', None) is not None
-            else (os.getenv('CORETG_DOCKER_WAIT_RUNNING_S') or 180.0)
+            else (os.getenv('CORETG_DOCKER_WAIT_RUNNING_S') or 45.0)
         )
     except Exception:
-        docker_wait_s = 180.0
+        docker_wait_s = 45.0
     core_start_timeout_s = max(5.0, min(core_start_timeout_s, 600.0))
     docker_wait_s = max(5.0, min(docker_wait_s, 600.0))
     try:
@@ -2515,7 +2618,11 @@ def main():
             session_state = st
             if not ok_runtime:
                 start_ok = False
-                start_error = f"CORE session did not reach runtime (state={st or 'unknown'})"
+                _st_text = str(st or 'unknown').strip().lower()
+                if _st_text == 'configuration':
+                    start_error = 'CORE session stayed in "configuration"'
+                else:
+                    start_error = f"CORE session did not reach runtime (state={st or 'unknown'})"
 
         # Validate docker-compose nodes are actually running (not merely created in config).
         if start_ok:
@@ -2685,12 +2792,16 @@ def main():
                 generation_meta['docker_nodes_runtime'] = docker_runtime
             generation_meta['docker_nodes_runtime_timeout_s'] = docker_wait_s
 
-            # Diagnostics: if we timed out waiting for runtime, include recent core-daemon logs when available.
+            # Diagnostics: if runtime validation failed, include recent core-daemon logs when available.
             try:
-                if (not start_ok) and isinstance(start_error, str) and 'did not reach runtime' in start_error.lower():
+                if (not start_ok) and _should_collect_core_daemon_runtime_diag(start_error):
                     tail = _tail_core_daemon_journal(lines=200, since_seconds=int(core_start_timeout_s) + 60)
                     if tail:
                         generation_meta['core_daemon_journal_tail'] = tail
+                        hint = _extract_core_daemon_runtime_hint(tail)
+                        if hint:
+                            generation_meta['core_daemon_runtime_hint'] = hint
+                            logging.error("CORE daemon runtime hint: %s", hint)
             except Exception:
                 pass
     except Exception:

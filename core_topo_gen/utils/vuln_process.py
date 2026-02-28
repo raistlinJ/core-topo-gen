@@ -1263,8 +1263,8 @@ def _compose_force_root_workdir_enabled() -> bool:
 	paths relative to the container filesystem root. For images with non-root WORKDIR,
 	this can cause CORE to fail to chmod service files that were copied into `/`.
 
-	Default: auto (base-OS images only). Modes:
-	- unset / auto: force only for base OS-style images
+	Default: all (force for all services). Modes:
+	- unset / all: force for all services
 	- 1/true/yes/on/all: force for all services
 	- 0/false/no/off: disable
 	"""
@@ -1276,7 +1276,7 @@ def _compose_force_root_workdir_mode() -> str:
 	"""Return root-workdir forcing mode: off | auto | all."""
 	val = os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR')
 	if val is None:
-		return 'auto'
+		return 'all'
 	low = str(val).strip().lower()
 	if low in ('0', 'false', 'no', 'off', ''):
 		return 'off'
@@ -1284,7 +1284,7 @@ def _compose_force_root_workdir_mode() -> str:
 		return 'all'
 	if low in ('auto', 'default'):
 		return 'auto'
-	return 'auto'
+	return 'all'
 
 
 def _looks_like_base_os_image(image_ref: str) -> bool:
@@ -1353,13 +1353,13 @@ def _should_force_service_workdir_root(service: Dict[str, object]) -> bool:
 	return False
 
 
-def _force_service_workdir_root(service: Dict[str, object]) -> None:
+def _force_service_workdir_root(service: Dict[str, object], *, override_existing: bool = False) -> None:
 	"""Force a compose service to run with working_dir: / (best-effort)."""
 	if not isinstance(service, dict):
 		return
 	try:
 		current = service.get('working_dir')
-		if isinstance(current, str) and current.strip():
+		if (not override_existing) and isinstance(current, str) and current.strip():
 			return
 	except Exception:
 		pass
@@ -1370,9 +1370,12 @@ def _maybe_force_service_workdir_root(service: Dict[str, object]) -> None:
 	"""Force root working_dir when policy and service characteristics require it."""
 	if not isinstance(service, dict):
 		return
+	mode = _compose_force_root_workdir_mode()
+	if mode == 'off':
+		return
 	if not _should_force_service_workdir_root(service):
 		return
-	_force_service_workdir_root(service)
+	_force_service_workdir_root(service, override_existing=(mode == 'all'))
 
 
 def _copy_build_contexts(obj: dict, src_dir: str, base_dir: str) -> dict:
@@ -2723,14 +2726,16 @@ def _write_iproute2_wrapper(
 			]
 		lines += [
 			"USER root",
+			"WORKDIR /",
 			"",
 			"# CORE may chmod relative service script paths (e.g., defaultroute.sh, runtraffic.sh).",
-			"# Ensure those relative names resolve from the image WORKDIR to root-level files.",
+			"# Ensure those relative names resolve from common runtime working directories.",
 			"RUN set -eu; \\",
-			"\twd=\"$(pwd)\"; \\",
-			"\tmkdir -p \"$wd\"; \\",
-			"\tln -sfn /defaultroute.sh \"$wd/defaultroute.sh\" || true; \\",
-			"\tln -sfn /runtraffic.sh \"$wd/runtraffic.sh\" || true",
+			"\tfor d in / /root /tmp /home /home/core /home/ubuntu /app /opt /workspace /work; do \\",
+			"\t\tmkdir -p \"$d\" 2>/dev/null || true; \\",
+			"\t\tln -sfn /defaultroute.sh \"$d/defaultroute.sh\" || true; \\",
+			"\t\tln -sfn /runtraffic.sh \"$d/runtraffic.sh\" || true; \\",
+			"\tdone",
 			"",
 			"# If the base image already provides `ip`, keep it; otherwise inject busybox as `ip`.",
 			"# We avoid any RUN that relies on networked package repositories.",
@@ -2808,14 +2813,16 @@ def _write_iproute2_wrapper(
 		f"FROM {base_image}",
 		"",
 		"USER root",
+		"WORKDIR /",
 		"",
 		"# CORE may chmod relative service script paths (e.g., defaultroute.sh, runtraffic.sh).",
-		"# Ensure those relative names resolve from the image WORKDIR to root-level files.",
+		"# Ensure those relative names resolve from common runtime working directories.",
 		"RUN set -eu; \\",
-		"\twd=\"$(pwd)\"; \\",
-		"\tmkdir -p \"$wd\"; \\",
-		"\tln -sfn /defaultroute.sh \"$wd/defaultroute.sh\" || true; \\",
-		"\tln -sfn /runtraffic.sh \"$wd/runtraffic.sh\" || true",
+		"\tfor d in / /root /tmp /home /home/core /home/ubuntu /app /opt /workspace /work; do \\",
+		"\t\tmkdir -p \"$d\" 2>/dev/null || true; \\",
+		"\t\tln -sfn /defaultroute.sh \"$d/defaultroute.sh\" || true; \\",
+		"\t\tln -sfn /runtraffic.sh \"$d/runtraffic.sh\" || true; \\",
+		"\tdone",
 		"",
 		"",
 		# Avoid `set -x` to reduce giant build logs; keep `-e` and `-u`.
@@ -4081,6 +4088,15 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							services = obj.get('services') if isinstance(obj, dict) else None
 							if isinstance(services, dict) and isinstance(services.get(node_name), dict):
 								services.get(node_name)['container_name'] = str(node_name)
+					except Exception:
+						pass
+					# Compose node services can fail once during dependency warm-up (e.g., DB not ready).
+					# Keep them resilient so transient startup races do not become hard validation failures.
+					try:
+						services = obj.get('services') if isinstance(obj, dict) else None
+						node_svc = services.get(node_name) if isinstance(services, dict) else None
+						if isinstance(node_svc, dict):
+							node_svc['restart'] = 'unless-stopped'
 					except Exception:
 						pass
 				except Exception:
