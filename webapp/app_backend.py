@@ -779,10 +779,28 @@ def _make_forward_handler(transport: Any, remote_host: str, remote_port: int):
                 )
             except Exception as exc:
                 try:
-                    logger.error('SSH tunnel channel open failed to %s:%s', remote_host, remote_port, exc_info=True)
+                    msg = str(exc or '').strip().lower()
+                except Exception:
+                    msg = ''
+                expected = (
+                    'transport is not active' in msg
+                    or 'channel closed' in msg
+                    or 'eof' in msg
+                    or 'connection reset' in msg
+                    or 'broken pipe' in msg
+                )
+                try:
+                    if expected:
+                        logger.debug('SSH tunnel channel closed while opening %s:%s: %s', remote_host, remote_port, exc)
+                    else:
+                        logger.warning('SSH tunnel channel open failed to %s:%s: %s', remote_host, remote_port, exc)
                 except Exception:
                     pass
-                raise _SSHTunnelError(f'Failed to open SSH channel to {remote_host}:{remote_port}: {exc}') from exc
+                try:
+                    self.request.close()
+                except Exception:
+                    pass
+                return
             if chan is None:
                 raise _SSHTunnelError('SSH channel creation returned None')
             try:
@@ -3916,19 +3934,23 @@ def _extract_inject_expected_by_node(scenario_xml_path: str, scenario_label: str
         return '(' in s and ')' in s
 
     def _normalize_expected_runtime_path(path_value: str) -> str:
+        flow_default_dest = str(os.getenv('CORETG_FLOW_INJECTS_DIR') or '').strip() or '/flow_injects'
         p = str(path_value or '').strip()
         if not p:
             return ''
         if not p.startswith('/'):
-            return f"/tmp/{p.lstrip('./')}"
+            base_rel = _basename(p.lstrip('./'))
+            if base_rel:
+                return f"{flow_default_dest.rstrip('/')}/{base_rel}"
+            return flow_default_dest
         p_norm = p.replace('\\', '/')
         if p_norm.startswith('/tmp/vulns/'):
             base = _basename(p_norm)
             if base.lower() == 'exports':
                 return '/exports'
             if base:
-                return f"/tmp/{base}"
-            return '/tmp'
+                return f"{flow_default_dest.rstrip('/')}/{base}"
+            return flow_default_dest
         for pref in ('/exports', '/outputs', '/inputs'):
             if p_norm == pref or p_norm.startswith(pref + '/'):
                 return p_norm
@@ -3938,8 +3960,8 @@ def _extract_inject_expected_by_node(scenario_xml_path: str, scenario_label: str
         if base.lower() == 'exports':
             return '/exports'
         if base:
-            return f"/tmp/{base}"
-        return '/tmp'
+            return f"{flow_default_dest.rstrip('/')}/{base}"
+        return flow_default_dest
 
     for entry in assigns or []:
         if not isinstance(entry, dict):
@@ -7838,6 +7860,179 @@ def _merge_hitl_preview_with_full_preview(full_preview: Dict[str, Any], hitl_cfg
         full_preview['hitl_router_count'] = len([nid for nid in hitl_router_ids if nid is not None])
     _wire_hitl_preview_routers(full_preview, hitl_cfg)
     _augment_hitl_existing_router_interfaces(full_preview, hitl_cfg)
+
+
+def _hitl_core_validation_ok(core_cfg: Any) -> bool:
+    if not isinstance(core_cfg, dict):
+        return False
+    try:
+        if _coerce_bool(core_cfg.get('validated')):
+            return True
+    except Exception:
+        pass
+    try:
+        status = str(core_cfg.get('last_tested_status') or '').strip().lower()
+        if status == 'success':
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _lookup_hitl_validation_hint(scenario_norm: str) -> Optional[Dict[str, Any]]:
+    if not scenario_norm:
+        return None
+    try:
+        hv_map = _load_scenario_hitl_validation_from_disk()
+    except Exception:
+        hv_map = None
+    if not isinstance(hv_map, dict):
+        return None
+    hint = hv_map.get(scenario_norm)
+    if isinstance(hint, dict):
+        return hint
+    try:
+        key = _scenario_match_key(scenario_norm)
+    except Exception:
+        key = ''
+    if not key:
+        return None
+    for k, v in hv_map.items():
+        try:
+            if _scenario_match_key(k) == key and isinstance(v, dict):
+                return v
+        except Exception:
+            continue
+    return None
+
+
+def _hitl_config_ready_for_preview(hitl_cfg: Dict[str, Any], scenario_name: Optional[str]) -> bool:
+    if not isinstance(hitl_cfg, dict):
+        return False
+    if not bool(hitl_cfg.get('enabled')):
+        return False
+    interfaces = hitl_cfg.get('interfaces') if isinstance(hitl_cfg.get('interfaces'), list) else []
+    usable_ifaces = [it for it in interfaces if isinstance(it, dict) and str(it.get('name') or '').strip()]
+    if not usable_ifaces:
+        return False
+
+    if _hitl_core_validation_ok(hitl_cfg.get('core')):
+        return True
+
+    scenario_norm = _normalize_scenario_label(scenario_name or hitl_cfg.get('scenario_key') or '')
+    if not scenario_norm:
+        return False
+
+    hint = _lookup_hitl_validation_hint(scenario_norm)
+    if isinstance(hint, dict):
+        if _hitl_core_validation_ok(hint.get('core')):
+            return True
+
+    return False
+
+
+def _strip_hitl_overlay_from_full_preview(full_preview: Dict[str, Any]) -> None:
+    if not isinstance(full_preview, dict):
+        return
+
+    removed_router_ids: set[str] = set()
+    routers = full_preview.get('routers')
+    if isinstance(routers, list):
+        kept = []
+        for router in routers:
+            if not isinstance(router, dict):
+                continue
+            md = router.get('metadata') if isinstance(router.get('metadata'), dict) else {}
+            is_hitl_router = bool(md.get('hitl_preview'))
+            node_id = router.get('node_id')
+            node_id_key = str(node_id) if node_id is not None else ''
+            if is_hitl_router:
+                if node_id_key:
+                    removed_router_ids.add(node_id_key)
+                continue
+
+            iface_map = router.get('r2r_interfaces') if isinstance(router.get('r2r_interfaces'), dict) else None
+            if isinstance(iface_map, dict):
+                cleaned_iface_map: Dict[str, Any] = {}
+                for key, value in iface_map.items():
+                    key_str = str(key)
+                    if key_str in removed_router_ids:
+                        continue
+                    if not key_str.isdigit():
+                        continue
+                    cleaned_iface_map[key_str] = value
+                router['r2r_interfaces'] = cleaned_iface_map
+            kept.append(router)
+        full_preview['routers'] = kept
+
+    links = full_preview.get('r2r_links_preview')
+    if isinstance(links, list):
+        kept_links = []
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            if bool(link.get('hitl_preview')):
+                continue
+            endpoints = link.get('routers') if isinstance(link.get('routers'), list) else []
+            drop = False
+            for endpoint in endpoints:
+                if not isinstance(endpoint, dict):
+                    continue
+                rid = endpoint.get('id')
+                rid_key = str(rid) if rid is not None else ''
+                if rid_key in removed_router_ids:
+                    drop = True
+                    break
+                if rid is not None and (not str(rid).isdigit()):
+                    drop = True
+                    break
+            if drop:
+                continue
+            kept_links.append(link)
+        full_preview['r2r_links_preview'] = kept_links
+
+    edges = full_preview.get('r2r_edges_preview')
+    if isinstance(edges, list):
+        kept_edges = []
+        for edge in edges:
+            if not isinstance(edge, (list, tuple)) or len(edge) < 2:
+                continue
+            a = str(edge[0])
+            b = str(edge[1])
+            if a in removed_router_ids or b in removed_router_ids:
+                continue
+            if not a.isdigit() or not b.isdigit():
+                continue
+            kept_edges.append([int(a), int(b)])
+        full_preview['r2r_edges_preview'] = kept_edges
+
+    full_preview['hitl_enabled'] = False
+    full_preview['hitl_interfaces'] = []
+    full_preview.pop('hitl_core', None)
+    full_preview['hitl_router_ids'] = []
+    full_preview['hitl_router_count'] = 0
+    full_preview['hitl_existing_router_interfaces'] = []
+
+
+def _apply_hitl_config_to_full_preview(full_preview: Dict[str, Any], hitl_cfg: Dict[str, Any], scenario_name: Optional[str]) -> None:
+    if not isinstance(full_preview, dict):
+        return
+    if not isinstance(hitl_cfg, dict):
+        full_preview['hitl_enabled'] = False
+        full_preview['hitl_interfaces'] = []
+        return
+
+    if not _hitl_config_ready_for_preview(hitl_cfg, scenario_name):
+        _strip_hitl_overlay_from_full_preview(full_preview)
+        full_preview['hitl_scenario_key'] = hitl_cfg.get('scenario_key')
+        return
+
+    full_preview['hitl_interfaces'] = hitl_cfg.get('interfaces', [])
+    full_preview['hitl_enabled'] = bool(hitl_cfg.get('enabled'))
+    full_preview['hitl_scenario_key'] = hitl_cfg.get('scenario_key')
+    if hitl_cfg.get('core'):
+        full_preview['hitl_core'] = hitl_cfg.get('core')
+    _merge_hitl_preview_with_full_preview(full_preview, hitl_cfg)
 
 """Flask web backend for core-topo-gen.
 
@@ -14792,7 +14987,7 @@ def api_flow_latest_preview_plan():
                     meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
                     docker_count, vuln_count, flow_eligible = _flow_eligibility_from_payload(payload)
                     scen_chk = str(meta.get('scenario') or '').strip()
-                    if not scen_chk or _normalize_scenario_label(scen_chk) == scenario_norm:
+                    if (not scen_chk or _normalize_scenario_label(scen_chk) == scenario_norm) and flow_eligible:
                         return jsonify({
                             'ok': True,
                             'scenario': scenario_label or scenario_norm,
@@ -21549,7 +21744,7 @@ def api_flow_prepare_preview_for_execute():
                     for marker in ('/artifacts/', '/flow_artifacts/'):
                         if marker in src:
                             return _normalize_rel_artifacts(src.split(marker, 1)[1], source_dir)
-                    return ''
+                    return src
 
                 def _normalize_inject_spec_for_copy(raw: str, source_dir: str) -> str:
                     text = str(raw or '').strip()
@@ -30712,11 +30907,11 @@ def _inject_mappings_from_assignment(entry):
                     if os.path.commonpath([src_abs, src_base]) == src_base:
                         rel_src = os.path.relpath(src_abs, src_base).replace('\\', '/').lstrip('./')
                     else:
-                        rel_src = os.path.basename(src_abs)
+                        rel_src = src_abs
                 except Exception:
-                    rel_src = os.path.basename(resolved)
+                    rel_src = str(resolved or '').strip()
             else:
-                rel_src = os.path.basename(resolved)
+                rel_src = str(resolved or '').strip()
         else:
             rel_src = resolved.replace('\\', '/').lstrip('./')
         if not rel_src:
@@ -30742,7 +30937,7 @@ def _inject_mappings_from_assignment(entry):
             if not dest_raw.startswith('/'):
                 dest_raw = '/tmp'
             if os.path.isabs(src_raw):
-                rel_src = os.path.basename(src_raw)
+                rel_src = src_raw
             else:
                 rel_src = src_raw.replace('\\', '/').lstrip('./')
             if not rel_src:
@@ -32882,11 +33077,92 @@ def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> di
 
 def _load_preview_payload_from_path(path: str, scenario_label: str | None = None) -> dict[str, Any] | None:
     """Load a preview payload from XML only."""
+    def _is_effectively_empty_preview_payload(candidate: Any) -> bool:
+        if not isinstance(candidate, dict):
+            return True
+        full = candidate.get('full_preview') if isinstance(candidate.get('full_preview'), dict) else None
+        if not isinstance(full, dict):
+            return True
+        hosts = full.get('hosts') if isinstance(full.get('hosts'), list) else []
+        routers = full.get('routers') if isinstance(full.get('routers'), list) else []
+        switches = full.get('switches_detail') if isinstance(full.get('switches_detail'), list) else []
+        role_counts = full.get('role_counts') if isinstance(full.get('role_counts'), dict) else {}
+        if hosts or routers or switches:
+            return False
+        for value in role_counts.values():
+            try:
+                if int(value) > 0:
+                    return False
+            except Exception:
+                continue
+        return True
+
+    def _xml_suggests_expected_nodes(xml_file: str, scenario_name: str | None) -> bool:
+        try:
+            parsed = _parse_scenarios_xml(xml_file)
+        except Exception:
+            return False
+        scenarios = parsed.get('scenarios') if isinstance(parsed, dict) else None
+        if not isinstance(scenarios, list) or not scenarios:
+            return False
+        scenario_norm = _normalize_scenario_label(scenario_name or '')
+        chosen = None
+        for sc in scenarios:
+            if not isinstance(sc, dict):
+                continue
+            nm_norm = _normalize_scenario_label(sc.get('name') or '')
+            if scenario_norm and nm_norm != scenario_norm:
+                continue
+            chosen = sc
+            break
+        if not isinstance(chosen, dict):
+            chosen = scenarios[0] if isinstance(scenarios[0], dict) else None
+        if not isinstance(chosen, dict):
+            return False
+        try:
+            total = int(chosen.get('scenario_total_nodes') or 0)
+            if total > 0:
+                return True
+        except Exception:
+            pass
+        sections = chosen.get('sections') if isinstance(chosen.get('sections'), dict) else {}
+        node_info = sections.get('Node Information') if isinstance(sections, dict) and isinstance(sections.get('Node Information'), dict) else {}
+        try:
+            density_count = int(chosen.get('density_count') or node_info.get('density_count') or 0)
+            if density_count > 0:
+                return True
+        except Exception:
+            pass
+        items = node_info.get('items') if isinstance(node_info.get('items'), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                if str(item.get('v_metric') or '').strip() == 'Count' and int(item.get('v_count') or 0) > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
     try:
         ap = _existing_xml_path_or_none(path)
         if not ap:
             return None
         payload = _load_plan_preview_payload_from_path(ap, scenario_label)
+        if _is_effectively_empty_preview_payload(payload) and _xml_suggests_expected_nodes(ap, scenario_label):
+            try:
+                recomputed = _planner_persist_flow_plan(
+                    xml_path=ap,
+                    scenario=scenario_label,
+                    seed=None,
+                    persist_plan_file=False,
+                )
+            except Exception:
+                recomputed = None
+            if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
+                payload = recomputed
+            else:
+                payload = _load_plan_preview_payload_from_path(ap, scenario_label)
         if not isinstance(payload, dict):
             return None
         try:
@@ -35446,15 +35722,7 @@ def api_plan_preview_full():
             raw_hitl_config = {"enabled": False, "interfaces": []}
         hitl_config = _sanitize_hitl_config(raw_hitl_config, scenario, xml_basename)
         try:
-            full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
-            full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
-            full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
-            if hitl_config.get('core'):
-                full_prev['hitl_core'] = hitl_config.get('core')
-        except Exception:
-            pass
-        try:
-            _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+            _apply_hitl_config_to_full_preview(full_prev, hitl_config, scenario)
         except Exception:
             pass
         flow_meta = None
@@ -35563,15 +35831,7 @@ def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int
     except Exception:
         hitl_config = {"enabled": False, "interfaces": []}
     try:
-        full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
-        full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
-        full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
-        if hitl_config.get('core'):
-            full_prev['hitl_core'] = hitl_config.get('core')
-    except Exception:
-        pass
-    try:
-        _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+        _apply_hitl_config_to_full_preview(full_prev, hitl_config, scenario_name)
     except Exception:
         pass
 
@@ -35891,15 +36151,7 @@ def plan_full_preview_page():
             raw_hitl_config = {"enabled": False, "interfaces": []}
         hitl_config = _sanitize_hitl_config(raw_hitl_config, scenario_name, xml_basename)
         try:
-            full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
-            full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
-            full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
-            if hitl_config.get('core'):
-                full_prev['hitl_core'] = hitl_config.get('core')
-        except Exception:
-            pass
-        try:
-            _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+            _apply_hitl_config_to_full_preview(full_prev, hitl_config, scenario_name)
         except Exception:
             pass
         flow_meta = None
@@ -36185,6 +36437,22 @@ def plan_full_preview_from_xml():
                 pass
 
         scenario_name = str(meta.get('scenario') or '') or scenario or None
+        try:
+            xml_basename_for_hitl = os.path.basename(xml_path)
+        except Exception:
+            xml_basename_for_hitl = None
+        try:
+            raw_hitl_config = parse_hitl_info(xml_path, scenario_name)
+        except Exception:
+            raw_hitl_config = {"enabled": False, "interfaces": []}
+        try:
+            hitl_cfg_live = _sanitize_hitl_config(raw_hitl_config, scenario_name, xml_basename_for_hitl)
+        except Exception:
+            hitl_cfg_live = {"enabled": False, "interfaces": []}
+        try:
+            _apply_hitl_config_to_full_preview(full_prev, hitl_cfg_live, scenario_name)
+        except Exception:
+            pass
         seed_val = meta.get('seed')
         try:
             seed_val = int(seed_val) if seed_val is not None else full_prev.get('seed')
@@ -37588,7 +37856,7 @@ def _normalize_inject_src_for_copy(raw_src: str, source_dir: str) -> str:
     for marker in ('/artifacts/', '/flow_artifacts/'):
         if marker in src:
             return _normalize_rel_artifacts(src.split(marker, 1)[1], source_dir)
-    return ''
+    return src
 
 
 def _normalize_inject_spec_for_copy(raw: str, source_dir: str) -> str:

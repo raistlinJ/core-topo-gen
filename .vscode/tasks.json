@@ -432,6 +432,37 @@
 				"scripts/_tmp_capture_real_dialogs.py"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "shell: debug flow generate disabled",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_debug_flow_disabled.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "shell: debug flow generate disabled (py path)",
+			"type": "shell",
+			"command": "env",
+			"args": [
+				"PYTHONPATH=.",
+				"./.venv312/bin/python",
+				"scripts/_tmp_debug_flow_disabled.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "shell: compare Anatest eligibility snapshots",
+			"type": "shell",
+			"command": "env",
+			"args": [
+				"PYTHONPATH=.",
+				"./.venv312/bin/python",
+				"scripts/_tmp_compare_anatest_eligibility.py"
+			],
+			"isBackground": false
 		}
 	]
 }
