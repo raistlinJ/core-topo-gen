@@ -22370,6 +22370,14 @@ def api_flow_prepare_preview_for_execute():
             pass
 
         persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(flag_assignments)
+        try:
+            if run_generators_request or mode in {'resolve', 'resolve_hints', 'hint', 'hint_only'}:
+                persisted_flag_assignments = [
+                    _canonicalize_flow_assignment_paths(x) if isinstance(x, dict) else x
+                    for x in (flag_assignments or [])
+                ]
+        except Exception:
+            persisted_flag_assignments = persisted_flag_assignments
         flow_meta = {
             'source_preview_plan_path': _abs_path_or_original(base_plan_path),
             'scenario': scenario_label or scenario_norm,
@@ -40705,42 +40713,11 @@ def run_cli_async():
                     pass
             if isinstance(plan_payload, dict) and plan_payload:
                 _update_plan_preview_in_xml(xml_path, scenario_for_plan, plan_payload)
-                try:
-                    meta = plan_payload.get('metadata') if isinstance(plan_payload.get('metadata'), dict) else {}
-                    flow_meta = meta.get('flow') if isinstance(meta.get('flow'), dict) else None
-                    if isinstance(flow_meta, dict) and flow_meta:
-                        def _flow_has_runtime_values(flow_obj: dict[str, Any]) -> bool:
-                            try:
-                                fas = flow_obj.get('flag_assignments') if isinstance(flow_obj.get('flag_assignments'), list) else None
-                                if not isinstance(fas, list) or not fas:
-                                    return False
-                                for fa in fas:
-                                    if not isinstance(fa, dict):
-                                        continue
-                                    flag_val = str(fa.get('flag_value') or '').strip()
-                                    outs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
-                                    if not flag_val and isinstance(outs, dict):
-                                        flag_val = str(outs.get('Flag(flag_id)') or outs.get('flag') or '').strip()
-                                    if flag_val:
-                                        return True
-                                    if str(fa.get('artifacts_dir') or fa.get('run_dir') or '').strip():
-                                        return True
-                                return False
-                            except Exception:
-                                return False
-                        if _flow_has_runtime_values(flow_meta):
-                            _update_flow_state_in_xml(xml_path, scenario_for_plan, flow_meta)
-                except Exception:
-                    pass
         except Exception:
             pass
     # Enforce that Flow-generated values already exist before Execute runs.
     try:
-        if flow_enabled and preview_plan_path and scenario_for_plan:
-            plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
-            meta = plan_payload.get('metadata') if isinstance(plan_payload, dict) else None
-            flow_meta = meta.get('flow') if isinstance(meta, dict) else None
-            flag_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
+        if flow_enabled and scenario_for_plan:
             def _flow_assignments_have_runtime(fas: list[dict[str, Any]] | None) -> bool:
                 if not isinstance(fas, list) or not fas:
                     return False
@@ -40749,34 +40726,30 @@ def run_cli_async():
                         continue
                     flag_val = str(fa.get('flag_value') or '').strip()
                     outs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
+                    has_any_outputs = bool(isinstance(outs, dict) and outs)
                     if not flag_val and isinstance(outs, dict):
                         flag_val = str(outs.get('Flag(flag_id)') or outs.get('flag') or '').strip()
                     if flag_val:
+                        return True
+                    if has_any_outputs:
                         return True
                     if str(fa.get('artifacts_dir') or fa.get('run_dir') or '').strip():
                         return True
                 return False
 
-            if ((not isinstance(flag_assignments, list)) or (not flag_assignments) or (not _flow_assignments_have_runtime(flag_assignments))) and xml_path:
-                try:
-                    parsed = _parse_scenarios_xml(xml_path)
-                    scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
-                    if isinstance(scen_list, list):
-                        for sc in scen_list:
-                            if not isinstance(sc, dict):
-                                continue
-                            nm = str(sc.get('name') or '').strip()
-                            if scenario_for_plan and _normalize_scenario_label(nm) != _normalize_scenario_label(scenario_for_plan):
-                                continue
-                            fs = sc.get('flow_state') if isinstance(sc.get('flow_state'), dict) else None
-                            if isinstance(fs, dict):
-                                flag_assignments = fs.get('flag_assignments') if isinstance(fs.get('flag_assignments'), list) else flag_assignments
-                            break
-                except Exception:
-                    pass
-            if not isinstance(flag_assignments, list) or not flag_assignments:
+            fs_xml = None
+            try:
+                fs_xml = _flow_state_from_xml_path(xml_path, scenario_for_plan)
+                if not isinstance(fs_xml, dict):
+                    fs_xml = _flow_state_from_xml_path(xml_path, None)
+            except Exception:
+                fs_xml = None
+
+            flag_assignments = fs_xml.get('flag_assignments') if isinstance(fs_xml, dict) and isinstance(fs_xml.get('flag_assignments'), list) else None
+
+            if (not isinstance(flag_assignments, list)) or (not flag_assignments) or (not _flow_assignments_have_runtime(flag_assignments)):
                 return jsonify({
-                    'error': 'No Flow flag assignments found. Generate the chain and resolve flags before Execute.',
+                    'error': 'Flow is enabled, but XML has no resolved Flow runtime values. Run Generate (resolve) and Save XML before Execute.',
                 }), 422
             flow_remote_expected = False
             try:
@@ -40808,8 +40781,16 @@ def run_cli_async():
                     try:
                         if not flow_remote_expected:
                             has_outputs = bool(_flow_read_outputs_map_from_artifacts_dir(art_dir))
+                        else:
+                            # Remote execute: local filesystem checks don't apply.
+                            # Presence of a generated artifacts/run dir in XML is sufficient.
+                            has_outputs = True
                     except Exception:
                         has_outputs = False
+                if (not has_outputs) and isinstance(outputs, dict) and outputs:
+                    # XML-resolved outputs are valid runtime values even when Flag(flag_id)
+                    # is not present (for generators that emit non-flag artifacts).
+                    has_outputs = True
                 if not flag_val and not has_outputs:
                     missing_values.append({
                         'index': idx,

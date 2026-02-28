@@ -8465,6 +8465,8 @@
             chain_ids: chain_ids,
             preview_plan: previewPlanForRequest(),
             allow_node_duplicates: !!allowNodeDuplicates,
+            mode: 'resolve',
+            best_effort: false,
           },
           { timeoutMs: 480000 }
         );
@@ -8479,6 +8481,30 @@
         previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
         if (!xmlPath || !previewPlan) {
           throw new Error('Prepare step did not return xml_path/preview_plan_path');
+        }
+
+        // Guardrail: do not call /run_cli_async unless resolve produced runtime values.
+        try {
+          const hasRuntimeFlowValues = (assignments) => {
+            if (!Array.isArray(assignments) || !assignments.length) return false;
+            return assignments.some((fa) => {
+              if (!fa || typeof fa !== 'object') return false;
+              const flagVal = String(fa.flag_value || '').trim();
+              const outs = (fa.resolved_outputs && typeof fa.resolved_outputs === 'object' && !Array.isArray(fa.resolved_outputs))
+                ? fa.resolved_outputs
+                : null;
+              const outFlag = outs ? String(outs['Flag(flag_id)'] || outs['flag'] || '').trim() : '';
+              const artDir = String(fa.artifacts_dir || fa.run_dir || '').trim();
+              return !!(flagVal || outFlag || artDir);
+            });
+          };
+          if (!hasRuntimeFlowValues(prepData && prepData.flag_assignments)) {
+            const flowErrs = Array.isArray(prepData && prepData.flow_errors) ? prepData.flow_errors.filter(Boolean) : [];
+            const detail = flowErrs.length ? (' Details: ' + flowErrs.join('; ')) : '';
+            throw new Error('Resolve did not produce runtime Flow values. Click Generate to resolve, then retry Execute.' + detail);
+          }
+        } catch (resolveCheckErr) {
+          throw resolveCheckErr;
         }
       } else {
         if (typeof window.coretgSaveXmlViaApi !== 'function') {
