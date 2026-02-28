@@ -7109,6 +7109,15 @@ def _run_core_connection_advanced_checks(
             auth_timeout=15.0,
         )
 
+        if adv_start_core_daemon:
+            try:
+                status_msg = _maybe_start_core_daemon(client)
+                _set('adv_start_core_daemon', enabled=True, ok=True, message=status_msg)
+            except Exception as exc:
+                _set('adv_start_core_daemon', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_start_core_daemon', enabled=False, ok=None, message='')
+
         if adv_check_core_version:
             try:
                 ver = _check_core_version(client, '9.2.1')
@@ -7144,15 +7153,6 @@ def _run_core_connection_advanced_checks(
                 _set('adv_restart_core_daemon', enabled=True, ok=False, message=str(exc))
         else:
             _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
-
-        if adv_start_core_daemon:
-            try:
-                status_msg = _maybe_start_core_daemon(client)
-                _set('adv_start_core_daemon', enabled=True, ok=True, message=status_msg)
-            except Exception as exc:
-                _set('adv_start_core_daemon', enabled=True, ok=False, message=str(exc))
-        else:
-            _set('adv_start_core_daemon', enabled=False, ok=None, message='')
 
     finally:
         try:
@@ -26520,6 +26520,11 @@ def _merge_editor_scenarios_into_catalog(
                 hints_out[norm] = participant_url
         snapshot_norms.add(norm)
 
+    try:
+        names_out = sorted(names_out, key=_scenario_display_sort_key)
+    except Exception:
+        pass
+
     return _prune_stale_scenario_entries(names_out, paths_out, hints_out, protected_norms=snapshot_norms or None)
 
 
@@ -28845,6 +28850,37 @@ def _collect_scenario_norms(scenarios: Iterable[Any]) -> set[str]:
     return norms
 
 
+def _order_scenarios_by_catalog_names(
+    scenarios: Iterable[Any],
+    catalog_names: Iterable[Any] | None,
+) -> List[Dict[str, Any]]:
+    ordered: List[Dict[str, Any]] = []
+    for scen in scenarios or []:
+        if isinstance(scen, dict):
+            ordered.append(scen)
+    if not ordered:
+        return ordered
+
+    rank_by_norm: Dict[str, int] = {}
+    next_rank = 0
+    for display in catalog_names or []:
+        norm = _normalize_scenario_label(display)
+        if not norm or norm in rank_by_norm:
+            continue
+        rank_by_norm[norm] = next_rank
+        next_rank += 1
+
+    indexed = list(enumerate(ordered))
+    indexed.sort(
+        key=lambda pair: (
+            rank_by_norm.get(_normalize_scenario_label(pair[1].get('name')), float('inf')),
+            _scenario_display_sort_key(pair[1].get('name')),
+            pair[0],
+        )
+    )
+    return [item for _idx, item in indexed]
+
+
 def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optional[dict] = None) -> Dict[str, Any]:
     """Normalize payload data before rendering the index page."""
     if not isinstance(payload, dict):
@@ -29127,6 +29163,14 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     except Exception:
         pass
 
+    try:
+        normalized_scenarios = _order_scenarios_by_catalog_names(
+            normalized_scenarios,
+            payload.get('scenario_catalog_names') if isinstance(payload.get('scenario_catalog_names'), list) else [],
+        )
+    except Exception:
+        pass
+
     payload['scenarios'] = normalized_scenarios
 
     # --- Base upload metadata ---
@@ -29240,6 +29284,10 @@ def _merge_catalog_scenario_stubs_into_payload(payload: Optional[Dict[str, Any]]
                 continue
             scenarios.append(_default_scenario_payload(display_name))
             existing_norms.add(norm)
+        try:
+            scenarios = _order_scenarios_by_catalog_names(scenarios, catalog_names)
+        except Exception:
+            pass
         payload['scenarios'] = scenarios
     except Exception:
         pass
@@ -30640,6 +30688,78 @@ def _parse_inject_labels(txt: str):
     return source_dir, items
 
 
+def _inject_mappings_from_assignment(entry):
+    source_dir = ''
+    out = []
+    if not isinstance(entry, dict):
+        return source_dir, out
+    source_dir = str(entry.get('inject_source_dir') or entry.get('artifacts_dir') or '').strip()
+
+    detail_list = entry.get('inject_files_detail') if isinstance(entry.get('inject_files_detail'), list) else []
+    for item in detail_list:
+        if not isinstance(item, dict):
+            continue
+        resolved = str(item.get('resolved') or '').strip()
+        dest_path = str(item.get('path') or '').strip()
+        if not resolved or not dest_path or not dest_path.startswith('/'):
+            continue
+        dest_dir = os.path.dirname(dest_path) or '/tmp'
+        if os.path.isabs(resolved):
+            if source_dir:
+                try:
+                    src_abs = os.path.abspath(resolved)
+                    src_base = os.path.abspath(source_dir)
+                    if os.path.commonpath([src_abs, src_base]) == src_base:
+                        rel_src = os.path.relpath(src_abs, src_base).replace('\\', '/').lstrip('./')
+                    else:
+                        rel_src = os.path.basename(src_abs)
+                except Exception:
+                    rel_src = os.path.basename(resolved)
+            else:
+                rel_src = os.path.basename(resolved)
+        else:
+            rel_src = resolved.replace('\\', '/').lstrip('./')
+        if not rel_src:
+            continue
+        out.append({'src': rel_src, 'dest': dest_dir})
+
+    if not out:
+        inject_specs = entry.get('inject_files') if isinstance(entry.get('inject_files'), list) else []
+        for raw in inject_specs:
+            text = str(raw or '').strip()
+            if not text:
+                continue
+            sep = '->' if '->' in text else '=>' if '=>' in text else ''
+            if sep:
+                left, right = text.split(sep, 1)
+                src_raw = str(left or '').strip()
+                dest_raw = str(right or '').strip()
+            else:
+                src_raw = text
+                dest_raw = '/tmp'
+            if not src_raw:
+                continue
+            if not dest_raw.startswith('/'):
+                dest_raw = '/tmp'
+            if os.path.isabs(src_raw):
+                rel_src = os.path.basename(src_raw)
+            else:
+                rel_src = src_raw.replace('\\', '/').lstrip('./')
+            if not rel_src:
+                continue
+            out.append({'src': rel_src, 'dest': dest_raw})
+
+    dedup = []
+    seen = set()
+    for item in out:
+        key = (str(item.get('src') or ''), str(item.get('dest') or ''))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item)
+    return source_dir, dedup
+
+
 def _compose_container_ids(project: str, yml: str):
     p = _run_docker(['compose', '-p', project, '-f', yml, 'ps', '-q'], timeout=25, capture=True)
     if getattr(p, 'returncode', 1) != 0:
@@ -30693,6 +30813,7 @@ def main():
     assign_dir = os.path.dirname(assignments_path)
     items = []
     for node_name in sorted(assignments.keys()):
+        assignment_entry = assignments.get(node_name) if isinstance(assignments, dict) else None
         yml = os.path.join(assign_dir, f'docker-compose-{node_name}.yml')
         if not os.path.exists(yml):
             items.append({'node': node_name, 'compose': yml, 'ok': False, 'error': 'compose file missing'})
@@ -30705,6 +30826,11 @@ def main():
         src, dest = _parse_flow_labels(txt)
 
         inject_source, inject_items = _parse_inject_labels(txt)
+        fallback_inject_source, fallback_inject_items = _inject_mappings_from_assignment(assignment_entry)
+        if not inject_source and fallback_inject_source:
+            inject_source = fallback_inject_source
+        if not inject_items and fallback_inject_items:
+            inject_items = fallback_inject_items
 
         # Find container targets: prefer compose project containers (actual services),
         # and optionally include the node-name alias when present.
@@ -43677,46 +43803,18 @@ def test_core():
         adv_restart_core_daemon = bool(cfg.get('adv_restart_core_daemon'))
         adv_start_core_daemon = bool(cfg.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = bool(cfg.get('adv_auto_kill_sessions'))
+        if _webui_running_in_docker() and adv_fix_docker_daemon:
+            return jsonify({
+                'ok': False,
+                'error': 'Fix Docker daemon for CORE is disabled while the Web UI runs in Docker because restarting Docker may interrupt this validation request.',
+                'code': 'adv_fix_docker_daemon_disabled_in_docker',
+            }), 400
         is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
         install_meta: Optional[Dict[str, Any]] = None
 
         advanced_checks: Dict[str, Dict[str, Any]] = {}
         advanced_warnings: List[str] = []
-        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_start_core_daemon or adv_auto_kill_sessions):
-            # These checks require remote access.
-            if is_pytest:
-                app.logger.info('[core] advanced checks enabled but skipping remote execution (pytest)')
-                advanced_checks = _run_core_connection_advanced_checks(
-                    cfg,
-                    adv_fix_docker_daemon=False,
-                    adv_run_core_cleanup=False,
-                    adv_check_core_version=False,
-                    adv_restart_core_daemon=False,
-                    adv_start_core_daemon=False,
-                    adv_auto_kill_sessions=False,
-                )
-            else:
-                advanced_checks = _run_core_connection_advanced_checks(
-                    cfg,
-                    adv_fix_docker_daemon=adv_fix_docker_daemon,
-                    adv_run_core_cleanup=adv_run_core_cleanup,
-                    adv_check_core_version=adv_check_core_version,
-                    adv_restart_core_daemon=adv_restart_core_daemon,
-                    adv_start_core_daemon=adv_start_core_daemon,
-                    adv_auto_kill_sessions=adv_auto_kill_sessions,
-                )
-                failures = [
-                    (key, res)
-                    for key, res in (advanced_checks or {}).items()
-                    if isinstance(res, dict) and res.get('enabled') and (res.get('ok') is False)
-                ]
-                if failures:
-                    parts = []
-                    for key, res in failures:
-                        msg = str(res.get('message') or '').strip()
-                        parts.append(f"{key}: {msg or 'failed'}")
-                    advanced_warnings.append('Advanced checks failed: ' + '; '.join(parts))
         if is_pytest and not (auto_start_daemon or install_custom_services or stop_duplicate_daemons):
             # Unit tests mock the tunnel/socket checks and should not depend on real DNS/SSH.
             app.logger.info('[core] skipping core-daemon SSH inspection (pytest)')
@@ -43868,6 +43966,42 @@ def test_core():
                     ssh_client.close()
                 except Exception:
                     pass
+
+        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_start_core_daemon or adv_auto_kill_sessions):
+            # Advanced checks run after auto-start handling so core-daemon-dependent
+            # checks do not fail solely because the daemon was initially stopped.
+            if is_pytest:
+                app.logger.info('[core] advanced checks enabled but skipping remote execution (pytest)')
+                advanced_checks = _run_core_connection_advanced_checks(
+                    cfg,
+                    adv_fix_docker_daemon=False,
+                    adv_run_core_cleanup=False,
+                    adv_check_core_version=False,
+                    adv_restart_core_daemon=False,
+                    adv_start_core_daemon=False,
+                    adv_auto_kill_sessions=False,
+                )
+            else:
+                advanced_checks = _run_core_connection_advanced_checks(
+                    cfg,
+                    adv_fix_docker_daemon=adv_fix_docker_daemon,
+                    adv_run_core_cleanup=adv_run_core_cleanup,
+                    adv_check_core_version=adv_check_core_version,
+                    adv_restart_core_daemon=adv_restart_core_daemon,
+                    adv_start_core_daemon=adv_start_core_daemon,
+                    adv_auto_kill_sessions=adv_auto_kill_sessions,
+                )
+                failures = [
+                    (key, res)
+                    for key, res in (advanced_checks or {}).items()
+                    if isinstance(res, dict) and res.get('enabled') and (res.get('ok') is False)
+                ]
+                if failures:
+                    parts = []
+                    for key, res in failures:
+                        msg = str(res.get('message') or '').strip()
+                        parts.append(f"{key}: {msg or 'failed'}")
+                    advanced_warnings.append('Advanced checks failed: ' + '; '.join(parts))
         if is_pytest:
             app.logger.info('[core] skipping daemon listening check (pytest)')
         elif paramiko is None:
@@ -49198,7 +49332,71 @@ def _start_remote_flag_test_process(
             sftp.put(local_runner, remote_runner_path)
     except Exception:
         pass
-    sftp.stat(remote_runner_path)
+    try:
+        sftp.stat(remote_runner_path)
+    except Exception as first_missing_exc:
+        try:
+            if log_handle:
+                log_handle.write('[remote] runner missing on CORE VM; bootstrapping remote repo snapshot...\n')
+                log_handle.flush()
+        except Exception:
+            pass
+
+        include_repo_paths: list[str] = [
+            'scripts/run_flag_generator.py',
+            'core_topo_gen',
+            'flag_generators',
+            'flag_node_generators',
+            'outputs/installed_generators/flag_generators',
+            'outputs/installed_generators/flag_node_generators',
+        ]
+
+        try:
+            if str(kind or '').strip() == 'flag-generator':
+                selected_gen = _find_enabled_generator_by_id(generator_id)
+            else:
+                selected_gen = _find_enabled_node_generator_by_id(generator_id)
+        except Exception:
+            selected_gen = None
+        try:
+            src_path_raw = str(
+                (selected_gen or {}).get('_source_path')
+                or ((selected_gen or {}).get('source') or {}).get('path')
+                or ''
+            ).strip()
+            if src_path_raw:
+                repo_root_abs = os.path.abspath(_get_repo_root())
+                src_abs = os.path.abspath(src_path_raw) if os.path.isabs(src_path_raw) else os.path.abspath(os.path.join(repo_root_abs, src_path_raw))
+                if os.path.commonpath([repo_root_abs, src_abs]) == repo_root_abs:
+                    rel = os.path.relpath(src_abs, repo_root_abs).replace('\\', '/')
+                    if rel:
+                        include_repo_paths.append(rel)
+        except Exception:
+            pass
+
+        include_repo_paths = list(dict.fromkeys([p for p in include_repo_paths if isinstance(p, str) and p.strip()]))
+
+        try:
+            _push_repo_to_remote(
+                core_cfg,
+                logger=app.logger,
+                upload_only_injected_artifacts=False,
+                include_repo_paths=include_repo_paths,
+                log_handle=log_handle,
+            )
+        except Exception as push_exc:
+            raise RuntimeError(
+                f'Remote runtime bootstrap failed while preparing {remote_runner_path}: {push_exc}'
+            ) from first_missing_exc
+
+        try:
+            sftp.close()
+        except Exception:
+            pass
+        sftp = ssh_client.open_sftp()
+        remote_repo_dir = _remote_static_repo_dir(sftp)
+        remote_runner_path = _remote_path_join(remote_repo_dir, 'scripts', 'run_flag_generator.py')
+        sftp.stat(remote_runner_path)
 
     remote_run_dir = _remote_path_join('/tmp/tests', f'flag-test-{run_id}')
     _remote_mkdirs(ssh_client, remote_run_dir)

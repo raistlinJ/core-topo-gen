@@ -567,12 +567,22 @@
 
                     <div class="row g-2 mb-3">
                         <div class="col-12 col-md-6">
+                            {% if webui_running_in_docker %}
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch"
+                                    id="coreAdvFixDockerDaemon" disabled>
+                                <label class="form-check-label text-muted" for="coreAdvFixDockerDaemon">Fix Docker daemon for CORE
+                                    (disable default bridge + iptables)</label>
+                                <div class="form-text">Disabled while Web UI runs in Docker to avoid interrupting this session.</div>
+                            </div>
+                            {% else %}
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch"
                                     id="coreAdvFixDockerDaemon">
                                 <label class="form-check-label" for="coreAdvFixDockerDaemon">Fix Docker daemon for CORE
                                     (disable default bridge + iptables)</label>
                             </div>
+                            {% endif %}
                         </div>
                         <div class="col-12 col-md-6">
                             <div class="form-check form-switch">
@@ -1221,6 +1231,7 @@
     window.CORETG_USERNAME = CORETG_USERNAME;
     window.CORETG_USER_ROLE = CORETG_USER_ROLE;
     const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
+    const WEBUI_RUNNING_IN_DOCKER = {{ 'true' if webui_running_in_docker else 'false' }};
     const IS_ADMIN_USER = (CORETG_USER_ROLE || '') === 'admin';
     const SCENARIOS_ACTIVE_TAB = '{{ scenarios_active_tab }}';
     window.CORETG_SCENARIOS_ACTIVE_TAB = SCENARIOS_ACTIVE_TAB;
@@ -9701,6 +9712,10 @@
             if (advRestartCoreDaemon) enabledFlags.push('Advanced: Restart core-daemon');
             if (advStartCoreDaemon) enabledFlags.push('Advanced: Start core-daemon');
             if (advAutoKillSessions) enabledFlags.push('Advanced: Auto-kill sessions');
+            if (autoStartDaemon) {
+                verifySetStatus('Auto-starting core-daemon (if needed)…');
+                verifyLog('Auto-start core-daemon toggle is enabled; daemon startup check runs first.');
+            }
             verifyLog(`Calling /test_core for ${coreHost}:${corePort}`);
             verifyLog(`Using last dialog options: ${enabledFlags.length ? enabledFlags.join(' | ') : 'none'}`);
             const result = await validateCoreConnection(sidx, {
@@ -13657,7 +13672,7 @@
             }
             if (coreAdvFixDockerDaemonInput) {
                 coreAdvFixDockerDaemonInput.checked = !!(coreState.adv_fix_docker_daemon);
-                coreAdvFixDockerDaemonInput.disabled = builderLocked || inputsDisabled;
+                coreAdvFixDockerDaemonInput.disabled = WEBUI_RUNNING_IN_DOCKER || builderLocked || inputsDisabled;
             }
             if (coreAdvRunCoreCleanupInput) {
                 coreAdvRunCoreCleanupInput.checked = !!(coreState.adv_run_core_cleanup);
@@ -20086,7 +20101,10 @@
             try {
                 return String(value);
             } catch (err2) {
-                return '';
+                let message = err instanceof Error ? err.message : 'Connection test failed';
+                if (advFixDockerDaemon && isNetworkFetchError(err)) {
+                    message = 'Connection dropped while applying Docker daemon fix. Disable this toggle when Web UI runs in Docker and re-try validation.';
+                }
             }
         }
     }
