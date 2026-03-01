@@ -40339,7 +40339,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         return
 
     try:
-        required_custom_services = {"DockerDefaultRoute"}
+        required_custom_services = {"DockerDefaultRoute", "CoreTGPrereqs"}
         install_custom_services_on_execute = bool(core_cfg.get('install_custom_services', True))
         discovered = _remote_core_service_names(remote_client, core_cfg=core_cfg)
         missing = sorted([name for name in required_custom_services if name not in discovered])

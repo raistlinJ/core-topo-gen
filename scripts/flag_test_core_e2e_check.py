@@ -14,6 +14,20 @@ import requests
 DEFAULT_BASE_URL = "http://127.0.0.1:9090"
 
 
+PRESET_STEPS: dict[str, list[dict[str, str]]] = {
+    "sample": [
+        {"id": "binary_embed_text", "kind": "flag-generator"},
+        {"id": "nfs_sensitive_file", "kind": "flag-node-generator"},
+        {"id": "textfile_username_password", "kind": "flag-generator"},
+    ],
+    "sample_reverse_nfs_ssh": [
+        {"id": "binary_embed_text", "kind": "flag-generator"},
+        {"id": "nfs_sensitive_file", "kind": "flag-node-generator"},
+        {"id": "textfile_username_password", "kind": "flag-generator"},
+    ],
+}
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -33,6 +47,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=float(os.getenv("CORETG_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--poll-seconds", type=int, default=int(os.getenv("CORETG_SMOKE_POLL_SECONDS", "30")))
     parser.add_argument("--allow-pending", action="store_true", default=_truthy(os.getenv("CORETG_SMOKE_ALLOW_PENDING", "1")))
+    parser.add_argument("--preset", default=os.getenv("CORETG_SMOKE_PRESET", "sample"))
     return parser.parse_args()
 
 
@@ -132,22 +147,55 @@ def _load_core_cfg_from_secret(
     return None
 
 
-def _pick_generator_id(session: requests.Session, *, base_url: str, endpoint: str, timeout: float) -> str | None:
+def _available_generator_ids(session: requests.Session, *, base_url: str, endpoint: str, timeout: float) -> list[str]:
     response = session.get(f"{base_url}{endpoint}", timeout=timeout)
     _log(f"{endpoint}_STATUS={response.status_code}")
     if response.status_code != 200:
-        return None
+        return []
     payload = response.json() if "json" in (response.headers.get("content-type", "").lower()) else {}
     generators = payload.get("generators") if isinstance(payload, dict) else None
     if not isinstance(generators, list):
-        return None
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
     for item in generators:
         if not isinstance(item, dict):
             continue
         gid = str(item.get("id") or "").strip()
+        if gid and gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+    return out
+
+
+def _preset_preferred_ids(preset: str, *, kind: str) -> list[str]:
+    p = str(preset or "").strip().lower()
+    steps = PRESET_STEPS.get(p) or []
+    out: list[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("kind") or "").strip() != kind:
+            continue
+        gid = str(step.get("id") or "").strip()
         if gid:
-            return gid
-    return None
+            out.append(gid)
+    return out
+
+
+def _ordered_candidates(available_ids: list[str], preferred_ids: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    avail_set = set(available_ids)
+    for gid in preferred_ids:
+        if gid in avail_set and gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+    for gid in available_ids:
+        if gid not in seen:
+            seen.add(gid)
+            out.append(gid)
+    return out
 
 
 def _run_single(
@@ -251,35 +299,63 @@ def main() -> int:
         _log("NO_USABLE_CORE_SECRET")
         return 11
 
-    flag_gen_id = _pick_generator_id(session, base_url=base_url, endpoint="/flag_generators_data", timeout=args.timeout)
-    node_gen_id = _pick_generator_id(session, base_url=base_url, endpoint="/flag_node_generators_data", timeout=args.timeout)
-    _log(f"FLAG_GENERATOR_ID={flag_gen_id}")
-    _log(f"FLAG_NODE_GENERATOR_ID={node_gen_id}")
+    flag_ids = _available_generator_ids(session, base_url=base_url, endpoint="/flag_generators_data", timeout=args.timeout)
+    node_ids = _available_generator_ids(session, base_url=base_url, endpoint="/flag_node_generators_data", timeout=args.timeout)
 
-    if not flag_gen_id or not node_gen_id:
+    preset_flag_ids = _preset_preferred_ids(args.preset, kind="flag-generator")
+    preset_node_ids = _preset_preferred_ids(args.preset, kind="flag-node-generator")
+
+    flag_candidates = _ordered_candidates(flag_ids, preset_flag_ids)
+    node_candidates = _ordered_candidates(node_ids, preset_node_ids)
+
+    _log(f"SMOKE_PRESET={args.preset}")
+    _log(f"PRESET_FLAG_IDS={preset_flag_ids}")
+    _log(f"PRESET_NODE_IDS={preset_node_ids}")
+    _log(f"FLAG_GENERATOR_CANDIDATES={flag_candidates}")
+    _log(f"FLAG_NODE_GENERATOR_CANDIDATES={node_candidates}")
+
+    if not flag_candidates or not node_candidates:
         _log("MISSING_GENERATOR_IDS")
         return 12
 
-    ok_flag = _run_single(
-        session,
-        base_url=base_url,
-        path_prefix="/flag_generators_test",
-        generator_id=flag_gen_id,
-        core_cfg=core_cfg,
-        timeout=args.timeout,
-        poll_seconds=args.poll_seconds,
-        allow_pending=args.allow_pending,
-    )
-    ok_node = _run_single(
-        session,
-        base_url=base_url,
-        path_prefix="/flag_node_generators_test",
-        generator_id=node_gen_id,
-        core_cfg=core_cfg,
-        timeout=args.timeout,
-        poll_seconds=args.poll_seconds,
-        allow_pending=args.allow_pending,
-    )
+    ok_flag = False
+    selected_flag_id = ""
+    for candidate in flag_candidates:
+        selected_flag_id = candidate
+        _log(f"FLAG_GENERATOR_ID={candidate}")
+        ok_flag = _run_single(
+            session,
+            base_url=base_url,
+            path_prefix="/flag_generators_test",
+            generator_id=candidate,
+            core_cfg=core_cfg,
+            timeout=args.timeout,
+            poll_seconds=args.poll_seconds,
+            allow_pending=args.allow_pending,
+        )
+        if ok_flag:
+            break
+
+    ok_node = False
+    selected_node_id = ""
+    for candidate in node_candidates:
+        selected_node_id = candidate
+        _log(f"FLAG_NODE_GENERATOR_ID={candidate}")
+        ok_node = _run_single(
+            session,
+            base_url=base_url,
+            path_prefix="/flag_node_generators_test",
+            generator_id=candidate,
+            core_cfg=core_cfg,
+            timeout=args.timeout,
+            poll_seconds=args.poll_seconds,
+            allow_pending=args.allow_pending,
+        )
+        if ok_node:
+            break
+
+    _log(f"FLAG_GENERATOR_SELECTED={selected_flag_id}")
+    _log(f"FLAG_NODE_GENERATOR_SELECTED={selected_node_id}")
 
     _log(f"FLAG_TEST_OK={ok_flag}")
     _log(f"FLAG_NODE_TEST_OK={ok_node}")

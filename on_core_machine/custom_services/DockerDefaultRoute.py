@@ -44,14 +44,14 @@ if [ -z "$iface" ] || [ -z "$cidr" ]; then
   exit 0
 fi
 
-ipaddr="${cidr%%/*}"
-prefix="${cidr#*/}"
+ipaddr="$(printf '%s' "$cidr" | cut -d'/' -f1)"
+prefix="$(printf '%s' "$cidr" | cut -d'/' -f2)"
 
 IFS=. read -r a b c d <<EOF_IP
 $ipaddr
 EOF_IP
 
-if [ -z "${a:-}" ] || [ -z "${b:-}" ] || [ -z "${c:-}" ] || [ -z "${d:-}" ]; then
+if [ -z "$a" ] || [ -z "$b" ] || [ -z "$c" ] || [ -z "$d" ]; then
   log "invalid IPv4 address parsed: $ipaddr"
   exit 0
 fi

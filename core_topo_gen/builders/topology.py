@@ -474,9 +474,12 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
             # Container name should match node_name when `container_name` is set (our default).
             # If not, this still helps in many cases because CORE uses the node name.
             inspect_name = node_name
+            pid_ready = False
+            last_inspect_tail = ''
             for _ in range(12):
                 try:
                     rc2, tail2 = _run(docker_cmd + ['inspect', '--format', '{{.State.Pid}} {{.State.Status}}', inspect_name], timeout=20)
+                    last_inspect_tail = tail2 or ''
                     if rc2 == 0:
                         parts = (tail2 or '').strip().split()
                         if parts:
@@ -485,10 +488,25 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                             except Exception:
                                 pid = 0
                             if pid and pid > 0:
+                                pid_ready = True
                                 break
                 except Exception:
                     pass
                 time.sleep(0.5)
+
+            # If PID never becomes non-zero, core-daemon may fail with `/proc/0/environ`.
+            # Treat this as a hard preflight failure so Execute exits with a clear cause.
+            if not pid_ready:
+                ps_rc, ps_tail = _run(compose_base + ['ps', '--all'], timeout=30)
+                raise RuntimeError(
+                    (
+                        f"docker preflight startup failed: container PID remained 0 "
+                        f"(node={node_name} service={target_service} inspect={inspect_name} rc={ps_rc}). "
+                        "This would cause CORE to fail with /proc/0/environ.\n"
+                        f"inspect_tail={last_inspect_tail}\n"
+                        f"compose_ps_tail={ps_tail}"
+                    ).strip()
+                )
     except Exception as exc:
         if strict_pull:
             raise
@@ -770,7 +788,8 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
         except Exception as exc:
             # When strict pull mode is enabled (used by the Web UI Execute flow), treat
             # preflight failures as fatal so the run is cancelled and the user sees the error.
-            if strict_pull:
+            exc_text = str(exc or '')
+            if strict_pull or ('PID remained 0' in exc_text) or ('/proc/0/environ' in exc_text):
                 raise
             try:
                 logger.warning('[docker-node] preflight skipped/failed node=%s err=%s', node_name, exc)
@@ -820,6 +839,14 @@ def _docker_default_route_service_name() -> str:
         return 'DockerDefaultRoute'
     name = str(raw).strip()
     return name if name else 'DockerDefaultRoute'
+
+
+def _docker_default_route_dependencies(route_service: str) -> List[str]:
+    """Return required dependencies for the selected docker default-route service."""
+    service_name = str(route_service or '').strip()
+    if service_name == 'DockerDefaultRoute':
+        return ['CoreTGPrereqs']
+    return []
 
 
 def _docker_traffic_service_enabled() -> bool:
@@ -1164,6 +1191,11 @@ def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
             remove_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
         except Exception:
             pass
+        for dep_service in _docker_default_route_dependencies(route_service):
+            try:
+                ensure_service(session, getattr(node_obj, 'id'), dep_service, node_obj=node_obj)
+            except Exception:
+                pass
         try:
             ensure_service(session, getattr(node_obj, 'id'), route_service, node_obj=node_obj)
         except Exception:
@@ -1198,6 +1230,11 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
                     remove_service(session, node_id, "DefaultRoute", node_obj=node)
                 except Exception:
                     pass
+                for dep_service in _docker_default_route_dependencies(route_service):
+                    try:
+                        ensure_service(session, node_id, dep_service, node_obj=node)
+                    except Exception:
+                        pass
                 try:
                     ensure_service(session, node_id, route_service, node_obj=node)
                 except Exception:
