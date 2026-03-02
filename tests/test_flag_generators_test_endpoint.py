@@ -25,6 +25,7 @@ def test_flag_generators_test_run_returns_json_ok(monkeypatch, tmp_path):
         "/flag_generators_test/run",
         data={
             "generator_id": "textfile_username_password",
+            "execute_like_real": "0",
             "flag_prefix": "FLAG",
             "seed": "123",
         },
@@ -55,6 +56,7 @@ def test_flag_node_generators_test_run_returns_json_ok(monkeypatch, tmp_path):
         "/flag_node_generators_test/run",
         data={
             "generator_id": "sample_node_generator",
+            "execute_like_real": "0",
             "flag_prefix": "FLAG",
             "seed": "123",
         },
@@ -66,3 +68,26 @@ def test_flag_node_generators_test_run_returns_json_ok(monkeypatch, tmp_path):
     assert isinstance(run_id, str) and run_id
 
     app_backend.RUNS.pop(run_id, None)
+
+
+def test_flag_node_generators_test_run_execute_like_real_requires_core_cfg(monkeypatch):
+    monkeypatch.setattr(
+        app_backend,
+        "_find_enabled_node_generator_by_id",
+        lambda _generator_id: {"id": "sample_node_generator", "inputs": []},
+    )
+
+    client = app_backend.app.test_client()
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (200, 302)
+
+    resp = client.post(
+        "/flag_node_generators_test/run",
+        data={
+            "generator_id": "sample_node_generator",
+        },
+    )
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert payload.get("ok") is False
+    assert "CORE VM SSH config required" in str(payload.get("error") or "")

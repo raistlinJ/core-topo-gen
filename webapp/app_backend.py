@@ -19400,6 +19400,7 @@ def api_flow_prepare_preview_for_execute():
     mode = str(j.get('mode') or '').strip().lower()
     best_effort = bool(j.get('best_effort')) or (mode in {'hint', 'hint_only', 'resolve_hints', 'preview'})
     run_generators_request = bool(mode in {'resolve', 'resolve_hints', 'hint', 'hint_only'})
+    cleanup_generated_artifacts = _coerce_bool(j.get('cleanup_generated_artifacts'))
     allow_node_duplicates = str(j.get('allow_node_duplicates') or j.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     total_timeout_s: int | None = None
     try:
@@ -22964,6 +22965,29 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         pass
 
+    cleanup_deleted_run_dirs: list[str] = []
+    if cleanup_generated_artifacts:
+        try:
+            cleanup_targets = [
+                str(path or '').strip()
+                for path in ((created_run_dirs or []) + (failed_run_dirs or []))
+                if str(path or '').strip()
+            ]
+            seen_cleanup: set[str] = set()
+            for path in cleanup_targets:
+                if path in seen_cleanup:
+                    continue
+                seen_cleanup.add(path)
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    if not os.path.exists(path):
+                        cleanup_deleted_run_dirs.append(path)
+                except Exception:
+                    continue
+        except Exception:
+            cleanup_deleted_run_dirs = []
+
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
@@ -23002,6 +23026,8 @@ def api_flow_prepare_preview_for_execute():
         'generation_skipped': generation_skipped,
         'created_run_dirs': created_run_dirs,
         'failed_run_dirs': failed_run_dirs,
+        'cleanup_generated_artifacts': bool(cleanup_generated_artifacts),
+        'cleanup_deleted_run_dirs': cleanup_deleted_run_dirs,
         **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
         **({'warning': warning} if warning else {}),
     }), (422 if generation_failures and not best_effort else 200)
@@ -48415,6 +48441,13 @@ def vuln_catalog_items_test_start():
     _require_builder_or_admin()
     payload = request.get_json(silent=True) or {}
     force_replace = bool(payload.get('force_replace') or payload.get('replace'))
+    execute_like_real = _coerce_bool(payload.get('execute_like_real') if isinstance(payload, dict) and 'execute_like_real' in payload else True)
+    cleanup_generated_artifacts = True
+    try:
+        if 'cleanup_generated_artifacts' in payload:
+            cleanup_generated_artifacts = _coerce_bool(payload.get('cleanup_generated_artifacts'))
+    except Exception:
+        cleanup_generated_artifacts = True
     item_id_raw = payload.get('item_id')
     try:
         item_id = int(item_id_raw)
@@ -48479,6 +48512,72 @@ def vuln_catalog_items_test_start():
             return jsonify({'ok': False, 'error': 'CORE VM has active session(s). Stop running scenario before testing.'}), 409
     except Exception as exc:
         return jsonify({'ok': False, 'error': f'Unable to verify CORE sessions: {exc}' }), 409
+
+    if execute_like_real:
+        item_name = str(
+            target.get('name')
+            or target.get('Name')
+            or target.get('Title')
+            or f'vuln-{item_id}'
+        )
+        job_spec, build_err = _vuln_test_build_ephemeral_execute_job(
+            run_dir=run_dir,
+            run_id=run_id,
+            core_cfg=core_cfg,
+            item_id=item_id,
+            item_name=item_name,
+            compose_path=compose_path,
+        )
+        if not isinstance(job_spec, dict):
+            return jsonify({'ok': False, 'error': str(build_err or 'failed to prepare execute-like-real vulnerability test')}), 500
+
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[vuln-test] starting execute-like-real item_id={item_id}\n")
+                _write_sse_marker(log_f, 'phase', {
+                    'phase': 'starting',
+                    'run_id': run_id,
+                    'item_id': item_id,
+                    'execute_like_real': True,
+                })
+        except Exception:
+            pass
+
+        RUNS[run_id] = {
+            'kind': 'vuln_test',
+            'proc': None,
+            'log_path': log_path,
+            'run_dir': run_dir,
+            'done': False,
+            'returncode': None,
+            'status': 'executing',
+            'cleanup_started': False,
+            'cleanup_done': False,
+            'catalog_id': cid,
+            'item_id': item_id,
+            'core_cfg': core_cfg,
+            'cleanup_generated_artifacts': bool(cleanup_generated_artifacts),
+            'execute_like_real': True,
+            'compose_path_raw': compose_path,
+        }
+
+        try:
+            threading.Thread(
+                target=_run_cli_background_task,
+                args=(run_id, job_spec),
+                name=f'vuln-test-exec-{run_id[:8]}',
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            RUNS.pop(run_id, None)
+            return jsonify({'ok': False, 'error': f'failed to start execute-like-real vulnerability test: {exc}'}), 500
+
+        return jsonify({
+            'ok': True,
+            'run_id': run_id,
+            'cleanup_generated_artifacts': bool(cleanup_generated_artifacts),
+            'execute_like_real': True,
+        })
 
     remote_run_dir = f"/tmp/tests/test-{run_id}"
     prepared_compose_path = compose_path
@@ -49175,6 +49274,7 @@ def vuln_catalog_items_test_start():
         'ssh_channel': channel,
         'ssh_log_handle': log_f,
         'ssh_log_thread': relay_thread,
+        'cleanup_generated_artifacts': bool(cleanup_generated_artifacts),
     }
 
     def _monitor_remote_vuln_test(_run_id: str) -> None:
@@ -49218,7 +49318,7 @@ def vuln_catalog_items_test_start():
         threading.Thread(target=_monitor_remote_vuln_test, args=(run_id,), daemon=True).start()
     except Exception:
         pass
-    return jsonify({'ok': True, 'run_id': run_id})
+    return jsonify({'ok': True, 'run_id': run_id, 'cleanup_generated_artifacts': bool(cleanup_generated_artifacts)})
 
 
 @app.route('/vuln_catalog_items/test/stop', methods=['POST'])
@@ -49238,12 +49338,20 @@ def vuln_catalog_items_test_stop():
 
 
 def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
+    execute_like_real = bool(meta.get('execute_like_real'))
     compose_path = meta.get('remote_compose_path')
     remote_run_dir = meta.get('remote_run_dir')
+    local_run_dir = str(meta.get('run_dir') or '').strip()
+    cleanup_generated_artifacts = True
+    try:
+        if 'cleanup_generated_artifacts' in meta:
+            cleanup_generated_artifacts = _coerce_bool(meta.get('cleanup_generated_artifacts'))
+    except Exception:
+        cleanup_generated_artifacts = True
     project_name = meta.get('project_name')
     log_path = meta.get('log_path')
     core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
-    if not core_cfg:
+    if not core_cfg and not execute_like_real:
         return jsonify({'ok': False, 'error': 'Missing CORE VM credentials'}), 400
 
     try:
@@ -49253,15 +49361,16 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
     except Exception:
         pass
 
-    try:
-        channel = meta.get('ssh_channel')
-        if channel is not None and hasattr(channel, 'close'):
-            try:
-                channel.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    if not execute_like_real:
+        try:
+            channel = meta.get('ssh_channel')
+            if channel is not None and hasattr(channel, 'close'):
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     try:
         if isinstance(meta, dict):
@@ -49273,45 +49382,52 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
     def _cleanup_remote() -> None:
         _client = None
         try:
-            _client = _open_ssh_client(core_cfg)
-            if log_path:
-                with open(log_path, 'a', encoding='utf-8') as log_f:
-                    log_f.write('[cleanup] docker compose down -v --remove-orphans --rmi all\n')
-            pw = ''
-            try:
-                pw = str(core_cfg.get('ssh_password') or '')
-            except Exception:
-                pw = ''
-            down_cmd = (
-                f"cd {shlex.quote(remote_run_dir or '/tmp')} && "
-                f"COMPOSE_PROJECT_NAME={shlex.quote(project_name or '')} sudo -S -p '' -k "
-                f"docker compose -f {shlex.quote(compose_path or '')} down -v --remove-orphans --rmi all"
-            )
-            cmd = f"bash -lc {shlex.quote(down_cmd)}"
-            channel = _client.get_transport().open_session() if _client.get_transport() else None
-            if channel is not None:
-                try:
-                    channel.get_pty()
-                except Exception:
-                    pass
-                channel.exec_command(cmd)
-                try:
-                    if pw:
-                        channel.send(pw + "\n")
-                except Exception:
-                    pass
-                try:
+            if not execute_like_real:
+                _client = _open_ssh_client(core_cfg)
+                if log_path:
                     with open(log_path, 'a', encoding='utf-8') as log_f:
-                        _relay_remote_channel_to_log(channel, log_f, redact_tokens=[pw])
+                        log_f.write('[cleanup] docker compose down -v --remove-orphans --rmi all\n')
+                pw = ''
+                try:
+                    pw = str(core_cfg.get('ssh_password') or '')
                 except Exception:
-                    pass
+                    pw = ''
+                down_cmd = (
+                    f"cd {shlex.quote(remote_run_dir or '/tmp')} && "
+                    f"COMPOSE_PROJECT_NAME={shlex.quote(project_name or '')} sudo -S -p '' -k "
+                    f"docker compose -f {shlex.quote(compose_path or '')} down -v --remove-orphans --rmi all"
+                )
+                cmd = f"bash -lc {shlex.quote(down_cmd)}"
+                channel = _client.get_transport().open_session() if _client.get_transport() else None
+                if channel is not None:
+                    try:
+                        channel.get_pty()
+                    except Exception:
+                        pass
+                    channel.exec_command(cmd)
+                    try:
+                        if pw:
+                            channel.send(pw + "\n")
+                    except Exception:
+                        pass
+                    try:
+                        with open(log_path, 'a', encoding='utf-8') as log_f:
+                            _relay_remote_channel_to_log(channel, log_f, redact_tokens=[pw])
+                    except Exception:
+                        pass
         except Exception:
             pass
-        try:
-            if _client and remote_run_dir:
-                _remote_remove_path(_client, remote_run_dir)
-        except Exception:
-            pass
+        if cleanup_generated_artifacts:
+            try:
+                if _client and remote_run_dir:
+                    _remote_remove_path(_client, remote_run_dir)
+            except Exception:
+                pass
+            try:
+                if local_run_dir and os.path.isdir(local_run_dir):
+                    shutil.rmtree(local_run_dir, ignore_errors=True)
+            except Exception:
+                pass
         try:
             if _client:
                 _client.close()
@@ -50978,6 +51094,414 @@ def _find_enabled_generator_by_id(generator_id: str) -> Optional[dict]:
     return None
 
 
+def _flaggen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    run_dir = str((meta or {}).get('run_dir') or '').strip()
+    generator_id = str((meta or {}).get('generator_id') or '').strip()
+    if not run_dir or not os.path.isdir(run_dir):
+        return None, 'flag generator run_dir missing'
+    if not generator_id:
+        return None, 'flag generator id missing'
+
+    manifest_path = os.path.join(run_dir, 'outputs.json')
+    outputs: dict[str, Any] = {}
+    if os.path.isfile(manifest_path):
+        try:
+            payload = json.loads(Path(manifest_path).read_text(encoding='utf-8'))
+            outs = payload.get('outputs') if isinstance(payload, dict) else None
+            if isinstance(outs, dict):
+                outputs = dict(outs)
+        except Exception:
+            outputs = {}
+
+    scenario_name = f"flaggen-test-{str(run_id or '').replace('/', '-')[:24]}"
+    xml_path = os.path.abspath(os.path.join(run_dir, 'ephemeral_execute.xml'))
+    xml_text = f"""<Scenarios>
+  <Scenario name='{scenario_name}'>
+    <ScenarioEditor>
+      <section name='Node Information'>
+        <item selected='Docker' v_metric='Count' v_count='1'/>
+        <item selected='Router' v_metric='Count' v_count='1'/>
+      </section>
+      <section name='Routing' density='0.0'></section>
+      <section name='Services' density='0.0'></section>
+      <section name='Vulnerabilities' density='0.0'></section>
+      <section name='Segmentation' density='0.0'></section>
+      <section name='Traffic' density='0.0'></section>
+    </ScenarioEditor>
+  </Scenario>
+</Scenarios>"""
+    Path(xml_path).write_text(xml_text, encoding='utf-8')
+
+    try:
+        _planner_persist_flow_plan(xml_path=xml_path, scenario=scenario_name, seed=None, persist_plan_file=False)
+    except Exception as exc:
+        return None, f'failed to build ephemeral preview plan: {exc}'
+
+    payload = _load_preview_payload_from_path(xml_path, scenario_name)
+    full_preview = payload.get('full_preview') if isinstance(payload, dict) else None
+    if not isinstance(full_preview, dict):
+        return None, 'ephemeral preview payload missing full_preview'
+    hosts = full_preview.get('hosts') if isinstance(full_preview.get('hosts'), list) else []
+    docker_nodes = [
+        h for h in hosts
+        if isinstance(h, dict) and str(h.get('role') or '').strip().lower() == 'docker' and str(h.get('node_id') or '').strip()
+    ]
+    if not docker_nodes:
+        return None, 'ephemeral scenario missing docker node'
+    docker_node_id = str((docker_nodes[0] or {}).get('node_id') or '').strip()
+    if not docker_node_id:
+        return None, 'ephemeral docker node id missing'
+
+    resolved_outputs = dict(outputs)
+    flag_value = str(
+        resolved_outputs.get('Flag(flag_id)')
+        or resolved_outputs.get('flag')
+        or ''
+    ).strip()
+
+    inject_files: list[str] = []
+    seen_injects: set[str] = set()
+    for val in resolved_outputs.values():
+        if not isinstance(val, str):
+            continue
+        raw = val.strip()
+        if not raw:
+            continue
+        abs_path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(run_dir, raw.lstrip('/')))
+        if not os.path.exists(abs_path):
+            continue
+        if abs_path in seen_injects:
+            continue
+        seen_injects.add(abs_path)
+        inject_files.append(abs_path)
+
+    assignment: dict[str, Any] = {
+        'node_id': docker_node_id,
+        'id': generator_id,
+        'name': str((meta or {}).get('generator_name') or generator_id),
+        'type': 'flag-generator',
+        'generator_catalog': 'flag_generators',
+        'run_dir': run_dir,
+        'artifacts_dir': run_dir,
+        'outputs_manifest': manifest_path if os.path.isfile(manifest_path) else '',
+        'resolved_outputs': resolved_outputs,
+        'inject_files': inject_files,
+    }
+    if flag_value:
+        assignment['flag_value'] = flag_value
+
+    flow_state = {
+        'scenario': scenario_name,
+        'length': 1,
+        'chain': [{'id': docker_node_id, 'name': str((docker_nodes[0] or {}).get('name') or docker_node_id)}],
+        'flag_assignments': [assignment],
+        'flow_enabled': True,
+    }
+    ok, msg = _update_flow_state_in_xml(xml_path, scenario_name, flow_state)
+    if not ok:
+        return None, f'failed to save ephemeral flow state: {msg}'
+
+    core_cfg = (meta or {}).get('core_cfg') if isinstance((meta or {}).get('core_cfg'), dict) else None
+    if not isinstance(core_cfg, dict):
+        return None, 'missing core config for ephemeral execute'
+
+    job_spec: dict[str, Any] = {
+        'seed': None,
+        'xml_path': xml_path,
+        'preview_plan_path': xml_path,
+        'core_override': dict(core_cfg),
+        'scenario_core_override': None,
+        'scenario_name_hint': scenario_name,
+        'scenario_index_hint': 0,
+        'update_remote_repo': True,
+        'adv_fix_docker_daemon': False,
+        'adv_run_core_cleanup': False,
+        'adv_check_core_version': False,
+        'adv_restart_core_daemon': False,
+        'adv_start_core_daemon': False,
+        'adv_auto_kill_sessions': False,
+        'docker_remove_conflicts': False,
+        'docker_cleanup_before_run': False,
+        'docker_remove_all_containers': False,
+        'overwrite_existing_images': False,
+        'upload_only_injected_artifacts': False,
+        'scenarios_inline': None,
+        'flow_enabled': True,
+        'scenario_for_plan': scenario_name,
+    }
+    return job_spec, None
+
+
+def _flaggen_run_ephemeral_execute(run_id_local: str) -> None:
+    meta = RUNS.get(run_id_local)
+    if not isinstance(meta, dict):
+        return
+    job_spec, err = _flaggen_build_ephemeral_execute_job(meta, run_id=run_id_local)
+    if not isinstance(job_spec, dict):
+        meta['done'] = True
+        meta['returncode'] = 1
+        meta['status'] = 'failed'
+        meta['error'] = str(err or 'failed to prepare ephemeral execute run')
+        return
+    meta['done'] = False
+    meta['returncode'] = None
+    meta['status'] = 'executing'
+    _run_cli_background_task(run_id_local, job_spec)
+
+
+def _flagnodegen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    run_dir = str((meta or {}).get('run_dir') or '').strip()
+    generator_id = str((meta or {}).get('generator_id') or '').strip()
+    if not run_dir or not os.path.isdir(run_dir):
+        return None, 'flag node generator run_dir missing'
+    if not generator_id:
+        return None, 'flag node generator id missing'
+
+    manifest_path = os.path.join(run_dir, 'outputs.json')
+    outputs: dict[str, Any] = {}
+    if os.path.isfile(manifest_path):
+        try:
+            payload = json.loads(Path(manifest_path).read_text(encoding='utf-8'))
+            outs = payload.get('outputs') if isinstance(payload, dict) else None
+            if isinstance(outs, dict):
+                outputs = dict(outs)
+        except Exception:
+            outputs = {}
+
+    scenario_name = f"flagnodegen-test-{str(run_id or '').replace('/', '-')[:24]}"
+    xml_path = os.path.abspath(os.path.join(run_dir, 'ephemeral_execute.xml'))
+    xml_text = f"""<Scenarios>
+  <Scenario name='{scenario_name}'>
+    <ScenarioEditor>
+      <section name='Node Information'>
+        <item selected='Docker' v_metric='Count' v_count='1'/>
+        <item selected='Router' v_metric='Count' v_count='1'/>
+      </section>
+      <section name='Routing' density='0.0'></section>
+      <section name='Services' density='0.0'></section>
+      <section name='Vulnerabilities' density='0.0'></section>
+      <section name='Segmentation' density='0.0'></section>
+      <section name='Traffic' density='0.0'></section>
+    </ScenarioEditor>
+  </Scenario>
+</Scenarios>"""
+    Path(xml_path).write_text(xml_text, encoding='utf-8')
+
+    try:
+        _planner_persist_flow_plan(xml_path=xml_path, scenario=scenario_name, seed=None, persist_plan_file=False)
+    except Exception as exc:
+        return None, f'failed to build ephemeral preview plan: {exc}'
+
+    payload = _load_preview_payload_from_path(xml_path, scenario_name)
+    full_preview = payload.get('full_preview') if isinstance(payload, dict) else None
+    if not isinstance(full_preview, dict):
+        return None, 'ephemeral preview payload missing full_preview'
+    hosts = full_preview.get('hosts') if isinstance(full_preview.get('hosts'), list) else []
+    docker_nodes = [
+        h for h in hosts
+        if isinstance(h, dict) and str(h.get('role') or '').strip().lower() == 'docker' and str(h.get('node_id') or '').strip()
+    ]
+    if not docker_nodes:
+        return None, 'ephemeral scenario missing docker node'
+    docker_node_id = str((docker_nodes[0] or {}).get('node_id') or '').strip()
+    if not docker_node_id:
+        return None, 'ephemeral docker node id missing'
+
+    resolved_outputs = dict(outputs)
+    flag_value = str(
+        resolved_outputs.get('Flag(flag_id)')
+        or resolved_outputs.get('flag')
+        or ''
+    ).strip()
+
+    inject_files: list[str] = []
+    seen_injects: set[str] = set()
+    for val in resolved_outputs.values():
+        if not isinstance(val, str):
+            continue
+        raw = val.strip()
+        if not raw:
+            continue
+        abs_path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(run_dir, raw.lstrip('/')))
+        if not os.path.exists(abs_path):
+            continue
+        if abs_path in seen_injects:
+            continue
+        seen_injects.add(abs_path)
+        inject_files.append(abs_path)
+
+    assignment: dict[str, Any] = {
+        'node_id': docker_node_id,
+        'id': generator_id,
+        'name': str((meta or {}).get('generator_name') or generator_id),
+        'type': 'flag-node-generator',
+        'generator_catalog': 'flag_node_generators',
+        'run_dir': run_dir,
+        'artifacts_dir': run_dir,
+        'outputs_manifest': manifest_path if os.path.isfile(manifest_path) else '',
+        'resolved_outputs': resolved_outputs,
+        'inject_files': inject_files,
+    }
+    if flag_value:
+        assignment['flag_value'] = flag_value
+
+    flow_state = {
+        'scenario': scenario_name,
+        'length': 1,
+        'chain': [{'id': docker_node_id, 'name': str((docker_nodes[0] or {}).get('name') or docker_node_id)}],
+        'flag_assignments': [assignment],
+        'flow_enabled': True,
+    }
+    ok, msg = _update_flow_state_in_xml(xml_path, scenario_name, flow_state)
+    if not ok:
+        return None, f'failed to save ephemeral flow state: {msg}'
+
+    core_cfg = (meta or {}).get('core_cfg') if isinstance((meta or {}).get('core_cfg'), dict) else None
+    if not isinstance(core_cfg, dict):
+        return None, 'missing core config for ephemeral execute'
+
+    job_spec: dict[str, Any] = {
+        'seed': None,
+        'xml_path': xml_path,
+        'preview_plan_path': xml_path,
+        'core_override': dict(core_cfg),
+        'scenario_core_override': None,
+        'scenario_name_hint': scenario_name,
+        'scenario_index_hint': 0,
+        'update_remote_repo': True,
+        'adv_fix_docker_daemon': False,
+        'adv_run_core_cleanup': False,
+        'adv_check_core_version': False,
+        'adv_restart_core_daemon': False,
+        'adv_start_core_daemon': False,
+        'adv_auto_kill_sessions': False,
+        'docker_remove_conflicts': False,
+        'docker_cleanup_before_run': False,
+        'docker_remove_all_containers': False,
+        'overwrite_existing_images': False,
+        'upload_only_injected_artifacts': False,
+        'scenarios_inline': None,
+        'flow_enabled': True,
+        'scenario_for_plan': scenario_name,
+    }
+    return job_spec, None
+
+
+def _flagnodegen_run_ephemeral_execute(run_id_local: str) -> None:
+    meta = RUNS.get(run_id_local)
+    if not isinstance(meta, dict):
+        return
+    job_spec, err = _flagnodegen_build_ephemeral_execute_job(meta, run_id=run_id_local)
+    if not isinstance(job_spec, dict):
+        meta['done'] = True
+        meta['returncode'] = 1
+        meta['status'] = 'failed'
+        meta['error'] = str(err or 'failed to prepare ephemeral execute run')
+        return
+    meta['done'] = False
+    meta['returncode'] = None
+    meta['status'] = 'executing'
+    _run_cli_background_task(run_id_local, job_spec)
+
+
+def _vuln_test_build_ephemeral_execute_job(
+    *,
+    run_dir: str,
+    run_id: str,
+    core_cfg: dict[str, Any],
+    item_id: int,
+    item_name: str,
+    compose_path: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    run_dir_abs = os.path.abspath(str(run_dir or '').strip()) if str(run_dir or '').strip() else ''
+    if not run_dir_abs:
+        return None, 'vuln test run_dir missing'
+    try:
+        os.makedirs(run_dir_abs, exist_ok=True)
+    except Exception as exc:
+        return None, f'failed to create vuln test run_dir: {exc}'
+
+    compose_abs = os.path.abspath(str(compose_path or '').strip()) if str(compose_path or '').strip() else ''
+    if not compose_abs or not os.path.isfile(compose_abs):
+        return None, 'vuln test compose path missing'
+
+    scenario_name = f"vuln-test-{str(item_id or 0)}-{str(run_id or '').replace('/', '-')[:16]}"
+    xml_path = os.path.abspath(os.path.join(run_dir_abs, 'ephemeral_execute.xml'))
+
+    def _xml_attr(value: str) -> str:
+        try:
+            return (
+                str(value or '')
+                .replace('&', '&amp;')
+                .replace("'", '&apos;')
+                .replace('"', '&quot;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+            )
+        except Exception:
+            return ''
+
+    item_name_xml = _xml_attr(str(item_name or f'vuln-{item_id}'))
+    compose_xml = _xml_attr(compose_abs)
+    scenario_xml = _xml_attr(scenario_name)
+
+    xml_text = f"""<Scenarios>
+  <Scenario name='{scenario_xml}'>
+    <ScenarioEditor>
+      <section name='Node Information'>
+        <item selected='Docker' v_metric='Count' v_count='1'/>
+      </section>
+      <section name='Routing' density='0.0'></section>
+      <section name='Services' density='0.0'></section>
+      <section name='Vulnerabilities' density='0.0'>
+        <item selected='Specific' v_metric='Count' v_count='1' v_name='{item_name_xml}' v_path='{compose_xml}'/>
+      </section>
+      <section name='Segmentation' density='0.0'></section>
+      <section name='Traffic' density='0.0'></section>
+    </ScenarioEditor>
+  </Scenario>
+</Scenarios>"""
+
+    try:
+        Path(xml_path).write_text(xml_text, encoding='utf-8')
+    except Exception as exc:
+        return None, f'failed to write vuln test XML: {exc}'
+
+    try:
+        _planner_persist_flow_plan(xml_path=xml_path, scenario=scenario_name, seed=None, persist_plan_file=False)
+    except Exception as exc:
+        return None, f'failed to build vuln test preview plan: {exc}'
+
+    if not isinstance(core_cfg, dict):
+        return None, 'missing core config for vuln test execute'
+
+    job_spec: dict[str, Any] = {
+        'seed': None,
+        'xml_path': xml_path,
+        'preview_plan_path': xml_path,
+        'core_override': dict(core_cfg),
+        'scenario_core_override': None,
+        'scenario_name_hint': scenario_name,
+        'scenario_index_hint': 0,
+        'update_remote_repo': True,
+        'adv_fix_docker_daemon': False,
+        'adv_run_core_cleanup': False,
+        'adv_check_core_version': False,
+        'adv_restart_core_daemon': False,
+        'adv_start_core_daemon': False,
+        'adv_auto_kill_sessions': False,
+        'docker_remove_conflicts': False,
+        'docker_cleanup_before_run': False,
+        'docker_remove_all_containers': False,
+        'overwrite_existing_images': False,
+        'upload_only_injected_artifacts': False,
+        'scenarios_inline': None,
+        'flow_enabled': False,
+        'scenario_for_plan': scenario_name,
+    }
+    return job_spec, None
+
+
 @app.route('/flag_generators_test/run', methods=['POST'])
 def flag_generators_test_run():
     """Start a generator test run.
@@ -50987,6 +51511,7 @@ def flag_generators_test_run():
     """
     t0 = time.time()
     generator_id = (request.form.get('generator_id') or '').strip()
+    execute_like_real = _coerce_bool(request.form.get('execute_like_real') or '1')
     try:
         app.logger.info("[flaggen_test] POST /flag_generators_test/run generator_id=%s", generator_id)
     except Exception:
@@ -51134,6 +51659,9 @@ def flag_generators_test_run():
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 409
 
+    if execute_like_real and not isinstance(core_cfg, dict):
+        return jsonify({'ok': False, 'error': 'CORE VM SSH config required for execute-like-real test mode.'}), 400
+
     if core_cfg:
         try:
             with open(log_path, 'a', encoding='utf-8') as log_f:
@@ -51166,9 +51694,12 @@ def flag_generators_test_run():
             'log_path': log_path,
             'done': False,
             'returncode': None,
+            'status': 'generator_running',
             'run_dir': run_dir,
             'kind': 'flag_generator_test',
             'generator_id': generator_id,
+            'generator_name': str((gen or {}).get('name') or generator_id),
+            'execute_like_real': bool(execute_like_real),
             'remote': True,
             'core_cfg': core_cfg,
             'remote_run_dir': remote_meta.get('remote_run_dir'),
@@ -51197,11 +51728,9 @@ def flag_generators_test_run():
                             break
                         time.sleep(0.5)
             finally:
-                meta['done'] = True
-                meta['returncode'] = rc
                 try:
                     with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
-                        _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                        _write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
                 except Exception:
                     pass
                 try:
@@ -51232,6 +51761,23 @@ def flag_generators_test_run():
                         handle.close()
                 except Exception:
                     pass
+                if rc == 0 and bool(meta.get('execute_like_real')) and (not meta.get('cleanup_requested')):
+                    try:
+                        _flaggen_run_ephemeral_execute(run_id_local)
+                        return
+                    except Exception as exc:
+                        meta['done'] = True
+                        meta['returncode'] = 1
+                        meta['status'] = 'failed'
+                        meta['error'] = f'ephemeral execute failed: {exc}'
+                meta['done'] = True
+                meta['returncode'] = rc
+                meta['status'] = 'completed' if rc == 0 else 'failed'
+                try:
+                    with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                        _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                except Exception:
+                    pass
 
         threading.Thread(
             target=_finalize_remote_flaggen,
@@ -51249,7 +51795,7 @@ def flag_generators_test_run():
             )
         except Exception:
             pass
-        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads, 'execute_like_real': bool(execute_like_real)})
 
     # Launch runner.
     repo_root = _get_repo_root()
@@ -51315,9 +51861,13 @@ def flag_generators_test_run():
         'log_path': log_path,
         'done': False,
         'returncode': None,
+        'status': 'generator_running',
         'run_dir': run_dir,
         'kind': 'flag_generator_test',
         'generator_id': generator_id,
+        'generator_name': str((gen or {}).get('name') or generator_id),
+        'execute_like_real': bool(execute_like_real),
+        'core_cfg': core_cfg,
     }
 
     def _finalize_flaggen(run_id_local: str, log_handle_local: Any):
@@ -51329,8 +51879,23 @@ def flag_generators_test_run():
             if not p:
                 return
             rc = p.wait()
+            try:
+                with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                    _write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
+            except Exception:
+                pass
+            if rc == 0 and bool(meta.get('execute_like_real')):
+                try:
+                    _flaggen_run_ephemeral_execute(run_id_local)
+                    return
+                except Exception as exc:
+                    meta['done'] = True
+                    meta['returncode'] = 1
+                    meta['status'] = 'failed'
+                    meta['error'] = f'ephemeral execute failed: {exc}'
             meta['done'] = True
             meta['returncode'] = rc
+            meta['status'] = 'completed' if rc == 0 else 'failed'
             try:
                 with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
                     _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
@@ -51357,7 +51922,7 @@ def flag_generators_test_run():
         )
     except Exception:
         pass
-    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads, 'execute_like_real': bool(execute_like_real)})
 
 
 @app.route('/flag_node_generators_test/run', methods=['POST'])
@@ -51365,6 +51930,7 @@ def flag_node_generators_test_run():
     """Start a node-generator test run."""
     t0 = time.time()
     generator_id = (request.form.get('generator_id') or '').strip()
+    execute_like_real = _coerce_bool(request.form.get('execute_like_real') or '1')
     try:
         app.logger.info("[flagnodegen_test] POST /flag_node_generators_test/run generator_id=%s", generator_id)
     except Exception:
@@ -51449,6 +52015,9 @@ def flag_node_generators_test_run():
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 409
 
+    if execute_like_real and not isinstance(core_cfg, dict):
+        return jsonify({'ok': False, 'error': 'CORE VM SSH config required for execute-like-real test mode.'}), 400
+
     if core_cfg:
         try:
             with open(log_path, 'a', encoding='utf-8') as log_f:
@@ -51481,9 +52050,12 @@ def flag_node_generators_test_run():
             'log_path': log_path,
             'done': False,
             'returncode': None,
+            'status': 'generator_running',
             'run_dir': run_dir,
             'kind': 'flag_node_generator_test',
             'generator_id': generator_id,
+            'generator_name': str((gen or {}).get('name') or generator_id),
+            'execute_like_real': bool(execute_like_real),
             'remote': True,
             'core_cfg': core_cfg,
             'remote_run_dir': remote_meta.get('remote_run_dir'),
@@ -51512,11 +52084,9 @@ def flag_node_generators_test_run():
                             break
                         time.sleep(0.5)
             finally:
-                meta['done'] = True
-                meta['returncode'] = rc
                 try:
                     with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
-                        _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                        _write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
                 except Exception:
                     pass
                 try:
@@ -51547,6 +52117,23 @@ def flag_node_generators_test_run():
                         handle.close()
                 except Exception:
                     pass
+                if rc == 0 and bool(meta.get('execute_like_real')) and (not meta.get('cleanup_requested')):
+                    try:
+                        _flagnodegen_run_ephemeral_execute(run_id_local)
+                        return
+                    except Exception as exc:
+                        meta['done'] = True
+                        meta['returncode'] = 1
+                        meta['status'] = 'failed'
+                        meta['error'] = f'ephemeral execute failed: {exc}'
+                meta['done'] = True
+                meta['returncode'] = rc
+                meta['status'] = 'completed' if rc == 0 else 'failed'
+                try:
+                    with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                        _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                except Exception:
+                    pass
 
         threading.Thread(
             target=_finalize_remote_flagnodegen,
@@ -51564,7 +52151,7 @@ def flag_node_generators_test_run():
             )
         except Exception:
             pass
-        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads, 'execute_like_real': bool(execute_like_real)})
 
     repo_root = _get_repo_root()
     runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
@@ -51618,9 +52205,13 @@ def flag_node_generators_test_run():
         'log_path': log_path,
         'done': False,
         'returncode': None,
+        'status': 'generator_running',
         'run_dir': run_dir,
         'kind': 'flag_node_generator_test',
         'generator_id': generator_id,
+        'generator_name': str((gen or {}).get('name') or generator_id),
+        'execute_like_real': bool(execute_like_real),
+        'core_cfg': core_cfg,
     }
 
     def _finalize(run_id_local: str, log_handle_local: Any):
@@ -51632,8 +52223,23 @@ def flag_node_generators_test_run():
             if not p:
                 return
             rc = p.wait()
+            try:
+                with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                    _write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
+            except Exception:
+                pass
+            if rc == 0 and bool(meta.get('execute_like_real')):
+                try:
+                    _flagnodegen_run_ephemeral_execute(run_id_local)
+                    return
+                except Exception as exc:
+                    meta['done'] = True
+                    meta['returncode'] = 1
+                    meta['status'] = 'failed'
+                    meta['error'] = f'ephemeral execute failed: {exc}'
             meta['done'] = True
             meta['returncode'] = rc
+            meta['status'] = 'completed' if rc == 0 else 'failed'
             try:
                 with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
                     _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
@@ -51662,7 +52268,7 @@ def flag_node_generators_test_run():
         )
     except Exception:
         pass
-    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads, 'execute_like_real': bool(execute_like_real)})
 
 
 @app.route('/flag_node_generators_test/outputs/<run_id>')

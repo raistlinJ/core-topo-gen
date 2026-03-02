@@ -19755,7 +19755,7 @@
                                 }
                                 let data = null;
                                 try {
-                                    data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg });
+                                    data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg, cleanup_generated_artifacts: true });
                                 } catch (e) {
                                     const msg = String(e || '');
                                     if (msg.includes('Another vulnerability test is already running')) {
@@ -19763,7 +19763,7 @@
                                         if (!shouldStop) throw e;
                                         await postJson('/vuln_catalog_items/test/stop_active', { ok: null });
                                         await new Promise(r => setTimeout(r, 600));
-                                        data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg });
+                                        data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg, cleanup_generated_artifacts: true });
                                     } else {
                                         throw e;
                                     }
@@ -19783,7 +19783,7 @@
                                         if (closeBtn) closeBtn.style.display = '';
                                         return;
                                     }
-                                    data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg, force_replace: true });
+                                    data = await postJson('/vuln_catalog_items/test/start', { item_id: it.id, core: coreCfg, force_replace: true, cleanup_generated_artifacts: true });
                                 }
                                 if (!data || data.ok !== true || !data.run_id) {
                                     throw new Error((data && data.error) ? data.error : 'Failed to start test');
