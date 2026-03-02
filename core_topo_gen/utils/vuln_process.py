@@ -1275,8 +1275,8 @@ def _compose_force_root_workdir_enabled() -> bool:
 	paths relative to the container filesystem root. For images with non-root WORKDIR,
 	this can cause CORE to fail to chmod service files that were copied into `/`.
 
-	Default: all (force for all services). Modes:
-	- unset / all: force for all services
+	Default: auto (force only for base OS / known-safe images). Modes:
+	- unset / auto: force only for base OS / known-safe images
 	- 1/true/yes/on/all: force for all services
 	- 0/false/no/off: disable
 	"""
@@ -1288,7 +1288,7 @@ def _compose_force_root_workdir_mode() -> str:
 	"""Return root-workdir forcing mode: off | auto | all."""
 	val = os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR')
 	if val is None:
-		return 'all'
+		return 'auto'
 	low = str(val).strip().lower()
 	if low in ('0', 'false', 'no', 'off', ''):
 		return 'off'
@@ -1296,7 +1296,7 @@ def _compose_force_root_workdir_mode() -> str:
 		return 'all'
 	if low in ('auto', 'default'):
 		return 'auto'
-	return 'all'
+	return 'auto'
 
 
 def _looks_like_base_os_image(image_ref: str) -> bool:
@@ -1385,8 +1385,27 @@ def _service_uses_relative_command_path(service: Dict[str, object]) -> bool:
 	- command: "java -jar ./build/libs/ofbiz.jar"
 	- command: ["./start.sh"]
 	- command: ["sh", "-lc", "./run.sh"]
+	- command: "ruby web.rb -p 8080" (relative script argument)
 	"""
 	if not isinstance(service, dict):
+		return False
+
+	def _looks_like_relative_script_arg(token: str) -> bool:
+		try:
+			t = str(token or '').strip()
+			if not t:
+				return False
+			if t.startswith('/'):
+				return False
+			if t.startswith('./') or t.startswith('../'):
+				return True
+			# Bare script/file in current working directory (no path separator).
+			if ('/' not in t) and ('.' in t):
+				ext = t.rsplit('.', 1)[-1].lower()
+				if ext in {'rb', 'py', 'pl', 'php', 'js', 'mjs', 'cjs', 'jar', 'sh', 'bash', 'zsh', 'ksh'}:
+					return True
+		except Exception:
+			return False
 		return False
 
 	def _has_relative_ref(value: object) -> bool:
@@ -1397,7 +1416,19 @@ def _service_uses_relative_command_path(service: Dict[str, object]) -> bool:
 					return False
 				if text.startswith('./'):
 					return True
-				return (' ./' in text) or (';./' in text) or ('&&./' in text) or ('|./' in text)
+				if (' ./' in text) or (';./' in text) or ('&&./' in text) or ('|./' in text):
+					return True
+				parts = [p for p in text.split() if p]
+				if len(parts) >= 2:
+					head = parts[0].lower()
+					# Interpreter + relative script/file argument.
+					if head in {'ruby', 'python', 'python3', 'perl', 'php', 'node', 'java', 'bash', 'sh', 'zsh', 'ksh'}:
+						for token in parts[1:4]:
+							if token.startswith('-'):
+								continue
+							if _looks_like_relative_script_arg(token):
+								return True
+				return False
 			if isinstance(value, list):
 				for item in value:
 					s = str(item or '').strip()
@@ -1407,6 +1438,15 @@ def _service_uses_relative_command_path(service: Dict[str, object]) -> bool:
 						return True
 					if (' ./' in s) or (';./' in s) or ('&&./' in s) or ('|./' in s):
 						return True
+				if len(value) >= 2:
+					head = str(value[0] or '').strip().lower()
+					if head in {'ruby', 'python', 'python3', 'perl', 'php', 'node', 'java', 'bash', 'sh', 'zsh', 'ksh'}:
+						for item in value[1:4]:
+							t = str(item or '').strip()
+							if not t or t.startswith('-'):
+								continue
+							if _looks_like_relative_script_arg(t):
+								return True
 		except Exception:
 			return False
 		return False
@@ -3737,11 +3777,16 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					with open(src_path, 'r', encoding='utf-8') as f:
 						base_compose_obj = yaml.safe_load(f) or {}
 					# Track that we successfully parsed the chosen src_path.
-					# If the compose is local, copy referenced support files (e.g., ./flag.txt)
+					# Copy referenced support files (e.g., ./web.rb, env files, build contexts)
 					# and rewrite relative bind sources to absolute paths under base_dir.
+					# Use the actual parsed compose location (src_path), falling back to key[1].
 					try:
+						src_dir = ''
 						if key[1] and os.path.exists(key[1]):
 							src_dir = os.path.dirname(os.path.abspath(key[1]))
+						elif src_path and os.path.exists(src_path):
+							src_dir = os.path.dirname(os.path.abspath(src_path))
+						if src_dir and base_dir:
 							base_compose_obj = _copy_support_paths_and_absolutize_binds(
 								base_compose_obj,
 								src_dir=src_dir,

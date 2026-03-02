@@ -182,6 +182,11 @@ Compose + CORE docker-node constraints (important for `flag-node-generator` outp
 - Assume containers may run with `network_mode: none` enforced and may have no outbound internet.
 - Do not rely on `ports:` for connectivity between CORE nodes. Clients should connect to the server using the server node’s CORE IP.
 - Prefer single-port protocols (one TCP port) to reduce segmentation/firewall complexity.
+- If startup uses relative script paths (for example `ruby web.rb`, `python app.py`, `./run.sh`), set a compatible `working_dir` explicitly or use absolute script paths.
+- Keep command/working_dir/mounts consistent: mounted files must resolve from the chosen `working_dir` (or command must use absolute paths).
+- Do not assume image default WORKDIR is always preserved after compose transformation.
+- Default runtime policy is `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=auto`; some base/known-safe images may still be forced to `/`.
+- If operators set `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=1`, all services may be forced to `/`; prefer absolute script paths when feasible.
 
 ---
 
@@ -195,6 +200,7 @@ Before accepting AI output, check:
 - Any `injects` key resolves to a real output file path.
 - No fragile internet/package-manager dependency for core success path.
 - No `${...}` in emitted compose for node generators.
+- Relative startup commands in compose have explicit safe `working_dir` (or absolute paths).
 
 ---
 

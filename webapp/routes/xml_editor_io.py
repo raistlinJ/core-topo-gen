@@ -267,6 +267,7 @@ def register(
             user = current_user_getter()
             data = request.get_json(silent=True) or {}
             scenarios = data.get('scenarios')
+            clear_flow_preview = bool(data.get('clear_flow_preview'))
             core_meta = data.get('core')
             normalized_core = normalize_core_config(core_meta, include_password=True) if isinstance(core_meta, (dict, list)) or core_meta else None
             raw_project_hint = data.get('project_key_hint') if isinstance(data, dict) else None
@@ -278,8 +279,216 @@ def register(
                 active_index = int(data.get('active_index')) if 'active_index' in data else None
             except Exception:
                 active_index = None
+
+            def _norm_name(value: Any) -> str:
+                try:
+                    return ' '.join(str(value or '').strip().lower().split())
+                except Exception:
+                    return ''
+
+            def _scenario_has_items(scen: Any) -> bool:
+                if not isinstance(scen, dict):
+                    return False
+                sections = scen.get('sections') if isinstance(scen.get('sections'), dict) else {}
+                if not isinstance(sections, dict) or not sections:
+                    return False
+                for sec in sections.values():
+                    if not isinstance(sec, dict):
+                        continue
+                    items = sec.get('items') if isinstance(sec.get('items'), list) else []
+                    if any(isinstance(item, dict) and item for item in (items or [])):
+                        return True
+                return False
+
+            def _is_summary_only_scenario(scen: Any) -> bool:
+                if not isinstance(scen, dict):
+                    return False
+                sections = scen.get('sections') if isinstance(scen.get('sections'), dict) else None
+                if not isinstance(sections, dict):
+                    return False
+                if _scenario_has_items(scen):
+                    return False
+                # Keep this conservative: only treat as summary-only when at least one
+                # topology count/summary signal is present, which indicates this came
+                # from a reduced snapshot rather than an intentional empty authoring state.
+                for key in ('density_count', 'scenario_total_nodes', 'base_nodes', 'combined_nodes', 'additional_nodes'):
+                    try:
+                        raw = scen.get(key)
+                        if raw is None:
+                            continue
+                        if str(raw).strip() != '':
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _candidate_source_xml_paths(project_hint_path: str, scenario_name: str) -> list[str]:
+                out: list[str] = []
+                try:
+                    p = str(project_hint_path or '').strip()
+                    if p and os.path.isfile(p):
+                        out.append(os.path.abspath(p))
+                except Exception:
+                    pass
+                try:
+                    p = str(project_hint_path or '').strip()
+                    if p and os.path.exists(p):
+                        base_dir = os.path.dirname(os.path.abspath(p))
+                        stem = secure_filename(str(scenario_name or '').strip()).strip('_-.')
+                        if stem:
+                            candidate = os.path.join(base_dir, f'{stem}.xml')
+                            if os.path.isfile(candidate):
+                                out.append(os.path.abspath(candidate))
+                        if os.path.isdir(base_dir):
+                            target = _norm_name(scenario_name)
+                            if target:
+                                for name in os.listdir(base_dir):
+                                    if not name.lower().endswith('.xml'):
+                                        continue
+                                    try:
+                                        if _norm_name(os.path.splitext(name)[0]) == target:
+                                            out.append(os.path.abspath(os.path.join(base_dir, name)))
+                                    except Exception:
+                                        continue
+                except Exception:
+                    pass
+                # stable + de-dup
+                uniq: list[str] = []
+                seen: set[str] = set()
+                for p in out:
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    uniq.append(p)
+                return uniq
+
+            def _load_scenario_from_sources(scenario_name: str, project_hint_path: str) -> dict[str, Any] | None:
+                target = _norm_name(scenario_name)
+                if not target:
+                    return None
+                for src in _candidate_source_xml_paths(project_hint_path, scenario_name):
+                    try:
+                        parsed = parse_scenarios_xml(src)
+                        rows = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                        if not isinstance(rows, list):
+                            continue
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            if _norm_name(row.get('name')) != target:
+                                continue
+                            if _scenario_has_items(row):
+                                return row
+                    except Exception:
+                        continue
+                return None
+
+            def _topology_signature(scen: Any) -> str:
+                if not isinstance(scen, dict):
+                    return ''
+                sections = scen.get('sections') if isinstance(scen.get('sections'), dict) else {}
+                if not isinstance(sections, dict):
+                    sections = {}
+                keys = (
+                    'Node Information',
+                    'Routing',
+                    'Services',
+                    'Traffic',
+                    'Vulnerabilities',
+                    'Segmentation',
+                )
+                picked: dict[str, Any] = {}
+                for key in keys:
+                    sec = sections.get(key)
+                    if isinstance(sec, dict):
+                        picked[key] = sec
+                summary = {
+                    'density_count': scen.get('density_count'),
+                    'scenario_total_nodes': scen.get('scenario_total_nodes'),
+                    'sections': picked,
+                }
+                try:
+                    return json.dumps(summary, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+                except Exception:
+                    return ''
+
+            def _with_flow_state_dirty_if_topology_changed(scen: Any, src: Any) -> Any:
+                if not isinstance(scen, dict):
+                    return scen
+                out = dict(scen)
+                flow_state = out.get('flow_state') if isinstance(out.get('flow_state'), dict) else {}
+                if not flow_state and isinstance(src, dict) and isinstance(src.get('flow_state'), dict):
+                    flow_state = dict(src.get('flow_state') or {})
+                if not isinstance(src, dict):
+                    if flow_state:
+                        out['flow_state'] = flow_state
+                    return out
+                try:
+                    changed = _topology_signature(out) != _topology_signature(src)
+                except Exception:
+                    changed = False
+                if changed:
+                    flow_state = dict(flow_state or {})
+                    flow_state['topology_dirty'] = True
+                    flow_state['topology_dirty_reason'] = 'topology_or_ip_changed'
+                    flow_state['updated_at'] = local_timestamp_safe()
+                    out['flow_state'] = flow_state
+                elif flow_state:
+                    out['flow_state'] = flow_state
+                return out
+
             if not isinstance(scenarios, list):
                 return jsonify({'ok': False, 'error': 'Invalid payload (scenarios list required)'}), 400
+
+            # Guard against reduced snapshots (e.g., from non-topology pages) that
+            # carry only section summaries and would otherwise wipe topology items.
+            if isinstance(scenarios, list):
+                hydrated: list[Any] = []
+                for scen in scenarios:
+                    if not isinstance(scen, dict):
+                        hydrated.append(scen)
+                        continue
+                    if not _is_summary_only_scenario(scen):
+                        hydrated.append(scen)
+                        continue
+                    src = _load_scenario_from_sources(str(scen.get('name') or ''), project_key_hint)
+                    if not isinstance(src, dict):
+                        hydrated.append(scen)
+                        continue
+                    merged = dict(src)
+                    for key, val in scen.items():
+                        if key == 'sections':
+                            continue
+                        merged[key] = val
+                    hydrated.append(merged)
+                scenarios = hydrated
+
+            # If topology/IP-related fields changed compared to source XML, mark
+            # FlowState as dirty so Flag Sequencing prompts a re-generate.
+            if isinstance(scenarios, list):
+                marked: list[Any] = []
+                for scen in scenarios:
+                    if not isinstance(scen, dict):
+                        marked.append(scen)
+                        continue
+                    src = _load_scenario_from_sources(str(scen.get('name') or ''), project_key_hint)
+                    marked.append(_with_flow_state_dirty_if_topology_changed(scen, src))
+                scenarios = marked
+
+            if clear_flow_preview and isinstance(scenarios, list):
+                cleaned: list[Any] = []
+                for scen in scenarios:
+                    if not isinstance(scen, dict):
+                        cleaned.append(scen)
+                        continue
+                    scen2 = dict(scen)
+                    for key in ('flow_state', 'plan_preview', 'full_preview', 'fullPreview', 'preview'):
+                        try:
+                            scen2.pop(key, None)
+                        except Exception:
+                            pass
+                    cleaned.append(scen2)
+                scenarios = cleaned
             try:
                 normalize_scenario_names_strict(scenarios)
             except Exception:

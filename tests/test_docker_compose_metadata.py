@@ -741,8 +741,7 @@ def test_prepare_compose_root_workdir_auto_mode_skips_app_images(tmp_path, monke
     services = (obj or {}).get("services") or {}
     target = services.get("docker-1")
     assert isinstance(target, dict)
-    assert isinstance(target.get("working_dir"), str) and str(target.get("working_dir") or "").strip()
-    assert str(target.get("working_dir") or "") == "/"
+    assert target.get("working_dir") != "/"
 
 
 def test_prepare_compose_root_workdir_default_preserves_relative_command_paths(tmp_path, monkeypatch):
@@ -840,8 +839,7 @@ def test_prepare_compose_root_workdir_auto_mode_does_not_force_nextjs(tmp_path, 
     services = (obj or {}).get("services") or {}
     target = services.get("docker-1")
     assert isinstance(target, dict)
-    assert isinstance(target.get("working_dir"), str) and str(target.get("working_dir") or "").strip()
-    assert str(target.get("working_dir") or "") == "/"
+    assert target.get("working_dir") != "/"
 
 
 def test_prepare_compose_root_workdir_auto_mode_forces_base_os(tmp_path, monkeypatch):

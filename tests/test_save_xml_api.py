@@ -356,3 +356,208 @@ def test_save_xml_api_topology_roundtrip_preserves_section_fields(tmp_path, monk
     assert v0.get('v_vector') == 'network'
 
     assert scen0.get('notes') == 'roundtrip'
+
+
+def test_save_xml_api_hydrates_summary_only_payload_from_project_hint(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    original_payload = {
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "density_count": 10,
+                "base": {"filepath": ""},
+                "sections": {
+                    "Node Information": {
+                        "density": 0,
+                        "items": [
+                            {"selected": "Docker", "factor": 1.0, "v_metric": "Count", "v_count": 5}
+                        ],
+                    },
+                    "Routing": {
+                        "density": 0.5,
+                        "items": [
+                            {
+                                "selected": "RIP",
+                                "factor": 1.0,
+                                "v_metric": "Weight",
+                                "r2r_mode": "NonUniform",
+                            }
+                        ],
+                    },
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {
+                        "density": 0.5,
+                        "items": [
+                            {"selected": "Specific", "factor": 1.0, "v_metric": "Count", "v_name": "redis/CVE-2022-0543", "v_count": 1}
+                        ],
+                    },
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+                "notes": "seed",
+            }
+        ]
+    }
+
+    first = client.post('/save_xml_api', data=json.dumps(original_payload), content_type='application/json')
+    assert first.status_code == 200
+    first_data = first.get_json() or {}
+    assert first_data.get('ok') is True
+    source_xml = first_data.get('result_path')
+    assert source_xml and os.path.exists(source_xml)
+
+    summary_only_payload = {
+        "project_key_hint": source_xml,
+        "scenario_query": "Anatest",
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "density_count": 10,
+                "scenario_total_nodes": 10,
+                "sections": {
+                    "Node Information": {
+                        "density": 0,
+                        "base_nodes": 10,
+                        "additional_nodes": 0,
+                        "combined_nodes": 10,
+                        "items": [],
+                    },
+                    "Routing": {"density": 0.5, "items": []},
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ],
+    }
+
+    second = client.post('/save_xml_api', data=json.dumps(summary_only_payload), content_type='application/json')
+    assert second.status_code == 200
+    second_data = second.get_json() or {}
+    assert second_data.get('ok') is True
+    result_xml = second_data.get('result_path')
+    assert result_xml and os.path.exists(result_xml)
+
+    parsed = backend._parse_scenarios_xml(result_xml)
+    scen0 = (parsed.get('scenarios') or [])[0]
+    secs = scen0.get('sections', {})
+
+    ni_items = (secs.get('Node Information', {}) or {}).get('items') or []
+    routing_items = (secs.get('Routing', {}) or {}).get('items') or []
+    vuln_items = (secs.get('Vulnerabilities', {}) or {}).get('items') or []
+
+    assert len(ni_items) == 1
+    assert ni_items[0].get('selected') == 'Docker'
+    assert len(routing_items) == 1
+    assert routing_items[0].get('selected') == 'RIP'
+    assert len(vuln_items) == 1
+    assert vuln_items[0].get('v_name') == 'redis/CVE-2022-0543'
+
+
+def test_save_xml_api_marks_topology_dirty_when_topology_changes(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    base_payload = {
+        "scenarios": [
+            {
+                "name": "DirtyTopo",
+                "density_count": 8,
+                "base": {"filepath": ""},
+                "flow_state": {
+                    "length": 2,
+                    "chain_ids": ["n1", "n2"],
+                    "flow_enabled": True,
+                },
+                "sections": {
+                    "Node Information": {
+                        "density": 0,
+                        "items": [
+                            {"selected": "Docker", "factor": 1.0, "v_metric": "Count", "v_count": 4}
+                        ],
+                    },
+                    "Routing": {
+                        "density": 0.5,
+                        "items": [
+                            {"selected": "RIP", "factor": 1.0, "v_metric": "Weight", "r2r_mode": "NonUniform"}
+                        ],
+                    },
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ]
+    }
+
+    first = client.post('/save_xml_api', data=json.dumps(base_payload), content_type='application/json')
+    assert first.status_code == 200
+    first_data = first.get_json() or {}
+    assert first_data.get('ok') is True
+    source_xml = first_data.get('result_path')
+    assert source_xml and os.path.exists(source_xml)
+
+    changed_payload = {
+        "project_key_hint": source_xml,
+        "scenario_query": "DirtyTopo",
+        "scenarios": [
+            {
+                "name": "DirtyTopo",
+                "density_count": 8,
+                "base": {"filepath": ""},
+                "sections": {
+                    "Node Information": {
+                        "density": 0,
+                        "items": [
+                            {"selected": "Docker", "factor": 1.0, "v_metric": "Count", "v_count": 5}
+                        ],
+                    },
+                    "Routing": {
+                        "density": 0.5,
+                        "items": [
+                            {"selected": "RIP", "factor": 1.0, "v_metric": "Weight", "r2r_mode": "Exact"}
+                        ],
+                    },
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ],
+    }
+
+    second = client.post('/save_xml_api', data=json.dumps(changed_payload), content_type='application/json')
+    assert second.status_code == 200
+    second_data = second.get_json() or {}
+    assert second_data.get('ok') is True
+    result_xml = second_data.get('result_path')
+    assert result_xml and os.path.exists(result_xml)
+
+    parsed = backend._parse_scenarios_xml(result_xml)
+    scen0 = (parsed.get('scenarios') or [])[0]
+    flow_state = scen0.get('flow_state') or {}
+    assert flow_state.get('topology_dirty') is True
+    assert flow_state.get('topology_dirty_reason') == 'topology_or_ip_changed'

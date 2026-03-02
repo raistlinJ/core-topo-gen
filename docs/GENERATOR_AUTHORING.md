@@ -200,6 +200,30 @@ If no destination is provided (or it fails validation), files default to `/tmp`.
 
 ---
 
+## 4.1) Compose runtime contract (flag-node-generators)
+
+When your generator emits `/outputs/docker-compose.yml`, treat these as hard compatibility rules:
+
+- **If `command`/`entrypoint` uses relative script paths, set an explicit compatible `working_dir`.**
+  - Example: `command: ruby web.rb ...` requires `working_dir: /usr/src` (or an equivalent directory where `web.rb` exists).
+  - Example: `command: ["python", "app.py"]` should either set `working_dir` to the script directory or use an absolute path (`/app/app.py`).
+- **Prefer absolute script paths in `command` where practical.**
+  - Absolute paths reduce breakage if runtime policy changes `working_dir` for CORE service compatibility.
+- **Do not assume image-default WORKDIR will always be preserved.**
+  - Compose transformation may enforce runtime safety policies; author compose so startup remains deterministic.
+- **Mount paths and command paths must agree.**
+  - If you mount `./web.rb` to `/usr/src/web.rb`, the runtime command must resolve that file from the selected `working_dir` or use `/usr/src/web.rb` directly.
+
+Current default behavior in core-topo-gen is conservative:
+
+- `CORETG_COMPOSE_FORCE_ROOT_WORKDIR` defaults to `auto`.
+- Base OS / known-safe images may still be forced to `working_dir: /`.
+- Setting `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=1` forces root workdir for all services and can break relative-path startup commands.
+
+Author generators assuming transforms can happen, and make startup robust to them.
+
+---
+
 ## 5) Hint templates and substitution
 
 Manifests can declare:

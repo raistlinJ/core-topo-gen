@@ -231,6 +231,7 @@ def test_plan_full_preview_from_xml_recomputes_when_embedded_planpreview_effecti
             f'<Scenario name="{scenario}" scenario_total_nodes="10">'
             '<ScenarioEditor>'
             f'<PlanPreview>{json.dumps(stale_payload)}</PlanPreview>'
+            '<FlagSequencing><FlowState>{"topology_dirty":true}</FlowState></FlagSequencing>'
             '<section name="Node Information" density_count="10">'
             '<item selected="Docker" v_metric="Count" v_count="5" />'
             '</section>'
@@ -369,10 +370,10 @@ def test_plan_full_preview_from_xml_recomputes_when_routers_missing_but_plan_exp
 
     assert resp.status_code == 200
     assert resp.data == b'ok'
-    assert calls['recompute'] == 1
+    assert calls['recompute'] == 0
 
 
-def test_plan_full_preview_from_xml_recomputes_even_when_embedded_plan_exists_by_default(tmp_path, monkeypatch):
+def test_plan_full_preview_from_xml_uses_embedded_plan_when_not_dirty(tmp_path, monkeypatch):
     from webapp import app_backend as backend
 
     client = app.test_client()
@@ -447,7 +448,7 @@ def test_plan_full_preview_from_xml_recomputes_even_when_embedded_plan_exists_by
 
     assert resp.status_code == 200
     assert resp.data == b'ok'
-    assert calls['recompute'] == 1
+    assert calls['recompute'] == 0
 
 
 def test_plan_full_preview_from_xml_sets_preview_source_recomputed_on_read(tmp_path, monkeypatch):
@@ -490,6 +491,7 @@ def test_plan_full_preview_from_xml_sets_preview_source_recomputed_on_read(tmp_p
             f'<Scenario name="{scenario}">'
             '<ScenarioEditor>'
             f'<PlanPreview>{json.dumps(embedded_payload)}</PlanPreview>'
+            '<FlagSequencing><FlowState>{"topology_dirty":true}</FlowState></FlagSequencing>'
             '</ScenarioEditor>'
             '</Scenario>'
             '</Scenarios>'

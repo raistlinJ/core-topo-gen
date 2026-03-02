@@ -833,7 +833,7 @@
 
   async function saveXmlViaApi(opts){
     const options = (opts && typeof opts === 'object') ? opts : {};
-    const persistPreviewPlan = (options.persistPreviewPlan !== false) && (options.skipPreviewPlan !== true);
+    let persistPreviewPlan = (options.persistPreviewPlan !== false) && (options.skipPreviewPlan !== true);
     let progressShown = false;
     let hideTimer = null;
     const logInfoSafe = (msg) => {
@@ -1015,6 +1015,27 @@
         }
       } catch (e) { topologyChanged = false; }
     }
+
+    if (topologyChanged === true) {
+      try {
+        if (Array.isArray(payload.scenarios)) {
+          payload.scenarios = payload.scenarios.map((sc) => {
+            if (!sc || typeof sc !== 'object') return sc;
+            const clone = { ...sc };
+            try { delete clone.plan_preview; } catch (e) {}
+            try { delete clone.full_preview; } catch (e) {}
+            try { delete clone.fullPreview; } catch (e) {}
+            try { delete clone.preview; } catch (e) {}
+            try { delete clone.flow_state; } catch (e) {}
+            return clone;
+          });
+        }
+      } catch (e) {}
+      try { payload.clear_flow_preview = true; } catch (e) {}
+      persistPreviewPlan = false;
+      try { logInfoSafe('[xml-save] Topology changed: clearing embedded Flow/Preview and marking topology dirty'); } catch (e) {}
+    }
+
     if (!Array.isArray(payload.scenarios) || !payload.scenarios.length) {
       throw new Error('No scenarios available to save.');
     }

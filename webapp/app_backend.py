@@ -11975,9 +11975,27 @@ def api_flow_save_flow_state_to_xml():
     except Exception:
         return jsonify({'ok': False, 'error': 'invalid xml_path'}), 400
 
+    prior_flow_state = None
+    try:
+        prior_flow_state = _flow_state_from_xml_path(xml_path, scenario_label)
+    except Exception:
+        prior_flow_state = None
+
     if clear_state:
         ok, msg = _clear_flow_state_in_xml(xml_path, scenario_label)
     else:
+        try:
+            prev_enabled = None
+            next_enabled = None
+            if isinstance(prior_flow_state, dict) and ('flow_enabled' in prior_flow_state):
+                prev_enabled = _coerce_bool(prior_flow_state.get('flow_enabled'))
+            if isinstance(flow_state, dict) and ('flow_enabled' in flow_state):
+                next_enabled = _coerce_bool(flow_state.get('flow_enabled'))
+            if (next_enabled is not None) and (prev_enabled is None or prev_enabled != next_enabled):
+                flow_state['topology_dirty'] = True
+                flow_state['topology_dirty_reason'] = 'flow_enabled_toggled'
+        except Exception:
+            pass
         flow_state = _enrich_flow_state_with_artifacts(flow_state)
         ok, msg = _update_flow_state_in_xml(xml_path, scenario_label, flow_state)
     if not ok:
@@ -16869,8 +16887,9 @@ def _flow_enrich_saved_flag_assignments(
         except Exception:
             pass
 
-        # Preserve persisted hint text when present (Flow persistence contract), but
-        # strip ids if they exist. Only regenerate hints from catalogs when missing.
+        # Prefer rendering from templates using the current chain/IP map so hints stay
+        # consistent after topology/IP changes. Fall back to persisted hint text only
+        # when no template source is available.
         has_hints = False
         try:
             if isinstance(a2.get('hints'), list) and any(str(x or '').strip() for x in (a2.get('hints') or [])):
@@ -16879,6 +16898,50 @@ def _flow_enrich_saved_flag_assignments(
                 has_hints = True
         except Exception:
             has_hints = False
+
+        hint_templates_effective: list[str] = []
+        try:
+            if isinstance(a2.get('hint_templates'), list):
+                hint_templates_effective = [str(x or '').strip() for x in (a2.get('hint_templates') or []) if str(x or '').strip()]
+        except Exception:
+            hint_templates_effective = []
+        try:
+            if not hint_templates_effective:
+                single_tpl = str(a2.get('hint_template') or '').strip()
+                if single_tpl:
+                    hint_templates_effective = [single_tpl]
+        except Exception:
+            pass
+        try:
+            if not hint_templates_effective and isinstance(gen_def, dict):
+                hint_templates_effective = _flow_hint_templates_from_generator(gen_def)
+        except Exception:
+            pass
+
+        if hint_templates_effective:
+            try:
+                hint_tpl = hint_templates_effective[0] if hint_templates_effective else 'Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}'
+                rendered = [
+                    _flow_render_hint_template(
+                        t,
+                        scenario_label=scenario_label,
+                        id_to_name=id_to_name,
+                        id_to_ip=id_to_ip,
+                        this_id=str(this_id),
+                        next_id=str(next_id),
+                    )
+                    for t in (hint_templates_effective or [hint_tpl])
+                ]
+                rendered = [str(x or '').strip() for x in rendered if str(x or '').strip()]
+                if rendered:
+                    a2['hint_templates'] = hint_templates_effective
+                    a2['hint_template'] = str(hint_tpl or '')
+                    a2['hints'] = rendered
+                    a2['hint'] = rendered[0]
+                    out.append(a2)
+                    continue
+            except Exception:
+                pass
 
         def _apply_ip_to_hint_text(s: str) -> str:
             try:
@@ -16924,21 +16987,28 @@ def _flow_enrich_saved_flag_assignments(
             except Exception:
                 pass
         elif isinstance(gen_def, dict):
-            # No saved hints: fall back to catalog templates and render for current chain order.
-            hint_templates: list[str] = []
-            try:
-                hint_templates = _flow_hint_templates_from_generator(gen_def)
-            except Exception:
-                hint_templates = []
-            hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
-            a2['hint_templates'] = hint_templates
+            hint_tpl = 'Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}'
+            a2['hint_templates'] = [hint_tpl]
             a2['hint_template'] = hint_tpl
             rendered = [
-                _flow_render_hint_template(t, scenario_label=scenario_label, id_to_name=id_to_name, id_to_ip=id_to_ip, this_id=str(this_id), next_id=str(next_id))
-                for t in (hint_templates or [hint_tpl])
+                _flow_render_hint_template(
+                    hint_tpl,
+                    scenario_label=scenario_label,
+                    id_to_name=id_to_name,
+                    id_to_ip=id_to_ip,
+                    this_id=str(this_id),
+                    next_id=str(next_id),
+                )
             ]
             a2['hints'] = rendered
-            a2['hint'] = rendered[0] if rendered else _flow_render_hint_template(hint_tpl, scenario_label=scenario_label, id_to_name=id_to_name, id_to_ip=id_to_ip, this_id=str(this_id), next_id=str(next_id))
+            a2['hint'] = rendered[0] if rendered else _flow_render_hint_template(
+                hint_tpl,
+                scenario_label=scenario_label,
+                id_to_name=id_to_name,
+                id_to_ip=id_to_ip,
+                this_id=str(this_id),
+                next_id=str(next_id),
+            )
 
         out.append(a2)
     return out
@@ -18071,6 +18141,9 @@ def api_flow_attackflow_preview():
     if not preview_plan_path:
         return jsonify({'ok': False, 'error': 'No XML found for this scenario. Save XML with a PlanPreview first.'}), 404
 
+    # NOTE: attackflow preview must remain read-only against the selected XML
+    # snapshot to avoid drifting from the Preview page within the same user flow.
+
     # Prefer the canonical plan; flow metadata is stored in metadata.flow.
 
     payload = {}
@@ -18336,7 +18409,7 @@ def api_flow_attackflow_preview():
     flow_state_from_xml: dict[str, Any] | None = None
     try:
         if not ignore_saved_flow:
-            flow_state_from_xml = _flow_state_from_latest_xml(scenario_norm)
+            flow_state_from_xml = _flow_state_from_xml_path(preview_plan_path, scenario_label or scenario_norm)
         if flow_state_from_xml and isinstance(flow_state_from_xml.get('chain_ids'), list):
             saved_ids = [str(x).strip() for x in (flow_state_from_xml.get('chain_ids') or []) if str(x).strip()]
             if saved_ids:
@@ -19877,6 +19950,129 @@ def api_flow_prepare_preview_for_execute():
                 initial_facts_override=initial_facts_override,
                 goal_facts_override=goal_facts_override,
             )
+
+    # Triggered flows (Preview/Hint/Resolve) must refresh hints from the current
+    # chain/IP map so stale persisted hint text cannot leak across recomputes.
+    try:
+        _hint_refresh_triggers = {'preview', 'resolve', 'resolve_hints', 'hint', 'hint_only'}
+        should_force_refresh_hints = bool(mode in _hint_refresh_triggers)
+    except Exception:
+        should_force_refresh_hints = False
+
+    def _refresh_hints_for_current_chain(assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(assignments, list) or not isinstance(chain_nodes, list):
+            return assignments
+
+        id_to_name_local: dict[str, str] = {}
+        id_to_ip_local: dict[str, str] = {}
+        chain_ids_local: list[str] = []
+        try:
+            for n in (chain_nodes or []):
+                if not isinstance(n, dict):
+                    continue
+                nid = str(n.get('id') or '').strip()
+                if not nid:
+                    continue
+                chain_ids_local.append(nid)
+                id_to_name_local[nid] = str(n.get('name') or '').strip() or nid
+                ip_val = _first_valid_ipv4(n.get('ip4') or n.get('ipv4') or n.get('ip') or '')
+                if ip_val:
+                    id_to_ip_local[nid] = ip_val
+        except Exception:
+            pass
+
+        out_local: list[dict[str, Any]] = []
+        for idx, raw in enumerate(assignments or []):
+            if not isinstance(raw, dict):
+                continue
+            fa_local = dict(raw)
+            this_id = str(fa_local.get('node_id') or '').strip() or (chain_ids_local[idx] if idx < len(chain_ids_local) else '')
+            next_id = chain_ids_local[idx + 1] if (idx + 1) < len(chain_ids_local) else ''
+            fa_local['node_id'] = this_id
+            fa_local['next_node_id'] = str(next_id)
+            fa_local['next_node_name'] = str(id_to_name_local.get(str(next_id)) or '')
+
+            templates: list[str] = []
+            try:
+                ovr = fa_local.get('hint_overrides') if isinstance(fa_local.get('hint_overrides'), list) else None
+                if isinstance(ovr, list) and ovr:
+                    templates = [str(x or '').strip() for x in ovr if str(x or '').strip()]
+            except Exception:
+                templates = []
+            try:
+                if not templates:
+                    ht = fa_local.get('hint_templates') if isinstance(fa_local.get('hint_templates'), list) else None
+                    if isinstance(ht, list) and ht:
+                        templates = [str(x or '').strip() for x in ht if str(x or '').strip()]
+            except Exception:
+                pass
+            try:
+                if not templates:
+                    single_tpl = str(fa_local.get('hint_template') or '').strip()
+                    if single_tpl:
+                        templates = [single_tpl]
+            except Exception:
+                pass
+            if not templates:
+                try:
+                    gid = str(fa_local.get('id') or '').strip()
+                    gen_def_local = _gen_by_id.get(gid) if gid else None
+                    if isinstance(gen_def_local, dict):
+                        templates = _flow_hint_templates_from_generator(gen_def_local)
+                except Exception:
+                    templates = []
+
+            if not templates:
+                templates = ['Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}']
+
+            normalized_templates: list[str] = []
+            for t in (templates or []):
+                txt = str(t or '').strip()
+                if not txt:
+                    continue
+                if ('{{NEXT_NODE_' not in txt) and ('{{THIS_NODE_' not in txt):
+                    txt = 'Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}'
+                normalized_templates.append(txt)
+            if not normalized_templates:
+                normalized_templates = ['Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}']
+
+            rendered = [
+                _flow_render_hint_template(
+                    tpl,
+                    scenario_label=(scenario_label or scenario_norm),
+                    id_to_name=id_to_name_local,
+                    id_to_ip=id_to_ip_local,
+                    this_id=str(this_id),
+                    next_id=str(next_id),
+                )
+                for tpl in normalized_templates
+            ]
+            rendered = [str(x or '').strip() for x in rendered if str(x or '').strip()]
+            if not rendered:
+                rendered = [
+                    _flow_render_hint_template(
+                        'Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}',
+                        scenario_label=(scenario_label or scenario_norm),
+                        id_to_name=id_to_name_local,
+                        id_to_ip=id_to_ip_local,
+                        this_id=str(this_id),
+                        next_id=str(next_id),
+                    )
+                ]
+
+            fa_local['hint_templates'] = normalized_templates
+            fa_local['hint_template'] = str(normalized_templates[0] or '') if normalized_templates else ''
+            fa_local['hints'] = rendered
+            fa_local['hint'] = rendered[0] if rendered else ''
+            out_local.append(fa_local)
+
+        return out_local
+
+    if should_force_refresh_hints:
+        try:
+            flag_assignments = _refresh_hints_for_current_chain(flag_assignments)
+        except Exception:
+            pass
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Note: chain_ids is populated for both explicit and auto-picked chains; use explicit_chain.
@@ -33541,106 +33737,10 @@ def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> di
 
 
 def _load_preview_payload_from_path(path: str, scenario_label: str | None = None) -> dict[str, Any] | None:
-    """Load a preview payload from XML, recomputing from scenario inputs by default.
+    """Load a preview payload from embedded XML PlanPreview only.
 
-    This avoids stale embedded PlanPreview snapshots across Preview/Flow/Execute pages.
-    Set `CORETG_PREVIEW_RECOMPUTE_ON_READ=0` to trust embedded PlanPreview first.
+    Recompute is handled by explicit routes/actions (Generate and Preview page load).
     """
-    def _is_effectively_empty_preview_payload(candidate: Any) -> bool:
-        if not isinstance(candidate, dict):
-            return True
-        full = candidate.get('full_preview') if isinstance(candidate.get('full_preview'), dict) else None
-        if not isinstance(full, dict):
-            return True
-        hosts = full.get('hosts') if isinstance(full.get('hosts'), list) else []
-        routers = full.get('routers') if isinstance(full.get('routers'), list) else []
-        switches = full.get('switches_detail') if isinstance(full.get('switches_detail'), list) else []
-        role_counts = full.get('role_counts') if isinstance(full.get('role_counts'), dict) else {}
-        if hosts or routers or switches:
-            return False
-        for value in role_counts.values():
-            try:
-                if int(value) > 0:
-                    return False
-            except Exception:
-                continue
-        return True
-
-    def _xml_suggests_expected_nodes(xml_file: str, scenario_name: str | None) -> bool:
-        try:
-            parsed = _parse_scenarios_xml(xml_file)
-        except Exception:
-            return False
-        scenarios = parsed.get('scenarios') if isinstance(parsed, dict) else None
-        if not isinstance(scenarios, list) or not scenarios:
-            return False
-        scenario_norm = _normalize_scenario_label(scenario_name or '')
-        chosen = None
-        for sc in scenarios:
-            if not isinstance(sc, dict):
-                continue
-            nm_norm = _normalize_scenario_label(sc.get('name') or '')
-            if scenario_norm and nm_norm != scenario_norm:
-                continue
-            chosen = sc
-            break
-        if not isinstance(chosen, dict):
-            chosen = scenarios[0] if isinstance(scenarios[0], dict) else None
-        if not isinstance(chosen, dict):
-            return False
-        try:
-            total = int(chosen.get('scenario_total_nodes') or 0)
-            if total > 0:
-                return True
-        except Exception:
-            pass
-        sections = chosen.get('sections') if isinstance(chosen.get('sections'), dict) else {}
-        node_info = sections.get('Node Information') if isinstance(sections, dict) and isinstance(sections.get('Node Information'), dict) else {}
-        try:
-            density_count = int(chosen.get('density_count') or node_info.get('density_count') or 0)
-            if density_count > 0:
-                return True
-        except Exception:
-            pass
-        items = node_info.get('items') if isinstance(node_info.get('items'), list) else []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            try:
-                if str(item.get('v_metric') or '').strip() == 'Count' and int(item.get('v_count') or 0) > 0:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _preview_missing_router_projection(candidate: Any) -> bool:
-        if not isinstance(candidate, dict):
-            return False
-        full = candidate.get('full_preview') if isinstance(candidate.get('full_preview'), dict) else None
-        if not isinstance(full, dict):
-            return False
-        routers = full.get('routers') if isinstance(full.get('routers'), list) else []
-        if routers:
-            return False
-        hosts = full.get('hosts') if isinstance(full.get('hosts'), list) else []
-        role_counts = full.get('role_counts') if isinstance(full.get('role_counts'), dict) else {}
-        if hosts:
-            return True
-        for value in role_counts.values():
-            try:
-                if int(value) > 0:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _planned_router_count(xml_file: str, scenario_name: str | None) -> int:
-        try:
-            from core_topo_gen.planning.orchestrator import compute_full_plan
-            plan = compute_full_plan(xml_file, scenario=scenario_name, seed=None, include_breakdowns=False)
-            return int(plan.get('routers_planned') or 0)
-        except Exception:
-            return 0
 
     try:
         ap = _existing_xml_path_or_none(path)
@@ -33649,34 +33749,6 @@ def _load_preview_payload_from_path(path: str, scenario_label: str | None = None
         payload = _load_plan_preview_payload_from_path(ap, scenario_label)
         preview_source = 'embedded'
 
-        recompute_on_read = str(os.getenv('CORETG_PREVIEW_RECOMPUTE_ON_READ', '1') or '').strip().lower() not in {
-            '0', 'false', 'no', 'off'
-        }
-        should_recompute = bool(recompute_on_read)
-        if not should_recompute:
-            if _is_effectively_empty_preview_payload(payload) and _xml_suggests_expected_nodes(ap, scenario_label):
-                should_recompute = True
-            elif _preview_missing_router_projection(payload):
-                expected_routers = _planned_router_count(ap, scenario_label)
-                if expected_routers > 0:
-                    should_recompute = True
-
-        if should_recompute:
-            try:
-                recomputed = _planner_persist_flow_plan(
-                    xml_path=ap,
-                    scenario=scenario_label,
-                    seed=None,
-                    persist_plan_file=False,
-                )
-            except Exception:
-                recomputed = None
-            if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
-                payload = recomputed
-                preview_source = 'recomputed_on_read'
-            else:
-                payload = _load_plan_preview_payload_from_path(ap, scenario_label)
-                preview_source = 'embedded'
         if not isinstance(payload, dict):
             return None
         try:
@@ -36222,6 +36294,50 @@ def api_plan_preview_full():
         xml_path = os.path.abspath(xml_path)
         if not os.path.exists(xml_path):
             return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+        try:
+            payload_from_xml = _load_preview_payload_from_path(xml_path, scenario)
+            if isinstance(payload_from_xml, dict):
+                embedded_preview = payload_from_xml.get('full_preview') if isinstance(payload_from_xml.get('full_preview'), dict) else None
+                if isinstance(embedded_preview, dict):
+                    flow_meta = None
+                    try:
+                        flow_meta = _flow_state_from_xml_path(xml_path, scenario)
+                        if not isinstance(flow_meta, dict):
+                            flow_meta = _attach_latest_flow_into_full_preview(embedded_preview, scenario)
+                        elif isinstance(flow_meta, dict):
+                            try:
+                                repaired = _flow_repair_saved_flow_for_preview(embedded_preview, flow_meta)
+                                if isinstance(repaired, dict):
+                                    flow_meta = repaired
+                                else:
+                                    flow_meta = None
+                            except Exception:
+                                flow_meta = None
+                    except Exception:
+                        flow_meta = None
+                    return jsonify({
+                        'ok': True,
+                        'full_preview': embedded_preview,
+                        'plan': {},
+                        'breakdowns': None,
+                        'flow_meta': flow_meta or {},
+                    })
+        except Exception:
+            pass
+        if seed is None:
+            try:
+                existing_payload = _load_preview_payload_from_path(xml_path, scenario)
+                if isinstance(existing_payload, dict):
+                    existing_meta = existing_payload.get('metadata') if isinstance(existing_payload.get('metadata'), dict) else {}
+                    raw_seed = None
+                    if isinstance(existing_meta, dict):
+                        raw_seed = existing_meta.get('seed')
+                    if raw_seed is None and isinstance(existing_payload.get('full_preview'), dict):
+                        raw_seed = existing_payload.get('full_preview', {}).get('seed')
+                    if raw_seed is not None:
+                        seed = int(raw_seed)
+            except Exception:
+                seed = None
         from core_topo_gen.planning.orchestrator import compute_full_plan
         from core_topo_gen.planning.plan_cache import hash_xml_file
         xml_hash = hash_xml_file(xml_path)
@@ -36361,6 +36477,12 @@ def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int
     flow_meta = flow_meta_from_plan
     if not isinstance(flow_meta, dict):
         flow_meta = existing_meta.get('flow') if isinstance(existing_meta.get('flow'), dict) else {}
+    try:
+        if isinstance(flow_meta, dict):
+            flow_meta.pop('topology_dirty', None)
+            flow_meta.pop('topology_dirty_reason', None)
+    except Exception:
+        pass
     created_at = existing_meta.get('created_at') if isinstance(existing_meta, dict) else None
     if not isinstance(created_at, str) or not created_at.strip():
         created_at = _local_timestamp_display()
@@ -36870,6 +36992,43 @@ def plan_full_preview_from_xml():
         except Exception:
             pass
 
+        preview_dirty = False
+        try:
+            flow_state = _flow_state_from_xml_path(xml_path, scenario)
+            if isinstance(flow_state, dict) and _coerce_bool(flow_state.get('topology_dirty')):
+                preview_dirty = True
+        except Exception:
+            preview_dirty = False
+
+        if preview_dirty:
+            try:
+                recomputed = _planner_persist_flow_plan(
+                    xml_path=xml_path,
+                    scenario=scenario,
+                    seed=None,
+                    persist_plan_file=False,
+                )
+            except Exception:
+                recomputed = None
+            if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
+                payload = recomputed
+                try:
+                    meta_re = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                    if not isinstance(meta_re, dict):
+                        meta_re = {}
+                    meta_re['preview_source'] = 'recomputed_on_read'
+                    payload['metadata'] = meta_re
+                except Exception:
+                    pass
+                try:
+                    app.logger.info(
+                        '[plan.full_preview_from_xml] recomputed due to topology_dirty xml=%s scenario=%s',
+                        xml_path,
+                        scenario or '',
+                    )
+                except Exception:
+                    pass
+
         def _payload_matches_requested_scenario(payload_obj: Any, requested: str | None) -> bool:
             if not requested:
                 return True
@@ -36949,6 +37108,14 @@ def plan_full_preview_from_xml():
                 recomputed = None
             if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
                 payload = recomputed
+                try:
+                    meta_re = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                    if not isinstance(meta_re, dict):
+                        meta_re = {}
+                    meta_re['preview_source'] = 'recomputed_on_read'
+                    payload['metadata'] = meta_re
+                except Exception:
+                    pass
                 try:
                     app.logger.info(
                         '[plan.full_preview_from_xml] recomputed planpreview xml=%s scenario=%s',
@@ -41708,13 +41875,6 @@ def run_cli_async():
     if preview_plan_path and scenario_for_plan and flow_enabled:
         try:
             plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
-            if not (isinstance(plan_payload, dict) and plan_payload):
-                try:
-                    if str(preview_plan_path).lower().endswith('.xml'):
-                        _planner_persist_flow_plan(xml_path=preview_plan_path, scenario=scenario_for_plan, seed=seed, persist_plan_file=False)
-                        plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
-                except Exception:
-                    pass
             if isinstance(plan_payload, dict) and plan_payload:
                 _update_plan_preview_in_xml(xml_path, scenario_for_plan, plan_payload)
         except Exception:
@@ -41860,6 +42020,8 @@ def run_cli_async():
     try:
         if flow_enabled and preview_plan_path and scenario_for_plan:
             plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
+            if not isinstance(plan_payload, dict):
+                raise ValueError('preview plan not embedded in XML')
             preview = plan_payload.get('full_preview') if isinstance(plan_payload, dict) else None
             docker_count = 0
             vuln_count = 0
@@ -41928,7 +42090,9 @@ def run_cli_async():
                     },
                 }), 409
     except Exception as exc:
-        return jsonify({"error": f"Failed to validate flow/preview plan vs XML: {exc}"}), 500
+        msg = str(exc or '')
+        if 'preview plan not embedded' not in msg.lower():
+            return jsonify({"error": f"Failed to validate flow/preview plan vs XML: {exc}"}), 500
 
     # Generate Run ID
     run_id = str(uuid.uuid4())

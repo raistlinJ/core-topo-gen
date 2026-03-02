@@ -24,6 +24,15 @@
       min-height: 0;
     }
   }
+
+  .flow-stale {
+    opacity: 0.55;
+    filter: grayscale(0.25);
+  }
+
+  .flow-stale-links a {
+    pointer-events: none;
+  }
 </style>
 {% endblock %}
 
@@ -85,7 +94,7 @@
           </div>
         </div>
 
-        <div class="card mb-3">
+        <div class="card mb-3" id="flowControlsCard">
           <div class="card-body">
             <input id="flowScenario" class="form-control d-none"
               value="{{ active_scenario or request.args.get('scenario','') }}">
@@ -155,6 +164,7 @@
           </div>
         </div>
 
+        <div id="flowTopologyDirtyAlert" class="alert alert-warning d-none" role="alert"></div>
         <div id="flowValidityAlert" class="alert alert-danger d-none" role="alert"></div>
 
 
@@ -404,6 +414,7 @@
     const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
 
     const validityAlertEl = document.getElementById('flowValidityAlert');
+    const topologyDirtyAlertEl = document.getElementById('flowTopologyDirtyAlert');
     const loadingOverlayEl = document.getElementById('flowLoadingOverlay');
     const loadingTextEl = document.getElementById('flowLoadingText');
     const loadingStepsLabelEl = document.getElementById('flowLoadingStepsLabel');
@@ -414,6 +425,8 @@
     const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
     const flowEnabledToggleEl = document.getElementById('flowEnabledToggle');
     const flowEnabledHelpEl = document.getElementById('flowEnabledHelp');
+    const flowControlsCardEl = document.getElementById('flowControlsCard');
+    const flowDownloadDropdownEl = document.getElementById('flowDownloadDropdown');
     const flowChainCardEl = document.getElementById('flowChainCard');
     const flowVizCardEl = document.getElementById('flowVizCard');
 
@@ -425,6 +438,52 @@
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
   let flowEnabled = true;
   let flowEligible = true;
+  let topologyDirty = false;
+  let topologyDirtyReason = '';
+
+  function setTopologyDirtyState(isDirty, reason) {
+    topologyDirty = !!isDirty;
+    topologyDirtyReason = topologyDirty ? String(reason || '').trim() : '';
+    updateTopologyDirtyUi();
+  }
+
+  function syncTopologyDirtyFromFlowState(flowState) {
+    if (!flowState || typeof flowState !== 'object') {
+      setTopologyDirtyState(false, '');
+      return;
+    }
+    const isDirty = !!flowState.topology_dirty;
+    const reason = String(flowState.topology_dirty_reason || '').trim();
+    setTopologyDirtyState(isDirty, reason);
+  }
+
+  function updateTopologyDirtyUi() {
+    const dirty = !!topologyDirty;
+    if (topologyDirtyAlertEl) {
+      if (dirty) {
+        const reasonText = topologyDirtyReason ? ` (${topologyDirtyReason.replaceAll('_', ' ')})` : '';
+        topologyDirtyAlertEl.textContent = `Topology/IP data changed${reasonText}. Re-run Generate before sequencing or executing, otherwise the scenario will not contain flags.`;
+        topologyDirtyAlertEl.classList.remove('d-none');
+      } else {
+        topologyDirtyAlertEl.textContent = '';
+        topologyDirtyAlertEl.classList.add('d-none');
+      }
+    }
+    [flowChainCardEl, flowVizCardEl].forEach((el) => {
+      if (!el) return;
+      el.classList.toggle('flow-stale', dirty);
+    });
+    if (flowControlsCardEl) {
+      flowControlsCardEl.classList.toggle('flow-stale-links', dirty);
+    }
+    if (revalidateBtnEl) {
+      revalidateBtnEl.disabled = (!flowEnabled || !flowEligible || dirty);
+    }
+    if (flowDownloadDropdownEl) {
+      flowDownloadDropdownEl.disabled = dirty;
+      flowDownloadDropdownEl.title = dirty ? 'Re-run Generate to refresh chain and flags before downloading.' : '';
+    }
+  }
 
   function simplifyResolvedValue(val) {
     if (typeof val !== 'string') return val;
@@ -454,6 +513,8 @@
         goal_facts: null,
         flow_enabled: false,
         flags_enabled: false,
+        topology_dirty: false,
+        topology_dirty_reason: '',
         updated_at: Date.now(),
       };
       await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
@@ -467,6 +528,7 @@
           flowStateByScenario[key] = flowStatePayload;
         }
       } catch (e) { }
+      setTopologyDirtyState(false, '');
       return true;
     } catch (e) {
       return false;
@@ -506,6 +568,16 @@
     }
     if (!options.skipPersist) {
       persistFlowState();
+      try {
+        const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
+        let xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+        if (!xmlPath && scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+          xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
+        }
+        if (xmlPath) {
+          saveFlowStateToXml(xmlPath);
+        }
+      } catch (e) { }
     }
   }
 
@@ -529,6 +601,7 @@
         flowEnabledHelpEl.textContent = '';
       }
     }
+    updateTopologyDirtyUi();
   }
 
   function getSidebarShowSeed() {
@@ -684,6 +757,8 @@
         initial_facts: flowInitialFactsOverride,
         goal_facts: flowGoalFactsOverride,
         flow_enabled: !!flowEnabled,
+        topology_dirty: !!topologyDirty,
+        topology_dirty_reason: topologyDirtyReason || '',
         updated_at: Date.now(),
       };
       if (!xmlPath) return false;
@@ -1260,6 +1335,16 @@
 
   async function restoreSavedFlowForScenario(scenarioName) {
     const saved = getSavedFlowStateForScenario(scenarioName);
+    syncTopologyDirtyFromFlowState(saved);
+    if (topologyDirty) {
+      try {
+        currentChain = [];
+        currentFlagAssignments = [];
+        selectedChainIndex = -1;
+        renderChainEditor();
+      } catch (e) { }
+      return false;
+    }
     if (!saved || !Array.isArray(saved.chain_ids) || !saved.chain_ids.length) {
       try {
         if (saved && saved.flow_enabled !== undefined) {
@@ -1326,6 +1411,18 @@
       setStatus('Ready.', false);
       return true;
     } catch (err) {
+      try {
+        const msg = String(err && err.message || '').toLowerCase();
+        if (msg.includes('preview plan not embedded') || msg.includes('no xml found') || msg.includes('404')) {
+          setTopologyDirtyState(true, 'topology_or_ip_changed');
+          currentChain = [];
+          currentFlagAssignments = [];
+          selectedChainIndex = -1;
+          renderChainEditor();
+          const diagram = buildMermaid([]);
+          await renderMermaid(diagram);
+        }
+      } catch (e) { }
       setStatus('Restore failed: ' + String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
       return false;
@@ -1778,6 +1875,20 @@
     lastFlagsEnabled = flagsEnabled;
     lastFlowErrors = flowErrors;
     try {
+      let dirtySeen = null;
+      let reason = '';
+      if (p && Object.prototype.hasOwnProperty.call(p, 'topology_dirty')) {
+        dirtySeen = !!p.topology_dirty;
+        reason = String(p.topology_dirty_reason || '').trim();
+      } else if (p && p.flow_state && typeof p.flow_state === 'object' && Object.prototype.hasOwnProperty.call(p.flow_state, 'topology_dirty')) {
+        dirtySeen = !!p.flow_state.topology_dirty;
+        reason = String(p.flow_state.topology_dirty_reason || '').trim();
+      }
+      if (dirtySeen !== null) {
+        setTopologyDirtyState(!!dirtySeen, reason);
+      }
+    } catch (e) { }
+    try {
       if (p && p.initial_facts) {
         flowInitialFactsOverride = normalizeFactsOverride(p.initial_facts);
       }
@@ -1957,7 +2068,14 @@
         updateMeta();
         return path;
       }
-    } catch (e) { }
+    } catch (e) {
+      try {
+        const msg = String(e && e.message || '').toLowerCase();
+        if (msg.includes('preview plan not embedded') || msg.includes('no xml found') || msg.includes('404')) {
+          setTopologyDirtyState(true, 'topology_or_ip_changed');
+        }
+      } catch (ex) { }
+    }
     try {
       flowEligible = true;
       updateFlowEnabledUi();
@@ -1973,6 +2091,7 @@
     updateScenarioFilterControls();
     refreshParticipantNavForScenario(activeScenario);
     rememberActiveScenario();
+    setTopologyDirtyState(false, '');
     updateScenarioSeedBadges();
     clearPreviewPlanCacheForScenario(activeScenario);
     await refreshLatestPreviewPlanPathForScenario(activeScenario);
@@ -1989,6 +2108,8 @@
       } catch (e) { }
       if (!flowEligible) {
         setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+      } else if (topologyDirty) {
+        setStatus('Topology/IP changed. Re-run Generate to refresh flow and flags.', true);
       } else if (!flowEnabled) {
         setStatus('Flag sequencing is disabled.', false);
       } else {
@@ -7609,8 +7730,7 @@
   function buildMermaid(chain) {
     const lines = ['flowchart LR'];
     if (!Array.isArray(chain) || chain.length === 0) {
-      lines.push('  A[No chain available]');
-      return lines.join('\n');
+      return '';
     }
     for (let i = 0; i < chain.length; i++) {
       const node = chain[i];
@@ -7618,7 +7738,12 @@
       const label = (node && node.name) ? node.name : ('Node ' + (i + 1));
       const seq = toRoman(i + 1);
       const prefixed = (seq ? (seq + '. ') : '') + String(label || '');
-      lines.push(`  ${safeId}[${prefixed.replace(/\]/g, '')}]`);
+      const safeLabel = prefixed
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+        .replace(/\n/g, ' ')
+        .replace(/\r/g, ' ');
+      lines.push(`  ${safeId}["${safeLabel}"]`);
       if (i > 0) {
         lines.push(`  N${i - 1} --> ${safeId}`);
       }
@@ -7631,17 +7756,34 @@
 
   async function renderMermaid(diagramText) {
     try {
+      const wrap = document.getElementById('flowDiagram');
+      if (!wrap) return;
+      const fallbackText = 'No Chain Exists';
+      if (!diagramText || !String(diagramText).trim()) {
+        wrap.textContent = fallbackText;
+        wrap.removeAttribute('data-processed');
+        return;
+      }
       if (window.mermaid) {
         mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
-        const wrap = document.getElementById('flowDiagram');
         wrap.textContent = diagramText;
         wrap.removeAttribute('data-processed');
         await mermaid.run({ querySelector: '#flowDiagram' });
+        try {
+          const renderedText = String(wrap.textContent || '').toLowerCase();
+          if (renderedText.includes('syntax error in text')) {
+            wrap.textContent = fallbackText;
+            wrap.removeAttribute('data-processed');
+          }
+        } catch (e) { }
       }
     } catch (e) {
-      // If rendering fails, keep plaintext.
+      // If rendering fails, keep a stable fallback state.
       const wrap = document.getElementById('flowDiagram');
-      if (wrap) wrap.textContent = diagramText;
+      if (wrap) {
+        wrap.textContent = 'No Chain Exists';
+        wrap.removeAttribute('data-processed');
+      }
     }
   }
 
@@ -8022,6 +8164,16 @@
       }
       currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
       setFlowValidityFromPayload(data);
+      setTopologyDirtyState(false, '');
+      try {
+        const key = normalizeScenarioNorm(scenario);
+        if (key && flowStateByScenario && typeof flowStateByScenario === 'object') {
+          const fs = (flowStateByScenario[key] && typeof flowStateByScenario[key] === 'object') ? { ...flowStateByScenario[key] } : {};
+          fs.topology_dirty = false;
+          fs.topology_dirty_reason = '';
+          flowStateByScenario[key] = fs;
+        }
+      } catch (e) { }
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
       try {

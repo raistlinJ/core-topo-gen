@@ -277,6 +277,113 @@ def test_flow_state_flag_inject_roundtrip_saved_and_loaded_from_xml(tmp_path, mo
     assert 'flag.txt -> /tmp' in topo_injects
 
 
+def test_attackflow_preview_prefers_runtime_session_ips_for_chain_and_resolved_inputs(tmp_path, monkeypatch):
+    app_backend.app.config['TESTING'] = True
+    client = app_backend.app.test_client()
+
+    login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert login_resp.status_code in (302, 303)
+
+    scenario = f"zz-test-runtime-ips-{uuid.uuid4().hex[:8]}"
+    scenario_norm = app_backend._normalize_scenario_label(scenario)
+
+    full_preview = {
+        'seed': 123,
+        'routers': [],
+        'switches': [],
+        'switches_detail': [],
+        'hosts': [
+            {'node_id': '10', 'name': 'docker-5', 'role': 'Docker', 'ip4': '10.1.1.2', 'vulnerabilities': [{'id': 'v1'}]},
+            {'node_id': '7', 'name': 'docker-2', 'role': 'Docker', 'ip4': '10.2.2.2', 'vulnerabilities': [{'id': 'v2'}]},
+        ],
+        'host_router_map': {},
+        'r2r_links_preview': [],
+    }
+
+    saved_chain = [
+        {'id': '10', 'name': 'docker-5', 'type': 'docker'},
+        {'id': '7', 'name': 'docker-2', 'type': 'docker'},
+    ]
+    saved_assignments = [
+        {'node_id': '10', 'id': 'textfile_username_password', 'name': 'G1', 'type': 'flag-generator'},
+        {'node_id': '7', 'id': 'textfile_username_password', 'name': 'G2', 'type': 'flag-generator'},
+    ]
+
+    plan_path, plan_dir = _seed_xml_plan(
+        scenario,
+        full_preview,
+        flow_meta={
+            'scenario': scenario,
+            'length': 2,
+            'chain': saved_chain,
+            'flag_assignments': saved_assignments,
+            'modified_at': '2026-01-06T00:00:00Z',
+        },
+    )
+
+    try:
+        monkeypatch.setattr(
+            app_backend,
+            '_latest_session_xml_for_scenario_norm',
+            lambda norm: plan_path if norm == scenario_norm else None,
+        )
+        monkeypatch.setattr(
+            app_backend,
+            '_build_topology_graph_from_session_xml',
+            lambda _path: (
+                [
+                    {'id': '10', 'name': 'docker-5', 'ipv4s': ['192.168.197.2']},
+                    {'id': '7', 'name': 'docker-2', 'ipv4s': ['10.218.55.2']},
+                ],
+                [],
+                {},
+            ),
+        )
+        monkeypatch.setattr(
+            app_backend,
+            '_build_topology_graph_from_preview_plan',
+            lambda _preview: (
+                [
+                    {'id': '10', 'name': 'docker-5', 'type': 'docker', 'is_vuln': True, 'interfaces': [], 'services': []},
+                    {'id': '7', 'name': 'docker-2', 'type': 'docker', 'is_vuln': True, 'interfaces': [], 'services': []},
+                ],
+                [{'node1': '10', 'node2': '7'}],
+                {'10': {'7'}, '7': {'10'}},
+            ),
+        )
+
+        resp = client.get('/api/flag-sequencing/attackflow_preview', query_string={
+            'scenario': scenario,
+            'length': 2,
+            'preview_plan': plan_path,
+        })
+        assert resp.status_code == 200
+        data = resp.get_json() or {}
+        assert data.get('ok') is True
+
+        chain = data.get('chain') or []
+        chain_ip_by_id = {
+            str(c.get('id') or ''): str(c.get('ip4') or '')
+            for c in chain
+            if isinstance(c, dict)
+        }
+        assert chain_ip_by_id.get('10') == '192.168.197.2'
+        assert chain_ip_by_id.get('7') == '10.218.55.2'
+
+        fas = data.get('flag_assignments') or []
+        assignment_ip_by_node = {}
+        for fa in fas:
+            if not isinstance(fa, dict):
+                continue
+            node_id = str(fa.get('node_id') or '')
+            ri = fa.get('resolved_inputs') if isinstance(fa.get('resolved_inputs'), dict) else {}
+            assignment_ip_by_node[node_id] = str(ri.get('Knowledge(ip)') or '')
+        assert assignment_ip_by_node.get('10') == '192.168.197.2'
+        assert assignment_ip_by_node.get('7') == '10.218.55.2'
+    finally:
+        shutil.rmtree(plan_dir, ignore_errors=True)
+
+
 def test_attackflow_preview_returns_vuln_assignment_with_flag_inject(tmp_path):
     app_backend.app.config['TESTING'] = True
     client = app_backend.app.test_client()
