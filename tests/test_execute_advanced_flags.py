@@ -133,6 +133,7 @@ def test_run_cli_async_adv_auto_kill_sessions_invokes_delete(tmp_path, monkeypat
         data={
             'xml_path': str(xml_path),
             'adv_auto_kill_sessions': '1',
+            'flow_enabled': '0',
         },
     )
 
@@ -180,6 +181,7 @@ def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, mo
         '/run_cli_async',
         data={
             'xml_path': str(xml_path),
+            'flow_enabled': '0',
         },
     )
     assert resp.status_code == 202
@@ -239,6 +241,21 @@ def test_run_cli_async_blocks_when_flow_artifact_paths_missing(tmp_path, monkeyp
         }
 
     monkeypatch.setattr(backend, '_load_preview_payload_from_path', _fake_preview_payload)
+    monkeypatch.setattr(
+        backend,
+        '_flow_state_from_xml_path',
+        lambda *_a, **_k: {
+            'flag_assignments': [
+                {
+                    'node_id': '7',
+                    'id': 'nfs_sensitive_file',
+                    'artifacts_dir': missing_artifacts,
+                    'inject_files': [missing_inject],
+                    'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                }
+            ]
+        },
+    )
 
     client = app.test_client()
     _login(client)
@@ -314,6 +331,21 @@ def test_run_cli_async_remote_allows_missing_local_flow_paths(tmp_path, monkeypa
         }
 
     monkeypatch.setattr(backend, '_load_preview_payload_from_path', _fake_preview_payload)
+    monkeypatch.setattr(
+        backend,
+        '_flow_state_from_xml_path',
+        lambda *_a, **_k: {
+            'flag_assignments': [
+                {
+                    'node_id': '7',
+                    'id': 'nfs_sensitive_file',
+                    'artifacts_dir': missing_artifacts,
+                    'inject_files': [f'{missing_inject} -> /tmp/seed'],
+                    'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                }
+            ]
+        },
+    )
 
     client = app.test_client()
     _login(client)
@@ -388,6 +420,21 @@ def test_run_cli_async_accepts_inject_spec_with_dest_when_source_exists(tmp_path
         }
 
     monkeypatch.setattr(backend, '_load_preview_payload_from_path', _fake_preview_payload)
+    monkeypatch.setattr(
+        backend,
+        '_flow_state_from_xml_path',
+        lambda *_a, **_k: {
+            'flag_assignments': [
+                {
+                    'node_id': '7',
+                    'id': 'nfs_sensitive_file',
+                    'artifacts_dir': str(artifacts_dir),
+                    'inject_files': [f'{inject_source} -> /tmp/seed'],
+                    'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                }
+            ]
+        },
+    )
     monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
 
     client = app.test_client()
@@ -406,6 +453,85 @@ def test_run_cli_async_accepts_inject_spec_with_dest_when_source_exists(tmp_path
     assert resp.status_code == 202
     payload = resp.get_json() or {}
     assert isinstance(payload.get('run_id'), str) and payload.get('run_id')
+
+
+def test_run_cli_async_disables_flow_when_plan_has_no_docker_or_vulns(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text(
+        '<Scenarios><Scenario name="Anatest"><ScenarioEditor /></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    fake_core_cfg = {
+        'host': '127.0.0.1',
+        'port': 50051,
+        'ssh_enabled': False,
+        'ssh_host': '127.0.0.1',
+        'ssh_port': 22,
+        'ssh_username': 'core',
+        'ssh_password': 'pw',
+        'auto_start_daemon': False,
+        'venv_bin': '',
+    }
+
+    monkeypatch.setattr(backend, '_merge_core_configs', lambda *a, **k: dict(fake_core_cfg))
+    monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(backend, '_select_core_config_for_page', lambda *a, **k: dict(fake_core_cfg))
+    monkeypatch.setattr(backend, '_summary_from_xml_plan', lambda *_a, **_k: ({}, None))
+    monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
+
+    monkeypatch.setattr(
+        backend,
+        '_flow_state_from_xml_path',
+        lambda *_a, **_k: {
+            'flag_assignments': [
+                {
+                    'node_id': '1',
+                    'id': 'example_generator',
+                    'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                }
+            ]
+        },
+    )
+
+    monkeypatch.setattr(
+        backend,
+        '_load_preview_payload_from_path',
+        lambda *_a, **_k: {
+            'full_preview': {
+                'role_counts': {'Docker': 0},
+                'hosts': [
+                    {'node_id': '1', 'role': 'host', 'vulnerabilities': []},
+                ],
+                'vulnerabilities_by_node': {},
+            }
+        },
+    )
+
+    client = app.test_client()
+    _login(client)
+
+    resp = client.post(
+        '/run_cli_async',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': 'Anatest',
+            'preview_plan': str(xml_path),
+            'flow_enabled': '1',
+        },
+    )
+
+    assert resp.status_code == 202
+    payload = resp.get_json() or {}
+    run_id = payload.get('run_id')
+    assert isinstance(run_id, str) and run_id
+    assert 'Flag sequencing disabled for this execute run' in str(payload.get('warning') or '')
+    assert backend.RUNS.get(run_id, {}).get('flow_enabled') is False
+    assert 'Docker nodes=0, vulnerability nodes=0' in str(backend.RUNS.get(run_id, {}).get('flow_disabled_reason') or '')
+    backend.RUNS.pop(run_id, None)
 
 
 def test_run_status_includes_flow_live_path_fields(tmp_path):

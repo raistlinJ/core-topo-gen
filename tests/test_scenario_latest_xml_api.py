@@ -88,3 +88,105 @@ def test_latest_xml_path_for_scenario_falls_back_to_outputs_scan_when_catalog_st
     resolved = backend._latest_xml_path_for_scenario(scenario_norm)
 
     assert resolved == str(new_xml)
+
+
+def test_filter_history_by_scenario_uses_xml_when_names_missing(tmp_path):
+    from webapp import app_backend as backend
+
+    scenario_name = 'HistoryXmlScenario'
+    scenario_norm = backend._normalize_scenario_label(scenario_name)
+    xml_path = tmp_path / 'history.xml'
+    xml_path.write_text(
+        '<Scenarios>'
+        f'<Scenario name="{scenario_name}"><ScenarioEditor/></Scenario>'
+        '</Scenarios>',
+        encoding='utf-8',
+    )
+
+    history = [
+        {
+            'timestamp': '2026-02-28T00:00:00+00:00',
+            'scenario_names': [],
+            'scenario_name': None,
+            'xml_path': str(xml_path),
+        }
+    ]
+
+    filtered = backend._filter_history_by_scenario(history, scenario_norm)
+
+    assert len(filtered) == 1
+
+
+def test_latest_xml_path_for_scenario_falls_back_to_run_history_when_catalog_empty(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    scenario_name = 'RunHistoryFallback'
+    scenario_norm = backend._normalize_scenario_label(scenario_name)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    hist_xml = tmp_path / 'outside' / f'{scenario_name}.xml'
+    hist_xml.parent.mkdir(parents=True, exist_ok=True)
+    hist_xml.write_text(
+        '<Scenarios>'
+        f'<Scenario name="{scenario_name}"><ScenarioEditor/></Scenario>'
+        '</Scenarios>',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(backend, '_current_user', lambda: {'username': 'coreadmin', 'role': 'admin'})
+    monkeypatch.setattr(backend, '_scenario_catalog_for_user', lambda *_a, **_k: ([], {}, {}))
+    monkeypatch.setattr(
+        backend,
+        '_load_run_history',
+        lambda: [
+            {
+                'timestamp': '2026-02-28T12:34:56+00:00',
+                'scenario_names': [],
+                'scenario_name': None,
+                'xml_path': str(hist_xml),
+            }
+        ],
+    )
+
+    resolved = backend._latest_xml_path_for_scenario(scenario_norm)
+
+    assert resolved == str(hist_xml)
+
+
+def test_latest_xml_path_for_scenario_ignores_run_history_xml_without_scenario_names(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    scenario_name = 'RunHistoryNoNames'
+    scenario_norm = backend._normalize_scenario_label(scenario_name)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Session-style XML without <Scenarios>/<Scenario name=...> should not be used
+    # as latest scenario XML fallback.
+    session_like_xml = tmp_path / 'outside' / 'session-1.xml'
+    session_like_xml.parent.mkdir(parents=True, exist_ok=True)
+    session_like_xml.write_text('<session><node name="rj45"/></session>', encoding='utf-8')
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(backend, '_current_user', lambda: {'username': 'coreadmin', 'role': 'admin'})
+    monkeypatch.setattr(backend, '_scenario_catalog_for_user', lambda *_a, **_k: ([], {}, {}))
+    monkeypatch.setattr(
+        backend,
+        '_load_run_history',
+        lambda: [
+            {
+                'timestamp': '2026-03-01T12:34:56+00:00',
+                'scenario_names': [scenario_name],
+                'scenario_name': scenario_name,
+                'xml_path': str(session_like_xml),
+            }
+        ],
+    )
+
+    resolved = backend._latest_xml_path_for_scenario(scenario_norm)
+
+    assert resolved is None

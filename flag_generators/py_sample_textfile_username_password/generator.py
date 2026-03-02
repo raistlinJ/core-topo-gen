@@ -61,6 +61,8 @@ def main() -> int:
         "generator_id": generator_id,
         "outputs": {
             "Flag(flag_id)": flag_value,
+            "FlagDelivery(mode)": "file",
+            "FlagFile(path)": "flag.txt",
             "File(path)": "secrets.txt",
         },
     }

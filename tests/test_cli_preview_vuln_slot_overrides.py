@@ -1,4 +1,9 @@
-from core_topo_gen.cli import _merge_vuln_slot_assignments_with_preview, _preview_vuln_slot_overrides
+from core_topo_gen.cli import (
+    _flow_assignment_node_ids,
+    _merge_vuln_slot_assignments_with_preview,
+    _preview_vuln_slot_overrides,
+    _slot_names_for_flow_nodes,
+)
 
 
 def test_preview_vuln_slot_overrides_maps_airflow_to_slot_1():
@@ -71,3 +76,40 @@ def test_merge_preview_overrides_replaces_non_preview_slots_when_map_exists():
 
     assert list(merged.keys()) == ["slot-2"]
     assert merged["slot-2"]["Name"] == "airflow/CVE-2020-11981"
+
+
+def test_flow_assignment_node_ids_collects_valid_ids_only():
+    flow_state = {
+        "flag_assignments": [
+            {"node_id": "7", "id": "a"},
+            {"node_id": 8, "id": "b"},
+            {"node_id": "not-an-int", "id": "c"},
+            {"id": "missing"},
+        ]
+    }
+
+    assert _flow_assignment_node_ids(flow_state) == {7, 8}
+
+
+def test_slot_names_for_flow_nodes_maps_preview_host_ids_to_slots():
+    flow_state = {
+        "flag_assignments": [
+            {"node_id": "6", "id": "gen-a"},
+            {"node_id": "8", "id": "gen-b"},
+        ]
+    }
+    preview_full = {
+        "hosts": [
+            {"node_id": 6, "name": "docker-1"},
+            {"node_id": 7, "name": "docker-2"},
+            {"node_id": 8, "name": "docker-3"},
+        ]
+    }
+
+    slots = _slot_names_for_flow_nodes(
+        flow_state=flow_state,
+        preview_full=preview_full,
+        slot_names=["slot-1", "slot-2", "slot-3"],
+    )
+
+    assert slots == ["slot-1", "slot-3"]

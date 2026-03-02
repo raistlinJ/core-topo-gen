@@ -5003,6 +5003,23 @@ def _normalize_run_history_entry(entry: Any) -> Dict[str, Any]:
         return {}
     normalized = dict(entry)
 
+    # Normalize common path fields to absolute paths for stable reads.
+    for path_key in (
+        'xml_path',
+        'scenario_xml_path',
+        'single_scenario_xml_path',
+        'preview_plan_path',
+        'pre_xml_path',
+        'post_xml_path',
+        'session_xml_path',
+        'report_path',
+        'summary_path',
+        'full_scenario_path',
+    ):
+        if path_key not in normalized:
+            continue
+        normalized[path_key] = _abs_path_or_original(normalized.get(path_key))
+
     # Per-scenario invariant: run history entries represent a single scenario.
     # Prefer explicit scenario_name; otherwise fall back to scenario_names[0].
     try:
@@ -5043,6 +5060,26 @@ def _normalize_run_history_entry(entry: Any) -> Dict[str, Any]:
             seen.add(normalized_name)
             ordered.append(normalized_name)
         normalized['scenario_names'] = ordered
+
+    # If scenario metadata is missing, infer from XML path when possible.
+    if not (isinstance(normalized.get('scenario_names'), list) and normalized.get('scenario_names')):
+        src_xml = (
+            normalized.get('single_scenario_xml_path')
+            or normalized.get('scenario_xml_path')
+            or normalized.get('preview_plan_path')
+            or normalized.get('xml_path')
+        )
+        try:
+            inferred = _scenario_names_from_xml(src_xml) if src_xml else []
+        except Exception:
+            inferred = []
+        if isinstance(inferred, list) and inferred:
+            normalized['scenario_names'] = [str(inferred[0]).strip()]
+
+    if not normalized.get('scenario_name'):
+        names = normalized.get('scenario_names')
+        if isinstance(names, list) and names:
+            normalized['scenario_name'] = str(names[0]).strip()
     return normalized
 
 
@@ -8939,12 +8976,22 @@ def _canonicalize_flow_assignment_paths(assignment: dict[str, Any]) -> dict[str,
 
     inject_files = out.get('inject_files') if isinstance(out.get('inject_files'), list) else None
     if inject_files is not None:
+        resolved_outputs = out.get('resolved_outputs') if isinstance(out.get('resolved_outputs'), dict) else {}
         fixed_injects: list[Any] = []
         for item in inject_files:
             if not isinstance(item, str):
                 fixed_injects.append(item)
                 continue
             src, dest = _split_inject_spec_global(item)
+            if _looks_like_artifact_key(src):
+                try:
+                    resolved_src = resolved_outputs.get(src) if isinstance(resolved_outputs, dict) else None
+                    if isinstance(resolved_src, str) and resolved_src.strip() and _looks_like_fs_path(resolved_src):
+                        fixed_src = _abs_path_or_original(resolved_src, base_dir=base_dir or None)
+                        fixed_injects.append(f"{fixed_src} -> {dest}" if dest else fixed_src)
+                        continue
+                except Exception:
+                    pass
             if _looks_like_fs_path(src):
                 fixed_src = _abs_path_or_original(src, base_dir=base_dir or None)
                 fixed_injects.append(f"{fixed_src} -> {dest}" if dest else fixed_src)
@@ -9047,8 +9094,14 @@ def _backfill_flow_state_inject_files_from_catalog(flow_state: dict[str, Any]) -
         if cleaned:
             gen_injects[gid] = cleaned
 
-    if not gen_injects:
-        return flow_state
+    def _default_vuln_injects(entry: dict[str, Any]) -> list[str]:
+        try:
+            vulns = entry.get('vulnerabilities') if isinstance(entry.get('vulnerabilities'), list) else []
+            if any(str(v or '').strip() for v in (vulns or [])):
+                return ['flag.txt -> /tmp']
+        except Exception:
+            pass
+        return []
 
     out = dict(flow_state)
     out_assigns: list[Any] = []
@@ -9059,11 +9112,18 @@ def _backfill_flow_state_inject_files_from_catalog(flow_state: dict[str, Any]) -
         a2 = dict(a)
         existing = a2.get('inject_files') if isinstance(a2.get('inject_files'), list) else []
         if isinstance(existing, list) and any(str(x or '').strip() for x in existing):
+            fallback = _default_vuln_injects(a2)
+            if fallback and ('flag.txt -> /tmp' not in [str(x or '').strip() for x in existing]):
+                a2['inject_files'] = list(existing) + fallback
             out_assigns.append(a2)
             continue
         gid = str(a2.get('id') or a2.get('generator_id') or '').strip()
         if gid and gid in gen_injects:
             a2['inject_files'] = list(gen_injects[gid])
+        else:
+            fallback = _default_vuln_injects(a2)
+            if fallback:
+                a2['inject_files'] = fallback
         out_assigns.append(a2)
     out['flag_assignments'] = out_assigns
     return out
@@ -16363,6 +16423,12 @@ def _flow_compute_flag_assignments(
         except Exception:
             pass
 
+        vuln_names = list(vuln_names_by_id.get(str(cid), []) or [])
+        inject_files = [str(x or '').strip() for x in (gen.get('inject_files') or [])] if isinstance(gen.get('inject_files'), list) else []
+        inject_files = [x for x in inject_files if x]
+        if vuln_names and ('flag.txt -> /tmp' not in inject_files):
+            inject_files.append('flag.txt -> /tmp')
+
         out.append({
             'node_id': str(cid),
             'id': str(gen.get('id') or ''),
@@ -16372,9 +16438,9 @@ def _flow_compute_flag_assignments(
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
             'language': str(gen.get('language') or ''),
-            'vulnerabilities': list(vuln_names_by_id.get(str(cid), []) or []),
+            'vulnerabilities': vuln_names,
             'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
-            'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
+            'inject_files': inject_files,
             # Effective union (used for chaining feasibility / ordering validation).
             'inputs': sorted(list(_required_inputs_of(gen))),
             'outputs': sorted(list(_provides_of(gen))),
@@ -16603,6 +16669,21 @@ def _flow_enrich_saved_flag_assignments(
         pass
 
     out: list[dict[str, Any]] = []
+
+    def _default_vuln_injects_for_node(node_id: str, assignment: dict[str, Any]) -> list[str]:
+        try:
+            existing_vulns = assignment.get('vulnerabilities') if isinstance(assignment.get('vulnerabilities'), list) else []
+            if any(str(v or '').strip() for v in (existing_vulns or [])):
+                return ['flag.txt -> /tmp']
+        except Exception:
+            pass
+        try:
+            if str(node_id or '') in vuln_names_by_id:
+                return ['flag.txt -> /tmp']
+        except Exception:
+            pass
+        return []
+
     for i, a in enumerate(flag_assignments or []):
         if not isinstance(a, dict):
             continue
@@ -16648,6 +16729,15 @@ def _flow_enrich_saved_flag_assignments(
                     inj = gen_def.get('inject_files')
                     if isinstance(inj, list):
                         a2['inject_files'] = [str(x or '').strip() for x in inj if str(x or '').strip()]
+            existing_injects = a2.get('inject_files')
+            fallback = _default_vuln_injects_for_node(str(this_id), a2)
+            if fallback:
+                current = [str(x or '').strip() for x in (existing_injects or [])] if isinstance(existing_injects, list) else []
+                current = [x for x in current if x]
+                if 'flag.txt -> /tmp' not in current:
+                    current.extend(fallback)
+                if current:
+                    a2['inject_files'] = current
         except Exception:
             pass
 
@@ -21881,6 +21971,8 @@ def api_flow_prepare_preview_for_execute():
                     src = str(raw_src or '').strip()
                     if not src:
                         return ''
+                    if src == '/tmp/flag.txt':
+                        return src
                     if not os.path.isabs(src):
                         return _normalize_rel_artifacts(src, source_dir)
                     try:
@@ -27429,9 +27521,30 @@ def _filter_history_by_scenario(history: List[dict], scenario_norm: str) -> List
         return history
     filtered: List[dict] = []
     for entry in history:
-        names = entry.get('scenario_names') or []
-        if not isinstance(names, list):
+        if not isinstance(entry, dict):
             continue
+
+        names: List[str] = []
+        raw_names = entry.get('scenario_names') or []
+        if isinstance(raw_names, list):
+            names.extend([str(name).strip() for name in raw_names if str(name or '').strip()])
+
+        scenario_name = entry.get('scenario_name')
+        if isinstance(scenario_name, str) and scenario_name.strip():
+            names.append(scenario_name.strip())
+
+        if not names:
+            src_xml = (
+                entry.get('single_scenario_xml_path')
+                or entry.get('scenario_xml_path')
+                or entry.get('preview_plan_path')
+                or entry.get('xml_path')
+            )
+            try:
+                names = _scenario_names_from_xml(src_xml) if src_xml else []
+            except Exception:
+                names = []
+
         if any(_normalize_scenario_label(name) == scenario_norm for name in names):
             filtered.append(entry)
     return filtered
@@ -31094,6 +31207,17 @@ def _inject_mappings_from_assignment(entry):
                 continue
             if not dest_raw.startswith('/'):
                 dest_raw = '/tmp'
+            if src_raw == '/tmp/flag.txt':
+                try:
+                    cand = ''
+                    if source_dir:
+                        cand = os.path.join(source_dir, 'flag.txt')
+                        if not os.path.exists(cand):
+                            cand = os.path.join(os.path.dirname(source_dir), 'flag.txt')
+                    if cand and os.path.exists(cand):
+                        src_raw = cand
+                except Exception:
+                    pass
             if os.path.isabs(src_raw):
                 rel_src = src_raw
             else:
@@ -31182,8 +31306,72 @@ def main():
         fallback_inject_source, fallback_inject_items = _inject_mappings_from_assignment(assignment_entry)
         if not inject_source and fallback_inject_source:
             inject_source = fallback_inject_source
-        if not inject_items and fallback_inject_items:
-            inject_items = fallback_inject_items
+        if fallback_inject_items:
+            try:
+                merged = []
+                seen = set()
+                for item in list(inject_items or []) + list(fallback_inject_items or []):
+                    if not isinstance(item, dict):
+                        continue
+                    src_key = str(item.get('src') or '').strip()
+                    dest_key = str(item.get('dest') or '').strip()
+                    if os.path.basename(src_key.rstrip('/')) == 'flag.txt' and dest_key.rstrip('/') == '/tmp':
+                        dest_key = '/flow_injects'
+                    key = (src_key, dest_key)
+                    if not key[0] or not key[1] or key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append({'src': key[0], 'dest': key[1]})
+                inject_items = merged
+            except Exception:
+                if not inject_items:
+                    inject_items = fallback_inject_items
+
+        # Legacy guardrail: ensure flag.txt gets copied into /flow_injects when
+        # assignment metadata points to a concrete generated flag artifact.
+        try:
+            flag_src = ''
+            if isinstance(assignment_entry, dict):
+                candidates = []
+                inject_src = str(assignment_entry.get('inject_source_dir') or '').strip()
+                artifacts_dir = str(assignment_entry.get('artifacts_dir') or '').strip()
+                if inject_src:
+                    candidates.append(os.path.join(inject_src, 'flag.txt'))
+                    candidates.append(os.path.join(os.path.dirname(inject_src), 'flag.txt'))
+                if src:
+                    candidates.append(os.path.join(src, 'flag.txt'))
+                    candidates.append(os.path.join(os.path.dirname(src), 'flag.txt'))
+                if artifacts_dir:
+                    candidates.append(os.path.join(artifacts_dir, 'flag.txt'))
+                resolved_paths = assignment_entry.get('resolved_paths') if isinstance(assignment_entry.get('resolved_paths'), dict) else {}
+                inject_sources = resolved_paths.get('inject_sources') if isinstance(resolved_paths, dict) else []
+                if isinstance(inject_sources, list):
+                    for entry in inject_sources:
+                        if not isinstance(entry, dict):
+                            continue
+                        p = str(entry.get('path') or '').strip()
+                        if p and os.path.basename(p.rstrip('/')) == 'flag.txt':
+                            candidates.append(p)
+                seen_cands = set()
+                for cand in candidates:
+                    p = str(cand or '').strip()
+                    if not p or p in seen_cands:
+                        continue
+                    seen_cands.add(p)
+                    if os.path.exists(p):
+                        flag_src = p
+                        break
+            if flag_src:
+                existing = set()
+                for item in (inject_items or []):
+                    if not isinstance(item, dict):
+                        continue
+                    existing.add((str(item.get('src') or '').strip(), str(item.get('dest') or '').strip()))
+                key = (flag_src, '/flow_injects')
+                if key not in existing:
+                    inject_items = list(inject_items or []) + [{'src': flag_src, 'dest': '/flow_injects'}]
+        except Exception:
+            pass
 
         # Find container targets: prefer compose project containers (actual services),
         # and optionally include the node-name alias when present.
@@ -32923,6 +33111,33 @@ def _latest_xml_path_for_scenario(scenario_norm: str) -> str | None:
         if preferred:
             return preferred
 
+        # Run history fallback: some entries can have valid XML paths even when
+        # scenario catalog metadata is stale or incomplete.
+        try:
+            history = _load_run_history()
+            filtered_hist = _filter_history_by_scenario(history, scen_norm)
+            filtered_hist.sort(key=lambda e: _parse_iso_ts(e.get('timestamp') if isinstance(e, dict) else None), reverse=True)
+            for entry in filtered_hist:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ('single_scenario_xml_path', 'scenario_xml_path', 'preview_plan_path', 'xml_path'):
+                    cand = _existing_xml_path_or_none(entry.get(key))
+                    if not cand or _is_autosave_xml_path(cand):
+                        continue
+                    try:
+                        scen_names = _scenario_names_from_xml(cand)
+                    except Exception:
+                        scen_names = []
+                    # Do not accept candidates that do not encode scenario names
+                    # (e.g., session XML); that can cause cross-scenario preview drift.
+                    if not scen_names:
+                        continue
+                    if not any(_normalize_scenario_label(nm) == scen_norm for nm in scen_names):
+                        continue
+                    return cand
+        except Exception:
+            pass
+
         # Fallback: scan outputs/scenarios-* for per-scenario XML files and pick newest
         # match by scenario label + mtime. This covers cases where catalog/history mapping
         # is stale or missing for scenario-only API calls.
@@ -33337,12 +33552,48 @@ def _load_preview_payload_from_path(path: str, scenario_label: str | None = None
                 continue
         return False
 
+    def _preview_missing_router_projection(candidate: Any) -> bool:
+        if not isinstance(candidate, dict):
+            return False
+        full = candidate.get('full_preview') if isinstance(candidate.get('full_preview'), dict) else None
+        if not isinstance(full, dict):
+            return False
+        routers = full.get('routers') if isinstance(full.get('routers'), list) else []
+        if routers:
+            return False
+        hosts = full.get('hosts') if isinstance(full.get('hosts'), list) else []
+        role_counts = full.get('role_counts') if isinstance(full.get('role_counts'), dict) else {}
+        if hosts:
+            return True
+        for value in role_counts.values():
+            try:
+                if int(value) > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _planned_router_count(xml_file: str, scenario_name: str | None) -> int:
+        try:
+            from core_topo_gen.planning.orchestrator import compute_full_plan
+            plan = compute_full_plan(xml_file, scenario=scenario_name, seed=None, include_breakdowns=False)
+            return int(plan.get('routers_planned') or 0)
+        except Exception:
+            return 0
+
     try:
         ap = _existing_xml_path_or_none(path)
         if not ap:
             return None
         payload = _load_plan_preview_payload_from_path(ap, scenario_label)
+        should_recompute = False
         if _is_effectively_empty_preview_payload(payload) and _xml_suggests_expected_nodes(ap, scenario_label):
+            should_recompute = True
+        elif _preview_missing_router_projection(payload):
+            expected_routers = _planned_router_count(ap, scenario_label)
+            if expected_routers > 0:
+                should_recompute = True
+        if should_recompute:
             try:
                 recomputed = _planner_persist_flow_plan(
                     xml_path=ap,
@@ -36531,13 +36782,47 @@ def plan_full_preview_from_xml():
             flash('Invalid XML path')
             return redirect(url_for('index'))
 
-        payload = _load_plan_preview_from_xml(xml_path, scenario)
+        payload = _load_preview_payload_from_path(xml_path, scenario)
+
+        try:
+            app.logger.info(
+                '[plan.full_preview_from_xml] initial lookup xml=%s scenario=%s hit=%s',
+                xml_path,
+                scenario or '',
+                bool(payload),
+            )
+        except Exception:
+            pass
+
+        def _payload_matches_requested_scenario(payload_obj: Any, requested: str | None) -> bool:
+            if not requested:
+                return True
+            req_norm = _normalize_scenario_label(requested)
+            if not req_norm:
+                return True
+            try:
+                meta_obj = payload_obj.get('metadata') if isinstance(payload_obj, dict) else None
+                scen = str((meta_obj or {}).get('scenario') or '').strip() if isinstance(meta_obj, dict) else ''
+            except Exception:
+                scen = ''
+            return bool(scen and _normalize_scenario_label(scen) == req_norm)
+
         # Fallbacks for stale or mismatched xml_path/scenario combinations:
         # 1) retry same XML without scenario filter
         # 2) retry latest XML for scenario (with and without scenario filter)
         if not payload:
             try:
-                payload = _load_plan_preview_from_xml(xml_path, None)
+                candidate = _load_preview_payload_from_path(xml_path, None)
+                payload = candidate if _payload_matches_requested_scenario(candidate, scenario) else None
+                try:
+                    app.logger.info(
+                        '[plan.full_preview_from_xml] fallback same-xml no-scenario xml=%s requested=%s candidate_match=%s',
+                        xml_path,
+                        scenario or '',
+                        bool(payload),
+                    )
+                except Exception:
+                    pass
             except Exception:
                 payload = None
         if not payload and scenario:
@@ -36553,11 +36838,25 @@ def plan_full_preview_from_xml():
                     latest_xml_abs = latest_xml
                 if latest_xml_abs and os.path.exists(latest_xml_abs):
                     try:
-                        payload = _load_plan_preview_from_xml(latest_xml_abs, scenario)
+                        payload = _load_preview_payload_from_path(latest_xml_abs, scenario)
+                        selected_via = 'latest-xml+scenario' if payload else ''
                         if not payload:
-                            payload = _load_plan_preview_from_xml(latest_xml_abs, None)
+                            candidate = _load_preview_payload_from_path(latest_xml_abs, None)
+                            payload = candidate if _payload_matches_requested_scenario(candidate, scenario) else None
+                            if payload:
+                                selected_via = 'latest-xml+no-scenario(match)'
                         if payload:
                             xml_path = latest_xml_abs
+                        try:
+                            app.logger.info(
+                                '[plan.full_preview_from_xml] fallback latest-xml requested=%s latest_xml=%s selected=%s via=%s',
+                                scenario or '',
+                                latest_xml_abs,
+                                bool(payload),
+                                selected_via,
+                            )
+                        except Exception:
+                            pass
                     except Exception:
                         pass
         if not payload:
@@ -36574,9 +36873,17 @@ def plan_full_preview_from_xml():
                 recomputed = None
             if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
                 payload = recomputed
+                try:
+                    app.logger.info(
+                        '[plan.full_preview_from_xml] recomputed planpreview xml=%s scenario=%s',
+                        xml_path,
+                        scenario or '',
+                    )
+                except Exception:
+                    pass
             else:
                 try:
-                    payload = _load_plan_preview_from_xml(xml_path, scenario) or _load_plan_preview_from_xml(xml_path, None)
+                    payload = _load_preview_payload_from_path(xml_path, scenario) or _load_preview_payload_from_path(xml_path, None)
                 except Exception:
                     payload = None
         if not payload:
@@ -36620,7 +36927,7 @@ def plan_full_preview_from_xml():
                             )
                             if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
                                 full_prev = recomputed.get('full_preview')
-                            payload = _load_plan_preview_from_xml(xml_path, scenario) or payload
+                            payload = _load_preview_payload_from_path(xml_path, scenario) or payload
                             meta = payload.get('metadata') if isinstance(payload, dict) else meta
                             if not isinstance(meta, dict):
                                 meta = {}
@@ -38036,6 +38343,8 @@ def _normalize_inject_src_for_copy(raw_src: str, source_dir: str) -> str:
     src = str(raw_src or '').strip()
     if not src:
         return ''
+    if src == '/tmp/flag.txt':
+        return src
     if not os.path.isabs(src):
         return _normalize_rel_artifacts(src, source_dir)
     try:
@@ -38102,11 +38411,20 @@ def main():
         outputs_missing = []
         outputs_checked = []
         outputs_resolved = {}
+        flag_delivery_mode = 'unknown'
+        flag_file_path = ''
         manifest_expected = bool(outputs_manifest)
         manifest_exists = _safe_exists(outputs_manifest)
         outs = None
         if manifest_expected and not manifest_exists:
-            outputs_missing.append(f"missing manifest: {outputs_manifest}")
+            manifest_txt = str(outputs_manifest or '').strip().replace('\\', '/')
+            if (
+                manifest_txt.startswith('/tmp/')
+                or manifest_txt.startswith('/exports/')
+                or manifest_txt.startswith('/outputs/')
+                or manifest_txt.startswith('/inputs/')
+            ):
+                outputs_missing.append(f"missing manifest: {outputs_manifest}")
         if manifest_exists:
             try:
                 with open(outputs_manifest, 'r', encoding='utf-8') as f:
@@ -38117,6 +38435,18 @@ def main():
         if manifest_exists and not (isinstance(outs, dict) and outs):
             outputs_missing.append(f"empty manifest: {outputs_manifest}")
         if isinstance(outs, dict):
+            try:
+                mode_raw = str(outs.get('FlagDelivery(mode)') or '').strip().lower()
+                if mode_raw in ('file', 'embedded', 'none', 'unknown'):
+                    flag_delivery_mode = mode_raw
+            except Exception:
+                pass
+            try:
+                ff_raw = str(outs.get('FlagFile(path)') or '').strip()
+                if ff_raw:
+                    flag_file_path = _resolve_output_path(ff_raw, run_dir, artifacts_dir)
+            except Exception:
+                pass
             # Derive scenario tag from label if possible
             st = ''
             try:
@@ -38161,30 +38491,99 @@ def main():
 
         source_dir = artifacts_dir or run_dir
         inject_sources = _inject_files_for_copy_from_detail(a.get('inject_files_detail'), source_dir)
+        legacy_tmp_flag_spec = False
+        inj = a.get('inject_files') if isinstance(a.get('inject_files'), list) else []
+        for raw in inj:
+            text_raw = str(raw or '').strip()
+            if not text_raw:
+                continue
+            sep_raw = '->' if '->' in text_raw else '=>' if '=>' in text_raw else ''
+            left_raw = text_raw.split(sep_raw, 1)[0].strip() if sep_raw else text_raw
+            right_raw = text_raw.split(sep_raw, 1)[1].strip() if sep_raw else ''
+            left_base = os.path.basename(left_raw.rstrip('/')) if left_raw else ''
+            if left_raw == '/tmp/flag.txt':
+                legacy_tmp_flag_spec = True
+                break
+            if left_base == 'flag.txt' and (not right_raw or right_raw == '/tmp'):
+                legacy_tmp_flag_spec = True
+                break
         if not inject_sources:
-            inj = a.get('inject_files') if isinstance(a.get('inject_files'), list) else []
             for raw in inj:
                 src_norm = _normalize_inject_spec_for_copy(raw, source_dir)
                 if src_norm:
                     inject_sources.append(src_norm)
+
+        # Prefer generation-time resolved inject sources when available.
+        # This avoids stale/ambiguous inject_files normalization artifacts.
+        try:
+            resolved_paths = a.get('resolved_paths') if isinstance(a.get('resolved_paths'), dict) else {}
+            resolved_items = resolved_paths.get('inject_sources') if isinstance(resolved_paths, dict) else []
+            resolved_inject_sources = []
+            if isinstance(resolved_items, list):
+                for item in resolved_items:
+                    if not isinstance(item, dict):
+                        continue
+                    src_path = str(item.get('path') or '').strip()
+                    if src_path:
+                        resolved_inject_sources.append(src_path)
+            if resolved_inject_sources:
+                inject_sources = resolved_inject_sources
+        except Exception:
+            pass
+
+        # De-dupe while preserving order.
+        try:
+            _seen_inject = set()
+            _uniq_inject = []
+            for _src in inject_sources:
+                _key = str(_src or '').strip()
+                if not _key or _key in _seen_inject:
+                    continue
+                _seen_inject.add(_key)
+                _uniq_inject.append(_key)
+            inject_sources = _uniq_inject
+        except Exception:
+            pass
+
         inject_missing = []
         inject_checked = []
         for src in inject_sources:
-            if os.path.isabs(src):
-                p = src
+            src_txt = str(src or '').strip()
+            if not src_txt:
+                continue
+            if flag_delivery_mode == 'embedded' and os.path.basename(src_txt.rstrip('/')) == 'flag.txt':
+                continue
+            # Legacy fallback inside containers; not a host-side source path.
+            if str(gen_type or '').strip().lower() == 'flag-generator' and src_txt == '/tmp/flag.txt':
+                continue
+            if str(gen_type or '').strip().lower() == 'flag-generator' and legacy_tmp_flag_spec:
+                if os.path.basename(src_txt.rstrip('/')) == 'flag.txt' and '/artifacts/' not in src_txt.replace('\\', '/'):
+                    continue
+            if (not os.path.isabs(src_txt)) and (not source_dir):
+                # Relative inject source cannot be validated without a known base directory.
+                continue
+            if os.path.isabs(src_txt):
+                p = src_txt
             elif source_dir:
-                p = os.path.join(source_dir, src.lstrip('/'))
+                p = os.path.join(source_dir, src_txt.lstrip('/'))
             else:
-                p = src
+                p = src_txt
             inject_checked.append(p)
             if not _safe_exists(p):
                 inject_missing.append(p)
+
+        if flag_delivery_mode == 'file' and flag_file_path:
+            inject_checked.append(flag_file_path)
+            if not _safe_exists(flag_file_path):
+                inject_missing.append(flag_file_path)
 
         items.append({
             'node_id': node_id,
             'generator_id': gen_id,
             'generator_name': gen_name,
             'generator_type': gen_type,
+            'flag_delivery_mode': flag_delivery_mode,
+            'flag_file_path': flag_file_path,
             'run_dir': run_dir,
             'artifacts_dir': artifacts_dir,
             'outputs_manifest': outputs_manifest,
@@ -38280,6 +38679,78 @@ def _validate_session_nodes_and_injects(
         'flow_live_paths_missing': [],
         'flow_live_paths_detail': [],
     }
+
+    def _is_mount_root_path(path_value: Any) -> bool:
+        try:
+            p = str(path_value or '').strip().replace('\\', '/')
+        except Exception:
+            return False
+        if not p:
+            return False
+        return p in {'/exports', '/outputs', '/inputs'}
+
+    def _looks_like_optional_flag_path(path_value: Any) -> bool:
+        try:
+            p = str(path_value or '').strip().replace('\\', '/').rstrip('/')
+        except Exception:
+            return False
+        if not p:
+            return False
+        return p.endswith('/flag.txt')
+
+    def _sanitize_expected_inject_paths(paths: Any) -> List[str]:
+        if not isinstance(paths, list):
+            return []
+        out: List[str] = []
+        seen: set[str] = set()
+        for raw in paths:
+            p = str(raw or '').strip()
+            if not p:
+                continue
+            if _is_mount_root_path(p):
+                continue
+            if _looks_like_optional_flag_path(p):
+                continue
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+        return out
+
+    def _is_local_host_path(path_value: Any) -> bool:
+        try:
+            p = str(path_value or '').strip().replace('\\', '/')
+        except Exception:
+            return False
+        if not p:
+            return False
+        return p.startswith('/Users/') or p.startswith('/home/')
+
+    def _keep_generator_output_missing(raw_value: Any) -> bool:
+        text = str(raw_value or '').strip()
+        if not text:
+            return False
+        low = text.lower()
+        if low.startswith('missing manifest:'):
+            try:
+                manifest_path = text.split(':', 1)[1].strip()
+            except Exception:
+                manifest_path = ''
+            if not manifest_path:
+                return False
+            if _is_local_host_path(manifest_path):
+                return False
+        return True
+
+    def _keep_generator_inject_missing(raw_value: Any) -> bool:
+        text = str(raw_value or '').strip()
+        if not text:
+            return False
+        if _is_local_host_path(text):
+            return False
+        if (not text.startswith('/')) and ('/' not in text):
+            return False
+        return True
 
     def _collect_flow_live_path_diagnostics() -> None:
         if not flow_enabled:
@@ -38498,6 +38969,13 @@ def _validate_session_nodes_and_injects(
     if flow_enabled:
         flow_inject_specs = _extract_inject_specs_from_flow_state(scenario_xml_path, scenario_label)
         inject_expected_by_node = _extract_inject_expected_by_node(scenario_xml_path, scenario_label)
+        if isinstance(inject_expected_by_node, dict) and inject_expected_by_node:
+            cleaned_expected_by_node: Dict[str, List[str]] = {}
+            for node_name, paths in inject_expected_by_node.items():
+                clean_paths = _sanitize_expected_inject_paths(paths)
+                if clean_paths:
+                    cleaned_expected_by_node[str(node_name)] = clean_paths
+            inject_expected_by_node = cleaned_expected_by_node
         if flow_inject_specs:
             flow_payload = {'inject_files': flow_inject_specs}
             expected_inject_dirs = _extract_inject_dirs_from_payload(flow_payload)
@@ -38505,6 +38983,11 @@ def _validate_session_nodes_and_injects(
         else:
             expected_inject_dirs = _extract_inject_dirs_from_plan_xml(scenario_xml_path, scenario_label)
             expected_inject_files = _extract_inject_files_from_plan_xml(scenario_xml_path, scenario_label)
+        expected_inject_dirs = [
+            str(d) for d in (expected_inject_dirs or [])
+            if str(d or '').strip() and not _is_mount_root_path(d)
+        ]
+        expected_inject_files = _sanitize_expected_inject_paths(expected_inject_files)
         if isinstance(inject_expected_by_node, dict) and inject_expected_by_node:
             flat_expected: List[str] = []
             seen_expected: set[str] = set()
@@ -38812,6 +39295,7 @@ def _validate_session_nodes_and_injects(
                     'outputs_manifest': fa.get('outputs_manifest'),
                     'inject_files_detail': fa.get('inject_files_detail'),
                     'inject_files': fa.get('inject_files'),
+                    'resolved_paths': fa.get('resolved_paths'),
                 })
             try:
                 payload = _run_remote_python_json(
@@ -38828,15 +39312,20 @@ def _validate_session_nodes_and_injects(
                             continue
                         node_id = str(it.get('node_id') or '').strip()
                         gen_id = str(it.get('generator_id') or '').strip()
-                        miss_out = it.get('outputs_missing') if isinstance(it.get('outputs_missing'), list) else []
-                        miss_inj = it.get('inject_missing') if isinstance(it.get('inject_missing'), list) else []
+                        miss_out_raw = it.get('outputs_missing') if isinstance(it.get('outputs_missing'), list) else []
+                        miss_inj_raw = it.get('inject_missing') if isinstance(it.get('inject_missing'), list) else []
+                        miss_out = [p for p in miss_out_raw if _keep_generator_output_missing(p)]
+                        miss_inj = [p for p in miss_inj_raw if _keep_generator_inject_missing(p)]
                         if miss_out:
                             for p in miss_out:
                                 summary['generator_outputs_missing'].append(f"{node_id or gen_id}: {p}")
                         if miss_inj:
                             for p in miss_inj:
                                 summary['generator_injects_missing'].append(f"{node_id or gen_id}: {p}")
-                        summary['generator_validation_detail'].append(it)
+                        it_clean = dict(it)
+                        it_clean['outputs_missing'] = miss_out
+                        it_clean['inject_missing'] = miss_inj
+                        summary['generator_validation_detail'].append(it_clean)
                 else:
                     gen_validation_error = 'no generator validation items returned'
             except Exception as exc:
@@ -38919,6 +39408,8 @@ def _validate_session_nodes_and_injects(
             artifacts_dir = str(fa.get('inject_source_dir') or fa.get('artifacts_dir') or '')
             outputs_checked: List[str] = []
             inject_checked: List[str] = []
+            flag_delivery_mode = 'unknown'
+            flag_file_path = ''
             try:
                 resolved_detail = fa.get('resolved_outputs_detail') if isinstance(fa.get('resolved_outputs_detail'), list) else []
                 for item in resolved_detail:
@@ -38934,6 +39425,13 @@ def _validate_session_nodes_and_injects(
             try:
                 resolved_outputs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
                 if isinstance(resolved_outputs, dict):
+                    mode_raw = str(resolved_outputs.get('FlagDelivery(mode)') or '').strip().lower()
+                    if mode_raw in {'file', 'embedded', 'none', 'unknown'}:
+                        flag_delivery_mode = mode_raw
+                    ff_raw = str(resolved_outputs.get('FlagFile(path)') or '').strip()
+                    if ff_raw:
+                        ff_resolved = _resolve_output_path_local(ff_raw, run_dir, artifacts_dir)
+                        flag_file_path = ff_resolved or ff_raw
                     for v in resolved_outputs.values():
                         if _looks_like_path_local(v):
                             p = _resolve_output_path_local(str(v), run_dir, artifacts_dir)
@@ -38960,11 +39458,17 @@ def _validate_session_nodes_and_injects(
                         inject_checked.append(p)
             except Exception:
                 pass
+            if flag_delivery_mode == 'embedded':
+                inject_checked = [p for p in inject_checked if os.path.basename(str(p).rstrip('/')) != 'flag.txt']
+            if flag_delivery_mode == 'file' and flag_file_path:
+                inject_checked.append(flag_file_path)
             summary['generator_validation_detail'].append({
                 'node_id': fa.get('node_id'),
                 'generator_id': fa.get('id') or fa.get('generator_id'),
                 'generator_name': fa.get('name'),
                 'generator_type': fa.get('type') or fa.get('generator_type'),
+                'flag_delivery_mode': flag_delivery_mode,
+                'flag_file_path': flag_file_path,
                 'run_dir': run_dir,
                 'artifacts_dir': artifacts_dir,
                 'outputs_manifest': fa.get('outputs_manifest'),
@@ -40747,6 +41251,7 @@ def run_cli_async():
     upload_only_injected_artifacts = False
     scenarios_inline = None
     flow_enabled = True
+    flow_disabled_reason = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -41174,10 +41679,12 @@ def run_cli_async():
                 if isinstance(vuln_by_node, dict):
                     vuln_count = max(vuln_count, len([k for k, v in vuln_by_node.items() if v]))
             if (docker_count <= 0) and (vuln_count <= 0):
-                return jsonify({
-                    'error': 'Flag sequencing requires Docker or vulnerability nodes in the topology.',
-                    'detail': f'Docker nodes: {docker_count}, vulnerability nodes: {vuln_count}',
-                }), 422
+                flow_enabled = False
+                preview_plan_path = None
+                flow_disabled_reason = (
+                    'Flag sequencing disabled for this execute run: '
+                    f'Docker nodes={docker_count}, vulnerability nodes={vuln_count}'
+                )
     except Exception:
         pass
     try:
@@ -41260,6 +41767,7 @@ def run_cli_async():
         'preview_plan': preview_plan_path,
         'scenario': scenario_name_hint,
         'flow_enabled': bool(flow_enabled),
+        'flow_disabled_reason': flow_disabled_reason,
     }
     
     # Spawn background thread
@@ -41268,11 +41776,14 @@ def run_cli_async():
     
     app.logger.info("[async] Spawning background CLI task for run_id=%s", run_id)
     
-    return jsonify({
+    response_payload = {
         "run_id": run_id,
         "status": "initializing",
         "log_url": f"/outputs/{os.path.basename(os.path.dirname(log_path))}/{os.path.basename(log_path)}" if log_path else None
-    }), 202
+    }
+    if flow_disabled_reason:
+        response_payload["warning"] = flow_disabled_reason
+    return jsonify(response_payload), 202
 @app.route('/core/check_remote_repo', methods=['POST'])
 def check_remote_repo():
     payload = request.get_json(silent=True) or {}

@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from types import SimpleNamespace
@@ -55,8 +56,8 @@ services:
         assert "ports" not in svc
         # Preserve container-side port intent for reporting/metadata.
         assert "expose" in svc and "80" in [str(x) for x in (svc.get("expose") or [])]
-        # Auto mode only forces root workdir for base OS-style images.
-        assert "working_dir" not in svc
+        # Wrapped services now include an explicit working directory.
+        assert isinstance(svc.get("working_dir"), str) and str(svc.get("working_dir") or "").strip()
         # Compose handed to CORE should NOT include `build:`; core-daemon would
         # attempt to build during scenario startup (and therefore pull packages/images).
         assert "build" not in svc
@@ -494,6 +495,93 @@ def test_prepare_compose_flow_injects_default_to_flow_injects_dir(tmp_path, monk
     assert any(str(v).endswith(":/flow_injects") for v in vols), vols
 
 
+def test_prepare_compose_ignores_legacy_tmp_flag_container_path(tmp_path, monkeypatch):
+    """Regression: /tmp/flag.txt is an in-container fallback path, not a host source."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: nginx:latest\n    command: ['sh','-lc','sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    flow_artifacts = tmp_path / "tmp" / "vulns" / "flag_generators_runs" / "flow-z" / "01_gen" / "artifacts"
+    flow_artifacts.mkdir(parents=True, exist_ok=True)
+    (flow_artifacts / "hint.txt").write_text("hint\n", encoding="utf-8")
+
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "ScenarioTag": "test",
+        "InjectFiles": ["/tmp/flag.txt", "hint.txt"],
+        "InjectSourceDir": str(flow_artifacts),
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1") or services.get("app")
+    assert isinstance(target, dict)
+
+    labels = target.get("labels") or {}
+    assert isinstance(labels, dict)
+    raw_map = str(labels.get("coretg.inject.map") or "[]")
+    inject_map = json.loads(raw_map)
+    assert isinstance(inject_map, list)
+    assert any(str(item.get("src") or "") == "hint.txt" for item in inject_map if isinstance(item, dict))
+    assert not any(str(item.get("src") or "") == "flag.txt" for item in inject_map if isinstance(item, dict))
+
+
+def test_prepare_compose_vuln_text_auto_injects_flag(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: nginx:latest\n    command: ['sh','-lc','sleep 1']\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+    monkeypatch.setenv("CORETG_VULN_FLAG_TYPE", "text")
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "CoreTGVulnAssignment": "1",
+        "FlagType": "text",
+    }
+
+    created = prepare_compose_for_assignments({"docker-5": record}, out_base=str(tmp_path))
+    assert created
+
+    host_flag = tmp_path / "flag_injects" / "docker-5" / "flag.txt"
+    assert host_flag.exists(), "expected auto-generated host flag source"
+
+    out_path = tmp_path / "docker-compose-docker-5.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    ikeys = [k for k in services.keys() if str(k).startswith("inject_copy")]
+    assert ikeys, "expected inject_copy service"
+
+    target = services.get("docker-5") or services.get("app")
+    assert isinstance(target, dict)
+    vols = target.get("volumes") or []
+    assert any(str(v).endswith(":/tmp") for v in vols), vols
+
+
 def test_prepare_compose_inject_copy_runtime_guard_nonfatal_by_default(tmp_path, monkeypatch):
     """Regression: inject_copy command should guard missing runtime sources by default."""
     try:
@@ -579,6 +667,51 @@ def test_prepare_compose_inject_copy_runs_as_root_for_volume_writes(tmp_path, mo
     assert str(inject.get("user") or "") == "0:0"
 
 
+def test_prepare_compose_inject_copy_dependency_nonblocking_by_default(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: nginx:latest\n",
+        encoding="utf-8",
+    )
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "flag.txt").write_text("FLAG{demo}\n", encoding="utf-8")
+
+    monkeypatch.setenv("CORETG_INJECT_FILES_MODE", "copy")
+    monkeypatch.delenv("CORETG_INJECT_COPY_REQUIRE_SUCCESS", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "Example",
+        "Path": str(compose_src),
+        "InjectFiles": ["flag.txt -> /tmp"],
+        "InjectSourceDir": str(artifacts),
+    }
+
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-1.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-1") or services.get("app")
+    assert isinstance(target, dict)
+
+    depends_on = target.get("depends_on")
+    if isinstance(depends_on, dict):
+        inject_keys = [k for k in depends_on.keys() if str(k).startswith("inject_copy")]
+        assert not inject_keys
+    elif isinstance(depends_on, list):
+        inject_keys = [k for k in depends_on if str(k).startswith("inject_copy")]
+        assert not inject_keys
+
+
 def test_prepare_compose_root_workdir_auto_mode_skips_app_images(tmp_path, monkeypatch):
     try:
         import yaml  # type: ignore
@@ -608,7 +741,74 @@ def test_prepare_compose_root_workdir_auto_mode_skips_app_images(tmp_path, monke
     services = (obj or {}).get("services") or {}
     target = services.get("docker-1")
     assert isinstance(target, dict)
-    assert "working_dir" not in target
+    assert isinstance(target.get("working_dir"), str) and str(target.get("working_dir") or "").strip()
+    assert str(target.get("working_dir") or "") == "/"
+
+
+def test_prepare_compose_root_workdir_default_preserves_relative_command_paths(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: apache/ofbiz:latest\n    command: ['java','-jar','./build/libs/ofbiz.jar']\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR_STRICT", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "OFBiz",
+        "Path": str(compose_src),
+    }
+
+    created = prepare_compose_for_assignments({"docker-5": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-5.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-5")
+    assert isinstance(target, dict)
+    working_dir = target.get("working_dir")
+    # Relative command paths need image-defined workdir; do not force '/'.
+    assert working_dir != "/"
+
+
+def test_prepare_compose_root_workdir_default_preserves_ofbiz_image_workdir(tmp_path, monkeypatch):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    compose_src = tmp_path / "base-compose.yml"
+    compose_src.write_text(
+        "services:\n  app:\n    image: vulhub/ofbiz:18.12.10\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR", raising=False)
+    monkeypatch.delenv("CORETG_COMPOSE_FORCE_ROOT_WORKDIR_STRICT", raising=False)
+
+    record = {
+        "Type": "docker-compose",
+        "Name": "OFBiz",
+        "Path": str(compose_src),
+    }
+
+    created = prepare_compose_for_assignments({"docker-5": record}, out_base=str(tmp_path))
+    assert created
+
+    out_path = tmp_path / "docker-compose-docker-5.yml"
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    services = (obj or {}).get("services") or {}
+    target = services.get("docker-5")
+    assert isinstance(target, dict)
+    assert target.get("working_dir") != "/"
 
 
 def test_prepare_compose_root_workdir_auto_mode_does_not_force_nextjs(tmp_path, monkeypatch):
@@ -640,7 +840,8 @@ def test_prepare_compose_root_workdir_auto_mode_does_not_force_nextjs(tmp_path, 
     services = (obj or {}).get("services") or {}
     target = services.get("docker-1")
     assert isinstance(target, dict)
-    assert "working_dir" not in target
+    assert isinstance(target.get("working_dir"), str) and str(target.get("working_dir") or "").strip()
+    assert str(target.get("working_dir") or "") == "/"
 
 
 def test_prepare_compose_root_workdir_auto_mode_forces_base_os(tmp_path, monkeypatch):

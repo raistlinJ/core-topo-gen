@@ -78,6 +78,30 @@ _PREPARED_DOCKER_NODE_COMPOSES: Set[str] = set()
 _PREFLIGHTED_DOCKER_NODE_COMPOSES: Set[str] = set()
 
 
+def _reset_docker_compose_prepare_caches(context: str = '') -> None:
+    """Reset per-process docker compose prep/preflight caches.
+
+    The web UI runs multiple executes in one Python process. Reset these caches at
+    the start of each topology build so a previous run cannot skip compose prep or
+    preflight in a later run.
+    """
+    try:
+        _PREPARED_DOCKER_NODE_COMPOSES.clear()
+    except Exception:
+        pass
+    try:
+        _PREFLIGHTED_DOCKER_NODE_COMPOSES.clear()
+    except Exception:
+        pass
+    try:
+        if context:
+            logger.info('[docker-node] reset compose caches context=%s', context)
+        else:
+            logger.info('[docker-node] reset compose caches')
+    except Exception:
+        pass
+
+
 _DOCKER_SUDO_PASSWORD_CACHE: Optional[str] = None
 
 
@@ -183,6 +207,67 @@ def _docker_cmd() -> List[str]:
         return ['docker']
 
 
+def _sanitize_compose_incompatible_workdirs(compose_path: str) -> bool:
+    """Best-effort sanitize known incompatible `working_dir` overrides.
+
+    Removes `working_dir: /` for OFBiz images because their default startup
+    uses relative paths (for example `./build/libs/ofbiz.jar`) and fails when
+    forced to filesystem root.
+
+    Returns True when the compose file was modified.
+    """
+    try:
+        strict = str(os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR_STRICT') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+    except Exception:
+        strict = False
+    if strict:
+        return False
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return False
+
+    try:
+        with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+            compose_obj = yaml.safe_load(fh)  # type: ignore
+    except Exception:
+        return False
+
+    if not isinstance(compose_obj, dict):
+        return False
+    services = compose_obj.get('services')
+    if not isinstance(services, dict):
+        return False
+
+    changed = False
+    for _svc_name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        image = ''
+        try:
+            image = str(svc.get('image') or '').strip().lower()
+        except Exception:
+            image = ''
+        if 'ofbiz' not in image:
+            continue
+        workdir = str(svc.get('working_dir') or '').strip()
+        if workdir == '/':
+            svc.pop('working_dir', None)
+            changed = True
+
+    if not changed:
+        return False
+
+    try:
+        with open(compose_path, 'w', encoding='utf-8') as fh:
+            yaml.safe_dump(compose_obj, fh, sort_keys=False)  # type: ignore
+        logger.info('[docker-node] sanitized incompatible working_dir overrides for compose=%s', compose_path)
+    except Exception:
+        return False
+    return True
+
+
 def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     """Best-effort prepare docker-compose assets before CORE starts docker nodes.
 
@@ -198,7 +283,6 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
         key = os.path.abspath(compose_path)
         if key in _PREFLIGHTED_DOCKER_NODE_COMPOSES:
             return
-        _PREFLIGHTED_DOCKER_NODE_COMPOSES.add(key)
     except Exception:
         return
 
@@ -268,6 +352,13 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     # (network `h7conf_default`, container `h7`) that core-daemon will manage.
     project = f"{node_name}conf" if node_name else "coretg"
     compose_base = cmd + ['-p', project, '-f', compose_path]
+
+    # Runtime safety net: sanitize known incompatible workdir overrides before
+    # any compose build/pull/up commands are executed.
+    try:
+        _sanitize_compose_incompatible_workdirs(compose_path)
+    except Exception:
+        pass
 
     # Determine which services are buildable vs pull-only.
     # `docker compose pull` fails for buildable services with scenario-scoped tags
@@ -473,10 +564,32 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
             # Best-effort: wait for PID to be non-zero.
             # Container name should match node_name when `container_name` is set (our default).
             # If not, this still helps in many cases because CORE uses the node name.
+            #
+            # IMPORTANT:
+            # Docker restart backoff can keep PID=0 for several seconds while status is
+            # `restarting`. A short fixed wait (e.g. ~6s) can fail healthy-but-slow starts.
+            # Use a configurable wait budget with periodic retries.
             inspect_name = node_name
             pid_ready = False
             last_inspect_tail = ''
-            for _ in range(12):
+            last_status = ''
+            wait_seconds = 60.0
+            poll_seconds = 1.0
+            try:
+                raw_wait = str(os.getenv('CORETG_DOCKER_PREFLIGHT_WAIT_SECONDS') or '').strip()
+                if raw_wait:
+                    wait_seconds = max(5.0, float(raw_wait))
+            except Exception:
+                wait_seconds = 60.0
+            try:
+                raw_poll = str(os.getenv('CORETG_DOCKER_PREFLIGHT_POLL_SECONDS') or '').strip()
+                if raw_poll:
+                    poll_seconds = max(0.2, float(raw_poll))
+            except Exception:
+                poll_seconds = 1.0
+
+            attempts = max(1, int(wait_seconds / poll_seconds))
+            for _ in range(attempts):
                 try:
                     rc2, tail2 = _run(docker_cmd + ['inspect', '--format', '{{.State.Pid}} {{.State.Status}}', inspect_name], timeout=20)
                     last_inspect_tail = tail2 or ''
@@ -487,27 +600,44 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                                 pid = int(parts[0])
                             except Exception:
                                 pid = 0
+                            try:
+                                last_status = str(parts[1]).strip().lower() if len(parts) > 1 else ''
+                            except Exception:
+                                last_status = ''
                             if pid and pid > 0:
                                 pid_ready = True
                                 break
+                            # If compose left the container in Created state, try an explicit
+                            # start once and continue waiting.
+                            if last_status == 'created':
+                                _run(compose_base + ['start', str(target_service)], timeout=120)
                 except Exception:
                     pass
-                time.sleep(0.5)
+                time.sleep(poll_seconds)
 
             # If PID never becomes non-zero, core-daemon may fail with `/proc/0/environ`.
             # Treat this as a hard preflight failure so Execute exits with a clear cause.
             if not pid_ready:
                 ps_rc, ps_tail = _run(compose_base + ['ps', '--all'], timeout=30)
+                logs_rc, logs_tail = _run(compose_base + ['logs', '--no-color', '--tail', '120', str(target_service)], timeout=45)
+                st_rc, st_tail = _run(docker_cmd + ['inspect', '--format', '{{json .State}}', inspect_name], timeout=20)
                 raise RuntimeError(
                     (
                         f"docker preflight startup failed: container PID remained 0 "
                         f"(node={node_name} service={target_service} inspect={inspect_name} rc={ps_rc}). "
                         "This would cause CORE to fail with /proc/0/environ.\n"
+                        f"wait_seconds={wait_seconds} poll_seconds={poll_seconds} status={last_status}\n"
                         f"inspect_tail={last_inspect_tail}\n"
-                        f"compose_ps_tail={ps_tail}"
+                        f"state_rc={st_rc} state_tail={st_tail}\n"
+                        f"compose_ps_tail={ps_tail}\n"
+                        f"compose_logs_rc={logs_rc} compose_logs_tail={logs_tail}"
                     ).strip()
                 )
     except Exception as exc:
+        # PID instability is a hard failure regardless of strict pull settings.
+        # Continuing would let core-daemon hit `/proc/0/environ` and fail later.
+        if 'container PID remained 0' in str(exc):
+            raise
         if strict_pull:
             raise
         try:
@@ -517,6 +647,10 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
 
     try:
         logger.info('[docker-node] preflight done node=%s elapsed_ms=%s', node_name, int((time.time() - start) * 1000))
+    except Exception:
+        pass
+    try:
+        _PREFLIGHTED_DOCKER_NODE_COMPOSES.add(key)
     except Exception:
         pass
 
@@ -795,7 +929,19 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
                 logger.warning('[docker-node] preflight skipped/failed node=%s err=%s', node_name, exc)
             except Exception:
                 pass
-    except Exception:
+    except Exception as exc:
+        # Never swallow critical preflight startup failures; otherwise CORE may
+        # proceed and crash later with `/proc/0/environ` when PID is still 0.
+        try:
+            exc_text = str(exc or '')
+        except Exception:
+            exc_text = ''
+        if (
+            'preflight startup failed' in exc_text
+            or 'PID remained 0' in exc_text
+            or '/proc/0/environ' in exc_text
+        ):
+            raise
         try:
             strict_pull2 = str(os.getenv('CORETG_DOCKER_STRICT_PULL') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
         except Exception:
@@ -2283,6 +2429,7 @@ def build_star_from_roles(core,
                           docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
                           enable_traffic_mount: bool = False,
                           enable_segmentation_mount: bool = False):
+    _reset_docker_compose_prepare_caches('star')
     logger.info("Creating CORE session and building star topology")
     logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     mac_alloc = UniqueAllocator(ip4_prefix)
@@ -2561,6 +2708,7 @@ def build_multi_switch_topology(core,
 
     Returns: session, [switch_ids], host NodeInfo list, service assignments
     """
+    _reset_docker_compose_prepare_caches('multi-switch')
     logger.info("Creating CORE session and building multi-switch topology (agg + access)")
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
@@ -3010,6 +3158,8 @@ def _try_build_segmented_topology_from_preview(
     enable_segmentation_mount: bool = False,
 ) -> Optional[Tuple[Any, List[NodeInfo], List[NodeInfo], Dict[int, List[str]], Dict[int, List[str]], Dict[str, Dict[str, str]]]]:
     """Attempt to realize the provided preview plan exactly. Returns None on failure."""
+
+    _reset_docker_compose_prepare_caches('segmented-preview')
 
     routers_data = preview_plan.get('routers') or []
     hosts_data = preview_plan.get('hosts') or []
@@ -3758,6 +3908,7 @@ def build_segmented_topology(core,
                              preview_plan: Optional[Dict[str, Any]] = None,
                              enable_traffic_mount: bool = False,
                              enable_segmentation_mount: bool = False):
+    _reset_docker_compose_prepare_caches('segmented')
     logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     def _preview_payload_present(payload: Optional[Dict[str, Any]]) -> bool:
         """Return True when caller provided a preview-like payload (not just a seed override)."""

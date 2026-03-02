@@ -178,6 +178,76 @@ def _merge_vuln_slot_assignments_with_preview(
         return assignments_slots if isinstance(assignments_slots, dict) else {}
 
 
+def _flow_assignment_node_ids(flow_state: Any) -> set[int]:
+    try:
+        if not isinstance(flow_state, dict):
+            return set()
+        assigns = flow_state.get('flag_assignments')
+        if not isinstance(assigns, list):
+            return set()
+        node_ids: set[int] = set()
+        for entry in assigns:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get('node_id')
+            if raw is None:
+                continue
+            try:
+                node_ids.add(int(raw))
+            except Exception:
+                continue
+        return node_ids
+    except Exception:
+        return set()
+
+
+def _slot_names_for_flow_nodes(
+    *,
+    flow_state: Any,
+    preview_full: Any,
+    slot_names: list[str],
+) -> list[str]:
+    try:
+        if not isinstance(preview_full, dict):
+            return []
+        hosts_preview = preview_full.get('hosts')
+        if not isinstance(hosts_preview, list) or not hosts_preview:
+            return []
+        flow_node_ids = _flow_assignment_node_ids(flow_state)
+        if not flow_node_ids:
+            return []
+
+        ordered_hosts = sorted(
+            hosts_preview,
+            key=lambda h: (h.get('node_id', 0) if isinstance(h, dict) else 0),
+        )
+        allowed_slots: list[str] = []
+        slot_set = set(str(s) for s in (slot_names or []))
+        for idx, host in enumerate(ordered_hosts):
+            if not isinstance(host, dict):
+                continue
+            try:
+                host_id = int(host.get('node_id'))
+            except Exception:
+                continue
+            if host_id not in flow_node_ids:
+                continue
+            slot = f"slot-{idx + 1}"
+            if slot in slot_set:
+                allowed_slots.append(slot)
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for slot in allowed_slots:
+            if slot in seen:
+                continue
+            seen.add(slot)
+            out.append(slot)
+        return out
+    except Exception:
+        return []
+
+
 def _core_session_id(session: Any) -> int | None:
     try:
         sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)
@@ -1518,6 +1588,7 @@ def main():
     # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots (reuse orchestrator raw)
     docker_slot_plan: dict | None = None
     preview_vuln_slots: list[str] = []
+    flow_state = _flow_state_from_xml(args.xml, args.scenario)
     seed_for_vuln = args.seed
     try:
         if seed_for_vuln is None and isinstance(preview_full, dict):
@@ -1580,18 +1651,36 @@ def main():
                     ordered_slots.append(slot)
             slot_names = ordered_slots
             logging.info("Using preview vulnerability slot ordering (%d slots prioritized)", len(preview_vuln_slots))
-        logging.info("Vulnerabilities config: density=%.3f, items=%d (total_hosts=%d)", float(vuln_density or 0.0), len(vuln_items or []), total_hosts)
-        assignments_slots = assign_compose_to_nodes(
-            slot_names,
-            vuln_density or 0.0,
-            vuln_items or [],
-            catalog,
-            out_base="/tmp/vulns",
-            require_pulled=False,
-            base_host_pool=density_base,
-            seed=seed_for_vuln,
-            shuffle_nodes=not bool(preview_vuln_slots),
+        flow_slots = _slot_names_for_flow_nodes(
+            flow_state=flow_state,
+            preview_full=preview_full,
+            slot_names=slot_names,
         )
+        if flow_slots:
+            slot_names = flow_slots
+            logging.info(
+                "Restricting vulnerability docker assignments to %d Flow-selected slots",
+                len(slot_names),
+            )
+        elif _flow_assignment_node_ids(flow_state):
+            slot_names = []
+            logging.info(
+                "Flow assignments detected but no preview slot mapping resolved; skipping vulnerability docker assignments",
+            )
+        logging.info("Vulnerabilities config: density=%.3f, items=%d (total_hosts=%d)", float(vuln_density or 0.0), len(vuln_items or []), total_hosts)
+        assignments_slots = {}
+        if slot_names:
+            assignments_slots = assign_compose_to_nodes(
+                slot_names,
+                vuln_density or 0.0,
+                vuln_items or [],
+                catalog,
+                out_base="/tmp/vulns",
+                require_pulled=False,
+                base_host_pool=density_base,
+                seed=seed_for_vuln,
+                shuffle_nodes=not bool(preview_vuln_slots),
+            )
 
         # Preview parity: if the preview plan has explicit vulnerabilities_by_node,
         # force those vulnerability names onto the corresponding slots. This prevents
@@ -2016,7 +2105,18 @@ def main():
                         except Exception:
                             pass
                     if name_to_vuln:
-                        created = prepare_compose_for_assignments(name_to_vuln, out_base="/tmp/vulns")
+                        prepared_name_to_vuln = {}
+                        for _node_name, _rec in name_to_vuln.items():
+                            try:
+                                rec_copy = dict(_rec or {})
+                            except Exception:
+                                rec_copy = {}
+                            rec_copy['CoreTGVulnAssignment'] = '1'
+                            if vuln_flag_type:
+                                rec_copy['FlagType'] = str(vuln_flag_type)
+                            prepared_name_to_vuln[_node_name] = rec_copy
+
+                        created = prepare_compose_for_assignments(prepared_name_to_vuln, out_base="/tmp/vulns")
                         logging.info("Prepared per-node compose files: %d for %d docker nodes", len(created), len(name_to_vuln))
                         # Do not start compose stacks here; CORE will start docker nodes during session start
                         # This avoids container name conflicts when CORE brings up containers automatically.
@@ -2025,7 +2125,7 @@ def main():
                             import json as _json, time as _time
                             summary = {
                                 'timestamp': int(_time.time()),
-                                'assignments': { n: {'Name': r.get('Name'), 'Path': r.get('Path'), 'Vector': r.get('Vector') } for n, r in name_to_vuln.items() },
+                                'assignments': { n: {'Name': r.get('Name'), 'Path': r.get('Path'), 'Vector': r.get('Vector') } for n, r in prepared_name_to_vuln.items() },
                                 'files': created,
                             }
                             with open('/tmp/vulns/compose_assignments.json', 'w', encoding='utf-8') as f:
@@ -2046,7 +2146,7 @@ def main():
                                     nm = None
                                 if nm and nm in name_to_vuln:
                                     try:
-                                        _apply_docker_compose_meta(node_obj, name_to_vuln[nm], session=session)
+                                        _apply_docker_compose_meta(node_obj, prepared_name_to_vuln[nm], session=session)
                                     except Exception:
                                         pass
                         except Exception:

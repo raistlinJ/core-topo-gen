@@ -1824,7 +1824,9 @@
         const hostRouterMap = previewData.host_router_map || {};
         (previewData.switches_detail || []).forEach(sw => {
           (sw.hosts || []).forEach(hid => { linkDescriptors.push({ sourceId: sw.switch_id, targetId: hid, kind: 'sw-host' }); });
-          linkDescriptors.push({ sourceId: sw.router_id, targetId: sw.switch_id, kind: 'r-sw' });
+          if (sw && sw.router_id !== undefined && sw.router_id !== null && String(sw.router_id).trim() !== '') {
+            linkDescriptors.push({ sourceId: sw.router_id, targetId: sw.switch_id, kind: 'r-sw' });
+          }
         });
         Object.entries(hostRouterMap).forEach(([hid, rid]) => {
           const hIdNum = parseInt(hid, 10);
@@ -2206,7 +2208,22 @@
           });
         }
 
-        const simLinks = linkDescriptors.map(l => ({ ...l, source: l.sourceId, target: l.targetId }));
+        const nodeIdSet = new Set(nodes.map(n => String(n && n.id !== undefined && n.id !== null ? n.id : '')).filter(Boolean));
+        const seenLinkKeys = new Set();
+        const simLinks = linkDescriptors
+          .filter(l => l && l.sourceId !== undefined && l.sourceId !== null && l.targetId !== undefined && l.targetId !== null)
+          .filter(l => {
+            const sourceKey = String(l.sourceId).trim();
+            const targetKey = String(l.targetId).trim();
+            if (!sourceKey || !targetKey) return false;
+            if (!nodeIdSet.has(sourceKey) || !nodeIdSet.has(targetKey)) return false;
+            const kind = String(l.kind || '');
+            const edgeKey = `${sourceKey}|${targetKey}|${kind}`;
+            if (seenLinkKeys.has(edgeKey)) return false;
+            seenLinkKeys.add(edgeKey);
+            return true;
+          })
+          .map(l => ({ ...l, source: l.sourceId, target: l.targetId }));
 
         // Build per-node interface/IP hints for hover tooltips.
         function buildIfaceHints(preview) {

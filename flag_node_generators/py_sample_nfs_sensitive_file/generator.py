@@ -119,6 +119,8 @@ def main() -> None:
         "generator_id": str(cfg.get("generator_id") or "sample.nfs_sensitive_file"),
         "outputs": {
             "Flag(flag_id)": flag_value,
+            "FlagDelivery(mode)": "file",
+            "FlagFile(path)": "exports/flag.txt",
             "Credential(user, password)": credential_pair,
             "File(path)": str(compose_path.name),
             "PortForward(host, port)": nfs_port,

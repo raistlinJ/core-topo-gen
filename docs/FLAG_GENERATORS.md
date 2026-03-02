@@ -95,6 +95,11 @@ Some generators need to deliver a file/binary that will be mounted/copied into o
 
 Key rules:
 
+- Prefer explicit delivery metadata in `outputs.json.outputs`:
+	- `FlagDelivery(mode)` = `file` | `embedded` | `none` | `unknown`
+	- `FlagFile(path)` when mode is `file`
+- This lets runtime validation distinguish real flag files from embedded-flag artifacts.
+
 Destination directory (optional):
 
 - `injects: ["File(path) -> /opt/bin"]`

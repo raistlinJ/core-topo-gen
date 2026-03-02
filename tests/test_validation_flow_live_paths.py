@@ -350,3 +350,150 @@ def test_validate_inspect_no_such_container_is_startup_pending_not_missing(monke
     assert summary.get('docker_missing') == []
     assert summary.get('docker_not_running') == []
     assert summary.get('docker_start_pending') == ['docker-3']
+
+
+def test_validate_inject_expected_sanitizes_mount_roots_and_optional_flag(monkeypatch):
+    monkeypatch.setattr(backend, '_expected_from_plan_preview', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_parse_session_xml_for_compare', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_specs_from_flow_state', lambda *a, **k: [])
+    monkeypatch.setattr(
+        backend,
+        '_extract_inject_expected_by_node',
+        lambda *a, **k: {
+            'docker-1': ['/exports'],
+            'docker-4': ['/flow_injects/secrets.txt', '/flow_injects/flag.txt'],
+        },
+    )
+    monkeypatch.setattr(backend, '_extract_inject_dirs_from_plan_xml', lambda *a, **k: ['/exports'])
+    monkeypatch.setattr(backend, '_extract_inject_files_from_plan_xml', lambda *a, **k: ['/exports'])
+    monkeypatch.setattr(backend, '_extract_expected_docker_and_vuln_nodes_from_plan_xml', lambda *a, **k: ([], []))
+    monkeypatch.setattr(backend, '_session_docker_nodes_from_xml', lambda *a, **k: ['docker-1', 'docker-4'])
+    monkeypatch.setattr(backend, '_extract_inject_node_ids_from_flow_state', lambda *a, **k: set())
+    monkeypatch.setattr(backend, '_flow_state_from_xml_path', lambda *a, **k: {'flag_assignments': []})
+
+    def _fake_remote_json(_cfg, _script, logger=None, label='', timeout=0):
+        if label == 'docker.exec.injects_status':
+            return {
+                'items': [
+                    {
+                        'container': 'docker-1',
+                        'exists': True,
+                        'running': True,
+                        'inject_count': 0,
+                        'inject_samples': [],
+                        'inject_dirs_found': [],
+                        'debug_logs': [],
+                    },
+                    {
+                        'container': 'docker-4',
+                        'exists': True,
+                        'running': True,
+                        'inject_count': 0,
+                        'inject_samples': [],
+                        'inject_dirs_found': [],
+                        'debug_logs': [],
+                    },
+                ]
+            }
+        if label == 'docker.compose.assignments':
+            return {'nodes': []}
+        if label == 'flow.artifacts.validate':
+            return {'items': []}
+        return {'items': []}
+
+    monkeypatch.setattr(backend, '_run_remote_python_json', _fake_remote_json)
+
+    summary = backend._validate_session_nodes_and_injects(
+        scenario_xml_path='/tmp/scenario.xml',
+        session_xml_path='/tmp/session.xml',
+        core_cfg={'ssh_enabled': True},
+        preview_plan_path=None,
+        scenario_label='NewScenario1',
+    )
+
+    assert summary.get('inject_files_expected_by_node') == {'docker-4': ['/flow_injects/secrets.txt']}
+    assert summary.get('injects_missing') == ['docker-4']
+
+
+def test_validate_generator_missing_filters_local_host_paths_and_bare_relative(monkeypatch):
+    monkeypatch.setattr(backend, '_expected_from_plan_preview', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_parse_session_xml_for_compare', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_specs_from_flow_state', lambda *a, **k: [])
+    monkeypatch.setattr(backend, '_extract_inject_expected_by_node', lambda *a, **k: {})
+    monkeypatch.setattr(backend, '_extract_inject_dirs_from_plan_xml', lambda *a, **k: [])
+    monkeypatch.setattr(backend, '_extract_inject_files_from_plan_xml', lambda *a, **k: [])
+    monkeypatch.setattr(backend, '_extract_expected_docker_and_vuln_nodes_from_plan_xml', lambda *a, **k: ([], []))
+    monkeypatch.setattr(backend, '_session_docker_nodes_from_xml', lambda *a, **k: ['docker-1'])
+    monkeypatch.setattr(backend, '_extract_inject_node_ids_from_flow_state', lambda *a, **k: set())
+    monkeypatch.setattr(
+        backend,
+        '_flow_state_from_xml_path',
+        lambda *a, **k: {
+            'flag_assignments': [
+                {
+                    'node_id': '1',
+                    'id': 'nfs_sensitive_file',
+                    'name': 'nfs_sensitive_file',
+                    'type': 'flag-node-generator',
+                    'run_dir': '/tmp/vulns/flag_node_generators_runs/flow-anatest/01_nfs_sensitive_file_docker-1',
+                    'artifacts_dir': '/tmp/vulns/flag_node_generators_runs/flow-anatest/01_nfs_sensitive_file_docker-1',
+                    'inject_source_dir': '/tmp/vulns/flag_node_generators_runs/flow-anatest/01_nfs_sensitive_file_docker-1',
+                    'outputs_manifest': '/Users/jcacosta/Documents/core-topo-gen/outputs/flag_node_generators_runs/old/outputs.json',
+                    'inject_files': ['exports'],
+                }
+            ]
+        },
+    )
+
+    def _fake_remote_json(_cfg, _script, logger=None, label='', timeout=0):
+        if label == 'docker.exec.injects_status':
+            return {
+                'items': [
+                    {
+                        'container': 'docker-1',
+                        'exists': True,
+                        'running': True,
+                        'inject_count': 1,
+                        'inject_samples': ['/flow_injects/secrets.txt'],
+                        'inject_dirs_found': ['/flow_injects'],
+                        'debug_logs': [],
+                    }
+                ]
+            }
+        if label == 'docker.compose.assignments':
+            return {'nodes': ['docker-1']}
+        if label == 'flow.artifacts.validate':
+            return {
+                'items': [
+                    {
+                        'node_id': 'docker-1',
+                        'generator_id': 'nfs_sensitive_file',
+                        'outputs_missing': [
+                            'missing manifest: /Users/jcacosta/Documents/core-topo-gen/outputs/flag_node_generators_runs/old/outputs.json',
+                        ],
+                        'inject_missing': [
+                            'secrets.txt',
+                            '/Users/jcacosta/Documents/core-topo-gen/outputs/flag_node_generators_runs/old/exports',
+                            '/tmp/vulns/flag_node_generators_runs/flow-anatest/01_nfs_sensitive_file_docker-1/exports',
+                        ],
+                        'outputs_checked': [],
+                        'inject_checked': [],
+                    }
+                ]
+            }
+        return {'items': []}
+
+    monkeypatch.setattr(backend, '_run_remote_python_json', _fake_remote_json)
+
+    summary = backend._validate_session_nodes_and_injects(
+        scenario_xml_path='/tmp/scenario.xml',
+        session_xml_path='/tmp/session.xml',
+        core_cfg={'ssh_enabled': True},
+        preview_plan_path=None,
+        scenario_label='Anatest',
+    )
+
+    assert summary.get('generator_outputs_missing') == []
+    assert summary.get('generator_injects_missing') == [
+        'docker-1: /tmp/vulns/flag_node_generators_runs/flow-anatest/01_nfs_sensitive_file_docker-1/exports'
+    ]

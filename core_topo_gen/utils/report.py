@@ -438,11 +438,11 @@ def write_report(
             flag_type = str(vulnerabilities_cfg.get('flag_type') or '').strip() or 'text'
             lines.append(f"- Vulnerability flag type: {flag_type}")
             if flag_type == 'text':
-                lines.append("- Flag injection: host copy at /tmp/vulns/flag-<node>.txt; copied into container at /flag.txt (fallback /tmp/flag.txt)")
+                lines.append("- Flag injection: generated per node under /tmp/vulns/flag_injects/<node>/flag.txt and injected into container at /tmp/flag.txt")
                 if vuln_assigned_nodes:
                     lines.append("- Flag files (host):")
                     for node_name in vuln_assigned_nodes[:50]:
-                        lines.append(f"  - /tmp/vulns/flag-{node_name}.txt")
+                        lines.append(f"  - /tmp/vulns/flag_injects/{node_name}/flag.txt")
                     if len(vuln_assigned_nodes) > 50:
                         lines.append(f"  - ... ({len(vuln_assigned_nodes) - 50} more)")
     except Exception:

@@ -25,12 +25,15 @@ inputs:
 outputs:
   - name: Flag(flag_id)
     type: text
+  - name: FlagDelivery(mode)
+    type: string
   - name: File(path)
     type: string
 artifacts:
   requires: []
   produces:
     - Flag(flag_id)
+    - FlagDelivery(mode)
     - File(path)
 injects:
   - File(path)

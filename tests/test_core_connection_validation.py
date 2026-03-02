@@ -554,7 +554,7 @@ def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
     monkeypatch.setattr(backend, '_parse_scenarios_xml', lambda *_args, **_kwargs: {})
     monkeypatch.setattr(backend.threading, 'Thread', _NoRunThread)
 
-    resp = client.post('/run_cli_async', data={'xml_path': str(xml_path)})
+    resp = client.post('/run_cli_async', data={'xml_path': str(xml_path), 'flow_enabled': '0'})
     # run_cli_async now accepts and validates execution prerequisites in background.
     assert resp.status_code == 202
     data = resp.get_json()

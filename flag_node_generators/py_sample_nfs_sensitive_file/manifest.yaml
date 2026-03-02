@@ -27,6 +27,8 @@ artifacts:
     - Knowledge(ip)
   produces:
     - Flag(flag_id)
+    - FlagDelivery(mode)
+    - FlagFile(path)
     - Credential(user, password)
     - File(path)
     - PortForward(host, port)

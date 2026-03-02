@@ -22,6 +22,8 @@ artifacts:
   requires: []
   produces:
     - Flag(flag_id)
+    - FlagDelivery(mode)
+    - FlagFile(path)
     - File(path)
 injects:
   - File(path)

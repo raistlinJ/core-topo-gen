@@ -33,6 +33,7 @@ def main() -> None:
         "generator_id": "CHANGE_ME_PLUGIN_ID",
         "outputs": {
             "Flag(flag_id)": flag_value,
+            "FlagDelivery(mode)": "unknown",
             "example": "replace-me",
         },
     }

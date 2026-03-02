@@ -22487,12 +22487,25 @@
                 return false;
             }
             const dataInit = await res.json();
+            const startWarning = (dataInit && typeof dataInit.warning === 'string') ? String(dataInit.warning).trim() : '';
+            if (startWarning) {
+                runProgressLogLine(`Start warning: ${startWarning}`);
+                appendExecuteDialogLog(`Warning: ${startWarning}`);
+                if (showProgressModal) {
+                    try {
+                        const statusEl = document.getElementById('runProgressStatus');
+                        if (statusEl) statusEl.textContent = 'Starting with warning';
+                        const metaEl = document.getElementById('runProgressMeta');
+                        if (metaEl) metaEl.textContent = startWarning;
+                    } catch (e) { }
+                }
+            }
             const run_id = dataInit?.run_id;
             if (run_id) {
                 runProgressRunId = run_id;
                 waitingForRemoteLogs = true;
                 appendExecuteDialogLog(`Remote CLI run id ${run_id} acknowledged; waiting for logs…`);
-                updateRunStatus('Remote CLI starting…', 'Waiting for remote logs…');
+                updateRunStatus('Remote CLI starting…', startWarning || 'Waiting for remote logs…');
                 try { opts.onRunId?.(run_id); } catch (e) { }
             }
             if (!run_id) {

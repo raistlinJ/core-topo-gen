@@ -48,7 +48,9 @@ def main() -> None:
         "generator_id": "CHANGE_ME_PLUGIN_ID",
         "outputs": {
             "File(path)": "docker-compose.yml",
-            "Flag(flag_id)": flag_value
+            "Flag(flag_id)": flag_value,
+            "FlagDelivery(mode)": "file",
+            "FlagFile(path)": "flag.txt"
         }
     }
     (out_dir / "outputs.json").write_text(json.dumps(outputs, indent=2) + "\n", encoding="utf-8")

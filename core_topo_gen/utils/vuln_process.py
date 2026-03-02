@@ -1366,6 +1366,69 @@ def _force_service_workdir_root(service: Dict[str, object], *, override_existing
 	service['working_dir'] = '/'
 
 
+def _service_uses_relative_command_path(service: Dict[str, object]) -> bool:
+	"""Return True when entrypoint/command appears to invoke a relative executable path.
+
+	Examples:
+	- command: "java -jar ./build/libs/ofbiz.jar"
+	- command: ["./start.sh"]
+	- command: ["sh", "-lc", "./run.sh"]
+	"""
+	if not isinstance(service, dict):
+		return False
+
+	def _has_relative_ref(value: object) -> bool:
+		try:
+			if isinstance(value, str):
+				text = value.strip()
+				if not text:
+					return False
+				if text.startswith('./'):
+					return True
+				return (' ./' in text) or (';./' in text) or ('&&./' in text) or ('|./' in text)
+			if isinstance(value, list):
+				for item in value:
+					s = str(item or '').strip()
+					if not s:
+						continue
+					if s.startswith('./'):
+						return True
+					if (' ./' in s) or (';./' in s) or ('&&./' in s) or ('|./' in s):
+						return True
+		except Exception:
+			return False
+		return False
+
+	try:
+		if _has_relative_ref(service.get('entrypoint')):
+			return True
+	except Exception:
+		pass
+	try:
+		if _has_relative_ref(service.get('command')):
+			return True
+	except Exception:
+		pass
+	return False
+
+
+def _service_requires_image_workdir(service: Dict[str, object]) -> bool:
+	"""Return True when known images require their original image working directory."""
+	if not isinstance(service, dict):
+		return False
+	try:
+		img = str(_service_effective_image(service) or '').strip().lower()
+	except Exception:
+		img = ''
+	if not img:
+		return False
+	# OFBiz startup often uses relative paths (e.g. ./build/libs/ofbiz.jar)
+	# from image-default command/entrypoint behavior.
+	if 'ofbiz' in img:
+		return True
+	return False
+
+
 def _maybe_force_service_workdir_root(service: Dict[str, object]) -> None:
 	"""Force root working_dir when policy and service characteristics require it."""
 	if not isinstance(service, dict):
@@ -1374,6 +1437,17 @@ def _maybe_force_service_workdir_root(service: Dict[str, object]) -> None:
 	if mode == 'off':
 		return
 	if not _should_force_service_workdir_root(service):
+		return
+	# Compatibility guard: do not override working_dir for services that execute
+	# binaries/scripts via relative paths (for example OFBiz jars under ./build).
+	# Operators can force strict behavior with CORETG_COMPOSE_FORCE_ROOT_WORKDIR_STRICT=1.
+	try:
+		strict = str(os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR_STRICT') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+	except Exception:
+		strict = False
+	if (not strict) and _service_requires_image_workdir(service):
+		return
+	if (not strict) and _service_uses_relative_command_path(service):
 		return
 	_force_service_workdir_root(service, override_existing=(mode == 'all'))
 
@@ -2329,6 +2403,15 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 	for raw in inject_files or []:
 		src_raw, dest_raw = _split_inject_spec(str(raw))
 		src_raw_s = str(src_raw or '').strip()
+		# Legacy fallback semantics: `/tmp/flag.txt` denotes an in-container
+		# path that may be provided by downstream runtime logic. Do not treat
+		# it as a host source artifact in compose inject mapping.
+		if src_raw_s == '/tmp/flag.txt' and not str(dest_raw or '').strip():
+			try:
+				logger.info('[injects] skipping legacy container fallback source: %s', src_raw_s)
+			except Exception:
+				pass
+			continue
 		# If src is an absolute path that points into source_dir, interpret it as an
 		# artifacts path (relative to source_dir) rather than a container destination.
 		try:
@@ -2551,20 +2634,48 @@ def _inject_copy_for_inject_files(compose_obj: dict, *, inject_files: list[str],
 		bind = f"{vol_name}:{dest_dir}"
 		compose_obj = _inject_service_bind_mount(compose_obj, bind, prefer_service=target_service)
 
-	# Ensure target waits for copy service
+	# Ensure target has an ordering dependency on copy service.
+	#
+	# IMPORTANT:
+	# Using `service_completed_successfully` can block target startup when the
+	# helper image lacks expected shell/coreutils for the generated copy command.
+	# That ultimately leaves CORE Docker nodes at PID=0 (`/proc/0/environ`).
+	#
+	# Default to no dependency at all so target containers always start even if
+	# inject_copy is incompatible with a specific image. Operators can opt into
+	# strict blocking with CORETG_INJECT_COPY_REQUIRE_SUCCESS=1.
 	try:
 		svc = services.get(target_service)
 		if isinstance(svc, dict):
+			strict_dep = False
+			try:
+				strict_dep = str(os.getenv('CORETG_INJECT_COPY_REQUIRE_SUCCESS') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+			except Exception:
+				strict_dep = False
 			dep = svc.get('depends_on')
-			if isinstance(dep, dict):
-				dep.setdefault(copy_service_name, {'condition': 'service_completed_successfully'})
-				svc['depends_on'] = dep
-			elif isinstance(dep, list):
-				if copy_service_name not in dep:
-					dep.append(copy_service_name)
-				svc['depends_on'] = dep
+			if strict_dep:
+				if isinstance(dep, dict):
+					dep.setdefault(copy_service_name, {'condition': 'service_completed_successfully'})
+					svc['depends_on'] = dep
+				elif isinstance(dep, list):
+					if copy_service_name not in dep:
+						dep.append(copy_service_name)
+					svc['depends_on'] = dep
+				else:
+					svc['depends_on'] = {copy_service_name: {'condition': 'service_completed_successfully'}}
 			else:
-				svc['depends_on'] = {copy_service_name: {'condition': 'service_completed_successfully'}}
+				if isinstance(dep, list):
+					dep = [x for x in dep if str(x) != copy_service_name]
+					if dep:
+						svc['depends_on'] = dep
+					else:
+						svc.pop('depends_on', None)
+				elif isinstance(dep, dict):
+					dep.pop(copy_service_name, None)
+					if dep:
+						svc['depends_on'] = dep
+					else:
+						svc.pop('depends_on', None)
 	except Exception:
 		pass
 
@@ -3191,6 +3302,43 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		except Exception:
 			return False
 
+	def _is_truthy(value: object) -> bool:
+		try:
+			v = str(value or '').strip().lower()
+		except Exception:
+			v = ''
+		return v in ('1', 'true', 'yes', 'y', 'on')
+
+	def _effective_vuln_flag_type(rec: Dict[str, str]) -> str:
+		try:
+			raw = str(rec.get('FlagType') or rec.get('flag_type') or '').strip().lower()
+		except Exception:
+			raw = ''
+		if raw:
+			return raw
+		try:
+			env_raw = str(os.getenv('CORETG_VULN_FLAG_TYPE') or '').strip().lower()
+		except Exception:
+			env_raw = ''
+		return env_raw or 'text'
+
+	def _ensure_vuln_text_flag_source(node_name: str) -> tuple[str, str]:
+		node_slug = _safe_name(str(node_name or '').strip()) or 'node'
+		source_dir = os.path.join(out_base, 'flag_injects', node_slug)
+		os.makedirs(source_dir, exist_ok=True)
+		flag_path = os.path.join(source_dir, 'flag.txt')
+		needs_write = True
+		try:
+			needs_write = (not os.path.exists(flag_path)) or os.path.getsize(flag_path) <= 0
+		except Exception:
+			needs_write = True
+		if needs_write:
+			alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+			token = ''.join(random.choice(alphabet) for _ in range(24))
+			with open(flag_path, 'w', encoding='utf-8') as fh:
+				fh.write(f'FLAG{{{token}}}\n')
+		return source_dir, flag_path
+
 	def _set_container_name_for_selected_service(compose_obj: dict, node_name: str, prefer_service: Optional[str] = None) -> dict:
 		"""Set container_name for the selected service to the CORE node name (best-effort).
 
@@ -3741,6 +3889,21 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				inject_files = rec.get('InjectFiles') or rec.get('inject_files')
 				source_dir = str(rec.get('InjectSourceDir') or rec.get('ArtifactsDir') or '').strip()
 				outputs_manifest = str(rec.get('OutputsManifest') or '')
+				if (not isinstance(inject_files, list) or not inject_files):
+					is_vuln_assignment = _is_truthy(rec.get('CoreTGVulnAssignment') or rec.get('coretg_vuln_assignment'))
+					if is_vuln_assignment and _effective_vuln_flag_type(rec) == 'text':
+						auto_source_dir, auto_flag_path = _ensure_vuln_text_flag_source(node_name)
+						source_dir = auto_source_dir
+						inject_files = ['flag.txt -> /tmp']
+						try:
+							logger.info(
+								"[vuln] auto-inject text flag for node=%s source=%s inject=%s",
+								node_name,
+								auto_flag_path,
+								inject_files,
+							)
+						except Exception:
+							pass
 				if not outputs_manifest:
 					# best-effort: look for outputs.json in run dir
 					run_dir = str(rec.get('RunDir') or '').strip()

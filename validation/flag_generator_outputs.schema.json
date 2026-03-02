@@ -12,7 +12,12 @@
       "type": "object",
       "required": ["Flag(flag_id)"],
       "properties": {
-        "Flag(flag_id)": {"type": "string", "minLength": 1}
+        "Flag(flag_id)": {"type": "string", "minLength": 1},
+        "FlagDelivery(mode)": {
+          "type": "string",
+          "enum": ["file", "embedded", "none", "unknown"]
+        },
+        "FlagFile(path)": {"type": "string", "minLength": 1}
       },
       "patternProperties": {
         "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$": {}

@@ -24,7 +24,7 @@ def test_extract_inject_expected_by_node_maps_absolute_source_to_tmp(monkeypatch
 
     assert 'docker-1' in out
     assert '/exports' in out['docker-1']
-    assert '/tmp/seed.txt' in out['docker-1']
+    assert '/flow_injects/seed.txt' in out['docker-1']
     assert all(not str(p).startswith('/Users/') for p in out['docker-1'])
 
 
@@ -85,7 +85,7 @@ def test_extract_inject_expected_by_node_maps_tmp_vulns_source_to_tmp_basename(m
     out = backend._extract_inject_expected_by_node('/tmp/scenario.xml', 'NewScenario1')
 
     assert 'docker-1' in out
-    assert out['docker-1'] == ['/tmp/secrets.txt']
+    assert out['docker-1'] == ['/flow_injects/secrets.txt']
 
 
 def test_extract_inject_expected_by_node_prefers_resolved_runtime_sources(monkeypatch):

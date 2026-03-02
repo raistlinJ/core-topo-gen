@@ -322,7 +322,7 @@
 		{
 			"label": "run tmp flow repro",
 			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python scripts/_tmp_flow_copy_repro.py",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q tests/test_remote_flow_artifacts_validation_script.py tests/test_flow_generate_validate_execute_copy.py tests/test_sample_binary_embed_text_generator.py",
 			"isBackground": false
 		},
 		{
@@ -330,6 +330,20 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q",
 			"isBackground": false
+		},
+		{
+			"label": "pytest: full suite (one-click)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q",
+			"isBackground": false,
+			"group": "test"
+		},
+		{
+			"label": "pytest: full suite (one-click, captured)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ./.venv312/bin/python -m pytest -q > /tmp/pytest_full_one_click.txt 2>&1; code=$?; tail -n 80 /tmp/pytest_full_one_click.txt; echo EXIT_CODE=$code; exit $code",
+			"isBackground": false,
+			"group": "test"
 		},
 		{
 			"label": "pytest: full suite (captured)",
@@ -461,6 +475,26 @@
 				"PYTHONPATH=.",
 				"./.venv312/bin/python",
 				"scripts/_tmp_compare_anatest_eligibility.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "tmp: fetch docker-5 compose text",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_fetch_compose_text.py"
+			],
+			"isBackground": false
+		},
+		{
+			"label": "tmp: grep docker-5 logs run_output",
+			"type": "shell",
+			"command": "rg",
+			"args": [
+				"-n",
+				"docker-5\\s*\\||compose_logs_tail|State.Status|is restarting|Unable to access jarfile|Exception|ERROR",
+				"outputs/logs/execute-errors/97451529-3073-4577-beb2-ed71e2830eee/run_output.log"
 			],
 			"isBackground": false
 		}

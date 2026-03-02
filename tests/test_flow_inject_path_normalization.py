@@ -54,6 +54,29 @@ def test_enrich_flow_state_normalizes_symbolic_inject_source_path() -> None:
     assert "File(path)" not in inject_path
 
 
+def test_canonicalize_assignment_resolves_symbolic_inject_spec_from_resolved_outputs() -> None:
+    artifacts_dir = "/tmp/vulns/flag_generators_runs/flow-anatest/01_binary_embed_text_docker-3/artifacts"
+    resolved_file_path = f"{artifacts_dir}/challenge_cf7c967dd5"
+    assignment = {
+        "node_id": "docker-3",
+        "id": "binary_embed_text",
+        "run_dir": "/tmp/vulns/flag_generators_runs/flow-anatest/01_binary_embed_text_docker-3",
+        "artifacts_dir": artifacts_dir,
+        "resolved_outputs": {
+            "File(path)": resolved_file_path,
+        },
+        "inject_files": ["File(path) -> /flow_injects"],
+    }
+
+    canonical = backend._canonicalize_flow_assignment_paths(assignment)
+    inject_files = canonical.get("inject_files") if isinstance(canonical, dict) else None
+    assert isinstance(inject_files, list) and inject_files
+
+    first = str(inject_files[0])
+    assert "File(path)" not in first
+    assert first.endswith("/challenge_cf7c967dd5 -> /flow_injects")
+
+
 def test_update_flow_state_xml_persists_normalized_inject_source_path(tmp_path) -> None:
     scenario_name = "NewScenario1"
     xml_path = tmp_path / "scenario.xml"

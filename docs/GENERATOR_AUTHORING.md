@@ -167,6 +167,12 @@ Practical guidance on `generator_id`:
 
 Notes:
 - `outputs.json.outputs.Flag(flag_id)` is **required** by the schema.
+- Optional explicit delivery contract keys:
+  - `FlagDelivery(mode)` = `file` | `embedded` | `none` | `unknown`
+  - `FlagFile(path)` = relative/absolute path to the flag file when `FlagDelivery(mode)=file`
+
+Using these keys avoids ambiguity when a generator embeds the flag in another
+artifact (for example, an ELF binary) instead of writing `flag.txt`.
 
 ---
 
