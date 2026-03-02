@@ -77,6 +77,19 @@ uv run python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbos
 - Execute validation now exposes downloadable per-issue logs via `validation_summary.error_logs` in `run_status` (documented in [API.md](./API.md)).
 - [SCENARIO_XML_SCHEMA.md](./SCENARIO_XML_SCHEMA.md) – Schema walkthrough and examples
 
+## Runtime validation
+- Runtime validator script: [scripts/validate_scenario_runtime.py](scripts/validate_scenario_runtime.py)
+- Default behavior is **strict mode** (enabled): validates CORE session up, docker runtime health, flow inject/artifact revalidation, and latest execute `validation_summary` counters (`missing_nodes`, `docker_not_running`, `injects_missing`, `generator_outputs_missing`, `generator_injects_missing`) are all zero.
+- Run against latest scenario XML:
+```bash
+latest_xml=$(ls -1t outputs/scenarios-*/Anatest.xml 2>/dev/null | head -n 1)
+./.venv312/bin/python scripts/validate_scenario_runtime.py "$latest_xml" --username coreadmin --password coreadmin --verbose
+```
+- Disable strict checks (legacy/basic mode) with:
+```bash
+./.venv312/bin/python scripts/validate_scenario_runtime.py "$latest_xml" --username coreadmin --password coreadmin --no-strict
+```
+
 ## Contributing
 Pull requests and issue reports are welcome! Please run the relevant pytest targets (`pytest -q`) before submitting changes and keep documentation up to date when behaviour changes.
 

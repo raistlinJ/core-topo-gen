@@ -18,6 +18,96 @@ class ValidationError(RuntimeError):
     pass
 
 
+def _scenario_norm(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _repo_root_from_script() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _latest_run_entry_for_scenario(scenario: str) -> dict[str, Any] | None:
+    target = _scenario_norm(scenario)
+    if not target:
+        return None
+    history_path = _repo_root_from_script() / "outputs" / "run_history.json"
+    if not history_path.exists():
+        return None
+    try:
+        payload = json.loads(history_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+
+    for entry in reversed(payload):
+        if not isinstance(entry, dict):
+            continue
+        names: list[str] = []
+        scenario_name = entry.get("scenario_name")
+        if isinstance(scenario_name, str) and scenario_name.strip():
+            names.append(scenario_name.strip())
+        scenario_names = entry.get("scenario_names")
+        if isinstance(scenario_names, list):
+            for raw in scenario_names:
+                text = str(raw or "").strip()
+                if text:
+                    names.append(text)
+        if not names:
+            continue
+        if any(_scenario_norm(name) == target for name in names):
+            return entry
+    return None
+
+
+def _strict_issues_from_run_entry(run_entry: dict[str, Any] | None) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    details: dict[str, Any] = {
+        "run_entry_found": bool(isinstance(run_entry, dict)),
+        "run_returncode": None,
+        "validation_summary_present": False,
+        "counts": {},
+    }
+
+    if not isinstance(run_entry, dict):
+        issues.append("No run history entry found for scenario")
+        return issues, details
+
+    rc = run_entry.get("returncode")
+    details["run_returncode"] = rc
+    try:
+        if rc is None or int(rc) != 0:
+            issues.append(f"Latest execute returncode is not 0 (returncode={rc})")
+    except Exception:
+        issues.append(f"Latest execute returncode is not numeric (returncode={rc})")
+
+    summary = run_entry.get("validation_summary") if isinstance(run_entry.get("validation_summary"), dict) else None
+    details["validation_summary_present"] = bool(isinstance(summary, dict))
+    if not isinstance(summary, dict):
+        issues.append("Latest execute has no validation_summary")
+        return issues, details
+
+    if summary.get("validation_unavailable") is True:
+        issues.append("Latest execute validation_summary is marked unavailable")
+
+    checks_map = {
+        "missing_nodes": "Missing nodes detected",
+        "docker_not_running": "Docker nodes not running",
+        "injects_missing": "Missing inject files/paths",
+        "generator_outputs_missing": "Missing generator outputs",
+        "generator_injects_missing": "Missing generator inject sources",
+    }
+    counts: dict[str, int] = {}
+    for key, label in checks_map.items():
+        values = summary.get(key)
+        count = len(values) if isinstance(values, list) else 0
+        counts[key] = count
+        if count > 0:
+            issues.append(f"{label}: {count}")
+    details["counts"] = counts
+    return issues, details
+
+
 def _login(base_url: str, username: str, password: str, timeout_s: float) -> requests.Session:
     session = requests.Session()
     session.get(f"{base_url}/login", timeout=timeout_s)
@@ -115,6 +205,7 @@ def run_validation(
     password: str,
     scenario_name: str | None,
     timeout_s: float,
+    strict: bool,
 ) -> dict[str, Any]:
     base = base_url.rstrip("/")
     xml_path = _resolve_xml_path(scenario_filename)
@@ -210,6 +301,18 @@ def run_validation(
         "inject_artifacts_ok": revalidate_ok and len(revalidate_missing) == 0,
     }
 
+    strict_report: dict[str, Any] = {
+        "enabled": bool(strict),
+        "issues": [],
+        "details": {},
+    }
+    if strict:
+        run_entry = _latest_run_entry_for_scenario(scenario)
+        strict_issues, strict_details = _strict_issues_from_run_entry(run_entry)
+        strict_report["issues"] = strict_issues
+        strict_report["details"] = strict_details
+        checks["strict_validation"] = len(strict_issues) == 0
+
     ok = all(checks.values())
 
     return {
@@ -239,6 +342,7 @@ def run_validation(
             "missing": [str(x) for x in revalidate_missing],
             "present_sample": [str(x) for x in revalidate_present[:20]],
         },
+        "strict": strict_report,
     }
 
 
@@ -256,6 +360,8 @@ def _print_summary(report: dict[str, Any], *, verbose: bool = False) -> None:
     print(f"[{_status('scenario_running')}] scenario has active CORE session")
     print(f"[{_status('docker_nodes_healthy')}] docker nodes healthy")
     print(f"[{_status('inject_artifacts_ok')}] flow inject/artifact revalidation")
+    if 'strict_validation' in checks:
+        print(f"[{_status('strict_validation')}] strict execute validation summary checks")
 
     core = report.get("core") if isinstance(report.get("core"), dict) else {}
     docker = report.get("docker") if isinstance(report.get("docker"), dict) else {}
@@ -314,6 +420,20 @@ def _print_summary(report: dict[str, Any], *, verbose: bool = False) -> None:
             print("Revalidate endpoint error:")
             print(f"  - {rv_error}")
 
+        strict = report.get("strict") if isinstance(report.get("strict"), dict) else {}
+        if bool(strict.get("enabled")):
+            strict_issues = strict.get("issues") if isinstance(strict.get("issues"), list) else []
+            strict_details = strict.get("details") if isinstance(strict.get("details"), dict) else {}
+            if strict_issues:
+                print("Strict mode issues:")
+                for issue in strict_issues:
+                    print(f"  - {issue}")
+            counts = strict_details.get("counts") if isinstance(strict_details.get("counts"), dict) else {}
+            if counts:
+                print("Strict validation counts:")
+                for key in sorted(counts.keys()):
+                    print(f"  - {key}: {counts.get(key)}")
+
         present_sample = rv.get("present_sample") if isinstance(rv.get("present_sample"), list) else []
         if present_sample:
             print("Present path sample:")
@@ -344,6 +464,11 @@ def main() -> None:
         action="store_true",
         help="Print full validation details in terminal output",
     )
+    parser.add_argument(
+        "--no-strict",
+        action="store_true",
+        help="Disable strict checks against latest execute validation summary",
+    )
 
     args = parser.parse_args()
 
@@ -355,6 +480,7 @@ def main() -> None:
             password=str(args.password),
             scenario_name=str(args.scenario).strip() or None,
             timeout_s=float(args.timeout),
+            strict=not bool(args.no_strict),
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

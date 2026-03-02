@@ -44,6 +44,18 @@ Popular options:
 - `--seg-include-hosts`, `--seg-allow-docker-ports`, `--nat-mode`, `--dnat-prob` fine-tune segmentation
 - `--traffic-pattern`, `--traffic-rate`, `--traffic-content` override traffic defaults
 
+## Runtime validation
+Validate a running scenario via Web UI APIs:
+```bash
+latest_xml=$(ls -1t outputs/scenarios-*/Anatest.xml 2>/dev/null | head -n 1)
+./.venv312/bin/python scripts/validate_scenario_runtime.py "$latest_xml" --username coreadmin --password coreadmin --verbose
+```
+- Default is **strict mode**: also requires latest execute `validation_summary` counters to be zero (`missing_nodes`, `docker_not_running`, `injects_missing`, `generator_outputs_missing`, `generator_injects_missing`).
+- Use `--no-strict` for baseline-only checks:
+```bash
+./.venv312/bin/python scripts/validate_scenario_runtime.py "$latest_xml" --username coreadmin --password coreadmin --no-strict
+```
+
 ## VS Code smoke tasks
 For Execute retry-prompt validation, use these tasks from **Terminal → Run Task**:
 

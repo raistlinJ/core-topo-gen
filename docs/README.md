@@ -4,6 +4,7 @@ Use this page to navigate the main project documentation.
 
 ## Getting started
 - [Quick Start](QUICK_START.md)
+- [Runtime Validation (strict by default)](QUICK_START.md#runtime-validation)
 - [Screenshots](screenshots.md)
 
 ## Core workflows
