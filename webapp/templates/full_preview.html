@@ -107,8 +107,8 @@
       data-preview-plan="{{ preview_plan_path or '' }}"></button>
     {% endif %}
   </div>
-  <p class="text-muted">Topology Seed: <strong>{{ seed }}</strong> | Flow Seed: <strong>{{ flow_meta.seed if flow_meta
-      and flow_meta.seed else '-' }}</strong> | XML: {{ xml_path }}</p>
+    <p class="text-muted">Topology Seed: <strong>{{ seed }}</strong> | Flow Seed: <strong>{{ flow_meta.seed if flow_meta
+      and flow_meta.seed else '-' }}</strong> | Preview Source: <strong>{{ preview_source or 'unknown' }}</strong> | XML: {{ xml_path }}</p>
   <div class="mb-3">
     <button id="exportJsonBtn" class="btn btn-sm btn-outline-secondary me-2">Export JSON</button>
     <button id="exportPngBtn" class="btn btn-sm btn-outline-secondary me-2">Export Graph PNG</button>

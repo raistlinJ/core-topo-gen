@@ -534,6 +534,139 @@ def test_run_cli_async_disables_flow_when_plan_has_no_docker_or_vulns(tmp_path, 
     backend.RUNS.pop(run_id, None)
 
 
+def test_diff_plan_summaries_ignores_policy_key_type_differences():
+    from webapp import app_backend as backend
+
+    flow_summary = {
+        'hosts_total': 10,
+        'routers_planned': 5,
+        'switches_allocated': 7,
+        'role_counts': {'Docker': 10},
+        'services_plan': {},
+        'vulnerabilities_plan': {},
+        'r2r_policy': {'mode': 'Exact', 'by_router': {1: 2, 2: 2}},
+        'r2s_policy': {'mode': 'Exact', 'target_per_router': {1: 2, 2: 2}},
+    }
+    xml_summary = {
+        'hosts_total': 10,
+        'routers_planned': 5,
+        'switches_allocated': 7,
+        'role_counts': {'Docker': 10},
+        'services_plan': {},
+        'vulnerabilities_plan': {},
+        'r2r_policy': {'mode': 'Exact', 'by_router': {'1': 2, '2': 2}},
+        'r2s_policy': {'mode': 'Exact', 'target_per_router': {'1': 2, '2': 2}},
+    }
+
+    diffs = backend._diff_plan_summaries(flow_summary, xml_summary)
+    assert diffs == []
+
+
+def test_run_cli_async_mismatch_response_includes_compare_debug(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text(
+        '<Scenarios><Scenario name="Anatest"><ScenarioEditor /></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    fake_core_cfg = {
+        'host': '127.0.0.1',
+        'port': 50051,
+        'ssh_enabled': False,
+        'ssh_host': '127.0.0.1',
+        'ssh_port': 22,
+        'ssh_username': 'core',
+        'ssh_password': 'pw',
+        'auto_start_daemon': False,
+        'venv_bin': '',
+    }
+
+    monkeypatch.setattr(backend, '_merge_core_configs', lambda *a, **k: dict(fake_core_cfg))
+    monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(backend, '_select_core_config_for_page', lambda *a, **k: dict(fake_core_cfg))
+    monkeypatch.setattr(
+        backend,
+        '_flow_state_from_xml_path',
+        lambda *_a, **_k: {
+            'flag_assignments': [
+                {
+                    'node_id': '1',
+                    'id': 'example_generator',
+                    'resolved_outputs': {'Flag(flag_id)': 'FLAG{abc}'},
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        '_load_preview_payload_from_path',
+        lambda *_a, **_k: {
+            'full_preview': {
+                'role_counts': {'Docker': 1},
+                'hosts': [{'node_id': '1', 'role': 'Docker', 'vulnerabilities': []}],
+                'vulnerabilities_by_node': {},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        '_summary_from_preview_plan_path',
+        lambda *_a, **_k: (
+            {
+                'hosts_total': 1,
+                'routers_planned': 1,
+                'switches_allocated': 1,
+                'role_counts': {'Docker': 1},
+                'services_plan': {},
+                'vulnerabilities_plan': {},
+                'r2r_policy': {},
+                'r2s_policy': {},
+            },
+            {'scenario': 'Anatest'},
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        '_summary_from_xml_plan',
+        lambda *_a, **_k: (
+            {
+                'hosts_total': 1,
+                'routers_planned': 2,
+                'switches_allocated': 1,
+                'role_counts': {'Docker': 1},
+                'services_plan': {},
+                'vulnerabilities_plan': {},
+                'r2r_policy': {},
+                'r2s_policy': {},
+            },
+            None,
+        ),
+    )
+
+    client = app.test_client()
+    _login(client)
+
+    resp = client.post(
+        '/run_cli_async',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': 'Anatest',
+            'preview_plan': str(xml_path),
+            'flow_enabled': '1',
+        },
+    )
+
+    assert resp.status_code == 409
+    payload = resp.get_json() or {}
+    mismatch = payload.get('mismatch') if isinstance(payload.get('mismatch'), dict) else {}
+    comparison = mismatch.get('comparison') if isinstance(mismatch.get('comparison'), dict) else {}
+    assert comparison.get('mode') == 'canonicalized_json_keys'
+    assert comparison.get('policy_fields') == ['r2r_policy', 'r2s_policy']
+
+
 def test_run_status_includes_flow_live_path_fields(tmp_path):
     from webapp import app_backend as backend
 

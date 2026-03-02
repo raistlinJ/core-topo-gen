@@ -33484,7 +33484,11 @@ def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> di
 
 
 def _load_preview_payload_from_path(path: str, scenario_label: str | None = None) -> dict[str, Any] | None:
-    """Load a preview payload from XML only."""
+    """Load a preview payload from XML, recomputing from scenario inputs by default.
+
+    This avoids stale embedded PlanPreview snapshots across Preview/Flow/Execute pages.
+    Set `CORETG_PREVIEW_RECOMPUTE_ON_READ=0` to trust embedded PlanPreview first.
+    """
     def _is_effectively_empty_preview_payload(candidate: Any) -> bool:
         if not isinstance(candidate, dict):
             return True
@@ -33586,13 +33590,20 @@ def _load_preview_payload_from_path(path: str, scenario_label: str | None = None
         if not ap:
             return None
         payload = _load_plan_preview_payload_from_path(ap, scenario_label)
-        should_recompute = False
-        if _is_effectively_empty_preview_payload(payload) and _xml_suggests_expected_nodes(ap, scenario_label):
-            should_recompute = True
-        elif _preview_missing_router_projection(payload):
-            expected_routers = _planned_router_count(ap, scenario_label)
-            if expected_routers > 0:
+        preview_source = 'embedded'
+
+        recompute_on_read = str(os.getenv('CORETG_PREVIEW_RECOMPUTE_ON_READ', '1') or '').strip().lower() not in {
+            '0', 'false', 'no', 'off'
+        }
+        should_recompute = bool(recompute_on_read)
+        if not should_recompute:
+            if _is_effectively_empty_preview_payload(payload) and _xml_suggests_expected_nodes(ap, scenario_label):
                 should_recompute = True
+            elif _preview_missing_router_projection(payload):
+                expected_routers = _planned_router_count(ap, scenario_label)
+                if expected_routers > 0:
+                    should_recompute = True
+
         if should_recompute:
             try:
                 recomputed = _planner_persist_flow_plan(
@@ -33605,12 +33616,18 @@ def _load_preview_payload_from_path(path: str, scenario_label: str | None = None
                 recomputed = None
             if isinstance(recomputed, dict) and isinstance(recomputed.get('full_preview'), dict):
                 payload = recomputed
+                preview_source = 'recomputed_on_read'
             else:
                 payload = _load_plan_preview_payload_from_path(ap, scenario_label)
+                preview_source = 'embedded'
         if not isinstance(payload, dict):
             return None
         try:
             meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta['preview_source'] = preview_source
+            payload['metadata'] = meta
             xml_hint = _abs_path_or_original(meta.get('xml_path') or '')
             if not xml_hint:
                 xml_hint = ap
@@ -36464,6 +36481,7 @@ def plan_full_preview_page():
                             xml_path=_abs_path_or_original(xml_path0) or _abs_path_or_original(plan_path),
                         scenario=scenario0,
                         seed=seed0,
+                        preview_source=str((meta or {}).get('preview_source') or 'embedded'),
                         flow_meta=flow_meta or {},
                             preview_plan_path=_abs_path_or_original(plan_path),
                         display_artifacts=display_artifacts,
@@ -36622,6 +36640,7 @@ def plan_full_preview_page():
             xml_path=_abs_path_or_original(xml_path),
             scenario=scenario_name,
             seed=full_prev.get('seed'),
+            preview_source='computed_from_xml',
             flow_meta=flow_meta or {},
             preview_plan_path=_abs_path_or_original(preview_plan_path),
             display_artifacts=display_artifacts,
@@ -37028,6 +37047,7 @@ def plan_full_preview_from_xml():
             xml_path=_abs_path_or_original(xml_path),
             scenario=scenario_name,
             seed=seed_val,
+            preview_source=str((meta or {}).get('preview_source') or 'embedded'),
             flow_meta=flow_meta or {},
             preview_plan_path=_abs_path_or_original(xml_path),
             display_artifacts=display_artifacts,
@@ -37119,6 +37139,17 @@ def _normalize_plan_count_dict(raw: Any) -> dict[str, int]:
     return {}
 
 
+def _canonicalize_jsonish_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized[str(key)] = _canonicalize_jsonish_keys(item)
+        return normalized
+    if isinstance(value, list):
+        return [_canonicalize_jsonish_keys(item) for item in value]
+    return value
+
+
 def _normalize_plan_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(summary, dict):
         return {}
@@ -37127,13 +37158,13 @@ def _normalize_plan_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
     normalized['services_plan'] = _normalize_plan_count_dict(summary.get('services_plan'))
     normalized['vulnerabilities_plan'] = _normalize_plan_count_dict(summary.get('vulnerabilities_plan'))
     try:
-        normalized['r2r_policy'] = _json_ready(summary.get('r2r_policy'))
+        normalized['r2r_policy'] = _canonicalize_jsonish_keys(_json_ready(summary.get('r2r_policy')))
     except Exception:
-        normalized['r2r_policy'] = summary.get('r2r_policy')
+        normalized['r2r_policy'] = _canonicalize_jsonish_keys(summary.get('r2r_policy'))
     try:
-        normalized['r2s_policy'] = _json_ready(summary.get('r2s_policy'))
+        normalized['r2s_policy'] = _canonicalize_jsonish_keys(_json_ready(summary.get('r2s_policy')))
     except Exception:
-        normalized['r2s_policy'] = summary.get('r2s_policy')
+        normalized['r2s_policy'] = _canonicalize_jsonish_keys(summary.get('r2s_policy'))
     return normalized
 
 
@@ -41709,6 +41740,10 @@ def run_cli_async():
                     "error": "Flow/preview plan mismatch with XML-derived plan.",
                     "detail": detail_text,
                     "mismatch": {
+                        "comparison": {
+                            "mode": "canonicalized_json_keys",
+                            "policy_fields": ["r2r_policy", "r2s_policy"],
+                        },
                         "plan_path": preview_plan_path,
                         "plan_scenario": flow_scen,
                         "xml_path": xml_path,

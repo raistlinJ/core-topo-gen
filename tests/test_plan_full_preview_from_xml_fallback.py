@@ -370,3 +370,162 @@ def test_plan_full_preview_from_xml_recomputes_when_routers_missing_but_plan_exp
     assert resp.status_code == 200
     assert resp.data == b'ok'
     assert calls['recompute'] == 1
+
+
+def test_plan_full_preview_from_xml_recomputes_even_when_embedded_plan_exists_by_default(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_get_repo_root', lambda: str(tmp_path))
+    monkeypatch.setattr(backend, 'render_template', lambda *args, **kwargs: 'ok')
+
+    scenario = 'Anatest'
+    xml_path = tmp_path / 'anatest_existing_plan.xml'
+    embedded_payload = {
+        'full_preview': {
+            'seed': 111,
+            'hosts': [{'node_id': 'h1', 'name': 'docker-1', 'role': 'Docker'}],
+            'routers': [{'node_id': 'r1', 'name': 'r1'}],
+            'switches': [],
+            'switches_detail': [],
+            'host_router_map': {},
+            'role_counts': {'Docker': 1},
+        },
+        'metadata': {
+            'scenario': scenario,
+            'seed': 111,
+            'xml_path': str(xml_path),
+        },
+    }
+    xml_path.write_text(
+        (
+            '<Scenarios>'
+            f'<Scenario name="{scenario}">'
+            '<ScenarioEditor>'
+            f'<PlanPreview>{json.dumps(embedded_payload)}</PlanPreview>'
+            '</ScenarioEditor>'
+            '</Scenario>'
+            '</Scenarios>'
+        ),
+        encoding='utf-8',
+    )
+
+    calls = {'recompute': 0}
+
+    def _fake_recompute(**kwargs):
+        calls['recompute'] += 1
+        assert kwargs.get('scenario') == scenario
+        assert kwargs.get('xml_path') == str(xml_path)
+        return {
+            'full_preview': {
+                'seed': 222,
+                'hosts': [{'node_id': 'h1', 'name': 'docker-1', 'role': 'Docker'}],
+                'routers': [{'node_id': 'r1', 'name': 'r1'}],
+                'switches': [],
+                'switches_detail': [],
+                'host_router_map': {},
+                'role_counts': {'Docker': 1},
+            },
+            'metadata': {
+                'scenario': scenario,
+                'seed': 222,
+                'xml_path': str(xml_path),
+            },
+        }
+
+    monkeypatch.setattr(backend, '_planner_persist_flow_plan', _fake_recompute)
+
+    resp = client.post(
+        '/plan/full_preview_from_xml',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': scenario,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.data == b'ok'
+    assert calls['recompute'] == 1
+
+
+def test_plan_full_preview_from_xml_sets_preview_source_recomputed_on_read(tmp_path, monkeypatch):
+    from webapp import app_backend as backend
+
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_get_repo_root', lambda: str(tmp_path))
+
+    captured: dict[str, object] = {}
+
+    def _capture_render(*args, **kwargs):
+        captured.update(kwargs)
+        return 'ok'
+
+    monkeypatch.setattr(backend, 'render_template', _capture_render)
+
+    scenario = 'Anatest'
+    xml_path = tmp_path / 'anatest_source_flag.xml'
+    embedded_payload = {
+        'full_preview': {
+            'seed': 1,
+            'hosts': [{'node_id': 'h1', 'name': 'docker-1', 'role': 'Docker'}],
+            'routers': [{'node_id': 'r1', 'name': 'r1'}],
+            'switches': [],
+            'switches_detail': [],
+            'host_router_map': {},
+            'role_counts': {'Docker': 1},
+        },
+        'metadata': {
+            'scenario': scenario,
+            'seed': 1,
+            'xml_path': str(xml_path),
+        },
+    }
+    xml_path.write_text(
+        (
+            '<Scenarios>'
+            f'<Scenario name="{scenario}">'
+            '<ScenarioEditor>'
+            f'<PlanPreview>{json.dumps(embedded_payload)}</PlanPreview>'
+            '</ScenarioEditor>'
+            '</Scenario>'
+            '</Scenarios>'
+        ),
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(
+        backend,
+        '_planner_persist_flow_plan',
+        lambda **kwargs: {
+            'full_preview': {
+                'seed': 2,
+                'hosts': [{'node_id': 'h1', 'name': 'docker-1', 'role': 'Docker'}],
+                'routers': [{'node_id': 'r1', 'name': 'r1'}],
+                'switches': [],
+                'switches_detail': [],
+                'host_router_map': {},
+                'role_counts': {'Docker': 1},
+            },
+            'metadata': {
+                'scenario': scenario,
+                'seed': 2,
+                'xml_path': str(xml_path),
+            },
+        },
+    )
+
+    resp = client.post(
+        '/plan/full_preview_from_xml',
+        data={
+            'xml_path': str(xml_path),
+            'scenario': scenario,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.data == b'ok'
+    assert captured.get('preview_source') == 'recomputed_on_read'
