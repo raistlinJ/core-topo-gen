@@ -269,10 +269,23 @@ def run_validation(
                 }
             )
         elif not pulled:
+            compose_images = item.get("compose_images") if isinstance(item.get("compose_images"), list) else []
+            compose_images_text = [str(v).strip() for v in compose_images if str(v).strip()]
+            container_image = str(item.get("container_image") or "").strip()
+            mismatch_likely = bool(container_image and compose_images_text and (container_image not in compose_images_text))
+            warning_text = "container running but compose images not fully resolved as pulled"
+            if mismatch_likely:
+                warning_text = (
+                    "container is running, but compose image names do not match the runtime image tag "
+                    "(common for build-based services); treated as advisory"
+                )
             docker_warnings.append(
                 {
                     "name": name,
-                    "warning": "container running but compose images not fully resolved as pulled",
+                    "warning": warning_text,
+                    "compose": item.get("compose"),
+                    "compose_images": compose_images_text,
+                    "container_image": container_image,
                 }
             )
 
@@ -341,6 +354,15 @@ def run_validation(
             "present_count": len(revalidate_present),
             "missing": [str(x) for x in revalidate_missing],
             "present_sample": [str(x) for x in revalidate_present[:20]],
+            "container_missing_count": len(revalidate.get("container_missing") if isinstance(revalidate.get("container_missing"), list) else []),
+            "container_present_count": len(revalidate.get("container_present") if isinstance(revalidate.get("container_present"), list) else []),
+            "container_missing": [str(x) for x in (revalidate.get("container_missing") if isinstance(revalidate.get("container_missing"), list) else [])],
+            "container_present_sample": [
+                str(x)
+                for x in (
+                    (revalidate.get("container_present") if isinstance(revalidate.get("container_present"), list) else [])[:20]
+                )
+            ],
         },
         "strict": strict_report,
     }
@@ -369,11 +391,12 @@ def _print_summary(report: dict[str, Any], *, verbose: bool = False) -> None:
 
     print("")
     print(
-        "Details: sessions={sessions}, docker_nodes={docker_nodes}, docker_failures={docker_failures}, missing_inject_paths={missing}".format(
+        "Details: sessions={sessions}, docker_nodes={docker_nodes}, docker_failures={docker_failures}, missing_inject_paths={missing}, missing_container_paths={missing_container}".format(
             sessions=int(core.get("active_session_count") or 0),
             docker_nodes=int(docker.get("count") or 0),
             docker_failures=len(docker.get("failures") or []),
             missing=int(rv.get("missing_count") or 0),
+            missing_container=int(rv.get("container_missing_count") or 0),
         )
     )
 
@@ -399,6 +422,13 @@ def _print_summary(report: dict[str, Any], *, verbose: bool = False) -> None:
     if missing:
         print("Missing inject/artifact paths (all):" if verbose else "Missing inject/artifact paths (first 10):")
         to_show = missing if verbose else missing[:10]
+        for p in to_show:
+            print(f"  - {p}")
+
+    container_missing = rv.get("container_missing") if isinstance(rv.get("container_missing"), list) else []
+    if container_missing:
+        print("Missing container paths (all):" if verbose else "Missing container paths (first 10):")
+        to_show = container_missing if verbose else container_missing[:10]
         for p in to_show:
             print(f"  - {p}")
 
@@ -438,6 +468,12 @@ def _print_summary(report: dict[str, Any], *, verbose: bool = False) -> None:
         if present_sample:
             print("Present path sample:")
             for p in present_sample:
+                print(f"  - {p}")
+
+        container_present_sample = rv.get("container_present_sample") if isinstance(rv.get("container_present_sample"), list) else []
+        if container_present_sample:
+            print("Present container path sample:")
+            for p in container_present_sample:
                 print(f"  - {p}")
 
 

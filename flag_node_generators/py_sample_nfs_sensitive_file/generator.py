@@ -102,7 +102,7 @@ def main() -> None:
         "    build:\n"
         "      context: .\n"
         "      dockerfile: Dockerfile\n"
-        "    command: ['sh','-lc','rpcbind -w -f & RPCBIND_PID=$!; trap ""kill $RPCBIND_PID 2>/dev/null || true"" EXIT; ganesha.nfsd -F -L STDOUT -f /etc/ganesha/ganesha.conf || { echo \\\"[coretg] ganesha failed; keeping container alive\\\" >&2; sleep infinity; }']\n"
+        "    command: ['sh','-lc','rpcbind -w -f & RPCBIND_PID=$$!; trap ""kill $$RPCBIND_PID 2>/dev/null || true"" EXIT; ganesha.nfsd -F -L STDOUT -f /etc/ganesha/ganesha.conf || { echo \\\"[coretg] ganesha failed; keeping container alive\\\" >&2; sleep infinity; }']\n"
         "    privileged: true\n"
         "    ports:\n"
         f"      - \"{nfs_port}:2049\"\n"

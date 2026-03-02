@@ -536,7 +536,19 @@ def _images_pulled_for_compose(yml_path: str) -> bool:
 		proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'config', '--images'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 		if proc.returncode != 0:
 			return False
-		images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+		images = []
+		for ln in (proc.stdout or '').splitlines():
+			text = (ln or '').strip()
+			if not text:
+				continue
+			low = text.lower()
+			if 'defaulting to a blank string' in low:
+				continue
+			if low.startswith('time="') and ' level=warning ' in low:
+				continue
+			if low.startswith('warning:'):
+				continue
+			images.append(text)
 		if not images:
 			return False
 		for img in images:

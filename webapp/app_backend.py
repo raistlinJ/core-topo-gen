@@ -15513,6 +15513,8 @@ def api_flow_revalidate_flow():
 
     missing: list[str] = []
     present: list[str] = []
+    container_present: list[str] = []
+    container_missing: list[str] = []
     path_map: dict[str, str] = {}
     try:
         check_items: list[dict[str, Any]] = []
@@ -15521,6 +15523,7 @@ def api_flow_revalidate_flow():
                 continue
             check_items.append({
                 'node_id': entry.get('node_id') or entry.get('node_name'),
+                'node_name': entry.get('node_name') or ((entry.get('resolved_inputs') or {}).get('node_name') if isinstance(entry.get('resolved_inputs'), dict) else None),
                 'generator_id': entry.get('id') or entry.get('generator_id'),
                 'generator_name': entry.get('name'),
                 'generator_type': entry.get('type') or entry.get('generator_type'),
@@ -15534,7 +15537,11 @@ def api_flow_revalidate_flow():
 
         payload = _run_remote_python_json(
             flow_core_cfg,
-            _remote_flow_artifacts_validation_script(check_items, scenario_label=scenario_norm),
+            _remote_flow_artifacts_validation_script(
+                check_items,
+                scenario_label=scenario_norm,
+                sudo_password=flow_core_cfg.get('ssh_password'),
+            ),
             logger=app.logger,
             label='flow.revalidate.artifacts',
             timeout=60.0,
@@ -15550,6 +15557,8 @@ def api_flow_revalidate_flow():
             miss_inj = it.get('inject_missing') if isinstance(it.get('inject_missing'), list) else []
             chk_out = it.get('outputs_checked') if isinstance(it.get('outputs_checked'), list) else []
             chk_inj = it.get('inject_checked') if isinstance(it.get('inject_checked'), list) else []
+            miss_container = it.get('container_missing') if isinstance(it.get('container_missing'), list) else []
+            chk_container = it.get('container_checked') if isinstance(it.get('container_checked'), list) else []
 
             miss_set = {str(x) for x in (miss_out + miss_inj) if str(x).strip()}
             for p in chk_out + chk_inj:
@@ -15563,15 +15572,30 @@ def api_flow_revalidate_flow():
             for p in miss_set:
                 missing.append(str(p))
 
+            container_miss_set = {str(x) for x in miss_container if str(x).strip()}
+            for p in chk_container:
+                s = str(p).strip()
+                if not s:
+                    continue
+                if s in container_miss_set:
+                    continue
+                container_present.append(s)
+            for p in container_miss_set:
+                container_missing.append(str(p))
+
     except Exception as exc:
         return jsonify({'ok': False, 'error': f'Remote validation failed: {exc}'}), 500
 
     missing_sorted = sorted(set(missing))
     present_sorted = sorted(set(present))
+    container_present_sorted = sorted(set(container_present))
+    container_missing_sorted = sorted(set(container_missing))
     return jsonify({
         'ok': True,
         'missing': missing_sorted,
         'present': present_sorted,
+        'container_present': container_present_sorted,
+        'container_missing': container_missing_sorted,
         'resolved_paths': path_map
     })
 
@@ -30959,7 +30983,19 @@ def _compose_images_configured(yml_path):
         p = _run_docker(['compose', '-f', yml_path, 'config', '--images'], timeout=25, capture=True)
         if p.returncode != 0:
             return []
-        images = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+        images = []
+        for ln in (p.stdout or '').splitlines():
+            text = (ln or '').strip()
+            if not text:
+                continue
+            low = text.lower()
+            if 'defaulting to a blank string' in low:
+                continue
+            if low.startswith('time="') and ' level=warning ' in low:
+                continue
+            if low.startswith('warning:'):
+                continue
+            images.append(text)
         # De-dupe while preserving order.
         out = []
         seen = set()
@@ -30973,20 +31009,41 @@ def _compose_images_configured(yml_path):
         return []
 
 
-def _images_pulled_for_compose(yml_path):
+def _images_pulled_for_compose(yml_path, running_image=''):
     # Best-effort: list images referenced by the compose file and confirm they exist locally.
     try:
         p = _run_docker(['compose', '-f', yml_path, 'config', '--images'], timeout=20, capture=True)
         if p.returncode != 0:
             return False
-        images = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+        images = []
+        for ln in (p.stdout or '').splitlines():
+            text = (ln or '').strip()
+            if not text:
+                continue
+            low = text.lower()
+            if 'defaulting to a blank string' in low:
+                continue
+            if low.startswith('time="') and ' level=warning ' in low:
+                continue
+            if low.startswith('warning:'):
+                continue
+            images.append(text)
         if not images:
             return False
+        missing = []
         for img in images:
             chk = _run_docker(['image', 'inspect', img], timeout=20, capture=False)
             if chk.returncode != 0:
-                return False
-        return True
+                missing.append(img)
+        if not missing:
+            return True
+        # Fallback for build-based compose services where `config --images`
+        # emits logical names that don't match the concrete runtime image tag.
+        if running_image:
+            chk2 = _run_docker(['image', 'inspect', running_image], timeout=20, capture=False)
+            if chk2.returncode == 0:
+                return True
+        return False
     except Exception:
         return False
 
@@ -31024,10 +31081,10 @@ def main():
             exists = os.path.exists(yml)
         except Exception:
             exists = False
-        pulled = _images_pulled_for_compose(yml) if exists else False
         c_exists = node_name in names
         running = _container_running(node_name) if c_exists else False
         img = _container_image(node_name) if c_exists else ''
+        pulled = _images_pulled_for_compose(yml, img if running else '') if exists else False
         cfg_imgs = _compose_images_configured(yml) if exists else []
         items.append({
             'name': node_name,
@@ -38217,12 +38274,17 @@ if __name__ == '__main__':
      .replace('__INJECT_DIRS_LITERAL__', inject_dirs_literal)
 
 
-def _remote_flow_artifacts_validation_script(assignments: List[Dict[str, Any]], scenario_label: str = '') -> str:
+def _remote_flow_artifacts_validation_script(
+    assignments: List[Dict[str, Any]],
+    scenario_label: str = '',
+    sudo_password: str | None = None,
+) -> str:
     assignments_literal = json.dumps(assignments or [])
     scenario_label_literal = json.dumps(str(scenario_label or ''))
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else '')
     return (
         r"""
-import json, os, glob
+import json, os, glob, subprocess, shlex
 
 null = None
 true = True
@@ -38230,6 +38292,56 @@ false = False
 
 ASSIGNMENTS = __ASSIGNMENTS_LITERAL__
 SCENARIO_LABEL = __SCENARIO_LABEL_LITERAL__
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=20, capture=True):
+    stdout = subprocess.PIPE if capture else subprocess.DEVNULL
+    stderr = subprocess.STDOUT if capture else subprocess.DEVNULL
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=stdout, stderr=stderr, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def _docker_names() -> tuple[set[str], str]:
+    p = _run_docker(['ps', '-a', '--format', '{{.Names}}'], timeout=20, capture=True)
+    if getattr(p, 'returncode', 1) != 0:
+        return set(), str(getattr(p, 'stdout', '') or '').strip()
+    out = set()
+    for ln in str(getattr(p, 'stdout', '') or '').splitlines():
+        s = str(ln or '').strip()
+        if s:
+            out.add(s)
+    return out, ''
+
+
+def _container_path_exists(container_name: str, container_path: str) -> tuple[bool, str]:
+    if not container_name or not container_path or not str(container_path).startswith('/'):
+        return False, 'invalid_container_path'
+    cmd = f"test -e {shlex.quote(str(container_path))}"
+    p = _run_docker(['exec', container_name, '/usr/local/coretg/bin/busybox', 'sh', '-lc', cmd], timeout=20, capture=True)
+    if getattr(p, 'returncode', 1) == 0:
+        return True, ''
+    p2 = _run_docker(['exec', container_name, 'sh', '-lc', cmd], timeout=20, capture=True)
+    if getattr(p2, 'returncode', 1) == 0:
+        return True, ''
+    return False, str(getattr(p2, 'stdout', '') or getattr(p, 'stdout', '') or '').strip()
 
 
 def _safe_exists(p: str) -> bool:
@@ -38428,11 +38540,13 @@ def _inject_files_for_copy_from_detail(detail_list, source_dir: str) -> list[str
 
 
 def main():
+    docker_names, docker_err = _docker_names()
     items = []
     for a in (ASSIGNMENTS or []):
         if not isinstance(a, dict):
             continue
         node_id = str(a.get('node_id') or '')
+        node_name = str(a.get('node_name') or a.get('node_id') or '').strip()
         gen_id = str(a.get('id') or a.get('generator_id') or '')
         gen_name = str(a.get('generator_name') or a.get('name') or '')
         gen_type = str(a.get('generator_type') or a.get('type') or '')
@@ -38578,6 +38692,34 @@ def main():
 
         inject_missing = []
         inject_checked = []
+        container_dest_paths = []
+        for raw in inj:
+            txt = str(raw or '').strip()
+            if not txt:
+                continue
+            sep = '->' if '->' in txt else '=>' if '=>' in txt else ''
+            if not sep:
+                continue
+            _left, right = txt.split(sep, 1)
+            dst_txt = str(right or '').strip()
+            if dst_txt.startswith('/'):
+                container_dest_paths.append(dst_txt)
+
+        # Canonical in-container destinations used by CORE flow artifact handling.
+        container_dest_paths.append('/flow_injects')
+        container_dest_paths.append('/flow_artifacts')
+
+        # De-dupe container destination paths while preserving order.
+        seen_container_paths = set()
+        uniq_container_paths = []
+        for pth in container_dest_paths:
+            k = str(pth or '').strip()
+            if not k or k in seen_container_paths:
+                continue
+            seen_container_paths.add(k)
+            uniq_container_paths.append(k)
+        container_dest_paths = uniq_container_paths
+
         for src in inject_sources:
             src_txt = str(src or '').strip()
             if not src_txt:
@@ -38608,11 +38750,43 @@ def main():
             if not _safe_exists(flag_file_path):
                 inject_missing.append(flag_file_path)
 
+        container_checked = []
+        container_missing = []
+        container_check_error = ''
+        target_container = ''
+        try:
+            if node_name and node_name in docker_names:
+                target_container = node_name
+            elif node_id and node_id in docker_names:
+                target_container = node_id
+            if container_dest_paths and not target_container:
+                msg = 'container_not_found'
+                if docker_err:
+                    msg = f"container_not_found ({docker_err})"
+                for dst in container_dest_paths:
+                    container_missing.append(f"{msg}: {dst}")
+            elif target_container:
+                for dst in container_dest_paths:
+                    container_checked.append(dst)
+                    ok, err = _container_path_exists(target_container, dst)
+                    if not ok:
+                        if err:
+                            container_missing.append(f"{dst} ({err})")
+                        else:
+                            container_missing.append(dst)
+        except Exception as exc:
+            container_check_error = str(exc)
+
         items.append({
             'node_id': node_id,
+            'node_name': node_name,
             'generator_id': gen_id,
             'generator_name': gen_name,
             'generator_type': gen_type,
+            'container_name': target_container,
+            'container_check_error': container_check_error,
+            'container_checked': container_checked,
+            'container_missing': container_missing,
             'flag_delivery_mode': flag_delivery_mode,
             'flag_file_path': flag_file_path,
             'run_dir': run_dir,
@@ -38633,7 +38807,8 @@ if __name__ == '__main__':
     main()
 """
     ).replace('__ASSIGNMENTS_LITERAL__', assignments_literal) \
-     .replace('__SCENARIO_LABEL_LITERAL__', scenario_label_literal)
+     .replace('__SCENARIO_LABEL_LITERAL__', scenario_label_literal) \
+     .replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
 def _remote_vuln_assignments_script(assignments_path: str = '/tmp/vulns/compose_assignments.json') -> str:
