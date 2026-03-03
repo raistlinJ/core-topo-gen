@@ -742,6 +742,36 @@
     } catch (e) { }
   }
 
+  function _bestEffortCurrentScenarioXmlPath() {
+    try {
+      const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
+      let xmlPath = '';
+      try {
+        if (scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+          xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
+        }
+      } catch (e) { xmlPath = ''; }
+      if (!xmlPath) {
+        try {
+          xmlPath = String(document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+        } catch (e) { xmlPath = ''; }
+      }
+      return xmlPath;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function persistFlowStateAndXmlBestEffort() {
+    try { persistFlowState(); } catch (e) { }
+    try {
+      const xmlPath = _bestEffortCurrentScenarioXmlPath();
+      if (xmlPath) {
+        saveFlowStateToXml(xmlPath).catch(() => { });
+      }
+    } catch (e) { }
+  }
+
   async function saveFlowStateToXml(xmlPath) {
     try {
       const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
@@ -1163,12 +1193,16 @@
       const resolvedPaths = (curA && typeof curA.resolved_paths === 'object' && curA.resolved_paths && !Array.isArray(curA.resolved_paths))
         ? curA.resolved_paths
         : undefined;
+      const injectPathView = (curA && typeof curA.inject_path_view === 'string' && curA.inject_path_view.trim())
+        ? String(curA.inject_path_view).trim().toLowerCase()
+        : undefined;
 
       if (artifactsDir) out.artifacts_dir = artifactsDir;
       if (mountDir) out.mount_dir = mountDir;
       if (runDir) out.run_dir = runDir;
       if (outputsManifest) out.outputs_manifest = outputsManifest;
       if (resolvedPaths) out.resolved_paths = resolvedPaths;
+      if (injectPathView === 'container' || injectPathView === 'core-vm') out.inject_path_view = injectPathView;
 
       const typeVal = (curA && typeof curA.type === 'string' && curA.type.trim()) ? String(curA.type).trim() : undefined;
       const genLabel = (curA && typeof curA.flag_generator === 'string' && curA.flag_generator.trim()) ? String(curA.flag_generator).trim() : undefined;
@@ -1192,6 +1226,7 @@
       if (runDir !== undefined) out.run_dir = runDir;
       if (outputsManifest !== undefined) out.outputs_manifest = outputsManifest;
       if (resolvedPaths !== undefined) out.resolved_paths = resolvedPaths;
+      if (injectPathView !== undefined && (injectPathView === 'container' || injectPathView === 'core-vm')) out.inject_path_view = injectPathView;
       if (inputDetails.length) out.resolved_inputs_detail = inputDetails;
       if (outputDetails.length) out.resolved_outputs_detail = outputDetails;
       if (hintOvr !== undefined) out.hint_overrides = hintOvr;
@@ -1233,59 +1268,14 @@
   }
 
   function getSavedFlowStateForScenario(scenarioName) {
-    const hasResolvedFields = (assignments) => {
-      if (!Array.isArray(assignments) || !assignments.length) return false;
-      return assignments.some((a) => {
-        if (!a || typeof a !== 'object') return false;
-        const hasInputs = a.resolved_inputs && typeof a.resolved_inputs === 'object' && !Array.isArray(a.resolved_inputs) && Object.keys(a.resolved_inputs).length > 0;
-        const hasOutputs = a.resolved_outputs && typeof a.resolved_outputs === 'object' && !Array.isArray(a.resolved_outputs) && Object.keys(a.resolved_outputs).length > 0;
-        return !!(hasInputs || hasOutputs);
-      });
-    };
-
-    const mergeAssignmentsPreferResolved = (serverAssignments, localAssignments) => {
-      const serverList = Array.isArray(serverAssignments) ? serverAssignments : [];
-      const localList = Array.isArray(localAssignments) ? localAssignments : [];
-      if (!localList.length) return serverList;
-      const out = serverList.length
-        ? serverList.map((a) => (a && typeof a === 'object') ? { ...a } : {})
-        : localList.map((a) => (a && typeof a === 'object') ? { ...a } : {});
-
-      const byNode = new Map();
-      localList.forEach((a, idx) => {
-        if (!a || typeof a !== 'object') return;
-        const nid = String(a.node_id || '').trim();
-        if (nid) byNode.set(nid, a);
-        byNode.set(`idx:${idx}`, a);
-      });
-
-      const maxLen = Math.max(out.length, localList.length);
-      for (let i = 0; i < maxLen; i++) {
-        const cur = (out[i] && typeof out[i] === 'object') ? out[i] : {};
-        const nid = String(cur.node_id || '').trim();
-        const src = byNode.get(nid) || byNode.get(`idx:${i}`);
-        if (!src || typeof src !== 'object') {
-          out[i] = cur;
-          continue;
-        }
-
-        const hasInputs = cur.resolved_inputs && typeof cur.resolved_inputs === 'object' && !Array.isArray(cur.resolved_inputs) && Object.keys(cur.resolved_inputs).length > 0;
-        const hasOutputs = cur.resolved_outputs && typeof cur.resolved_outputs === 'object' && !Array.isArray(cur.resolved_outputs) && Object.keys(cur.resolved_outputs).length > 0;
-        if (!hasInputs && src.resolved_inputs && typeof src.resolved_inputs === 'object' && !Array.isArray(src.resolved_inputs)) {
-          cur.resolved_inputs = src.resolved_inputs;
-        }
-        if (!hasOutputs && src.resolved_outputs && typeof src.resolved_outputs === 'object' && !Array.isArray(src.resolved_outputs)) {
-          cur.resolved_outputs = src.resolved_outputs;
-        }
-        if ((!Array.isArray(cur.inject_files) || !cur.inject_files.length) && Array.isArray(src.inject_files) && src.inject_files.length) {
-          cur.inject_files = src.inject_files;
-        }
-        if ((!Array.isArray(cur.inject_files_detail) || !cur.inject_files_detail.length) && Array.isArray(src.inject_files_detail) && src.inject_files_detail.length) {
-          cur.inject_files_detail = src.inject_files_detail;
-        }
-        out[i] = cur;
+    const hasAuthoritativeXmlPath = (name) => {
+      try {
+        if (!name || typeof window.coretgGetLatestXmlPathForScenario !== 'function') return false;
+        const p = String(window.coretgGetLatestXmlPathForScenario(name) || '').trim();
+        return !!p;
+      } catch (e) {
+        return false;
       }
-      return out;
     };
 
     const isUsableState = (state) => {
@@ -1304,26 +1294,14 @@
 
       const serverUsable = isUsableState(fromServer);
       const localUsable = isUsableState(fromLocal);
+      const xmlAuthoritative = hasAuthoritativeXmlPath(scenarioName);
+
+      if (xmlAuthoritative) {
+        if (serverUsable) return fromServer;
+        return null;
+      }
 
       if (serverUsable && localUsable) {
-        if (fromServer.flow_enabled === false) return fromServer;
-        const serverHasResolved = hasResolvedFields(fromServer.flag_assignments);
-        const localHasResolved = hasResolvedFields(fromLocal.flag_assignments);
-        if (!serverHasResolved && localHasResolved) {
-          const merged = {
-            ...fromServer,
-            flag_assignments: mergeAssignmentsPreferResolved(fromServer.flag_assignments, fromLocal.flag_assignments),
-          };
-          if (!merged.initial_facts && fromLocal.initial_facts) merged.initial_facts = fromLocal.initial_facts;
-          if (!merged.goal_facts && fromLocal.goal_facts) merged.goal_facts = fromLocal.goal_facts;
-          if ((!Array.isArray(merged.chain_ids) || !merged.chain_ids.length) && Array.isArray(fromLocal.chain_ids) && fromLocal.chain_ids.length) {
-            merged.chain_ids = fromLocal.chain_ids.slice();
-          }
-          if ((!Number.isFinite(+merged.length) || +merged.length <= 0) && Number.isFinite(+fromLocal.length)) {
-            merged.length = +fromLocal.length;
-          }
-          return merged;
-        }
         return fromServer;
       }
 
@@ -1463,6 +1441,9 @@
         if (savedA.inject_files && (!Array.isArray(curA.inject_files) || !curA.inject_files.length)) {
           curA.inject_files = savedA.inject_files;
         }
+        if ((!curA.inject_path_view || !String(curA.inject_path_view).trim()) && savedA.inject_path_view && String(savedA.inject_path_view).trim()) {
+          curA.inject_path_view = String(savedA.inject_path_view).trim().toLowerCase();
+        }
         nextAssignments[i] = curA;
       }
       currentFlagAssignments = nextAssignments;
@@ -1505,6 +1486,9 @@
         if (savedA.produces && (!Array.isArray(curA.produces) || !curA.produces.length)) curA.produces = savedA.produces;
         if (savedA.requires && (!Array.isArray(curA.requires) || !curA.requires.length)) curA.requires = savedA.requires;
         if (savedA.inject_files && (!Array.isArray(curA.inject_files) || !curA.inject_files.length)) curA.inject_files = savedA.inject_files;
+        if ((!curA.inject_path_view || !String(curA.inject_path_view).trim()) && savedA.inject_path_view && String(savedA.inject_path_view).trim()) {
+          curA.inject_path_view = String(savedA.inject_path_view).trim().toLowerCase();
+        }
         if (savedA.hint && (!curA.hint || !String(curA.hint).trim())) curA.hint = savedA.hint;
         if (savedA.hints && (!Array.isArray(curA.hints) || !curA.hints.length)) curA.hints = savedA.hints;
         if (savedA.description_hints && (!Array.isArray(curA.description_hints) || !curA.description_hints.length)) curA.description_hints = savedA.description_hints;
@@ -2091,6 +2075,17 @@
     updateScenarioFilterControls();
     refreshParticipantNavForScenario(activeScenario);
     rememberActiveScenario();
+    try {
+      if (activeScenario && typeof window.coretgRefreshScenarioStateFromXml === 'function') {
+        const latest = await window.coretgRefreshScenarioStateFromXml(activeScenario, { updateHidden: true });
+        const scenState = (latest && latest.scenario_state && typeof latest.scenario_state === 'object') ? latest.scenario_state : null;
+        const fs = (scenState && scenState.flow_state && typeof scenState.flow_state === 'object') ? scenState.flow_state : null;
+        if (fs) {
+          const key = normalizeScenarioNorm(activeScenario);
+          if (key) flowStateByScenario[key] = fs;
+        }
+      }
+    } catch (e) { }
     setTopologyDirtyState(false, '');
     updateScenarioSeedBadges();
     clearPreviewPlanCacheForScenario(activeScenario);
@@ -4121,16 +4116,49 @@
         }
 
         function buildInjectsTable(files, resolved) {
+          const wrap = document.createElement('div');
           const tbl = document.createElement('table');
           tbl.className = 'table table-sm mb-0';
           const thead = document.createElement('thead');
-          thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved path</th></tr>';
+          const headTr = document.createElement('tr');
+          headTr.className = 'text-secondary';
+          const headVar = document.createElement('th');
+          headVar.style.width = '1%';
+          headVar.style.whiteSpace = 'nowrap';
+          headVar.textContent = 'Variable';
+          const headResolved = document.createElement('th');
+          const headWrap = document.createElement('div');
+          headWrap.className = 'd-flex align-items-center justify-content-between gap-2';
+          const headLabel = document.createElement('span');
+          headLabel.textContent = 'Resolved path';
+          const viewToggle = document.createElement('button');
+          viewToggle.type = 'button';
+          viewToggle.className = 'btn btn-sm btn-outline-secondary py-0 px-2';
+          viewToggle.title = 'Toggle path view (CORE VM or Container)';
+          viewToggle.style.width = '98px';
+          viewToggle.style.whiteSpace = 'nowrap';
+          viewToggle.style.textAlign = 'center';
+          headWrap.appendChild(headLabel);
+          headWrap.appendChild(viewToggle);
+          headResolved.appendChild(headWrap);
+          headTr.appendChild(headVar);
+          headTr.appendChild(headResolved);
+          thead.appendChild(headTr);
           tbl.appendChild(thead);
           const tbody2 = document.createElement('tbody');
+          let pathView = (fa && String(fa.inject_path_view || '').trim().toLowerCase() === 'container') ? 'container' : 'core-vm';
           const rows = Array.isArray(files) ? files : [];
           const resolvedInjectSources = (fa && fa.resolved_paths && Array.isArray(fa.resolved_paths.inject_sources))
             ? fa.resolved_paths.inject_sources.filter(x => x && typeof x === 'object')
             : [];
+          const resolvedMap = (resolved && typeof resolved === 'object' && !Array.isArray(resolved)) ? resolved : null;
+          const embeddedDeliveryMode = String(
+            (resolvedMap && (resolvedMap['FlagDelivery(mode)'] || resolvedMap.flag_delivery_mode || resolvedMap.flag_delivery))
+            || ''
+          ).trim().toLowerCase();
+          const generatorIdForEmbed = String((fa && (fa.id || fa.generator_id)) || '').trim().toLowerCase();
+          const hasEmbeddedFlag = embeddedDeliveryMode === 'embedded' || generatorIdForEmbed === 'binary_embed_text';
+          const resolvedFilePath = String((resolvedMap && resolvedMap['File(path)']) || '').trim();
 
           function _basenameOnly(p) {
             const s = String(p || '').replace('\\', '/');
@@ -4178,16 +4206,37 @@
           }
 
 
-          if (!rows.length) {
-            const tr = document.createElement('tr');
-            const td = document.createElement('td');
-            td.colSpan = 2;
-            td.className = 'text-muted small';
-            td.textContent = 'No inject files.';
-            tr.appendChild(td);
-            tbody2.appendChild(tr);
-          } else {
-            const resolvedMap = (resolved && typeof resolved === 'object' && !Array.isArray(resolved)) ? resolved : null;
+          function _matchesResolvedFilePath(srcValue, resolvedValue, displayValue) {
+            if (!resolvedFilePath) return false;
+            const src = String(srcValue || '').trim();
+            const resolvedVal = String(resolvedValue || '').trim();
+            const displayVal = String(displayValue || '').trim();
+            if (src && src === 'File(path)') return true;
+            if (resolvedVal && resolvedVal === resolvedFilePath) return true;
+            const targetBase = _basenameOnly(resolvedFilePath);
+            if (!targetBase) return false;
+            const candidates = [src, resolvedVal, displayVal].map(_basenameOnly).filter(Boolean);
+            return candidates.some((c) => c === targetBase);
+          }
+
+          function _currentViewLabel() {
+            return pathView === 'container' ? 'Container' : 'CORE VM';
+          }
+
+          function _renderInjectRows() {
+            tbody2.innerHTML = '';
+            let hasFlagStar = false;
+
+            if (!rows.length) {
+              const tr = document.createElement('tr');
+              const td = document.createElement('td');
+              td.colSpan = 2;
+              td.className = 'text-muted small';
+              td.textContent = 'No inject files.';
+              tr.appendChild(td);
+              tbody2.appendChild(tr);
+              return hasFlagStar;
+            }
 
             function normalizeDestDir(d) {
               const s = String(d || '').trim();
@@ -4279,38 +4328,79 @@
                 const tdName = document.createElement('td');
                 const nameCode = document.createElement('code');
                 nameCode.className = 'font-monospace';
-                nameCode.textContent = (idx === 0 ? (name || '-') : '');
-                tdName.appendChild(nameCode);
+                const isFlagCarrier = hasEmbeddedFlag && _matchesResolvedFilePath(srcRaw, resolvedVal, displaySrc);
+                if (isFlagCarrier) hasFlagStar = true;
+                if (idx === 0) {
+                  nameCode.textContent = name || '-';
+                  tdName.appendChild(nameCode);
+                  if (isFlagCarrier) {
+                    const star = document.createElement('span');
+                    star.className = 'ms-1 fw-semibold';
+                    star.title = 'Flag is embedded in this artifact';
+                    star.textContent = '◆';
+                    tdName.appendChild(star);
+                  }
+                } else {
+                  nameCode.textContent = '';
+                  tdName.appendChild(nameCode);
+                }
 
                 const tdResolved = document.createElement('td');
                 tdResolved.className = 'small text-muted';
                 const resolvedBase = basenameFrom(resolvedVal ? resolvedVal : displaySrc);
                 const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
                 const resolvedMatches = resolvedPathsForCandidate(displaySrc, resolvedVal);
+
+                let coreVmText = '';
                 if (resolvedMatches.length) {
                   const values = resolvedMatches
                     .map((entry) => String((entry && entry.path) || '').trim())
                     .filter(Boolean)
                     .filter((value) => !_isHostLocalSyntheticPath(value));
-                  tdResolved.textContent = values.join('; ') || '-';
+                  coreVmText = values.join('; ') || '-';
+                } else if (!resolvedVal && (tokenLike || likelySymbolicToken)) {
+                  coreVmText = '<unresolved>';
+                } else if (resolvedVal && resolvedVal.startsWith('/') && !_isHostLocalSyntheticPath(resolvedVal)) {
+                  coreVmText = resolvedVal;
                 } else {
-                  if (!resolvedVal && (tokenLike || likelySymbolicToken)) {
-                    tdResolved.textContent = '<unresolved>';
-                  } else if (resolvedVal && resolvedVal.startsWith('/') && !_isHostLocalSyntheticPath(resolvedVal)) {
-                    tdResolved.textContent = resolvedVal;
-                  } else {
-                    tdResolved.textContent = destPath || '-';
-                  }
+                  coreVmText = destPath || '-';
                 }
+
+                const containerText = destPath || '-';
+                tdResolved.textContent = pathView === 'container' ? containerText : coreVmText;
 
                 tr.appendChild(tdName);
                 tr.appendChild(tdResolved);
                 tbody2.appendChild(tr);
               });
             });
+
+            return hasFlagStar;
           }
+
+          const legend = document.createElement('div');
+          legend.className = 'text-muted small mt-1';
+          legend.textContent = '◆ flag embedded in this artifact';
+
+          function _renderInjectTable() {
+            viewToggle.textContent = _currentViewLabel();
+            const hasFlagStar = _renderInjectRows();
+            legend.style.display = hasFlagStar ? '' : 'none';
+          }
+
+          viewToggle.addEventListener('click', () => {
+            pathView = (pathView === 'core-vm') ? 'container' : 'core-vm';
+            try { if (fa && typeof fa === 'object') fa.inject_path_view = pathView; } catch (e) { }
+            try { persistFlowStateAndXmlBestEffort(); } catch (e) { }
+            _renderInjectTable();
+          });
+
+          _renderInjectTable();
+
           tbl.appendChild(tbody2);
-          return tbl;
+          wrap.appendChild(tbl);
+          wrap.appendChild(legend);
+          return wrap;
         }
 
         injectsPane.appendChild(buildInjectsTable(injectedFiles, resolvedOutputs));
@@ -5493,6 +5583,7 @@
           }
           return null;
         }
+        let injectsResolvedPathView = (fa && String(fa.inject_path_view || '').trim().toLowerCase() === 'container') ? 'container' : 'core-vm';
 
         function renderInjectList(files) {
           injectOverrideInputs = [];
@@ -5556,7 +5647,18 @@
           const h1 = document.createElement('div');
           h1.textContent = 'Variable';
           const h2 = document.createElement('div');
-          h2.textContent = 'Resolved path';
+          h2.className = 'd-flex align-items-center justify-content-between gap-2';
+          const h2Label = document.createElement('span');
+          h2Label.textContent = 'Resolved path';
+          const pathViewToggleBtn = document.createElement('button');
+          pathViewToggleBtn.type = 'button';
+          pathViewToggleBtn.className = 'btn btn-sm btn-outline-secondary py-0 px-2';
+          pathViewToggleBtn.title = 'Toggle path view (CORE VM or Container)';
+          pathViewToggleBtn.style.width = '98px';
+          pathViewToggleBtn.style.whiteSpace = 'nowrap';
+          pathViewToggleBtn.style.textAlign = 'center';
+          h2.appendChild(h2Label);
+          h2.appendChild(pathViewToggleBtn);
           const h3 = document.createElement('div');
           h3.textContent = 'Destination dir';
           const h4 = document.createElement('div');
@@ -5746,6 +5848,32 @@
             const resolvedHint = document.createElement('div');
             resolvedHint.className = 'small text-muted';
             resolvedHint.textContent = '-';
+            function summarizeValues(values) {
+              const cleaned = Array.from(new Set((Array.isArray(values) ? values : []).map(v => String(v || '').trim()).filter(Boolean)));
+              if (!cleaned.length) return '-';
+              const head = cleaned.slice(0, 3);
+              const more = cleaned.length > head.length ? ` (+${cleaned.length - head.length})` : '';
+              return `${head.join(', ')}${more}`;
+            }
+            function currentInjectsPathViewLabel() {
+              return injectsResolvedPathView === 'container' ? 'Container' : 'CORE VM';
+            }
+            function toContainerDestPaths(targetValues, fallbackDisplaySrc, destDir) {
+              const vals = Array.isArray(targetValues) ? targetValues : [];
+              const computed = [];
+              if (vals.length) {
+                vals.forEach((value) => {
+                  const base = basenameFromPath(value);
+                  if (base) computed.push(`${destDir}/${base}`);
+                });
+              }
+              if (!computed.length && fallbackDisplaySrc) {
+                const resolvedBase = basenameFromPath(fallbackDisplaySrc);
+                const fallbackDest = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
+                if (fallbackDest) computed.push(fallbackDest);
+              }
+              return computed;
+            }
 
             function refreshPathHints() {
               let key = String((srcInp && srcInp.value) ?? '').trim();
@@ -5766,6 +5894,7 @@
                 && !displaySrc.startsWith('artifacts/')
                 && !/\.[A-Za-z0-9]{1,16}$/.test(displaySrc);
               const destDir = normalizeDestDir(destInp.value);
+              pathViewToggleBtn.textContent = currentInjectsPathViewLabel();
 
               if (!targets.length) {
                 if (!displaySrc) {
@@ -5774,23 +5903,31 @@
                 } else {
                   const resolvedBase = basenameFromPath(displaySrc);
                   const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
-                  resolvedHint.textContent = (tokenLike || likelySymbolicToken) ? '<unresolved>' : (destPath || '-');
+                  if (injectsResolvedPathView === 'container') {
+                    resolvedHint.textContent = destPath || '-';
+                  } else {
+                    resolvedHint.textContent = (tokenLike || likelySymbolicToken) ? '<unresolved>' : (destPath || '-');
+                  }
                   resolvedHint.classList.add('text-muted');
                 }
               } else {
                 const matchedResolvedPaths = resolvedPathsForCandidate(displaySrc, targets[0] || '');
-                const anticipated = matchedResolvedPaths.length
+                const anticipatedCoreVm = matchedResolvedPaths.length
                   ? matchedResolvedPaths.map((entry) => String((entry && entry.path) || '').trim()).filter(Boolean)
                   : targets
                     .filter((value) => !_isHostLocalSyntheticPath(value))
                     .map((value) => String(value || '').trim())
                     .filter(Boolean);
-                const head = anticipated.slice(0, 3);
-                const more = anticipated.length > head.length ? ` (+${anticipated.length - head.length})` : '';
-                resolvedHint.textContent = `${head.join(', ')}${more}`;
+                if (injectsResolvedPathView === 'container') {
+                  const anticipatedContainer = toContainerDestPaths(anticipatedCoreVm, displaySrc, destDir);
+                  resolvedHint.textContent = summarizeValues(anticipatedContainer);
+                } else {
+                  resolvedHint.textContent = summarizeValues(anticipatedCoreVm);
+                }
                 resolvedHint.classList.add('text-muted');
               }
             }
+            rowObj.refreshPathHints = refreshPathHints;
 
             try { refreshPathHints(); } catch (e) { }
 
@@ -5820,6 +5957,18 @@
               try { refreshPathHints(); } catch (e) { }
             });
           }
+          pathViewToggleBtn.textContent = injectsResolvedPathView === 'container' ? 'Container' : 'CORE VM';
+          pathViewToggleBtn.addEventListener('click', () => {
+            injectsResolvedPathView = injectsResolvedPathView === 'core-vm' ? 'container' : 'core-vm';
+            try { if (fa && typeof fa === 'object') fa.inject_path_view = injectsResolvedPathView; } catch (e) { }
+            try { persistFlowStateAndXmlBestEffort(); } catch (e) { }
+            pathViewToggleBtn.textContent = injectsResolvedPathView === 'container' ? 'Container' : 'CORE VM';
+            try {
+              (Array.isArray(injectOverrideInputs) ? injectOverrideInputs : []).forEach((entry) => {
+                try { if (entry && typeof entry.refreshPathHints === 'function') entry.refreshPathHints(); } catch (e) { }
+              });
+            } catch (e) { }
+          });
 
           (Array.isArray(files) ? files : []).forEach(addRow);
 
@@ -9352,6 +9501,18 @@
   updateScenarioFilterControls();
   refreshParticipantNavForScenario(activeScenario);
   rememberActiveScenario();
+
+  try {
+    if (activeScenario && typeof window.coretgRefreshScenarioStateFromXml === 'function') {
+      const latest = await window.coretgRefreshScenarioStateFromXml(activeScenario, { updateHidden: true });
+      const scenState = (latest && latest.scenario_state && typeof latest.scenario_state === 'object') ? latest.scenario_state : null;
+      const fs = (scenState && scenState.flow_state && typeof scenState.flow_state === 'object') ? scenState.flow_state : null;
+      if (fs) {
+        const key = normalizeScenarioNorm(activeScenario);
+        if (key) flowStateByScenario[key] = fs;
+      }
+    }
+  } catch (e) { }
 
   updateFlowEnabledUi();
   // Auto-generate on load (prefer any saved Flow state).

@@ -433,6 +433,124 @@
     } catch (e) {}
   }
 
+  async function refreshScenarioStateFromXml(scenarioName, opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
+    try {
+      const scenario = (scenarioName || '').toString().trim();
+      if (!scenario) return null;
+      const resp = await fetch('/api/scenario/latest_state?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+      let data = null;
+      try { data = await resp.json(); } catch (e) { data = null; }
+      if (!resp.ok || !data || data.ok !== true) return null;
+
+      const xmlPath = (data.xml_path || '').toString().trim();
+      if (xmlPath) {
+        setLatestXmlPathForScenario(scenario, xmlPath);
+        if (options.updateHidden !== false) {
+          try {
+            const hidden = document.getElementById('scenariosPreviewXmlPath');
+            if (hidden && typeof hidden.value === 'string') hidden.value = xmlPath;
+          } catch (e) {}
+        }
+      }
+
+      try {
+        const scenState = (data.scenario_state && typeof data.scenario_state === 'object') ? data.scenario_state : null;
+        const flowState = (scenState && scenState.flow_state && typeof scenState.flow_state === 'object') ? scenState.flow_state : null;
+        if (flowState) {
+          setSavedFlowStateForScenario(scenario, flowState);
+        }
+      } catch (e) {}
+
+      try {
+        const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
+        if (projectStateMap && typeof projectStateMap === 'object') {
+          const key = resolvePreferredProjectKey(projectStateMap);
+          const entry = key ? projectStateMap[key] : null;
+          if (entry && typeof entry === 'object' && Array.isArray(entry.scenarios)) {
+            const normScenario = normalizeScenarioKey(scenario);
+            const nextEntry = { ...entry };
+            const scenarios = entry.scenarios.map((s) => (s && typeof s === 'object') ? { ...s } : s);
+            const idx = scenarios.findIndex((s) => normalizeScenarioKey((s && s.name) ? s.name : '') === normScenario);
+            if (idx >= 0 && data.scenario_state && typeof data.scenario_state === 'object') {
+              const existingScenario = (scenarios[idx] && typeof scenarios[idx] === 'object') ? scenarios[idx] : null;
+              const incomingScenario = { ...data.scenario_state };
+              const mergedScenario = {
+                ...(existingScenario || {}),
+                ...incomingScenario,
+              };
+
+              const hasMeaningfulValue = (value) => {
+                if (value === null || value === undefined) return false;
+                if (typeof value === 'string') return value.trim() !== '';
+                if (typeof value === 'number') return Number.isFinite(value);
+                if (typeof value === 'boolean') return value === true;
+                if (Array.isArray(value)) return value.length > 0;
+                if (typeof value === 'object') {
+                  return Object.values(value).some((entry) => hasMeaningfulValue(entry));
+                }
+                return false;
+              };
+
+              const incomingHitlRaw = (incomingScenario.hitl && typeof incomingScenario.hitl === 'object') ? incomingScenario.hitl : null;
+              if (incomingHitlRaw) {
+                const incomingCoreRaw = (incomingHitlRaw.core && typeof incomingHitlRaw.core === 'object') ? incomingHitlRaw.core : null;
+                const incomingProxRaw = (incomingHitlRaw.proxmox && typeof incomingHitlRaw.proxmox === 'object') ? incomingHitlRaw.proxmox : null;
+                const hasCorePayload = !!(incomingCoreRaw && Object.values(incomingCoreRaw).some((entry) => hasMeaningfulValue(entry)));
+                const hasProxPayload = !!(incomingProxRaw && Object.values(incomingProxRaw).some((entry) => hasMeaningfulValue(entry)));
+                const hasInterfacesPayload = Array.isArray(incomingHitlRaw.interfaces) && incomingHitlRaw.interfaces.length > 0;
+                const hasParticipantPayload = typeof incomingHitlRaw.participant_proxmox_url === 'string' && incomingHitlRaw.participant_proxmox_url.trim() !== '';
+                const hasEnabledPayload = typeof incomingHitlRaw.enabled === 'boolean';
+
+                if (!(hasCorePayload || hasProxPayload || hasInterfacesPayload || hasParticipantPayload || hasEnabledPayload)) {
+                  if (existingScenario && existingScenario.hitl && typeof existingScenario.hitl === 'object') {
+                    mergedScenario.hitl = { ...existingScenario.hitl };
+                  }
+                } else {
+                  const existingHitl = (existingScenario && existingScenario.hitl && typeof existingScenario.hitl === 'object') ? existingScenario.hitl : {};
+                  const mergedHitl = { ...existingHitl };
+                  if (hasEnabledPayload) {
+                    mergedHitl.enabled = incomingHitlRaw.enabled === true;
+                  }
+                  if (hasCorePayload && incomingHitlRaw.core && typeof incomingHitlRaw.core === 'object') {
+                    const currentCore = (mergedHitl.core && typeof mergedHitl.core === 'object') ? mergedHitl.core : {};
+                    mergedHitl.core = { ...currentCore, ...incomingHitlRaw.core };
+                  }
+                  if (hasProxPayload && incomingHitlRaw.proxmox && typeof incomingHitlRaw.proxmox === 'object') {
+                    const currentProx = (mergedHitl.proxmox && typeof mergedHitl.proxmox === 'object') ? mergedHitl.proxmox : {};
+                    mergedHitl.proxmox = { ...currentProx, ...incomingHitlRaw.proxmox };
+                  }
+                  if (hasInterfacesPayload && Array.isArray(incomingHitlRaw.interfaces)) {
+                    mergedHitl.interfaces = incomingHitlRaw.interfaces;
+                  }
+                  if (hasParticipantPayload) {
+                    mergedHitl.participant_proxmox_url = incomingHitlRaw.participant_proxmox_url;
+                  }
+                  mergedScenario.hitl = mergedHitl;
+                }
+              } else if (existingScenario && existingScenario.hitl && typeof existingScenario.hitl === 'object') {
+                mergedScenario.hitl = { ...existingScenario.hitl };
+              }
+
+              scenarios[idx] = mergedScenario;
+            }
+            nextEntry.scenarios = scenarios;
+            if (data.core && typeof data.core === 'object') {
+              nextEntry.core = { ...data.core };
+            }
+            nextEntry.updated_at = Date.now();
+            projectStateMap[key] = nextEntry;
+            localStorage.setItem(PROJECT_STATE_STORAGE_KEY, JSON.stringify(projectStateMap));
+          }
+        }
+      } catch (e) {}
+
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
   function pickBestLocalSnapshotByScenarioCount(snapshotMap){
     try {
       if (!snapshotMap || typeof snapshotMap !== 'object') return null;
@@ -650,10 +768,13 @@
     } catch (e) {}
   }
 
-  function ensureScenarioPersistedAndTabsSynced(){
+  async function ensureScenarioPersistedAndTabsSynced(){
     try {
       const scen = resolveScenarioNameFromUrlOrHidden() || getLastSelectedScenario();
       if (scen) setLastSelectedScenario(scen);
+      if (scen) {
+        try { await refreshScenarioStateFromXml(scen, { updateHidden: true }); } catch (e) {}
+      }
       syncScenarioTabLinks(scen);
     } catch (e) {}
   }
@@ -1257,6 +1378,12 @@
       if (xmlPathInput) xmlPathInput.value = xmlPath;
     } catch (e) {}
     try {
+      const scenarioName = resolveScenarioNameForSave();
+      if (scenarioName) {
+        await refreshScenarioStateFromXml(scenarioName, { updateHidden: true });
+      }
+    } catch (e) {}
+    try {
       const dl = document.getElementById('downloadXmlBtn');
       if (dl) {
         dl.disabled = false;
@@ -1335,6 +1462,7 @@
   window.coretgSetSavedFlowStateForScenario = setSavedFlowStateForScenario;
   window.coretgGetLatestXmlPathForScenario = getLatestXmlPathForScenario;
   window.coretgSetLatestXmlPathForScenario = setLatestXmlPathForScenario;
+  window.coretgRefreshScenarioStateFromXml = refreshScenarioStateFromXml;
   window.coretgGetSeedForScenario = getSeedForScenario;
   window.coretgEnsureSeedForScenario = ensureSeedForScenario;
   window.coretgSetSeedForScenario = setSeedForScenario;

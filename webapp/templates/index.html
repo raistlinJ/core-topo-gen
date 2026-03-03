@@ -2296,8 +2296,34 @@
         const targetHitl = ensureHitlStateForScenario(targetScenario);
         const persistedClone = _structuredCloneSafe(persistedScenario);
         if (!persistedClone) return;
+        const sourceHitlRaw = (persistedClone.hitl && typeof persistedClone.hitl === 'object') ? persistedClone.hitl : null;
+        if (!sourceHitlRaw) return;
+
+        const hasMeaningfulValue = (value) => {
+            if (value === undefined || value === null) return false;
+            if (typeof value === 'string') return value.trim() !== '';
+            if (Array.isArray(value)) return value.length > 0;
+            if (typeof value === 'object') {
+                return Object.values(value).some((entry) => hasMeaningfulValue(entry));
+            }
+            if (typeof value === 'boolean') return value === true;
+            return true;
+        };
+
+        const sourceCoreRaw = (sourceHitlRaw.core && typeof sourceHitlRaw.core === 'object') ? sourceHitlRaw.core : null;
+        const sourceProxRaw = (sourceHitlRaw.proxmox && typeof sourceHitlRaw.proxmox === 'object') ? sourceHitlRaw.proxmox : null;
+        const sourceInterfacesRaw = Array.isArray(sourceHitlRaw.interfaces) ? sourceHitlRaw.interfaces : [];
+        const hasCorePayload = !!(sourceCoreRaw && Object.values(sourceCoreRaw).some((entry) => hasMeaningfulValue(entry)));
+        const hasProxPayload = !!(sourceProxRaw && Object.values(sourceProxRaw).some((entry) => hasMeaningfulValue(entry)));
+        const hasInterfacesPayload = sourceInterfacesRaw.length > 0;
+        const hasParticipantPayload = typeof sourceHitlRaw.participant_proxmox_url === 'string' && sourceHitlRaw.participant_proxmox_url.trim() !== '';
+        const hasEnabledPayload = Object.prototype.hasOwnProperty.call(sourceHitlRaw, 'enabled');
+        if (!(hasCorePayload || hasProxPayload || hasInterfacesPayload || hasParticipantPayload || hasEnabledPayload)) {
+            return;
+        }
+
         const sourceHitl = ensureHitlStateForScenario(persistedClone);
-        if (sourceHitl.proxmox && typeof sourceHitl.proxmox === 'object') {
+        if (hasProxPayload && sourceHitl.proxmox && typeof sourceHitl.proxmox === 'object') {
             const targetProx = targetHitl.proxmox || {};
             const mergedProx = { ...targetProx, ...sourceHitl.proxmox };
             const targetInv = targetProx.inventory;
@@ -2309,7 +2335,7 @@
             }
             targetHitl.proxmox = mergedProx;
         }
-        if (sourceHitl.core && typeof sourceHitl.core === 'object') {
+        if (hasCorePayload && sourceHitl.core && typeof sourceHitl.core === 'object') {
             const targetCore = targetHitl.core || {};
             const volatileFields = {
                 interfaces_refresh_inflight: targetCore.interfaces_refresh_inflight,
@@ -2325,7 +2351,7 @@
             });
             targetHitl.core = mergedCore;
         }
-        if (Array.isArray(sourceHitl.interfaces) && sourceHitl.interfaces.length) {
+        if (hasInterfacesPayload && Array.isArray(sourceHitl.interfaces) && sourceHitl.interfaces.length) {
             if (!Array.isArray(targetHitl.interfaces)) {
                 targetHitl.interfaces = [];
             }
@@ -7804,7 +7830,49 @@
         if (persistedState.core_tested_host !== undefined) state.core_tested_host = persistedState.core_tested_host;
         if (persistedState.core_tested_port !== undefined) state.core_tested_port = persistedState.core_tested_port;
     }
+    const findScenarioIndexByName = (name) => {
+        try {
+            const needle = (name || '').toString().trim().toLowerCase();
+            if (!needle || !Array.isArray(state.scenarios)) return -1;
+            return state.scenarios.findIndex((sc) => ((sc && sc.name) ? String(sc.name).trim().toLowerCase() : '') === needle);
+        } catch (e) {
+            return -1;
+        }
+    };
+
+    const resolvePreferredScenarioNameOnLoad = () => {
+        try {
+            const params = new URLSearchParams(window.location.search || '');
+            const q = (params.get('scenario') || '').trim();
+            if (q) return q;
+        } catch (e) { }
+        try {
+            const q = (initialScenarioQuery || '').trim();
+            if (q) return q;
+        } catch (e) { }
+        try {
+            const q = (serverScenarioQuery || '').trim();
+            if (q) return q;
+        } catch (e) { }
+        try {
+            const q = (localStorage.getItem('coretg_last_selected_scenario_v3') || '').trim();
+            if (q) return q;
+        } catch (e) { }
+        try {
+            const q = (state && typeof state.result_path_scenario === 'string') ? state.result_path_scenario.trim() : '';
+            if (q) return q;
+        } catch (e) { }
+        return '';
+    };
+
     let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.length || 1) - 1);
+    try {
+        const preferredScenarioName = resolvePreferredScenarioNameOnLoad();
+        const preferredIdx = findScenarioIndexByName(preferredScenarioName);
+        if (preferredIdx >= 0) {
+            activeIdx = preferredIdx;
+        }
+    } catch (e) { }
     try {
         state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
         window.state = state;

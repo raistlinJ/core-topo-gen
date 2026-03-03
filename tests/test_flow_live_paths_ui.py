@@ -35,7 +35,8 @@ def test_flow_injects_table_shows_resolved_path_column() -> None:
     text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
-        "<th style=\"width: 1%; white-space: nowrap;\">Variable</th><th>Resolved path</th>",
+        "headLabel.textContent = 'Resolved path';",
+        "viewToggle.title = 'Toggle path view (CORE VM or Container)';",
         "const resolvedInjectSources = (fa && fa.resolved_paths && Array.isArray(fa.resolved_paths.inject_sources))",
         "function resolvedPathsForCandidate(srcValue, resolvedValue)",
     ]
@@ -48,7 +49,9 @@ def test_flow_inject_override_editor_shows_resolved_column() -> None:
     text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
-        "h2.textContent = 'Resolved path';",
+        "const h2Label = document.createElement('span');",
+        "h2Label.textContent = 'Resolved path';",
+        "pathViewToggleBtn.title = 'Toggle path view (CORE VM or Container)';",
         "h3.textContent = 'Destination dir';",
         "function refreshPathHints()",
         "const resolvedInjectSources = (fa && fa.resolved_paths && Array.isArray(fa.resolved_paths.inject_sources))",
@@ -63,3 +66,31 @@ def test_flow_page_does_not_auto_generate_on_load() -> None:
 
     forbidden_snippet = "await generate(false, { autoLoad: true, resolveOnGenerate: false });"
     assert forbidden_snippet not in text, "Flow page should not auto-generate on load; Generate button must be explicit"
+
+
+def test_flow_inject_path_view_roundtrips_via_flow_state() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "out.inject_path_view = injectPathView;",
+        "curA.inject_path_view = String(savedA.inject_path_view).trim().toLowerCase();",
+        "fa.inject_path_view = pathView;",
+        "persistFlowStateAndXmlBestEffort();",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing inject path view XML/state round-trip snippets: " + "; ".join(missing)
+
+
+def test_flow_restore_prefers_xml_authoritative_state() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const xmlAuthoritative = hasAuthoritativeXmlPath(scenarioName);",
+        "if (xmlAuthoritative) {",
+        "if (serverUsable) return fromServer;",
+        "return null;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing XML-authoritative flow restore snippets: " + "; ".join(missing)
