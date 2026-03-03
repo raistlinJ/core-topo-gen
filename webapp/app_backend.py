@@ -1165,6 +1165,221 @@ def _exec_ssh_command(
     return exit_code, stdout_text, stderr_text
 
 
+def _exec_ssh_sudo_command(
+    client: Any,
+    command: str,
+    *,
+    password: str | None = None,
+    timeout: float | None = 120.0,
+) -> tuple[int, str, str]:
+    """Execute a command over SSH via sudo and capture stdout/stderr."""
+    sudo_cmd = (
+        f"sudo -S -p '' -k bash -lc {shlex.quote(command)}"
+        if str(password or '').strip()
+        else f"sudo -n bash -lc {shlex.quote(command)}"
+    )
+
+    stdin, stdout, stderr = client.exec_command(sudo_cmd, get_pty=True)
+    channel = getattr(stdout, 'channel', None)
+    start = time.time()
+
+    try:
+        if str(password or '').strip():
+            try:
+                stdin.write(str(password) + '\n')
+                stdin.flush()
+            except Exception:
+                pass
+
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        while True:
+            if channel is None:
+                break
+            try:
+                if channel.recv_ready():
+                    stdout_chunks.append(channel.recv(REMOTE_LOG_CHUNK_SIZE))
+                if channel.recv_stderr_ready():
+                    stderr_chunks.append(channel.recv_stderr(REMOTE_LOG_CHUNK_SIZE))
+            except Exception:
+                pass
+            try:
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    break
+            except Exception:
+                break
+            if timeout is not None and (time.time() - start) >= max(0.1, float(timeout)):
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+                raise TimeoutError(f'SSH sudo command timed out after {timeout:.0f}s')
+            time.sleep(0.15)
+
+        exit_code = 0
+        try:
+            if channel is not None:
+                exit_code = int(channel.recv_exit_status())
+        except Exception:
+            exit_code = 0
+
+        def _decode(blob: Any) -> str:
+            if isinstance(blob, bytes):
+                return blob.decode('utf-8', 'ignore')
+            return str(blob or '')
+
+        return exit_code, _decode(b''.join(stdout_chunks)), _decode(b''.join(stderr_chunks))
+    finally:
+        try:
+            stdin.close()
+        except Exception:
+            pass
+
+
+def _cleanup_remote_test_runtime(meta: dict[str, Any]) -> None:
+    """Best-effort cleanup of remote docker resources created by test runs."""
+    if not isinstance(meta, dict):
+        return
+    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+    if not isinstance(core_cfg, dict):
+        return
+
+    log_path = str(meta.get('log_path') or '').strip()
+
+    def _log(msg: str) -> None:
+        try:
+            if log_path:
+                with open(log_path, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"[cleanup] {msg}\n")
+        except Exception:
+            pass
+
+    client = None
+    try:
+        client = _open_ssh_client(core_cfg)
+        pw = str(core_cfg.get('ssh_password') or '')
+
+        project_name = str(meta.get('project_name') or '').strip()
+        compose_path = str(meta.get('remote_compose_path') or '').strip()
+        if project_name and compose_path:
+            down_cmd = (
+                f"if [ -f {shlex.quote(compose_path)} ]; then "
+                f"COMPOSE_PROJECT_NAME={shlex.quote(project_name)} docker compose -f {shlex.quote(compose_path)} "
+                f"down -v --remove-orphans --rmi all || true; fi"
+            )
+            rc, out, err = _exec_ssh_sudo_command(client, down_cmd, password=pw, timeout=120.0)
+            _log(
+                f"docker compose down (project={project_name}) rc={rc} "
+                f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+            )
+
+        node_id = str(meta.get('test_docker_node_id') or '').strip()
+        node_name = str(meta.get('test_docker_node_name') or '').strip()
+        node_candidates: list[str] = []
+        for candidate in (node_name, node_id):
+            if not candidate:
+                continue
+            if candidate not in node_candidates:
+                node_candidates.append(candidate)
+        if node_id and node_id.isdigit():
+            docker_name = f"docker-{node_id}"
+            if docker_name not in node_candidates:
+                node_candidates.append(docker_name)
+
+        for node_token in node_candidates:
+            node_compose = f"/tmp/vulns/docker-compose-{node_token}.yml"
+            node_project = f"{node_token}conf"
+            down_node_cmd = (
+                f"if [ -f {shlex.quote(node_compose)} ]; then "
+                f"COMPOSE_PROJECT_NAME={shlex.quote(node_project)} docker compose -f {shlex.quote(node_compose)} "
+                f"down -v --remove-orphans --rmi all || true; fi"
+            )
+            rc, out, err = _exec_ssh_sudo_command(client, down_node_cmd, password=pw, timeout=120.0)
+            _log(
+                f"docker compose down (node={node_token}) rc={rc} "
+                f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+            )
+
+            rm_node_cmd = f"docker rm -f {shlex.quote(node_token)} >/dev/null 2>&1 || true"
+            rc, out, err = _exec_ssh_sudo_command(client, rm_node_cmd, password=pw, timeout=60.0)
+            _log(
+                f"docker rm container (name={node_token}) rc={rc} "
+                f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+            )
+
+        scenario_tag = str(meta.get('test_scenario_tag') or meta.get('scenario_tag') or '').strip()
+        if scenario_tag:
+            rm_images_cmd = (
+                f"docker images --format '{{{{.Repository}}}}:{{{{.Tag}}}}' "
+                f"| grep -F {shlex.quote(scenario_tag)} "
+                f"| xargs -r docker rmi -f >/dev/null 2>&1 || true"
+            )
+            rc, out, err = _exec_ssh_sudo_command(client, rm_images_cmd, password=pw, timeout=120.0)
+            _log(
+                f"docker rmi scenario-tag={scenario_tag} rc={rc} "
+                f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+            )
+
+        # Ensure lingering CORE session state is cleaned up as part of test teardown.
+        core_cleanup_cmd = "(command -v core-cleanup >/dev/null 2>&1 && core-cleanup) || (/usr/sbin/core-cleanup || true)"
+        rc, out, err = _exec_ssh_sudo_command(client, core_cleanup_cmd, password=pw, timeout=120.0)
+        _log(
+            f"core-cleanup rc={rc} "
+            f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+        )
+
+        # Explicitly stop/delete active CORE sessions (core-cleanup alone may not clear all states).
+        try:
+            active_sessions = _list_active_core_sessions(
+                str(core_cfg.get('host') or CORE_HOST),
+                int(core_cfg.get('port') or CORE_PORT),
+                core_cfg,
+                errors=[],
+                meta={},
+            )
+        except Exception as exc:
+            active_sessions = []
+            _log(f"list active sessions failed: {exc}")
+
+        session_ids: list[int] = []
+        seen_ids: set[int] = set()
+        for sess in active_sessions:
+            try:
+                state_raw = str((sess or {}).get('state') or '').strip().lower()
+                if state_raw == 'shutdown':
+                    continue
+                sid = int(str((sess or {}).get('id') or '').strip())
+            except Exception:
+                continue
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+            session_ids.append(sid)
+
+        for sid in session_ids:
+            try:
+                _execute_remote_core_session_action(core_cfg, 'delete', sid, logger=app.logger, meta={})
+                _log(f"core session delete sid={sid} rc=0")
+            except Exception as exc:
+                _log(f"core session delete sid={sid} failed: {exc}")
+
+        if session_ids:
+            restart_cmd = "systemctl restart core-daemon || service core-daemon restart || true"
+            rc, out, err = _exec_ssh_sudo_command(client, restart_cmd, password=pw, timeout=60.0)
+            _log(
+                f"core-daemon restart after session delete rc={rc} "
+                f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+            )
+    except Exception as exc:
+        _log(f"remote runtime cleanup failed: {exc}")
+    finally:
+        try:
+            if client is not None:
+                client.close()
+        except Exception:
+            pass
+
+
 def _is_repo_push_cancel_requested(progress_id: Optional[str]) -> bool:
     if not progress_id:
         return False
@@ -4395,7 +4610,52 @@ def _prepare_remote_cli_context(
         for subdir in ('reports', 'outputs', 'uploads'):
             _remote_mkdirs(client, _remote_path_join(repo_dir, subdir))
         remote_xml_path = _remote_path_join(run_dir, os.path.basename(xml_path))
-        sftp.put(xml_path, remote_xml_path)
+        xml_upload_path = xml_path
+        temp_xml_upload_path: str | None = None
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            rewrites = 0
+            uploaded_paths: set[str] = set()
+            for item_el in root.findall('.//item'):
+                try:
+                    v_path_raw = str(item_el.get('v_path') or '').strip()
+                except Exception:
+                    v_path_raw = ''
+                if not v_path_raw:
+                    continue
+                local_compose_path = os.path.abspath(v_path_raw)
+                if not os.path.isfile(local_compose_path):
+                    continue
+                remote_compose_path = _remote_path_join(run_dir, os.path.basename(local_compose_path))
+                if local_compose_path not in uploaded_paths:
+                    sftp.put(local_compose_path, remote_compose_path)
+                    uploaded_paths.add(local_compose_path)
+                item_el.set('v_path', remote_compose_path)
+                rewrites += 1
+            if rewrites > 0:
+                import tempfile as _tempfile
+
+                fd, tmp_path = _tempfile.mkstemp(prefix='coretg-remote-xml-', suffix='.xml')
+                os.close(fd)
+                tree.write(tmp_path, encoding='utf-8', xml_declaration=True)
+                temp_xml_upload_path = tmp_path
+                xml_upload_path = temp_xml_upload_path
+                try:
+                    log_handle.write(
+                        f"[remote] uploaded/relinked {rewrites} vulnerability compose path(s) into run dir\n"
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            xml_upload_path = xml_path
+
+        sftp.put(xml_upload_path, remote_xml_path)
+        try:
+            if temp_xml_upload_path and os.path.exists(temp_xml_upload_path):
+                os.remove(temp_xml_upload_path)
+        except Exception:
+            pass
         remote_preview_plan = None
         if preview_plan_path:
             remote_preview_plan = _remote_path_join(run_dir, os.path.basename(preview_plan_path))
@@ -39903,6 +40163,9 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
         return
     if meta.get('flow_artifacts_copied'):
         return
+    if _coerce_bool(meta.get('skip_flow_artifact_container_copy')):
+        meta['flow_artifacts_copied'] = True
+        return
     cfg = meta.get('core_cfg')
     if not isinstance(cfg, dict):
         return
@@ -40107,8 +40370,21 @@ def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, s
                             f"tcp={tcp_rows} tcp6={tcp6_rows} udp={udp_rows} udp6={udp6_rows}",
                         )
                         out3 = lit.get('output') or ''
+                        missing_ss = False
                         for line in str(out3).splitlines()[:80]:
                             _append_async_run_log_line(meta, f"{log_prefix}{line}")
+                            try:
+                                ll = str(line or '').strip().lower()
+                                if 'ss:' in ll and 'not found' in ll:
+                                    missing_ss = True
+                            except Exception:
+                                pass
+                        if missing_ss:
+                            _append_async_run_log_line(
+                                meta,
+                                f"{log_prefix}WARNING: 'ss' command is not available inside this container. "
+                                "This is not fatal; listener snapshot falls back to /proc/net (tcp/tcp6/udp/udp6) counts for diagnostics.",
+                            )
         except Exception as exc_verify:
             _append_async_run_log_line(meta, f"{log_prefix}docker.exec.verify_flow_artifacts({stage}) failed: {exc_verify}")
         meta['flow_artifacts_copied'] = True
@@ -40465,13 +40741,40 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     scenarios_inline = job_spec.get('scenarios_inline')
     flow_enabled = job_spec.get('flow_enabled')
     scenario_for_plan = job_spec.get('scenario_for_plan')
+    test_docker_node_id = str(job_spec.get('test_docker_node_id') or '').strip()
+    test_docker_node_name = str(job_spec.get('test_docker_node_name') or '').strip()
+    test_scenario_tag = str(job_spec.get('test_scenario_tag') or '').strip()
+    skip_flow_artifact_container_copy = _coerce_bool(job_spec.get('skip_flow_artifact_container_copy'))
     
     out_dir = os.path.dirname(xml_path) if xml_path else _outputs_dir()
-    log_path = os.path.join(out_dir, f'cli-{run_id}.log')
+    default_log_path = os.path.join(out_dir, f'cli-{run_id}.log')
+    meta_for_log = RUNS.get(run_id_local)
+    existing_log_path = meta_for_log.get('log_path') if isinstance(meta_for_log, dict) else None
+    if isinstance(existing_log_path, str) and existing_log_path.strip():
+        log_path = existing_log_path.strip()
+        open_mode = 'a'
+    else:
+        log_path = default_log_path
+        open_mode = 'w'
+
     try:
-        log_f = open(log_path, 'w', encoding='utf-8', buffering=1)
+        log_f = open(log_path, open_mode, encoding='utf-8', buffering=1)
     except Exception:
-        log_f = open(log_path, 'w', encoding='utf-8')
+        log_f = open(log_path, open_mode, encoding='utf-8')
+
+    try:
+        if isinstance(meta_for_log, dict):
+            meta_for_log['log_path'] = log_path
+            if test_docker_node_id:
+                meta_for_log['test_docker_node_id'] = test_docker_node_id
+            if test_docker_node_name:
+                meta_for_log['test_docker_node_name'] = test_docker_node_name
+            if test_scenario_tag:
+                meta_for_log['test_scenario_tag'] = test_scenario_tag
+            if skip_flow_artifact_container_copy:
+                meta_for_log['skip_flow_artifact_container_copy'] = True
+    except Exception:
+        pass
     
     try:
         app.logger.debug("[async] Opened CLI log (line-buffered) at %s", log_path)
@@ -41528,6 +41831,12 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
             scenario_tag = _safe_name(candidate)
         except Exception:
             pass
+        try:
+            meta_tag = RUNS.get(run_id_local)
+            if isinstance(meta_tag, dict):
+                meta_tag['scenario_tag'] = scenario_tag
+        except Exception:
+            pass
 
         remote_command = (
             f"{activate_prefix}cd {shlex.quote(work_dir)} && "
@@ -41583,7 +41892,6 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         
         RUNS[run_id_local]['status'] = final_status
         RUNS[run_id_local]['returncode'] = exit_code
-        RUNS[run_id_local]['done'] = True
 
         # IMPORTANT: perform postrun Flow artifact copy immediately on completion.
         # Relying on /run_status polling is fragile (RUNS is in-memory and can be lost
@@ -41596,6 +41904,8 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                 log_f.write(f"{log_prefix}docker.copy_flow_artifacts(postrun) failed: {exc}\n")
             except Exception:
                 pass
+
+        RUNS[run_id_local]['done'] = True
         
         # Do not append run history here. Canonical history persistence happens in
         # run_status once report/summary/session artifacts and validation are resolved.
@@ -42248,7 +42558,6 @@ def run_status(run_id: str):
         polled = proc.poll()
         if polled is not None:
             rc = polled
-            meta['done'] = True
             meta['returncode'] = rc
             try:
                 _maybe_copy_flow_artifacts_into_containers(meta, stage='postrun')
@@ -42258,6 +42567,7 @@ def run_status(run_id: str):
                 _sync_remote_artifacts(meta)
             except Exception:
                 pass
+            meta['done'] = True
     # Append history once (success or failure) after run completion.
     # This must run for both local subprocess-based runs and remote background runs.
     if meta.get('done') and rc is not None and not meta.get('history_added'):
@@ -45904,6 +46214,10 @@ def flag_generators_test_cleanup(run_id: str):
     try:
         if isinstance(meta, dict):
             meta['cleanup_requested'] = True
+            try:
+                _cleanup_remote_test_runtime(meta)
+            except Exception:
+                pass
             if meta.get('remote'):
                 try:
                     channel = meta.get('ssh_channel')
@@ -48520,13 +48834,29 @@ def vuln_catalog_items_test_start():
             or target.get('Title')
             or f'vuln-{item_id}'
         )
+        prepared_compose_path = compose_path
+        try:
+            from core_topo_gen.utils.vuln_process import prepare_compose_for_assignments
+            node_name = f"vuln-test-{item_id}"
+            rec = {
+                'Name': item_name,
+                'Path': compose_path,
+                'Type': 'docker-compose',
+                'ScenarioTag': f"vuln-test-{item_id}",
+            }
+            created = prepare_compose_for_assignments({node_name: rec}, out_base=run_dir)
+            if created:
+                prepared_compose_path = created[0]
+        except Exception:
+            prepared_compose_path = compose_path
+
         job_spec, build_err = _vuln_test_build_ephemeral_execute_job(
             run_dir=run_dir,
             run_id=run_id,
             core_cfg=core_cfg,
             item_id=item_id,
             item_name=item_name,
-            compose_path=compose_path,
+            compose_path=prepared_compose_path,
         )
         if not isinstance(job_spec, dict):
             return jsonify({'ok': False, 'error': str(build_err or 'failed to prepare execute-like-real vulnerability test')}), 500
@@ -48559,6 +48889,10 @@ def vuln_catalog_items_test_start():
             'cleanup_generated_artifacts': bool(cleanup_generated_artifacts),
             'execute_like_real': True,
             'compose_path_raw': compose_path,
+            'compose_path_prepared': prepared_compose_path,
+            'test_docker_node_id': str(job_spec.get('test_docker_node_id') or '').strip(),
+            'test_docker_node_name': str(job_spec.get('test_docker_node_name') or '').strip(),
+            'test_scenario_tag': str(job_spec.get('test_scenario_tag') or '').strip(),
         }
 
         try:
@@ -49415,6 +49749,10 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
                             _relay_remote_channel_to_log(channel, log_f, redact_tokens=[pw])
                     except Exception:
                         pass
+        except Exception:
+            pass
+        try:
+            _cleanup_remote_test_runtime(meta)
         except Exception:
             pass
         if cleanup_generated_artifacts:
@@ -51120,13 +51458,7 @@ def _flaggen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: str) -
     <ScenarioEditor>
       <section name='Node Information'>
         <item selected='Docker' v_metric='Count' v_count='1'/>
-        <item selected='Router' v_metric='Count' v_count='1'/>
       </section>
-      <section name='Routing' density='0.0'></section>
-      <section name='Services' density='0.0'></section>
-      <section name='Vulnerabilities' density='0.0'></section>
-      <section name='Segmentation' density='0.0'></section>
-      <section name='Traffic' density='0.0'></section>
     </ScenarioEditor>
   </Scenario>
 </Scenarios>"""
@@ -51151,6 +51483,9 @@ def _flaggen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: str) -
     docker_node_id = str((docker_nodes[0] or {}).get('node_id') or '').strip()
     if not docker_node_id:
         return None, 'ephemeral docker node id missing'
+    docker_node_name = str((docker_nodes[0] or {}).get('name') or '').strip()
+    if not docker_node_name and docker_node_id.isdigit():
+        docker_node_name = f"docker-{docker_node_id}"
 
     resolved_outputs = dict(outputs)
     flag_value = str(
@@ -51228,6 +51563,10 @@ def _flaggen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: str) -
         'scenarios_inline': None,
         'flow_enabled': True,
         'scenario_for_plan': scenario_name,
+        'test_docker_node_id': docker_node_id,
+        'test_docker_node_name': docker_node_name,
+        'test_scenario_tag': scenario_name,
+        'skip_flow_artifact_container_copy': True,
     }
     return job_spec, None
 
@@ -51243,6 +51582,9 @@ def _flaggen_run_ephemeral_execute(run_id_local: str) -> None:
         meta['status'] = 'failed'
         meta['error'] = str(err or 'failed to prepare ephemeral execute run')
         return
+    meta['test_docker_node_id'] = str(job_spec.get('test_docker_node_id') or '').strip()
+    meta['test_docker_node_name'] = str(job_spec.get('test_docker_node_name') or '').strip()
+    meta['test_scenario_tag'] = str(job_spec.get('test_scenario_tag') or '').strip()
     meta['done'] = False
     meta['returncode'] = None
     meta['status'] = 'executing'
@@ -51275,13 +51617,7 @@ def _flagnodegen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: st
     <ScenarioEditor>
       <section name='Node Information'>
         <item selected='Docker' v_metric='Count' v_count='1'/>
-        <item selected='Router' v_metric='Count' v_count='1'/>
       </section>
-      <section name='Routing' density='0.0'></section>
-      <section name='Services' density='0.0'></section>
-      <section name='Vulnerabilities' density='0.0'></section>
-      <section name='Segmentation' density='0.0'></section>
-      <section name='Traffic' density='0.0'></section>
     </ScenarioEditor>
   </Scenario>
 </Scenarios>"""
@@ -51306,6 +51642,9 @@ def _flagnodegen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: st
     docker_node_id = str((docker_nodes[0] or {}).get('node_id') or '').strip()
     if not docker_node_id:
         return None, 'ephemeral docker node id missing'
+    docker_node_name = str((docker_nodes[0] or {}).get('name') or '').strip()
+    if not docker_node_name and docker_node_id.isdigit():
+        docker_node_name = f"docker-{docker_node_id}"
 
     resolved_outputs = dict(outputs)
     flag_value = str(
@@ -51383,6 +51722,10 @@ def _flagnodegen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: st
         'scenarios_inline': None,
         'flow_enabled': True,
         'scenario_for_plan': scenario_name,
+        'test_docker_node_id': docker_node_id,
+        'test_docker_node_name': docker_node_name,
+        'test_scenario_tag': scenario_name,
+        'skip_flow_artifact_container_copy': True,
     }
     return job_spec, None
 
@@ -51398,6 +51741,9 @@ def _flagnodegen_run_ephemeral_execute(run_id_local: str) -> None:
         meta['status'] = 'failed'
         meta['error'] = str(err or 'failed to prepare ephemeral execute run')
         return
+    meta['test_docker_node_id'] = str(job_spec.get('test_docker_node_id') or '').strip()
+    meta['test_docker_node_name'] = str(job_spec.get('test_docker_node_name') or '').strip()
+    meta['test_scenario_tag'] = str(job_spec.get('test_scenario_tag') or '').strip()
     meta['done'] = False
     meta['returncode'] = None
     meta['status'] = 'executing'
@@ -51451,13 +51797,9 @@ def _vuln_test_build_ephemeral_execute_job(
       <section name='Node Information'>
         <item selected='Docker' v_metric='Count' v_count='1'/>
       </section>
-      <section name='Routing' density='0.0'></section>
-      <section name='Services' density='0.0'></section>
       <section name='Vulnerabilities' density='0.0'>
         <item selected='Specific' v_metric='Count' v_count='1' v_name='{item_name_xml}' v_path='{compose_xml}'/>
       </section>
-      <section name='Segmentation' density='0.0'></section>
-      <section name='Traffic' density='0.0'></section>
     </ScenarioEditor>
   </Scenario>
 </Scenarios>"""
@@ -51471,6 +51813,27 @@ def _vuln_test_build_ephemeral_execute_job(
         _planner_persist_flow_plan(xml_path=xml_path, scenario=scenario_name, seed=None, persist_plan_file=False)
     except Exception as exc:
         return None, f'failed to build vuln test preview plan: {exc}'
+
+    docker_node_id = ''
+    docker_node_name = ''
+    try:
+        payload = _load_preview_payload_from_path(xml_path, scenario_name)
+        full_preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        hosts = full_preview.get('hosts') if isinstance(full_preview, dict) and isinstance(full_preview.get('hosts'), list) else []
+        for host in hosts:
+            if not isinstance(host, dict):
+                continue
+            role = str(host.get('role') or '').strip().lower()
+            node_id = str(host.get('node_id') or '').strip()
+            if role == 'docker' and node_id:
+                docker_node_id = node_id
+                docker_node_name = str(host.get('name') or '').strip()
+                break
+    except Exception:
+        docker_node_id = ''
+        docker_node_name = ''
+    if not docker_node_name and docker_node_id.isdigit():
+        docker_node_name = f"docker-{docker_node_id}"
 
     if not isinstance(core_cfg, dict):
         return None, 'missing core config for vuln test execute'
@@ -51498,6 +51861,10 @@ def _vuln_test_build_ephemeral_execute_job(
         'scenarios_inline': None,
         'flow_enabled': False,
         'scenario_for_plan': scenario_name,
+        'test_docker_node_id': docker_node_id,
+        'test_docker_node_name': docker_node_name,
+        'test_scenario_tag': scenario_name,
+        'skip_flow_artifact_container_copy': True,
     }
     return job_spec, None
 
@@ -52362,6 +52729,10 @@ def flag_node_generators_test_cleanup(run_id: str):
     try:
         if isinstance(meta, dict):
             meta['cleanup_requested'] = True
+            try:
+                _cleanup_remote_test_runtime(meta)
+            except Exception:
+                pass
             if meta.get('remote'):
                 try:
                     channel = meta.get('ssh_channel')
@@ -53832,12 +54203,88 @@ if __name__ == '__main__':
 
 def _remote_docker_exec_listener_snapshot_script(*, containers: List[str], sudo_password: str | None = None) -> str:
     containers_literal = json.dumps([str(value) for value in (containers or [])])
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
     return (
-        """CONTAINERS=__CONTAINERS_LITERAL__
-/proc/net/tcp
-/proc/net/tcp6
-/proc/net/udp
-/proc/net/udp6
-ss -lntu
+        r"""
+import json, re, subprocess
+
+CONTAINERS = __CONTAINERS_LITERAL__
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run(cmd, timeout=25):
+    try:
+        p = subprocess.run(['sudo', '-n'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', ''] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 127, stdout=str(e))
+
+
+def _parse_counts(output: str):
+    text = str(output or '')
+    vals = {'tcp_rows': 0, 'tcp6_rows': 0, 'udp_rows': 0, 'udp6_rows': 0}
+    for key, field in (
+        ('tcp', 'tcp_rows'),
+        ('tcp6', 'tcp6_rows'),
+        ('udp', 'udp_rows'),
+        ('udp6', 'udp6_rows'),
+    ):
+        m = re.search(rf'__COUNT__\s+{key}=(\d+)', text)
+        if m:
+            try:
+                vals[field] = int(m.group(1))
+            except Exception:
+                vals[field] = 0
+    return vals
+
+
+def main():
+    items = []
+    shell = (
+        "set +e; "
+        "for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do "
+        "  b=$(basename \"$f\"); "
+        "  if [ -r \"$f\" ]; then "
+        "    n=$(wc -l < \"$f\" 2>/dev/null || echo 0); "
+        "    n=$((n>0 ? n-1 : 0)); "
+        "  else "
+        "    n=0; "
+        "  fi; "
+        "  echo __COUNT__ ${b}=${n}; "
+        "done; "
+        "echo '--- ss -lntu ---'; "
+        "ss -lntu 2>&1 || true"
+    )
+    for c in CONTAINERS:
+        c = str(c or '').strip()
+        if not c:
+            continue
+        p = _run(['docker', 'exec', c, 'sh', '-c', shell], timeout=30)
+        out = p.stdout or ''
+        counts = _parse_counts(out)
+        items.append({
+            'container': c,
+            'ok': p.returncode == 0,
+            'rc': int(p.returncode),
+            'output': out,
+            **counts,
+        })
+    print(json.dumps({'ok': True, 'items': items}))
+
+
+if __name__ == '__main__':
+    main()
 """
-    ).replace("__CONTAINERS_LITERAL__", containers_literal)
+    ).replace('__CONTAINERS_LITERAL__', containers_literal) \
+     .replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)

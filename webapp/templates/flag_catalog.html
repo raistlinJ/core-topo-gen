@@ -213,7 +213,9 @@
 
         <form id="genTestForm">
           <input type="hidden" name="generator_id" id="genTestGeneratorId" />
-          <div id="genTestInputs"></div>
+          <div id="genTestInputsBlock">
+            <div id="genTestInputs"></div>
+          </div>
         </form>
 
         <div class="mt-3">
@@ -354,6 +356,8 @@
     runActive: false,
     streamEndedAt: null,
     completionLogged: false,
+    stageLabel: '',
+    lastStageLabel: '',
   };
 
   let pendingCleanupRunId = null;
@@ -448,6 +452,79 @@
     t.textContent = text || 'Working…';
   }
 
+  function setGenTestInputsEnabled(enabled) {
+    const form = document.getElementById('genTestForm');
+    if (!form) return;
+    const on = !!enabled;
+    const fields = form.querySelectorAll('input, select, textarea, button');
+    fields.forEach((el) => {
+      try {
+        if (el && String(el.id || '') === 'genTestGeneratorId') return;
+        el.disabled = !on;
+      } catch (e) {}
+    });
+  }
+
+  function setGenTestInputsCollapsed(collapsed) {
+    const block = document.getElementById('genTestInputsBlock');
+    if (!block) return;
+    block.hidden = !!collapsed;
+  }
+
+  function setGenTestStage(label) {
+    const txt = String(label || '').trim();
+    genTestState.stageLabel = txt;
+    if (txt) {
+      setOutputsStatus(true, txt);
+    }
+  }
+
+  function applyGenTestStage(label, source) {
+    const txt = String(label || '').trim();
+    if (!txt) return;
+    setGenTestStage(txt);
+    if (genTestState.lastStageLabel !== txt) {
+      genTestState.lastStageLabel = txt;
+      const src = String(source || '').trim();
+      setTestLogLine(`[stage${src ? ':' + src : ''}] ${txt}`);
+    }
+  }
+
+  function _stageFromPhasePayload(payload) {
+    const p = (payload && payload.phase) ? String(payload.phase).toLowerCase() : '';
+    const st = (payload && payload.stage) ? String(payload.stage).toLowerCase() : '';
+    const kind = (payload && payload.kind) ? String(payload.kind).toLowerCase() : '';
+    if (st.includes('upload') || st.includes('sync') || st.includes('packaging') || st.includes('hash')) return 'Uploading files to CORE VM…';
+    if (st.includes('sanitize') || st.includes('template') || st.includes('render')) return 'Modifying docker-compose/image metadata…';
+    if (st.includes('ssh.tunnel') || st.includes('tunnel')) return 'Connecting to CORE VM…';
+    if (st.includes('core.session') || st.includes('core') || st.includes('scenario') || st.includes('build') || st.includes('topology')) return 'Creating CORE scenario…';
+    if (st.includes('docker') || st.includes('image') || st.includes('build')) return 'Creating image…';
+    if (kind === 'error' || st.includes('error') || st.includes('fail')) return 'Error while running test.';
+    if (!p) return '';
+    if (p === 'starting') return 'Starting generator…';
+    if (p === 'generator_done') return 'Generator done. Creating CORE scenario…';
+    if (p === 'executing') return 'Creating CORE scenario…';
+    if (p === 'done') return 'Run complete. Finalizing outputs…';
+    if (p === 'error' || p === 'failed') return 'Error while running test.';
+    if (p === 'cleanup_start') return 'Cleaning up run artifacts…';
+    if (p === 'cleanup_done') return 'Cleanup complete.';
+    return '';
+  }
+
+  function _stageFromLogLine(line) {
+    const s = String(line || '');
+    const l = s.toLowerCase();
+    if (!l) return '';
+    if (l.includes('[upload]') || l.includes('uploading to core vm') || l.includes('repo upload:')) return 'Uploading files to CORE VM…';
+    if (l.includes('compose sanitize') || l.includes('sanitiz')) return 'Modifying docker-compose/image metadata…';
+    if (l.includes('docker build') || l.includes('building ') || l.includes('wrapper build')) return 'Creating image…';
+    if (l.includes('docker compose pull') || l.includes('pulling')) return 'Pulling images…';
+    if (l.includes('core session') || l.includes('creating session') || l.includes('topology built') || l.includes('phase: building topology') || l.includes('creating core scenario')) return 'Creating CORE scenario…';
+    if (l.includes('applying flow') || l.includes('flag sequencing') || l.includes('inject')) return 'Applying Flow artifacts…';
+    if (l.includes('[async error]') || l.includes('traceback') || l.includes('exception') || l.includes('error:')) return 'Error while running test.';
+    return '';
+  }
+
   function stopOutputsPolling() {
     if (genTestState.outputsPollTimer) {
       try { clearInterval(genTestState.outputsPollTimer); } catch (e) {}
@@ -470,6 +547,10 @@
     genTestState.runActive = false;
     genTestState.streamEndedAt = null;
     genTestState.completionLogged = false;
+    genTestState.stageLabel = '';
+    genTestState.lastStageLabel = '';
+    setGenTestInputsEnabled(true);
+    setGenTestInputsCollapsed(false);
     clearTestLog();
     setOutputsHtml('<div class="text-muted">Waiting… press Run button.</div>');
     setOutputsStatus(false);
@@ -619,6 +700,7 @@
       genTestState.runActive = false;
       const btn = document.getElementById('genTestRunBtn');
       if (btn) btn.disabled = false;
+      setGenTestInputsCollapsed(false);
       return;
     }
     if (data.ok === false) {
@@ -629,6 +711,7 @@
       genTestState.runActive = false;
       const btn = document.getElementById('genTestRunBtn');
       if (btn) btn.disabled = false;
+      setGenTestInputsCollapsed(false);
       return;
     }
 
@@ -652,13 +735,19 @@
     const streamGraceSatisfied = !genTestState.streamEndedAt || ((Date.now() - genTestState.streamEndedAt) >= finalizeGraceMs);
 
     if (!data.done) {
-      setOutputsStatus(true, `Generating outputs… (${fileCount} file${fileCount === 1 ? '' : 's'} so far)`);
+      const stage = (genTestState && genTestState.stageLabel) ? String(genTestState.stageLabel) : '';
+      if (!stage) {
+        setOutputsStatus(true, `Generating outputs… (${fileCount} file${fileCount === 1 ? '' : 's'} so far)`);
+      }
     } else if (data.done && (!streamGraceSatisfied || genTestState.outputsStablePolls < stableTarget)) {
-      const stableNow = Math.min(stableTarget, (genTestState.outputsStablePolls || 0) + 1);
-      setOutputsStatus(
-        true,
-        `Finalizing file list… (${fileCount} file${fileCount === 1 ? '' : 's'}, stable ${stableNow}/${stableTarget})`
-      );
+      const stage = (genTestState && genTestState.stageLabel) ? String(genTestState.stageLabel) : '';
+      if (!stage) {
+        const stableNow = Math.min(stableTarget, (genTestState.outputsStablePolls || 0) + 1);
+        setOutputsStatus(
+          true,
+          `Finalizing file list… (${fileCount} file${fileCount === 1 ? '' : 's'}, stable ${stableNow}/${stableTarget})`
+        );
+      }
     } else {
       setOutputsStatus(false);
     }
@@ -671,6 +760,8 @@
     if (data.done && streamGraceSatisfied && genTestState.outputsStablePolls >= stableTarget) {
       stopOutputsPolling();
       genTestState.runActive = false;
+      setGenTestInputsEnabled(true);
+      setGenTestInputsCollapsed(false);
       if (!genTestState.completionLogged) {
         setTestLogLine(`Completed. Final files ready (${fileCount}).`);
         genTestState.completionLogged = true;
@@ -1274,6 +1365,7 @@
     const inputs = Array.isArray(generator.inputs) ? generator.inputs : [];
     const inputsHtml = inputs.map(buildInputRow).join('') || '<div class="text-muted small">No inputs</div>';
     document.getElementById('genTestInputs').innerHTML = inputsHtml;
+    setGenTestInputsCollapsed(false);
 
     clearTestLog();
     setOutputsHtml('<div class="text-muted">Waiting… press Run button.</div>');
@@ -1412,14 +1504,24 @@
 
   async function runCurrentGenTest() {
     const btn = document.getElementById('genTestRunBtn');
+    const form = document.getElementById('genTestForm');
+    const fd = new FormData(form);
+    if (genTestState.testCoreCfg && typeof genTestState.testCoreCfg === 'object') {
+      fd.append('core', JSON.stringify(genTestState.testCoreCfg));
+    }
+
     btn.disabled = true;
     clearTestLog();
     setOutputsHtml('<div class="text-muted">Waiting for outputs…</div>');
     stopOutputsPolling();
-    setOutputsStatus(true, 'Starting generator…');
+    setGenTestStage('Starting generator…');
     genTestState.runActive = false;
     genTestState.streamEndedAt = null;
     genTestState.completionLogged = false;
+    genTestState.stageLabel = 'Starting generator…';
+    genTestState.lastStageLabel = '';
+    setGenTestInputsEnabled(false);
+    setGenTestInputsCollapsed(true);
 
     setTestLogLine('[ui] preparing request…');
 
@@ -1428,21 +1530,20 @@
       if (!canProceed) {
         setTestLogLine('[ui] Run cancelled.');
         setOutputsStatus(false);
+        setGenTestInputsEnabled(true);
+        setGenTestInputsCollapsed(false);
         btn.disabled = false;
         return;
       }
     } catch (e) {
       setTestLogLine(`ERROR: ${String(e)}`);
       setOutputsStatus(false);
+      setGenTestInputsEnabled(true);
+      setGenTestInputsCollapsed(false);
       btn.disabled = false;
       return;
     }
 
-    const form = document.getElementById('genTestForm');
-    const fd = new FormData(form);
-    if (genTestState.testCoreCfg && typeof genTestState.testCoreCfg === 'object') {
-      fd.append('core', JSON.stringify(genTestState.testCoreCfg));
-    }
     const base = genTestState.testBase || '/flag_generators_test';
     setTestLogLine(`[ui] POST ${base}/run …`);
     const data = await fetchJson(`${base}/run`, { method: 'POST', body: fd });
@@ -1452,6 +1553,8 @@
       setTestLogLine(`ERROR: ${data && data.error ? data.error : 'Failed to start run'}`);
       setOutputsStatus(false);
       genTestState.runActive = false;
+      setGenTestInputsEnabled(true);
+      setGenTestInputsCollapsed(false);
       btn.disabled = false;
       return;
     }
@@ -1484,14 +1587,21 @@
     genTestState.eventSource = es;
     setTestLogLine('[ui] opening log stream…');
     es.onmessage = (ev) => {
-      setTestLogLine(ev.data);
+      const line = ev && typeof ev.data === 'string' ? ev.data : '';
+      setTestLogLine(line);
+      const stage = _stageFromLogLine(line);
+      if (stage) applyGenTestStage(stage, 'log');
     };
     es.addEventListener('phase', (ev) => {
       try {
         const payload = JSON.parse(ev.data || '{}');
         if (payload && payload.phase) {
           setTestLogLine(`[phase] ${payload.phase}`);
+        } else if (payload && payload.stage) {
+          setTestLogLine(`[phase] ${payload.stage}`);
         }
+        const stage = _stageFromPhasePayload(payload);
+        if (stage) applyGenTestStage(stage, 'phase');
       } catch (e) {}
     });
     es.addEventListener('end', async () => {

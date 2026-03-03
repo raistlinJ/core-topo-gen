@@ -178,7 +178,7 @@
 
 <!-- Vulnerability Test Modal -->
 <div class="modal fade" id="vulnTestModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable" style="--bs-modal-width: 1200px;">
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">Test Vulnerability</h5>
@@ -266,6 +266,9 @@
     active: null,
     items: [],
     selectedItem: null,
+    activeTestRunId: null,
+    activeTestItemId: null,
+    cleanupItemId: null,
     sortKey: 'name',
     sortDir: 'asc',
   };
@@ -572,6 +575,12 @@
     }, sortDir);
 
     sorted.forEach((it, idx) => {
+      const itemId = String(it && it.id != null ? it.id : '');
+      const activeItemId = String(_vulnCatalogState.activeTestItemId != null ? _vulnCatalogState.activeTestItemId : '');
+      const cleanupItemId = String(_vulnCatalogState.cleanupItemId != null ? _vulnCatalogState.cleanupItemId : '');
+      const isRunning = !!_vulnCatalogState.activeTestRunId && itemId && itemId === activeItemId;
+      const isCleaning = itemId && itemId === cleanupItemId;
+      const isBusy = isRunning || isCleaning;
       const tr = document.createElement('tr');
       if (it.disabled) tr.classList.add('table-secondary');
       tr.innerHTML = `
@@ -580,6 +589,8 @@
           <div>
             <strong>${escapeHtml(it.name || '')}</strong>
             ${it.disabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+            ${isRunning ? `<span class="badge text-bg-info ms-2">Running</span>` : ''}
+            ${isCleaning ? `<span class="badge text-bg-secondary ms-2">Cleaning up</span>` : ''}
           </div>
           <div class="small text-muted">ID: ${escapeHtml(it.id ?? '')}</div>
         </td>
@@ -598,7 +609,7 @@
         <td class="small">${escapeHtml(it.from_source || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
-            <button class="btn btn-sm btn-outline-primary" data-action="test" type="button" ${it.disabled ? 'disabled' : ''} title="${it.disabled ? 'Disabled' : 'Test vulnerability'}">Test</button>
+            <button class="btn btn-sm btn-outline-primary" data-action="test" type="button" ${(it.disabled || isBusy) ? 'disabled' : ''} title="${it.disabled ? 'Disabled' : (isBusy ? 'Test already active/cleaning up' : 'Test vulnerability')}">Test</button>
             <button class="btn btn-sm btn-outline-warning" data-action="toggle" type="button" title="${it.disabled ? 'Enable vulnerability' : 'Disable vulnerability'}">${it.disabled ? 'Enable' : 'Disable'}</button>
             <button class="btn btn-sm btn-outline-danger" data-action="delete" type="button" title="Delete vulnerability">Delete</button>
           </div>
@@ -782,6 +793,9 @@
       }
       const runId = String(data.run_id);
       _vulnCatalogState.activeTestRunId = runId;
+      _vulnCatalogState.activeTestItemId = it.id;
+      _vulnCatalogState.cleanupItemId = null;
+      _renderVulnCatalogTable();
       started = true;
       if (btn) btn.style.display = 'none';
       if (stopOkBtn) stopOkBtn.style.display = '';
@@ -831,14 +845,6 @@
         }
         try { es.close(); } catch (e) {}
       };
-      try {
-        const modalEl = _qs('vulnTestModal');
-        if (modalEl) {
-          modalEl.addEventListener('hidden.bs.modal', () => {
-            if (_vulnCatalogState.activeTestRunId) stopVulnTest(null);
-          }, { once: true });
-        }
-      } catch (e) {}
     } catch (e) {
       _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
       if (closeBtn) closeBtn.style.display = '';
@@ -946,8 +952,14 @@
     if (stopFailBtn) stopFailBtn.disabled = true;
     if (stoppingLabel) stoppingLabel.classList.remove('d-none');
     if (closeBtn) closeBtn.style.display = 'none';
+    try {
+      const st = _qs('vulnTestStatus');
+      if (st) st.style.display = '';
+      _setText('vulnTestStatusText', 'Stopping and cleaning up…');
+    } catch (e) {}
     _appendLog('vulnTestLog', `[ui] Stopping test (${isIncomplete ? 'incomplete' : (ok ? 'success' : 'fail')})…`);
     _appendLog('vulnTestLog', '[stop] User requested stop');
+    _appendLog('vulnTestLog', '[ui] Cleanup in progress…');
     try {
       setTimeout(() => {
         try {
@@ -965,6 +977,8 @@
     try {
       await _postJson('/vuln_catalog_items/test/stop', { run_id: runId, ok: (isIncomplete ? null : !!ok) });
       cleanupPending = true;
+      _vulnCatalogState.cleanupItemId = _vulnCatalogState.activeTestItemId;
+      _renderVulnCatalogTable();
       try {
         const res = _qs('vulnTestResult');
         if (res) {
@@ -979,15 +993,29 @@
       if (closeBtn) { closeBtn.textContent = 'Cancel'; closeBtn.style.display = 'none'; }
       if (stoppingLabel) stoppingLabel.classList.remove('d-none');
       try {
+        let cleanupPollCount = 0;
         const poll = async () => {
           const st = await _postJson('/vuln_catalog_items/test/status', { run_id: runId });
+          cleanupPollCount += 1;
           if (st && st.cleanup_done) {
             cleanupPending = false;
+            _vulnCatalogState.cleanupItemId = null;
+            _vulnCatalogState.activeTestItemId = null;
+            _renderVulnCatalogTable();
             if (closeBtn) closeBtn.textContent = 'Close';
             if (stoppingLabel) stoppingLabel.classList.add('d-none');
             if (closeBtn) closeBtn.style.display = '';
+            try {
+              const stEl = _qs('vulnTestStatus');
+              if (stEl) stEl.style.display = 'none';
+              _setText('vulnTestStatusText', 'Working…');
+            } catch (e) {}
+            _appendLog('vulnTestLog', '[ui] Cleanup complete.');
             return;
           }
+          try {
+            _setText('vulnTestStatusText', `Stopping and cleaning up… (${cleanupPollCount}s)`);
+          } catch (e) {}
           setTimeout(poll, 1000);
         };
         setTimeout(poll, 500);
@@ -1006,6 +1034,10 @@
       } catch (e) {}
       _vulnCatalogState.activeTestStream = null;
       _vulnCatalogState.activeTestRunId = null;
+      if (!cleanupPending) {
+        _vulnCatalogState.activeTestItemId = null;
+      }
+      _renderVulnCatalogTable();
       if (stopOkBtn) { stopOkBtn.style.display = 'none'; stopOkBtn.disabled = false; }
       if (stopFailBtn) { stopFailBtn.style.display = 'none'; stopFailBtn.disabled = false; }
       if (!cleanupPending) {
@@ -1015,7 +1047,7 @@
       }
       try {
         const st = _qs('vulnTestStatus');
-        if (st) st.style.display = 'none';
+        if (st) st.style.display = cleanupPending ? '' : 'none';
       } catch (e) {}
       _vulnStopInFlight = false;
     }
@@ -1141,17 +1173,8 @@
     const stopFailBtn = _qs('vulnTestStopFailBtn');
     if (stopFailBtn) stopFailBtn.addEventListener('click', () => stopVulnTest(false));
 
-    // Auto-cleanup if dialog is closed while test is running.
-    try {
-      const testModalEl = _qs('vulnTestModal');
-      if (testModalEl) {
-        testModalEl.addEventListener('hidden.bs.modal', () => {
-          if (_vulnCatalogState.activeTestRunId) {
-            stopVulnTest(false);
-          }
-        });
-      }
-    } catch (e) {}
+    // Intentionally do not auto-stop on dialog close.
+    // Container/session remain active until explicit Stop is pressed.
   });
 </script>
 {% endblock %}
