@@ -33753,6 +33753,52 @@ def api_latest_xml_for_scenario():
         return jsonify({'ok': False, 'error': str(exc)}), 500
 
 
+@app.route('/api/scenario/latest_state', methods=['GET'])
+def api_latest_state_for_scenario():
+    scenario = (request.args.get('scenario') or '').strip()
+    if not scenario:
+        return jsonify({'ok': False, 'error': 'scenario required'}), 400
+    try:
+        scen_norm = _normalize_scenario_label(scenario)
+        xml_path = _latest_xml_path_for_scenario(scen_norm)
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'No XML found'}), 404
+        parsed = _parse_scenarios_xml(xml_path)
+        scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+        if not isinstance(scen_list, list) or not scen_list:
+            return jsonify({'ok': False, 'error': 'XML has no scenarios'}), 404
+
+        selected = None
+        for scen in scen_list:
+            if not isinstance(scen, dict):
+                continue
+            nm = str(scen.get('name') or '').strip()
+            if _normalize_scenario_label(nm) == scen_norm:
+                selected = scen
+                break
+
+        if selected is None:
+            return jsonify({'ok': False, 'error': 'Scenario not found in XML'}), 404
+
+        core_payload = parsed.get('core') if isinstance(parsed.get('core'), dict) else None
+        try:
+            xml_mtime = float(os.path.getmtime(xml_path))
+        except Exception:
+            xml_mtime = 0.0
+
+        return jsonify({
+            'ok': True,
+            'scenario': scenario,
+            'scenario_norm': scen_norm,
+            'xml_path': xml_path,
+            'xml_mtime': xml_mtime,
+            'scenario_state': selected,
+            'core': core_payload,
+        })
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
 def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_state: dict[str, Any]) -> tuple[bool, str]:
     """Update (or create) FlagSequencing/FlowState within a scenarios XML file."""
     xml_path = _abs_path_or_original(xml_path)

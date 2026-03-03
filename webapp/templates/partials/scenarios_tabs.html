@@ -467,9 +467,49 @@
     return '';
   }
 
+  function resolvePreferredProjectKey(projectStateMap){
+    try {
+      const liveKey = (window.currentProjectKey || '').toString().trim();
+      if (liveKey && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[liveKey]) {
+        return liveKey;
+      }
+    } catch (e) {}
+
+    try {
+      const key = (localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY) || '').trim();
+      if (key && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[key]) {
+        return key;
+      }
+    } catch (e) {}
+
+    try {
+      const scenarioHint = resolveScenarioNameHint();
+      if (!scenarioHint || !projectStateMap || typeof projectStateMap !== 'object') return '';
+      const normHint = scenarioHint.toLowerCase();
+      let bestKey = '';
+      let bestUpdatedAt = -1;
+      Object.keys(projectStateMap).forEach((key) => {
+        const entry = projectStateMap[key];
+        if (!entry || typeof entry !== 'object') return;
+        const scenarios = Array.isArray(entry.scenarios) ? entry.scenarios : [];
+        if (!scenarios.length) return;
+        const hasScenario = scenarios.some((s) => ((s?.name ?? '').toString().trim().toLowerCase() === normHint));
+        if (!hasScenario) return;
+        const updatedAt = Number(entry.updated_at || 0);
+        if (updatedAt >= bestUpdatedAt) {
+          bestUpdatedAt = updatedAt;
+          bestKey = key;
+        }
+      });
+      return bestKey;
+    } catch (e) {
+      return '';
+    }
+  }
+
   function getCurrentProjectSnapshot(){
     const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
-    const key = (localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY) || '').trim();
+    const key = resolvePreferredProjectKey(projectStateMap);
     if (key && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[key]) {
       return projectStateMap[key];
     }

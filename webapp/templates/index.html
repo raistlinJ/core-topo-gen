@@ -249,7 +249,10 @@
 
                 <div class="card mt-3" id="scenarioEditorCard">
                     <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-                        <strong>Scenario Editor</strong>
+                        <div class="d-flex align-items-center gap-2">
+                            <strong>Scenario Editor</strong>
+                            <span id="xmlRehydrateBadge" class="badge text-bg-info d-none">Loaded from latest XML</span>
+                        </div>
                         <div class="d-flex flex-wrap align-items-center gap-2">
                             <div id="hitlEntryButtonsWrap" class="d-flex align-items-center gap-2">
                                 {% if not is_builder_view %}
@@ -1619,6 +1622,9 @@
     if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && legacyProjectKeyHint) {
         currentProjectKey = legacyProjectKeyHint;
     }
+    function syncCurrentProjectKeyGlobal() {
+        try { window.currentProjectKey = currentProjectKey || DEFAULT_PROJECT_KEY; } catch (e) { }
+    }
     let activeIdxMap = readJsonFromLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, {});
     const serverCatalogEmpty = !!(initialPayload && initialPayload.scenario_catalog_empty);
     const serverCatalogForceEmpty = !!(initialPayload && initialPayload.scenario_catalog_force_empty);
@@ -1759,6 +1765,7 @@
         }
     }
     if (!currentProjectKey) currentProjectKey = DEFAULT_PROJECT_KEY;
+    syncCurrentProjectKeyGlobal();
     const serverResultPath = (initialPayload && typeof initialPayload.result_path === 'string')
         ? initialPayload.result_path.trim()
         : '';
@@ -7409,6 +7416,7 @@
                             currentProjectKey = previousProjectKey || DEFAULT_PROJECT_KEY;
                         }
                     }
+                    syncCurrentProjectKeyGlobal();
                     try {
                         if (USE_LOCAL_EDITOR_STATE) {
                             const persisted = { ...previousSnapshot };
@@ -7968,11 +7976,13 @@
             // Auto-save disabled: only explicit Save actions should write XML.
 
             // Local persistence is admin-only (and disabled in builder view).
+            syncCurrentProjectKeyGlobal();
             if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
 
             writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, snapshot);
             const nextProjectKey = deriveProjectKey(snapshot, currentProjectKey || DEFAULT_PROJECT_KEY);
             currentProjectKey = nextProjectKey || DEFAULT_PROJECT_KEY;
+            syncCurrentProjectKeyGlobal();
             projectStateMap[currentProjectKey] = snapshot;
             writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
             activeIdxMap[currentProjectKey] = activeIdx || 0;
@@ -11785,6 +11795,76 @@
 
 
 
+    async function rehydrateScenarioFromLatestXml(idx, scenarioName) {
+        try {
+            if (!Number.isInteger(idx) || idx < 0) return false;
+            const scenLabel = (scenarioName || '').toString().trim();
+            if (!scenLabel) return false;
+            const resp = await fetch(`/api/scenario/latest_state?scenario=${encodeURIComponent(scenLabel)}`, {
+                method: 'GET',
+                credentials: 'same-origin',
+                headers: { 'Accept': 'application/json' },
+            });
+            let data = null;
+            try { data = await resp.json(); } catch (e) { data = null; }
+            if (!resp.ok || !data || data.ok === false || !data.scenario_state || typeof data.scenario_state !== 'object') {
+                return false;
+            }
+
+            const existing = state?.scenarios?.[idx];
+            const sid = existing && typeof existing === 'object' ? existing._sid : null;
+            const nextScenario = JSON.parse(JSON.stringify(data.scenario_state));
+            if (sid && nextScenario && typeof nextScenario === 'object') {
+                nextScenario._sid = sid;
+            }
+
+            if (Array.isArray(state.scenarios) && idx < state.scenarios.length) {
+                state.scenarios[idx] = nextScenario;
+            }
+
+            if (data.core && typeof data.core === 'object') {
+                try {
+                    state.core = normalizeCoreState(data.core, true);
+                    storeCorePasswordInSession();
+                } catch (e) { }
+            }
+
+            const latestXmlPath = (data.xml_path || '').toString().trim();
+            if (latestXmlPath) {
+                state.result_path = latestXmlPath;
+                try {
+                    if (Array.isArray(state.saved_xml_paths_by_index)) {
+                        state.saved_xml_paths_by_index[idx] = latestXmlPath;
+                    }
+                } catch (e) { }
+            }
+
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function showXmlRehydrateBadge(message = 'Loaded from latest XML', tone = 'info') {
+        try {
+            const badge = document.getElementById('xmlRehydrateBadge');
+            if (!badge) return;
+            badge.textContent = (message || 'Loaded from latest XML').toString();
+            badge.classList.remove('text-bg-info', 'text-bg-warning', 'text-bg-success', 'text-bg-secondary');
+            if (tone === 'warning') badge.classList.add('text-bg-warning');
+            else if (tone === 'success') badge.classList.add('text-bg-success');
+            else if (tone === 'secondary') badge.classList.add('text-bg-secondary');
+            else badge.classList.add('text-bg-info');
+            badge.classList.remove('d-none');
+            if (showXmlRehydrateBadge._timer) {
+                clearTimeout(showXmlRehydrateBadge._timer);
+            }
+            showXmlRehydrateBadge._timer = window.setTimeout(() => {
+                try { badge.classList.add('d-none'); } catch (e) { }
+            }, 2200);
+        } catch (e) { }
+    }
+
     function renderSidebar() {
         ensureScenarioIds();
         const list = document.getElementById('scenarioList');
@@ -11810,7 +11890,7 @@
             ${checkboxHtml}
             <span class="flex-grow-1 text-truncate" title="${safeName}">${safeName}</span>
         </div>`;
-            a.onclick = (e) => {
+            a.onclick = async (e) => {
                 e.preventDefault();
                 activeIdx = idx;
                 try { restorePlanPreviewFromScenario(activeIdx, { force: true }); } catch (err) { }
@@ -11824,6 +11904,15 @@
                 persistEditorState();
                 render();
                 try { refreshXmlDockPreview({ force: true }); } catch (err) { }
+                const hydrated = await rehydrateScenarioFromLatestXml(idx, name);
+                if (hydrated) {
+                    persistEditorState();
+                    render();
+                    try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (err) { }
+                    try { showXmlRehydrateBadge('Loaded from latest XML', 'success'); } catch (err) { }
+                } else {
+                    try { showXmlRehydrateBadge('Using local state (XML refresh unavailable)', 'warning'); } catch (err) { }
+                }
             };
             list.appendChild(a);
         });
