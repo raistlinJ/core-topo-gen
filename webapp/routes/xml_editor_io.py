@@ -362,6 +362,155 @@ def register(
                     uniq.append(p)
                 return uniq
 
+            def _has_meaningful_value(value: Any) -> bool:
+                if value is None:
+                    return False
+                if isinstance(value, str):
+                    return bool(value.strip())
+                if isinstance(value, bool):
+                    return value is True
+                if isinstance(value, (int, float)):
+                    return True
+                if isinstance(value, list):
+                    return len(value) > 0
+                if isinstance(value, dict):
+                    return any(_has_meaningful_value(v) for v in value.values())
+                return False
+
+            def _preserve_hitl_if_missing(scen: Any, project_hint_path: str) -> Any:
+                if not isinstance(scen, dict):
+                    return scen
+                existing_hitl = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+                if isinstance(existing_hitl, dict) and _has_meaningful_value(existing_hitl):
+                    return scen
+
+                scenario_name = str(scen.get('name') or '').strip()
+                target = _norm_name(scenario_name)
+                if not target:
+                    return scen
+
+                explicit_path = ''
+                try:
+                    explicit_path = str(scen.get('saved_xml_path') or '').strip()
+                except Exception:
+                    explicit_path = ''
+
+                candidate_paths = []
+                if explicit_path and os.path.isfile(explicit_path):
+                    candidate_paths.append(os.path.abspath(explicit_path))
+                candidate_paths.extend(_candidate_source_xml_paths(project_hint_path, scenario_name))
+
+                seen: set[str] = set()
+                deduped: list[str] = []
+                for p in candidate_paths:
+                    if not p or p in seen:
+                        continue
+                    seen.add(p)
+                    deduped.append(p)
+
+                for src in deduped:
+                    try:
+                        parsed = parse_scenarios_xml(src)
+                        rows = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                        if isinstance(rows, list):
+                            for row in rows:
+                                if not isinstance(row, dict):
+                                    continue
+                                if _norm_name(row.get('name')) != target:
+                                    continue
+                                hitl = row.get('hitl') if isinstance(row.get('hitl'), dict) else None
+                                if isinstance(hitl, dict) and _has_meaningful_value(hitl):
+                                    out = dict(scen)
+                                    out['hitl'] = copy.deepcopy(hitl)
+                                    try:
+                                        if log is not None:
+                                            log.info('[save_xml_api] preserved hitl for scenario=%s from source=%s', scenario_name, src)
+                                    except Exception:
+                                        pass
+                                    return out
+                    except Exception:
+                        pass
+
+                    # Fallback for legacy/lowercase HITL tags not mapped by parser.
+                    try:
+                        tree = ET.parse(src)
+                        root = tree.getroot()
+
+                        def _lname(tag: Any) -> str:
+                            try:
+                                raw = str(tag or '')
+                            except Exception:
+                                raw = ''
+                            if '}' in raw:
+                                raw = raw.rsplit('}', 1)[-1]
+                            return raw.strip().lower()
+
+                        def _to_bool_if_known(key: str, value: Any) -> Any:
+                            k = str(key or '').strip().lower()
+                            if k in {'enabled', 'validated', 'verify_ssl', 'remember_credentials', 'ssh_enabled'}:
+                                sval = str(value or '').strip().lower()
+                                if sval in {'1', 'true', 'yes', 'on'}:
+                                    return True
+                                if sval in {'0', 'false', 'no', 'off'}:
+                                    return False
+                            return value
+
+                        for scenario_el in list(root):
+                            if _lname(getattr(scenario_el, 'tag', '')) != 'scenario':
+                                continue
+                            if _norm_name(scenario_el.get('name')) != target:
+                                continue
+                            editor = None
+                            for child in list(scenario_el):
+                                if _lname(getattr(child, 'tag', '')) == 'scenarioeditor':
+                                    editor = child
+                                    break
+                            if editor is None:
+                                continue
+                            hitl_el = None
+                            for child in list(editor):
+                                if _lname(getattr(child, 'tag', '')) == 'hardwareinloop':
+                                    hitl_el = child
+                                    break
+                            if hitl_el is None:
+                                continue
+
+                            hitl_dict: dict[str, Any] = {}
+                            try:
+                                enabled_raw = hitl_el.get('enabled')
+                                if enabled_raw is not None:
+                                    hitl_dict['enabled'] = _to_bool_if_known('enabled', enabled_raw)
+                            except Exception:
+                                pass
+
+                            core_dict: dict[str, Any] = {}
+                            prox_dict: dict[str, Any] = {}
+                            for node in list(hitl_el):
+                                node_name = _lname(getattr(node, 'tag', ''))
+                                if node_name == 'coreconnection':
+                                    for ak, av in dict(node.attrib or {}).items():
+                                        core_dict[str(ak)] = _to_bool_if_known(str(ak), av)
+                                elif node_name == 'proxmoxconnection':
+                                    for ak, av in dict(node.attrib or {}).items():
+                                        prox_dict[str(ak)] = _to_bool_if_known(str(ak), av)
+                            if core_dict:
+                                hitl_dict['core'] = core_dict
+                            if prox_dict:
+                                hitl_dict['proxmox'] = prox_dict
+
+                            if _has_meaningful_value(hitl_dict):
+                                out = dict(scen)
+                                out['hitl'] = hitl_dict
+                                try:
+                                    if log is not None:
+                                        log.info('[save_xml_api] preserved hitl (xml fallback) for scenario=%s from source=%s', scenario_name, src)
+                                except Exception:
+                                    pass
+                                return out
+                    except Exception:
+                        continue
+                return scen
+
             def _load_scenario_from_sources(scenario_name: str, project_hint_path: str) -> dict[str, Any] | None:
                 target = _norm_name(scenario_name)
                 if not target:
@@ -474,6 +623,15 @@ def register(
                     src = _load_scenario_from_sources(str(scen.get('name') or ''), project_key_hint)
                     marked.append(_with_flow_state_dirty_if_topology_changed(scen, src))
                 scenarios = marked
+
+            if isinstance(scenarios, list):
+                preserved: list[Any] = []
+                for scen in scenarios:
+                    if not isinstance(scen, dict):
+                        preserved.append(scen)
+                        continue
+                    preserved.append(_preserve_hitl_if_missing(scen, project_key_hint))
+                scenarios = preserved
 
             if clear_flow_preview and isinstance(scenarios, list):
                 cleaned: list[Any] = []

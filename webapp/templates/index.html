@@ -2704,6 +2704,10 @@
             };
             const core = hitl.core || {};
             const coreVmKey = (core.vm_key || '').toString();
+            const coreVmName = (core.vm_name || '').toString().trim();
+            const coreVmNodeStored = (core.vm_node || '').toString().trim();
+            const coreVmIdStored = (core.vmid ?? '').toString().trim();
+            const hasCoreVmSelectionSignal = !!(coreVmKey || coreVmName || coreVmNodeStored || coreVmIdStored);
             const coreHost = (core.grpc_host || '').toString().trim();
             const corePort = Number.isFinite(Number(core.grpc_port)) && Number(core.grpc_port) > 0 ? Number(core.grpc_port) : 50051;
             const coreSshHostRaw = (core.ssh_host || '').toString().trim();
@@ -2714,6 +2718,8 @@
             const coreHasSecret = !!coreSecretId;
             const corePasswordRaw = (core.ssh_password || '').toString();
             const corePasswordAvailable = !!corePasswordRaw || coreHasSecret;
+            const coreValidated = !!(core && core.validated === true);
+            const hasCoreVmSelection = !!(hasCoreVmSelectionSignal || (coreValidated && coreHasSecret));
             const vmKeyParts = coreVmKey ? coreVmKey.split('::') : [];
             const vmKeyNodePart = (vmKeyParts[0] || '').trim();
             const vmKeyIdPart = (vmKeyParts[1] || '').trim();
@@ -2750,11 +2756,11 @@
                 return null;
             })();
             const interfaceCountKnown = resolvedVmInterfaceCount !== null;
-            const coreVmHasInterfaces = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
-            const coreVmSupportsHitl = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
+            const coreVmHasInterfaces = !hasCoreVmSelection || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
+            const coreVmSupportsHitl = !hasCoreVmSelection || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
             const coreInputsComplete = IS_BUILDER_VIEW
-                ? !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreHasSecret)
-                : !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
+                ? !!(hasCoreVmSelection && coreHost && corePort && coreSshHost && coreSshPort && coreHasSecret)
+                : !!(hasCoreVmSelection && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
             const coreTestSuccess = core.last_tested_status === 'success';
             const coreTestMatches = coreTestSuccess
                 && !!core.last_tested_host
@@ -2764,8 +2770,9 @@
             const coreReady = coreConnectionReady && coreVmSupportsHitl;
             const coreHitlBlocked = coreConnectionReady && !coreVmSupportsHitl;
             const coreTestable = proxValidated && coreInputsComplete && coreVmHasInterfaces;
-            const coreVmVerified = !!(core && core.validated === true && coreHasSecret && !!coreVmKey);
-            const hitlAuthReady = proxValidated && coreHasSecret && !!coreVmKey;
+            const coreVmVerified = !!(coreValidated && hasCoreVmSelection && (coreHasSecret || corePasswordAvailable));
+            const hitlAuthReady = proxValidated && hasCoreVmSelection && (coreHasSecret || coreValidated);
+            const coreMappingReady = hitlAuthReady && hasCoreVmSelection && coreVmHasInterfaces && coreVmSupportsHitl;
 
             const summaryEl = document.querySelector(`[data-proxmox-summary="${sidx}"]`);
             if (summaryEl) {
@@ -2872,7 +2879,7 @@
                 let className = 'text-muted';
                 if (!proxValidated) {
                     statusText = 'Validate Proxmox credentials to choose a CORE VM.';
-                } else if (!coreVmKey) {
+                } else if (!hasCoreVmSelection) {
                     statusText = 'Select a CORE VM to configure connection details.';
                 } else if (!coreVmHasInterfaces) {
                     const count = resolvedVmInterfaceCount || 0;
@@ -2959,7 +2966,7 @@
                 const sanitize = (value) => {
                     return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
                 };
-                if (!coreVmKey || !selectedVm) {
+                if (!hasCoreVmSelection || !selectedVm) {
                     summaryDetailEl.innerHTML = '';
                 } else {
                     const name = sanitize(selectedVm.name ? String(selectedVm.name) : `VM ${selectedVm.vmid}`);
@@ -2986,7 +2993,7 @@
             const step3Enabled = hitl.enabled && hitlAuthReady;
             const gateNotice = document.querySelector(`[data-hitl-interface-gate="${sidx}"]`);
             if (gateNotice) {
-                const shouldHide = step3Enabled && coreReady;
+                const shouldHide = step3Enabled && coreMappingReady;
                 gateNotice.classList.toggle('d-none', shouldHide);
                 gateNotice.classList.remove('alert-info', 'alert-warning', 'alert-danger');
                 let gateText = 'Complete steps 1 and 2 to map this interface.';
@@ -2994,12 +3001,12 @@
                     gateNotice.classList.add('alert-warning');
                     if (!proxValidated) gateText = 'Validate Proxmox credentials (Step 1) to unlock HITL interface mappings.';
                     else if (!coreHasSecret) gateText = 'Store CORE credentials (Step 2) to unlock HITL interface mappings.';
-                    else if (!coreVmKey) gateText = 'Select a CORE VM in Step 2 to unlock HITL interface mappings.';
+                    else if (!hasCoreVmSelection) gateText = 'Select a CORE VM in Step 2 to unlock HITL interface mappings.';
                     else gateText = 'Authenticate Steps 1 and 2 to manage HITL interface mappings.';
                 } else if (!step3Enabled) {
                     gateNotice.classList.add('alert-info');
                     gateText = 'Enable Hardware in the Loop to manage HITL interface mappings.';
-                } else if (!coreVmKey) {
+                } else if (!hasCoreVmSelection) {
                     gateNotice.classList.add('alert-info');
                 } else if (!coreVmHasInterfaces) {
                     gateNotice.classList.add('alert-danger');
@@ -3014,7 +3021,7 @@
             }
             const availableSelect = document.querySelector(`[data-hitl-available][data-scen-idx="${sidx}"]`);
             if (availableSelect) {
-                availableSelect.disabled = !(coreReady && step3Enabled);
+                availableSelect.disabled = !(coreMappingReady && step3Enabled);
             }
             try { bindHostInterfacesToScenarioCache(sidx); } catch (e) { }
             const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
@@ -3026,10 +3033,10 @@
             });
             const availableCount = selectableInterfaces.length;
             document.querySelectorAll(`[data-hitl-add][data-scen-idx="${sidx}"]`).forEach(btn => {
-                btn.disabled = !(coreReady && step3Enabled) || availableCount === 0;
+                btn.disabled = !(coreMappingReady && step3Enabled) || availableCount === 0;
             });
             document.querySelectorAll(`[data-hitl-attach][data-scen-idx="${sidx}"]`).forEach(selectEl => {
-                selectEl.disabled = !(coreReady && step3Enabled);
+                selectEl.disabled = !(coreMappingReady && step3Enabled);
             });
         } catch (e) {
             console.warn('updateProxmoxSummary failed', e);
@@ -3038,9 +3045,41 @@
 
     async function fetchProxmoxInventory(sidx, options = {}) {
         const force = !!options.force;
+        const persistBeforeRefresh = options.persistBeforeRefresh !== undefined
+            ? !!options.persistBeforeRefresh
+            : force;
         if (Number.isNaN(sidx) || sidx === null || sidx === undefined) return null;
-        const scenario = state.scenarios?.[sidx];
+        let scenario = state.scenarios?.[sidx];
         if (!scenario) return null;
+        const scenarioName = (scenario && scenario.name) ? String(scenario.name) : '';
+
+        let canRehydrateFromXml = true;
+        if (persistBeforeRefresh && !IS_BUILDER_VIEW) {
+            try {
+                persistEditorState();
+                if (typeof autoSaveXml === 'function') {
+                    await autoSaveXml();
+                }
+            } catch (e) {
+                canRehydrateFromXml = false;
+                try {
+                    const msg = (e && e.message) ? e.message : 'Unable to save latest XML before refresh';
+                    showToast(`${msg}. Using current in-memory state.`, { autohide: true, delay: 3200 });
+                } catch (err) { }
+            }
+        }
+
+        if (canRehydrateFromXml) {
+            try {
+                const hydrated = await rehydrateScenarioFromLatestXml(sidx, scenarioName);
+                if (hydrated) {
+                    scenario = state.scenarios?.[sidx] || scenario;
+                }
+            } catch (e) {
+                // best effort; continue with current in-memory state
+            }
+        }
+
         const hitlState = ensureHitlStateForScenario(scenario);
         const prox = hitlState.proxmox || {};
         const hasSecret = !!prox.secret_id;
@@ -3071,7 +3110,11 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
-                body: JSON.stringify({ secret_id: prox.secret_id }),
+                body: JSON.stringify({
+                    secret_id: prox.secret_id,
+                    scenario_name: scenarioName,
+                    scenario_index: sidx,
+                }),
             });
             let data = null;
             try { data = await resp.json(); } catch (err) { data = null; }
@@ -8460,8 +8503,13 @@
         const coreState = hitlState.core && typeof hitlState.core === 'object' ? hitlState.core : {};
         const proxValidated = !!(proxState.validated && proxState.secret_id);
         const coreSecretId = typeof coreState.core_secret_id === 'string' ? coreState.core_secret_id.trim() : '';
+        const coreValidated = !!coreState.validated;
         const vmKey = (coreState.vm_key || '').toString();
-        return proxValidated && !!coreSecretId && !!vmKey;
+        const vmName = (coreState.vm_name || '').toString().trim();
+        const vmNode = (coreState.vm_node || '').toString().trim();
+        const vmId = (coreState.vmid ?? '').toString().trim();
+        const hasCoreVmSelection = !!(vmKey || vmName || vmNode || vmId || (coreValidated && !!coreSecretId));
+        return proxValidated && hasCoreVmSelection && (!!coreSecretId || coreValidated);
     }
 
     function setHitlStatus(sidx, message, tone = 'info') {
@@ -11809,6 +11857,98 @@
             const existing = state?.scenarios?.[idx];
             const sid = existing && typeof existing === 'object' ? existing._sid : null;
             const nextScenario = JSON.parse(JSON.stringify(data.scenario_state));
+
+            try {
+                const existingHitl = (existing && typeof existing === 'object' && existing.hitl && typeof existing.hitl === 'object') ? existing.hitl : null;
+                let nextHitl = (nextScenario && typeof nextScenario === 'object' && nextScenario.hitl && typeof nextScenario.hitl === 'object') ? nextScenario.hitl : null;
+                if (existingHitl && !nextHitl && nextScenario && typeof nextScenario === 'object') {
+                    nextScenario.hitl = JSON.parse(JSON.stringify(existingHitl));
+                    nextHitl = nextScenario.hitl;
+                }
+                if (existingHitl && nextHitl) {
+                    const existingInterfaces = Array.isArray(existingHitl.interfaces) ? existingHitl.interfaces : [];
+                    const nextInterfaces = Array.isArray(nextHitl.interfaces) ? nextHitl.interfaces : [];
+                    if (existingInterfaces.length > 0 && nextInterfaces.length === 0) {
+                        nextHitl.interfaces = JSON.parse(JSON.stringify(existingInterfaces));
+                    }
+                    if (existingHitl.enabled === true && nextHitl.enabled !== true) {
+                        nextHitl.enabled = true;
+                    }
+                    if (!nextHitl.participant_proxmox_url && existingHitl.participant_proxmox_url) {
+                        nextHitl.participant_proxmox_url = existingHitl.participant_proxmox_url;
+                    }
+
+                    const existingCore = (existingHitl.core && typeof existingHitl.core === 'object') ? existingHitl.core : null;
+                    const nextCore = (nextHitl.core && typeof nextHitl.core === 'object') ? nextHitl.core : (nextHitl.core = {});
+                    if (existingCore && nextCore && typeof nextCore === 'object') {
+                        const preserveCoreFields = [
+                            'vm_key', 'vm_name', 'vm_node', 'vmid',
+                            'core_secret_id', 'validated',
+                            'cached_vm_interface_count', 'cached_vm_status',
+                            'last_tested_status', 'last_tested_host', 'last_tested_port', 'last_tested_at', 'last_tested_message',
+                        ];
+                        preserveCoreFields.forEach((key) => {
+                            const nextVal = nextCore[key];
+                            const nextMissing = nextVal === undefined || nextVal === null || (typeof nextVal === 'string' && nextVal.trim() === '');
+                            if (!nextMissing) return;
+                            const existingVal = existingCore[key];
+                            const existingPresent = !(existingVal === undefined || existingVal === null || (typeof existingVal === 'string' && existingVal.trim() === ''));
+                            if (existingPresent) nextCore[key] = existingVal;
+                        });
+                    }
+
+                    const existingProx = (existingHitl.proxmox && typeof existingHitl.proxmox === 'object') ? existingHitl.proxmox : null;
+                    const nextProx = (nextHitl.proxmox && typeof nextHitl.proxmox === 'object') ? nextHitl.proxmox : (nextHitl.proxmox = {});
+                    if (existingProx && nextProx && typeof nextProx === 'object') {
+                        const existingValidated = existingProx.validated === true;
+                        const existingSecret = (existingProx.secret_id ?? '').toString().trim();
+                        const nextValidated = nextProx.validated === true;
+                        const nextSecret = (nextProx.secret_id ?? '').toString().trim();
+                        const toEpoch = (value) => {
+                            if (!value) return 0;
+                            try {
+                                const t = Date.parse(String(value));
+                                return Number.isFinite(t) ? t : 0;
+                            } catch (err) {
+                                return 0;
+                            }
+                        };
+                        const existingStamp = toEpoch(existingProx.last_validated_at || existingProx.stored_at);
+                        const nextStamp = toEpoch(nextProx.last_validated_at || nextProx.stored_at);
+                        const preferExistingValidatedSecret = !!(
+                            existingValidated
+                            && existingSecret
+                            && (
+                                !nextValidated
+                                || !nextSecret
+                                || existingStamp > nextStamp
+                            )
+                        );
+                        if (preferExistingValidatedSecret) {
+                            nextProx.secret_id = existingSecret;
+                            nextProx.validated = true;
+                            if (!nextProx.url && existingProx.url) nextProx.url = existingProx.url;
+                            if (!nextProx.username && existingProx.username) nextProx.username = existingProx.username;
+                            if ((!nextProx.port && nextProx.port !== 0) && (existingProx.port || existingProx.port === 0)) nextProx.port = existingProx.port;
+                            if (nextProx.verify_ssl === undefined && existingProx.verify_ssl !== undefined) nextProx.verify_ssl = existingProx.verify_ssl;
+                            if (!nextProx.last_validated_at && existingProx.last_validated_at) nextProx.last_validated_at = existingProx.last_validated_at;
+                            if (!nextProx.last_message && existingProx.last_message) nextProx.last_message = existingProx.last_message;
+                        }
+                        const preserveProxFields = ['secret_id', 'validated', 'url', 'username', 'port', 'verify_ssl', 'last_validated_at', 'last_message'];
+                        preserveProxFields.forEach((key) => {
+                            const nextVal = nextProx[key];
+                            const nextMissing = nextVal === undefined || nextVal === null || (typeof nextVal === 'string' && nextVal.trim() === '');
+                            if (!nextMissing) return;
+                            const existingVal = existingProx[key];
+                            const existingPresent = !(existingVal === undefined || existingVal === null || (typeof existingVal === 'string' && existingVal.trim() === ''));
+                            if (existingPresent) nextProx[key] = existingVal;
+                        });
+                    }
+                }
+            } catch (e) {
+                // best-effort metadata preservation
+            }
+
             if (sid && nextScenario && typeof nextScenario === 'object') {
                 nextScenario._sid = sid;
             }
@@ -12424,6 +12564,9 @@
         const core = hitl.core || {};
         const coreVmKey = (core.vm_key || '').toString();
         const coreVmName = (core.vm_name || '').toString();
+        const coreVmNodeStored = (core.vm_node || '').toString().trim();
+        const coreVmIdStored = (core.vmid ?? '').toString().trim();
+        const hasCoreVmSelectionSignal = !!(coreVmKey || coreVmName.trim() || coreVmNodeStored || coreVmIdStored);
         const coreHost = (core.grpc_host || '').toString().trim();
         const corePort = Number.isFinite(Number(core.grpc_port)) && Number(core.grpc_port) > 0 ? Number(core.grpc_port) : 50051;
         const coreSshHostRaw = (core.ssh_host || '').toString().trim();
@@ -12435,6 +12578,8 @@
         const corePasswordRaw = (core.ssh_password || '').toString();
         const corePassword = corePasswordRaw;
         const corePasswordAvailable = !!corePasswordRaw || coreHasSecret;
+        const coreValidatedHint = !!(core && core.validated === true);
+        const hasCoreVmSelection = !!(hasCoreVmSelectionSignal || (coreValidatedHint && coreHasSecret));
         const vmKeyParts = coreVmKey ? coreVmKey.split('::') : [];
         const vmKeyNodePart = (vmKeyParts[0] || '').trim();
         const vmKeyIdPart = (vmKeyParts[1] || '').trim();
@@ -12463,14 +12608,14 @@
             return null;
         })();
         const interfaceCountKnown = resolvedVmInterfaceCount !== null;
-        const coreVmHasInterfaces = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
-        const coreVmSupportsHitl = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
+        const coreVmHasInterfaces = !hasCoreVmSelection || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
+        const coreVmSupportsHitl = !hasCoreVmSelection || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
         const coreVmNode = resolvedCoreVm && resolvedCoreVm.node !== undefined && resolvedCoreVm.node !== null
             ? String(resolvedCoreVm.node).trim()
             : (core.vm_node ? String(core.vm_node).trim() : vmKeyNodePart);
         const coreVmNameDisplay = IS_BUILDER_VIEW ? '' : coreVmName;
         const coreVmNodeDisplay = IS_BUILDER_VIEW ? '' : coreVmNode;
-        const coreInputsComplete = !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
+        const coreInputsComplete = !!(hasCoreVmSelection && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
         const coreTestSuccess = core.last_tested_status === 'success';
         const coreTestMatches = coreTestSuccess
             && !!core.last_tested_host
@@ -12480,9 +12625,10 @@
         const coreReady = coreConnectionReady && coreVmSupportsHitl;
         const coreHitlBlocked = coreConnectionReady && !coreVmSupportsHitl;
         const coreTestable = proxValidated && coreInputsComplete && coreVmHasInterfaces;
-        const hitlAuthReady = proxValidated && coreHasSecret && !!coreVmKey;
+        const hitlAuthReady = proxValidated && hasCoreVmSelection && (coreHasSecret || coreValidatedHint);
+        const coreMappingReady = hitlAuthReady && hasCoreVmSelection && coreVmHasInterfaces && coreVmSupportsHitl;
         const coreVmInterfaceWarning = (() => {
-            if (!coreVmKey || !interfaceCountKnown) return '';
+            if (!hasCoreVmSelection || !interfaceCountKnown) return '';
             if (!coreVmHasInterfaces) {
                 const count = resolvedVmInterfaceCount || 0;
                 return `<div class="alert alert-danger small mt-2 mb-0">Selected VM exposes ${count} network interface${count === 1 ? '' : 's'}. Add at least one interface to enable CORE connectivity.</div>`;
@@ -12623,13 +12769,13 @@
             // Builder view intentionally omits the collapsible detail table.
             // Still compute and render status into the badge + builderStatusEl.
             if ((coreSummaryEl && hitlSummaryEl) || (IS_BUILDER_VIEW && builderStatusEl)) {
-                const coreTouched = !!(coreVmKey || coreHost || coreUser || coreSecretId || hasProxmox || proxHasSecret);
+                const coreTouched = !!(hasCoreVmSelection || coreHost || coreUser || coreSecretId || hasProxmox || proxHasSecret);
                 const hitlTouched = !!(participantProxmoxUrlHasValue || hitlToggleWasEnabled || hasHitlInterfaces || extSelections);
                 const anyTouched = coreTouched || hitlTouched;
 
-                const coreConfigured = !!(hasProxmox || proxHasSecret || coreVmKey || coreHost || coreUser || coreHasSecret);
+                const coreConfigured = !!(hasProxmox || proxHasSecret || hasCoreVmSelection || coreHost || coreUser || coreHasSecret);
                 const coreValidated = IS_BUILDER_VIEW
-                    ? !!(proxValidated && coreHasSecret && coreVmKey)
+                    ? !!(proxValidated && hasCoreVmSelection && (coreHasSecret || !!core?.validated))
                     : !!(proxValidated && coreTestMatches);
                 const hitlConfigured = !!(participantProxmoxUrlHasValue || hasHitlInterfaces || extSelections || hitlToggleWasEnabled);
                 const hitlEnabled = !!hitlToggleWasEnabled;
@@ -12740,7 +12886,7 @@
                 // Builder view: rely on admin-managed safe signals rather than strict per-interface
                 // mapping completeness (builders may not have inventory details to satisfy it).
                 if (IS_BUILDER_VIEW) {
-                    const builderCoreReady = !!(proxValidated && coreHasSecret && !!coreVmKey && coreVmSupportsHitl);
+                    const builderCoreReady = !!(proxValidated && hasCoreVmSelection && (coreHasSecret || coreValidated) && coreVmSupportsHitl);
                     const builderHitlReady = hitlEnabled
                         ? !!(builderCoreReady && hasHitlInterfaces)
                         : builderCoreReady;
@@ -13002,7 +13148,7 @@
                     ? 'Verify Proxmox + CORE connection (Steps 1 & 2).'
                     : (!proxValidated
                         ? 'Complete Step 1 (Validate Proxmox credentials) first.'
-                        : (!coreVmKey
+                        : (!hasCoreVmSelection
                             ? 'Complete Step 2 (Select CORE VM) first.'
                             : (!coreInputsComplete
                                 ? 'Complete Step 2 connection details (gRPC/SSH host/ports, SSH user, password) first.'
@@ -13077,16 +13223,16 @@
         const step3ToggleDisabledAttr = hitlAuthReady ? '' : 'disabled';
         const step3ToggleTooltipAttr = hitlAuthReady ? '' : 'data-bs-toggle="tooltip" data-bs-title="Validate Steps 1 and 2 before enabling Hardware in the Loop."';
         const step3ToggleCheckedAttr = hitlToggleWasEnabled ? 'checked' : '';
-        const attachmentControlsDisabledAttr = (coreReady && step3Enabled) ? '' : 'disabled';
+        const attachmentControlsDisabledAttr = (coreMappingReady && step3Enabled) ? '' : 'disabled';
         const interfaceNoticeText = (() => {
             if (!hitlAuthReady) {
                 if (!proxValidated) return 'Validate Proxmox credentials (Step 1) to unlock HITL interface mappings.';
                 if (!coreHasSecret) return 'Store CORE credentials (Step 2) to unlock HITL interface mappings.';
-                if (!coreVmKey) return 'Select a CORE VM in Step 2 to unlock HITL interface mappings.';
+                if (!hasCoreVmSelection) return 'Select a CORE VM in Step 2 to unlock HITL interface mappings.';
                 return 'Authenticate Steps 1 and 2 to manage HITL interface mappings.';
             }
             if (!hitlToggleWasEnabled) return 'Enable Hardware in the Loop to manage HITL interface mappings.';
-            if (!coreVmKey) return 'Complete steps 1 and 2 to manage HITL interface mappings.';
+            if (!hasCoreVmSelection) return 'Complete steps 1 and 2 to manage HITL interface mappings.';
             if (!coreVmHasInterfaces) {
                 return 'Selected CORE VM must expose at least one interface before mapping HITL interfaces.';
             }
@@ -13098,7 +13244,7 @@
         const interfaceNoticeClass = (() => {
             if (!hitlAuthReady) return 'alert-warning';
             if (!hitlToggleWasEnabled) return 'alert-info';
-            if (!coreVmKey) return 'alert-info';
+            if (!hasCoreVmSelection) return 'alert-info';
             if (!coreVmHasInterfaces) return 'alert-danger';
             if (!coreVmSupportsHitl) return 'alert-warning';
             return 'alert-info';
@@ -13110,7 +13256,7 @@
             const vmNode = vm && vm.node !== undefined && vm.node !== null ? String(vm.node).trim() : '';
             return vmNode && vmNode === coreVmNode;
         });
-        const step4BaseEnabled = step3Enabled && proxValidated && !!coreVmKey && hitlAuthReady;
+        const step4BaseEnabled = step3Enabled && proxValidated && hasCoreVmSelection && hitlAuthReady;
         const step4HasCandidates = externalVmCandidates.length > 0;
         const step4Enabled = step4BaseEnabled && step4HasCandidates;
         const step4PrereqItems = [
@@ -13131,8 +13277,8 @@
                 label: proxValidated ? 'Proxmox credentials are validated' : 'Validate the Proxmox credentials (Step 1)',
             },
             {
-                ok: !!coreVmKey,
-                label: coreVmKey ? 'CORE VM selected in Step 2' : 'Select a CORE VM in Step 2',
+                ok: hasCoreVmSelection,
+                label: hasCoreVmSelection ? 'CORE VM selected in Step 2' : 'Select a CORE VM in Step 2',
             },
             {
                 ok: !proxInventoryBusy,
@@ -13153,7 +13299,7 @@
             ? `<div class="alert alert-info small mt-2 mb-0"><div class="fw-semibold">Step 4 prerequisites</div><ul class="mb-0 ps-3" style="list-style: none;">${step4PrereqList}</ul></div>`
             : '';
         const availableSize = Math.min(8, Math.max(4, hostInterfaces.length || 4));
-        const gateShouldHide = step3Enabled && coreReady && hitlAuthReady;
+        const gateShouldHide = step3Enabled && coreMappingReady;
         const interfacesGateNotice = `<div class="alert ${interfaceNoticeClass} small mb-3 ${gateShouldHide ? 'd-none' : ''}" data-hitl-interface-gate="${activeIdx}">${interfaceNoticeText}</div>`;
         const allowStep3RefreshUi = !!hitlAuthReady;
         const interfacesRefreshBusyRaw = core.interfaces_refresh_inflight === true;
@@ -13161,8 +13307,8 @@
         const lastInterfacesError = core.last_interfaces_error || '';
         const lastInterfacesAttempt = core.last_interfaces_attempt || '';
         const lastInterfacesRefresh = core.last_interfaces_refresh || '';
-        const availableSelectDisabledAttr = (coreReady && step3Enabled) ? '' : 'disabled';
-        const addInterfacesDisabledAttr = (coreReady && step3Enabled && availableInterfaces.length && !interfacesRefreshBusy) ? '' : 'disabled';
+        const availableSelectDisabledAttr = (coreMappingReady && step3Enabled) ? '' : 'disabled';
+        const addInterfacesDisabledAttr = (coreMappingReady && step3Enabled && availableInterfaces.length && !interfacesRefreshBusy) ? '' : 'disabled';
         const refreshInterfacesDisabledAttr = (step3Enabled && !interfacesRefreshBusy) ? '' : 'disabled';
         const removeInterfaceDisabledAttr = step3Enabled ? '' : 'disabled';
         const refreshButtonLabel = interfacesRefreshBusy
@@ -13201,7 +13347,7 @@
             if (!hitlAuthReady) {
                 if (!proxValidated) return '<div class="alert alert-info mb-0">Validate Proxmox credentials in Step 1 to unlock HITL interfaces.</div>';
                 if (!coreHasSecret) return '<div class="alert alert-info mb-0">Store CORE credentials in Step 2 to unlock HITL interfaces.</div>';
-                if (!coreVmKey) return '<div class="alert alert-info mb-0">Select a CORE VM in Step 2 to unlock HITL interfaces.</div>';
+                if (!hasCoreVmSelection) return '<div class="alert alert-info mb-0">Select a CORE VM in Step 2 to unlock HITL interfaces.</div>';
             }
             if (interfacesRefreshBusy) {
                 return '<div class="alert alert-info mb-0">Enumerating interfaces from CORE…</div>';
@@ -13227,7 +13373,10 @@
                     return '<div class="alert alert-warning small mb-0">Unable to determine the CORE VM\'s Proxmox node. Refresh the inventory so external VMs on the same node can be suggested.</div>';
                 }
                 const nodeHint = ` on node ${escapeHtml(coreVmNode)}`;
-                return `<div class="alert alert-warning small mb-0">No eligible Proxmox VMs${nodeHint} detected that share the CORE VM's node. Refresh the inventory after provisioning additional VMs on the same node.</div>`;
+                return `<div class="alert alert-warning small mb-0">No eligible Proxmox VMs${nodeHint} detected that share the CORE VM's node. Refresh the inventory after provisioning additional VMs on the same node.</div>
+                <div class="mt-2">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-step4-refresh-vms data-scen-idx="${activeIdx}" ${(!proxValidated || proxInventoryBusy || IS_BUILDER_VIEW) ? 'disabled' : ''}>Refresh compatible VMs</button>
+                </div>`;
             }
             return hitlInterfaces.map((iface, ifaceIdx) => {
                 if (!iface || typeof iface !== 'object') return '';
@@ -13336,7 +13485,7 @@
             if (proxInventoryError) {
                 return `<div class="alert alert-danger small mb-0">${escapeHtml(proxInventoryError)}</div>` + step4PrereqHtml;
             }
-            if (!coreVmKey) {
+            if (!hasCoreVmSelection) {
                 return '<div class="alert alert-warning small mb-0">Select a CORE VM in Step 2 before configuring external connectivity.</div>' + step4PrereqHtml;
             }
             if (!step4HasCandidates) {
@@ -13450,7 +13599,7 @@
         }
 
         const coreVmDetailsHtml = (() => {
-            if (!coreVmKey) {
+            if (!hasCoreVmSelection) {
                 return '';
             }
             if (!resolvedCoreVm) {
@@ -13494,7 +13643,7 @@
         let coreStatusClass = 'text-muted';
         if (!proxValidated) {
             coreStatusText = 'Validate Proxmox credentials to choose a CORE VM.';
-        } else if (!coreVmKey) {
+        } else if (!hasCoreVmSelection) {
             coreStatusText = 'Select a CORE VM to configure connection details.';
         } else if (!coreVmHasInterfaces) {
             const count = interfaceCountKnown ? (resolvedVmInterfaceCount || 0) : 0;
@@ -13531,13 +13680,13 @@
             coreStatusClass = 'text-warning';
         }
         const coreStatusHtml = escapeHtml(coreStatusText);
-        const coreInputsDisabled = !(proxValidated && coreVmKey);
+        const coreInputsDisabled = !(proxValidated && hasCoreVmSelection);
         const testBtnDisabledAttr = coreTestable ? '' : 'disabled';
-        const configureBtnDisabledAttr = (!coreVmKey || !proxValidated || proxInventoryBusy) ? 'disabled' : '';
-        const coreVmVerified = !!(core && core.validated === true && coreHasSecret && !!coreVmKey);
+        const configureBtnDisabledAttr = (!hasCoreVmSelection || !proxValidated || proxInventoryBusy) ? 'disabled' : '';
+        const coreVmVerified = !!(core && core.validated === true && coreHasSecret && hasCoreVmSelection);
         const coreConnectionSummaryHtml = (() => {
             if (IS_BUILDER_VIEW) {
-                const summaryBody = coreVmKey
+                const summaryBody = hasCoreVmSelection
                     ? '<div class="text-muted small">Connection configured by an administrator.</div>'
                     : '<div class="text-muted small">No CORE VM assigned yet.</div>';
                 return `
@@ -13547,7 +13696,7 @@
                     </div>`;
             }
             const summarizeEndpoint = () => {
-                if (!coreVmKey) return '';
+                if (!hasCoreVmSelection) return '';
                 const grpcLabel = coreHost ? `${escapeHtml(coreHost)}:${corePort}` : '<span class="text-danger">Not set</span>';
                 const sshHostLabel = coreSshHost ? escapeHtml(coreSshHost) : '<span class="text-danger">Not set</span>';
                 const sshPortLabel = coreSshPort ? String(coreSshPort) : '<span class="text-danger">Not set</span>';
@@ -13658,7 +13807,10 @@
         </div>`;
         const step4SectionHtml = `
         <div class="mb-4" data-hitl-step="4">
-            <h6 class="mb-2">Step 4 — CTF Participant VM</h6>
+            <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+                <h6 class="m-0">Step 4 — CTF Participant VM</h6>
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-step4-refresh-vms data-scen-idx="${activeIdx}" ${(!proxValidated || proxInventoryBusy || IS_BUILDER_VIEW) ? 'disabled' : ''}>Refresh compatible VMs</button>
+            </div>
             <div class="form-text mb-2">Choose a VM that will connect a participant to the scenario.</div>
             <fieldset class="hitl-step-fieldset ${step3Disabled ? 'hitl-step-disabled' : ''}" ${step3Disabled ? 'disabled' : ''} data-hitl-step4-body>
                 ${step4Content}
@@ -15586,6 +15738,29 @@
                 }
             });
         });
+        document.querySelectorAll('[data-hitl-step4-refresh-vms]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                if (IS_BUILDER_VIEW) {
+                    try { showToast('Builder view is read-only. Ask an admin to refresh compatible VMs.', { autohide: true, delay: 3000 }); } catch (e) { }
+                    return;
+                }
+                if (btn.disabled) return;
+                const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+                if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+                const originalHtml = btn.innerHTML;
+                btn.disabled = true;
+                btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Refreshing';
+                try {
+                    await fetchProxmoxInventory(sidx, { force: true });
+                    try { showToast('Refreshed compatible VM inventory.', { autohide: true, delay: 1800 }); } catch (e) { }
+                } finally {
+                    if (document.body.contains(btn)) {
+                        btn.disabled = false;
+                        btn.innerHTML = originalHtml;
+                    }
+                }
+            });
+        });
         const setParticipantUrlStatus = (sidx, rawValue) => {
             const indicator = document.querySelector(`[data-hitl-participant-status="${sidx}"]`);
             if (!indicator) return;
@@ -15810,7 +15985,12 @@
                     const coreState = hitlState.core || (hitlState.core = {});
                     const prevVmKey = (coreState.vm_key || '').toString();
                     const rawValue = select.value || '';
-                    const resetCoreSelection = () => {
+                    const resetCoreSelection = (options = {}) => {
+                        const preserveAuth = !!options.preserveAuth;
+                        const priorSecretId = typeof coreState.core_secret_id === 'string' ? coreState.core_secret_id : null;
+                        const priorValidated = coreState.validated === true;
+                        const priorValidatedAt = coreState.last_validated_at || null;
+                        const priorStoredSummary = coreState.stored_summary || null;
                         coreState.vm_key = '';
                         coreState.vm_name = '';
                         coreState.vm_node = '';
@@ -15819,10 +15999,10 @@
                         coreState.last_tested_at = null;
                         coreState.last_tested_host = null;
                         coreState.last_tested_port = null;
-                        coreState.core_secret_id = null;
-                        coreState.validated = false;
-                        coreState.last_validated_at = null;
-                        coreState.stored_summary = null;
+                        coreState.core_secret_id = preserveAuth ? priorSecretId : null;
+                        coreState.validated = preserveAuth ? priorValidated : false;
+                        coreState.last_validated_at = preserveAuth ? priorValidatedAt : null;
+                        coreState.stored_summary = preserveAuth ? priorStoredSummary : null;
                         coreState.internal_bridge = '';
                         coreState.internal_bridge_owner = '';
                         coreState.cached_vm_interface_count = null;
@@ -15854,7 +16034,7 @@
                     const inventory = proxState.inventory && Array.isArray(proxState.inventory.vms) ? proxState.inventory.vms : [];
                     const selectedVm = inventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === rawValue) || null;
                     const [nodePart, vmidPartRaw] = rawValue.split('::');
-                    resetCoreSelection();
+                    resetCoreSelection({ preserveAuth: true });
                     coreState.vm_key = rawValue;
                     coreState.vm_name = selectedVm && selectedVm.name ? String(selectedVm.name) : '';
                     coreState.vm_node = selectedVm && selectedVm.node !== undefined && selectedVm.node !== null

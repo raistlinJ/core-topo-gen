@@ -192,6 +192,85 @@ def test_save_xml_api_topology_bounds_roundtrip_persists(tmp_path, monkeypatch):
     assert ni.get('node_count_max') == 50
 
 
+def test_save_xml_api_preserves_hitl_when_payload_omits_hitl(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    existing_xml = tmp_path / 'existing-anatest.xml'
+    existing_xml.write_text(
+        """<?xml version='1.0' encoding='utf-8'?>
+<Scenarios>
+  <Scenario name="Anatest">
+    <ScenarioEditor>
+      <section name="Node Information" density="0" />
+      <section name="Routing" density="0.5" />
+      <section name="Services" density="0.5" />
+      <section name="Traffic" density="0.5" />
+      <section name="Vulnerabilities" density="0.5" />
+      <section name="Segmentation" density="0.5" />
+      <hardwareinloop enabled="true">
+        <proxmoxconnection username="root@pam" validated="true" secret_id="prox-secret-1" />
+        <coreconnection grpc_host="localhost" grpc_port="50051" validated="true" core_secret_id="core-secret-1" />
+      </hardwareinloop>
+    </ScenarioEditor>
+  </Scenario>
+</Scenarios>
+""",
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(
+        backend,
+        '_latest_xml_path_for_scenario',
+        lambda norm: str(existing_xml) if norm == backend._normalize_scenario_label('Anatest') else None,
+    )
+
+    save_payload = {
+        'project_key_hint': str(existing_xml),
+        'scenarios': [
+            {
+                'name': 'Anatest',
+                'saved_xml_path': str(existing_xml),
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {'density': 0, 'items': []},
+                    'Routing': {'density': 0.5, 'items': []},
+                    'Services': {'density': 0.5, 'items': []},
+                    'Traffic': {'density': 0.5, 'items': []},
+                    'Events': {'density': 0.5, 'items': []},
+                    'Vulnerabilities': {'density': 0.5, 'items': []},
+                    'Segmentation': {'density': 0.5, 'items': []},
+                },
+                # Intentionally omits 'hitl'
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(save_payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+    path = data.get('result_path')
+    assert path and os.path.exists(path)
+
+    parsed = backend._parse_scenarios_xml(path)
+    scen = (parsed.get('scenarios') or [])[0]
+    hitl = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else {}
+    core = hitl.get('core') if isinstance(hitl.get('core'), dict) else {}
+    prox = hitl.get('proxmox') if isinstance(hitl.get('proxmox'), dict) else {}
+
+    assert core.get('validated') is True
+    assert prox.get('validated') is True
+
+
 def test_save_xml_api_topology_roundtrip_preserves_section_fields(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)

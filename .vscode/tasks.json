@@ -497,6 +497,20 @@
 				"outputs/logs/execute-errors/97451529-3073-4577-beb2-ed71e2830eee/run_output.log"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "pytest: hitl targeted gating",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests/test_flow_live_paths_ui.py",
+				"tests/test_scenarios_tabs_flow_state_storage_ui.py",
+				"tests/test_core_connection_validation.py"
+			],
+			"isBackground": false
 		}
 	]
 }

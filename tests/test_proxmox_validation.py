@@ -196,3 +196,4 @@ def test_proxmox_inventory_success(client):
     assert iface["id"] == "net0"
     assert iface["bridge"] == "vmbr0"
     assert iface["macaddr"].lower().startswith("aa:bb:cc:dd:ee")
+

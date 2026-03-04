@@ -36317,6 +36317,59 @@ def save_xml_api():
         except Exception:
             pass
         autosave = False
+
+        def _has_meaningful_value(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, bool):
+                return value is True
+            if isinstance(value, (int, float)):
+                return True
+            if isinstance(value, list):
+                return len(value) > 0
+            if isinstance(value, dict):
+                return any(_has_meaningful_value(v) for v in value.values())
+            return False
+
+        def _has_meaningful_hitl(scenario_payload: Any) -> bool:
+            if not isinstance(scenario_payload, dict):
+                return False
+            hitl = scenario_payload.get('hitl') if isinstance(scenario_payload.get('hitl'), dict) else None
+            if not isinstance(hitl, dict):
+                return False
+            return _has_meaningful_value(hitl)
+
+        existing_hitl_by_norm: dict[str, dict[str, Any]] = {}
+        try:
+            for scen in scenarios if isinstance(scenarios, list) else []:
+                if not isinstance(scen, dict):
+                    continue
+                nm = str((scen.get('name') or '')).strip()
+                norm = _normalize_scenario_label(nm)
+                if not norm or norm in existing_hitl_by_norm:
+                    continue
+                xml_existing = _latest_xml_path_for_scenario(norm)
+                if not xml_existing:
+                    continue
+                parsed_existing = _parse_scenarios_xml(xml_existing)
+                existing_list = parsed_existing.get('scenarios') if isinstance(parsed_existing, dict) else None
+                if not isinstance(existing_list, list):
+                    continue
+                for existing_scen in existing_list:
+                    if not isinstance(existing_scen, dict):
+                        continue
+                    ex_name = str(existing_scen.get('name') or '').strip()
+                    if _normalize_scenario_label(ex_name) != norm:
+                        continue
+                    ex_hitl = existing_scen.get('hitl') if isinstance(existing_scen.get('hitl'), dict) else None
+                    if isinstance(ex_hitl, dict) and _has_meaningful_value(ex_hitl):
+                        existing_hitl_by_norm[norm] = copy.deepcopy(ex_hitl)
+                    break
+        except Exception:
+            existing_hitl_by_norm = {}
+
         ts = _local_timestamp_safe()
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
@@ -36347,7 +36400,21 @@ def save_xml_api():
                         out_path = os.path.join(out_dir, f"{stem}.xml")
                         suffix += 1
                 try:
-                    tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                    scen_to_write = scen
+                    try:
+                        norm = _normalize_scenario_label(display_name)
+                        existing_hitl = existing_hitl_by_norm.get(norm)
+                        if isinstance(existing_hitl, dict) and not _has_meaningful_hitl(scen):
+                            scen_to_write = dict(scen)
+                            scen_to_write['hitl'] = copy.deepcopy(existing_hitl)
+                            try:
+                                app.logger.info('[save_xml_api] preserved hitl for scenario=%s from existing XML', display_name)
+                            except Exception:
+                                pass
+                    except Exception:
+                        scen_to_write = scen
+
+                    tree = _build_scenarios_xml({ 'scenarios': [scen_to_write], 'core': normalized_core })
                     raw = ET.tostring(tree.getroot(), encoding='utf-8')
                     lroot = LET.fromstring(raw)
                     pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
@@ -36355,7 +36422,7 @@ def save_xml_api():
                         f.write(pretty)
                 except Exception:
                     try:
-                        tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                        tree = _build_scenarios_xml({ 'scenarios': [scen_to_write], 'core': normalized_core })
                         tree.write(out_path, encoding='utf-8', xml_declaration=True)
                     except Exception:
                         continue
