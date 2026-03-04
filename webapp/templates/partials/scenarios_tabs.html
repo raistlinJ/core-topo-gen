@@ -18,7 +18,7 @@
       <a class="nav-link {% if scenarios_active_tab == 'topology' %}active{% endif %}" {% if scenarios_active_tab == 'topology' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab) if scenario_tab else url_for('index') }}">Topology</a>
     </li>
     <li class="nav-item">
-      <a class="nav-link {% if scenarios_active_tab == 'flag-sequencing' %}active{% endif %}" {% if scenarios_active_tab == 'flag-sequencing' %}aria-current="page"{% endif %} href="{{ url_for('flow_page', scenario=scenario_tab) if scenario_tab else url_for('flow_page') }}">Flag Sequencing</a>
+      <a class="nav-link {% if scenarios_active_tab == 'flag-sequencing' %}active{% endif %}" {% if scenarios_active_tab == 'flag-sequencing' %}aria-current="page"{% endif %} href="{{ url_for('flow_page', scenario=scenario_tab, xml_path=preview_xml_path) if scenario_tab else url_for('flow_page', xml_path=preview_xml_path) }}">Flag Sequencing</a>
     </li>
     <li class="nav-item">
       <a

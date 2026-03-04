@@ -14626,25 +14626,25 @@ def flow_page():
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
 
     # Best-effort: provide the saved scenario XML path so the shared Preview button can work from this page.
-    # Prefer latest XML by scenario (single source of truth), then explicit query path,
+    # Prefer explicit xml_path first (tab handoff pin), then latest XML by scenario,
     # then catalog fallback.
     active_scenario_xml_path = ''
     xml_path = (request.args.get('xml_path') or '').strip()
     try:
-        if scenario_norm:
-            latest_xml = _latest_xml_path_for_scenario(scenario_norm) or ''
-            if latest_xml:
-                latest_abs = os.path.abspath(latest_xml)
-                if os.path.exists(latest_abs):
-                    active_scenario_xml_path = latest_abs
+        if xml_path:
+            xml_path_abs = os.path.abspath(xml_path)
+            if os.path.exists(xml_path_abs):
+                active_scenario_xml_path = xml_path_abs
     except Exception:
         active_scenario_xml_path = ''
     if not active_scenario_xml_path:
         try:
-            if xml_path:
-                xml_path_abs = os.path.abspath(xml_path)
-                if os.path.exists(xml_path_abs):
-                    active_scenario_xml_path = xml_path_abs
+            if scenario_norm:
+                latest_xml = _latest_xml_path_for_scenario(scenario_norm) or ''
+                if latest_xml:
+                    latest_abs = os.path.abspath(latest_xml)
+                    if os.path.exists(latest_abs):
+                        active_scenario_xml_path = latest_abs
         except Exception:
             active_scenario_xml_path = ''
     if not active_scenario_xml_path:
@@ -14751,25 +14751,25 @@ def scenarios_preview_page():
             scenario_norm = _normalize_scenario_label(scenario_names[0])
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
 
-    # Prefer latest XML by scenario (single source of truth). Fallback to explicit
-    # xml_path (e.g., handoff from Topology), then catalog path for active scenario.
+    # Prefer explicit xml_path first (tab handoff pin). Fallback to latest XML by
+    # scenario, then catalog path for active scenario.
     xml_path = (request.args.get('xml_path') or '').strip()
     xml_path_abs = ''
     try:
-        if scenario_norm:
-            latest_xml = _latest_xml_path_for_scenario(scenario_norm) or ''
-            if latest_xml:
-                latest_abs = os.path.abspath(latest_xml)
-                if os.path.exists(latest_abs):
-                    xml_path_abs = latest_abs
+        if xml_path:
+            xml_path_abs = os.path.abspath(xml_path)
+            if not os.path.exists(xml_path_abs):
+                xml_path_abs = ''
     except Exception:
         xml_path_abs = ''
     if not xml_path_abs:
         try:
-            if xml_path:
-                xml_path_abs = os.path.abspath(xml_path)
-                if not os.path.exists(xml_path_abs):
-                    xml_path_abs = ''
+            if scenario_norm:
+                latest_xml = _latest_xml_path_for_scenario(scenario_norm) or ''
+                if latest_xml:
+                    latest_abs = os.path.abspath(latest_xml)
+                    if os.path.exists(latest_abs):
+                        xml_path_abs = latest_abs
         except Exception:
             xml_path_abs = ''
     if not xml_path_abs:
