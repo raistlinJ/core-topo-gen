@@ -2036,12 +2036,14 @@
             }
             if (clone.external_vm && typeof clone.external_vm === 'object') {
                 const ext = clone.external_vm;
-                const vmKey = (ext.vm_key ?? ext.key ?? '').toString();
-                const vmNode = (ext.vm_node ?? ext.node ?? '').toString();
+                const vmKeyRaw = (ext.vm_key ?? ext.key ?? '').toString().trim();
+                const vmNode = (ext.vm_node ?? ext.node ?? '').toString().trim();
                 const vmName = (ext.vm_name ?? ext.name ?? '').toString();
                 const status = (ext.status ?? '').toString();
                 let vmid = ext.vmid ?? ext.id ?? '';
                 if (typeof vmid === 'string') vmid = vmid.trim();
+                const vmidText = (vmid ?? '').toString().trim();
+                const vmKey = vmKeyRaw || ((vmNode && vmidText) ? `${vmNode}::${vmidText}` : '');
                 const ifaceIdRaw = (ext.interface_id ?? ext.iface ?? '').toString().trim();
                 const ifaceBridgeRaw = (ext.interface_bridge ?? ext.bridge ?? '').toString().trim();
                 const ifaceMacRaw = (ext.interface_mac ?? ext.macaddr ?? ext.mac ?? '').toString().trim();
@@ -2157,18 +2159,10 @@
             scen.hitl.core.adv_run_core_cleanup = true;
         }
         const coreVmKeyCurrent = (scen.hitl.core?.vm_key ?? '').toString();
-        const coreVmNodeCurrent = (scen.hitl.core?.vm_node ?? '').toString().trim();
         if (coreVmKeyCurrent) {
             scen.hitl.interfaces.forEach(iface => {
-                if (iface && iface.external_vm && iface.external_vm.vm_key === coreVmKeyCurrent) {
-                    delete iface.external_vm;
-                }
-            });
-        }
-        if (coreVmNodeCurrent) {
-            scen.hitl.interfaces.forEach(iface => {
-                const vmNode = iface?.external_vm?.vm_node ? String(iface.external_vm.vm_node).trim() : '';
-                if (vmNode && vmNode !== coreVmNodeCurrent) {
+                const mappedVmKey = (iface?.external_vm?.vm_key ?? '').toString().trim();
+                if (mappedVmKey && mappedVmKey === coreVmKeyCurrent) {
                     delete iface.external_vm;
                 }
             });
@@ -2314,8 +2308,31 @@
         const sourceCoreRaw = (sourceHitlRaw.core && typeof sourceHitlRaw.core === 'object') ? sourceHitlRaw.core : null;
         const sourceProxRaw = (sourceHitlRaw.proxmox && typeof sourceHitlRaw.proxmox === 'object') ? sourceHitlRaw.proxmox : null;
         const sourceInterfacesRaw = Array.isArray(sourceHitlRaw.interfaces) ? sourceHitlRaw.interfaces : [];
-        const hasCorePayload = !!(sourceCoreRaw && Object.values(sourceCoreRaw).some((entry) => hasMeaningfulValue(entry)));
-        const hasProxPayload = !!(sourceProxRaw && Object.values(sourceProxRaw).some((entry) => hasMeaningfulValue(entry)));
+        const hasCorePayload = !!(sourceCoreRaw && [
+            sourceCoreRaw.vm_key,
+            sourceCoreRaw.vm_name,
+            sourceCoreRaw.vm_node,
+            sourceCoreRaw.internal_bridge,
+            sourceCoreRaw.internal_bridge_owner,
+            sourceCoreRaw.core_secret_id,
+            sourceCoreRaw.last_validated_at,
+            sourceCoreRaw.stored_at,
+            sourceCoreRaw.last_tested_at,
+            sourceCoreRaw.last_tested_status,
+            sourceCoreRaw.last_tested_message,
+            sourceCoreRaw.last_tested_host,
+            sourceCoreRaw.last_tested_port,
+            sourceCoreRaw.validated === true,
+        ].some((entry) => hasMeaningfulValue(entry)));
+        const hasProxPayload = !!(sourceProxRaw && [
+            sourceProxRaw.url,
+            sourceProxRaw.username,
+            sourceProxRaw.secret_id,
+            sourceProxRaw.last_validated_at,
+            sourceProxRaw.stored_at,
+            sourceProxRaw.last_message,
+            sourceProxRaw.validated === true,
+        ].some((entry) => hasMeaningfulValue(entry)));
         const hasInterfacesPayload = sourceInterfacesRaw.length > 0;
         const hasParticipantPayload = typeof sourceHitlRaw.participant_proxmox_url === 'string' && sourceHitlRaw.participant_proxmox_url.trim() !== '';
         const hasEnabledPayload = Object.prototype.hasOwnProperty.call(sourceHitlRaw, 'enabled');
@@ -2323,10 +2340,29 @@
             return;
         }
 
+        const isMissingValue = (value) => {
+            if (value === undefined || value === null) return true;
+            if (typeof value === 'string') return value.trim() === '';
+            if (Array.isArray(value)) return value.length === 0;
+            return false;
+        };
+
+        const mergeMissingFields = (targetObj, sourceObj) => {
+            if (!targetObj || typeof targetObj !== 'object' || !sourceObj || typeof sourceObj !== 'object') return targetObj;
+            const out = { ...targetObj };
+            Object.entries(sourceObj).forEach(([key, sourceValue]) => {
+                const targetValue = out[key];
+                if (isMissingValue(targetValue) && !isMissingValue(sourceValue)) {
+                    out[key] = sourceValue;
+                }
+            });
+            return out;
+        };
+
         const sourceHitl = ensureHitlStateForScenario(persistedClone);
         if (hasProxPayload && sourceHitl.proxmox && typeof sourceHitl.proxmox === 'object') {
             const targetProx = targetHitl.proxmox || {};
-            const mergedProx = { ...targetProx, ...sourceHitl.proxmox };
+            const mergedProx = mergeMissingFields(targetProx, sourceHitl.proxmox);
             const targetInv = targetProx.inventory;
             const sourceInv = sourceHitl.proxmox.inventory;
             if (targetInv && Array.isArray(targetInv.vms) && targetInv.vms.length) {
@@ -2344,7 +2380,7 @@
                 last_interfaces_attempt: targetCore.last_interfaces_attempt,
                 last_interfaces_refresh: targetCore.last_interfaces_refresh,
             };
-            const mergedCore = { ...targetCore, ...sourceHitl.core };
+            const mergedCore = mergeMissingFields(targetCore, sourceHitl.core);
             Object.entries(volatileFields).forEach(([key, value]) => {
                 if (value !== undefined) {
                     mergedCore[key] = value;
@@ -2391,7 +2427,11 @@
                 }
                 if (cloneEntry.external_vm && typeof cloneEntry.external_vm === 'object') {
                     const externalClone = _structuredCloneSafe(cloneEntry.external_vm) || { ...cloneEntry.external_vm };
-                    targetEntry.external_vm = externalClone;
+                    if (!targetEntry.external_vm || typeof targetEntry.external_vm !== 'object') {
+                        targetEntry.external_vm = externalClone;
+                    } else {
+                        targetEntry.external_vm = mergeMissingFields(targetEntry.external_vm, externalClone);
+                    }
                 }
             });
         }
@@ -4384,15 +4424,22 @@
         if (!baseUrl || typeof baseUrl !== 'string') return baseUrl;
         const sourceName = scenarioName !== null ? scenarioName : getActiveScenarioName();
         const trimmed = (sourceName || '').trim();
+        const xmlPath = (state && typeof state.result_path === 'string') ? state.result_path.trim() : '';
         if (!trimmed) return baseUrl;
         try {
             const isAbsolute = /^https?:/i.test(baseUrl);
             const url = new URL(baseUrl, window.location.origin);
             url.searchParams.set('scenario', trimmed);
+            if (xmlPath && /\.xml$/i.test(xmlPath)) {
+                url.searchParams.set('xml_path', xmlPath);
+            }
             return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
         } catch (e) {
             const sep = baseUrl.includes('?') ? '&' : '?';
-            return `${baseUrl}${sep}scenario=${encodeURIComponent(trimmed)}`;
+            const xmlPart = (xmlPath && /\.xml$/i.test(xmlPath))
+                ? `&xml_path=${encodeURIComponent(xmlPath)}`
+                : '';
+            return `${baseUrl}${sep}scenario=${encodeURIComponent(trimmed)}${xmlPart}`;
         }
     }
 
@@ -4894,12 +4941,83 @@
                 merged.core = coreMerged;
                 merged.proxmox = proxMerged;
 
+                const mergeInterfacesPreservingMappings = (serverInterfaces, localInterfaces) => {
+                    const serverList = Array.isArray(serverInterfaces) ? serverInterfaces : [];
+                    const localList = Array.isArray(localInterfaces) ? localInterfaces : [];
+                    if (!serverList.length) return localList;
+                    if (!localList.length) return serverList;
+
+                    const keyFor = (iface, index) => {
+                        if (iface && typeof iface === 'object') {
+                            const n = (iface.name ?? iface.interface ?? iface.id ?? '').toString().trim().toLowerCase();
+                            if (n) return n;
+                        }
+                        return `idx:${index}`;
+                    };
+
+                    const isMissing = (value) => {
+                        if (value === undefined || value === null) return true;
+                        if (typeof value === 'string') return value.trim() === '';
+                        if (Array.isArray(value)) return value.length === 0;
+                        return false;
+                    };
+
+                    const mergeMissing = (target, source) => {
+                        if (!target || typeof target !== 'object') return target;
+                        if (!source || typeof source !== 'object') return target;
+                        const out = { ...target };
+                        Object.entries(source).forEach(([k, v]) => {
+                            if (isMissing(out[k]) && !isMissing(v)) {
+                                out[k] = v;
+                            }
+                        });
+                        return out;
+                    };
+
+                    const localByKey = new Map();
+                    localList.forEach((iface, idx) => {
+                        if (!iface || typeof iface !== 'object') return;
+                        localByKey.set(keyFor(iface, idx), iface);
+                    });
+
+                    const mergedList = serverList.map((serverIface, idx) => {
+                        if (!serverIface || typeof serverIface !== 'object') return serverIface;
+                        const key = keyFor(serverIface, idx);
+                        const localIface = localByKey.get(key);
+                        if (!localIface || typeof localIface !== 'object') return serverIface;
+
+                        const out = mergeMissing(serverIface, localIface);
+                        if (serverIface.proxmox_target && typeof serverIface.proxmox_target === 'object') {
+                            out.proxmox_target = mergeMissing(serverIface.proxmox_target, localIface.proxmox_target);
+                        } else if (localIface.proxmox_target && typeof localIface.proxmox_target === 'object') {
+                            out.proxmox_target = localIface.proxmox_target;
+                        }
+                        if (serverIface.external_vm && typeof serverIface.external_vm === 'object') {
+                            out.external_vm = mergeMissing(serverIface.external_vm, localIface.external_vm);
+                        } else if (localIface.external_vm && typeof localIface.external_vm === 'object') {
+                            out.external_vm = localIface.external_vm;
+                        }
+                        return out;
+                    });
+
+                    const serverKeys = new Set(mergedList.map((iface, idx) => keyFor(iface, idx)));
+                    localList.forEach((localIface, idx) => {
+                        const key = keyFor(localIface, idx);
+                        if (!serverKeys.has(key)) {
+                            mergedList.push(localIface);
+                            serverKeys.add(key);
+                        }
+                    });
+
+                    return mergedList;
+                };
+
                 // HITL config is admin-managed; keep server as source-of-truth.
                 if (Object.prototype.hasOwnProperty.call(serverObj, 'enabled') && hasMeaningfulValue(serverObj.enabled)) {
                     merged.enabled = !!serverObj.enabled;
                 }
                 if (Object.prototype.hasOwnProperty.call(serverObj, 'interfaces') && Array.isArray(serverObj.interfaces) && serverObj.interfaces.length) {
-                    merged.interfaces = serverObj.interfaces;
+                    merged.interfaces = mergeInterfacesPreservingMappings(serverObj.interfaces, localObj.interfaces);
                 }
                 // Participant URL hints should not disappear.
                 ['participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'].forEach((k) => {
@@ -5235,10 +5353,15 @@
         }
     }
 
-    function proceedUnsavedNavigation() {
+    async function proceedUnsavedNavigation() {
         const href = _unsavedNavPendingHref;
         _unsavedNavPendingHref = null;
         if (!href) return;
+        try {
+            if (typeof flushServerSnapshotPersistNow === 'function') {
+                await flushServerSnapshotPersistNow();
+            }
+        } catch (e) { }
         _unsavedNavAllowOnce = true;
         window.location.href = href;
     }
@@ -5258,7 +5381,7 @@
                     }
                     await autoSaveXml();
                     hideUnsavedChangesModal();
-                    proceedUnsavedNavigation();
+                    await proceedUnsavedNavigation();
                 } catch (e) {
                     const msg = (e && e.message) ? e.message : String(e || 'Save failed');
                     try { showToast(`Save failed: ${msg}`, { force: true, autohide: false }); } catch (_) { }
@@ -5270,9 +5393,9 @@
         }
 
         if (discardBtn) {
-            discardBtn.addEventListener('click', () => {
+            discardBtn.addEventListener('click', async () => {
                 hideUnsavedChangesModal();
-                proceedUnsavedNavigation();
+                await proceedUnsavedNavigation();
             });
         }
     });
@@ -5291,9 +5414,17 @@
             if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
             if (link.target && link.target.toLowerCase() === '_blank') return;
             if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-            if (!hasUnsavedChanges()) return;
+            const navHref = buildScenarioAwareUrl(href) || href;
+            if (!hasUnsavedChanges()) {
+                if (navHref !== href) {
+                    event.preventDefault();
+                    _unsavedNavAllowOnce = true;
+                    window.location.href = navHref;
+                }
+                return;
+            }
             event.preventDefault();
-            showUnsavedChangesModal(href);
+            showUnsavedChangesModal(navHref);
         } catch (e) { }
     }, true);
 
@@ -9148,7 +9279,7 @@
         if (busy) {
             modal.setAttribute('aria-busy', 'true');
             if (notice) {
-                notice.textContent = 'Refreshing Proxmox interfaces…';
+                notice.textContent = 'Refreshing compatible Proxmox VMs…';
                 notice.classList.remove('d-none');
             }
         } else {
@@ -9302,10 +9433,15 @@
                 const clean = {
                     enabled: !!rawHitl.enabled,
                     participant_proxmox_url: (rawHitl.participant_proxmox_url || '').toString().trim(),
+                    participant_ui_url: (rawHitl.participant_ui_url || '').toString().trim(),
+                    participant_url: (rawHitl.participant_url || '').toString().trim(),
+                    participant: (rawHitl.participant || '').toString().trim(),
                     interfaces: [],
                     core: {},
                     proxmox: {},
                 };
+                if (rawHitl.bridge_validated !== undefined) clean.bridge_validated = !!rawHitl.bridge_validated;
+                if (rawHitl.bridge_validated_at !== undefined) clean.bridge_validated_at = rawHitl.bridge_validated_at;
                 const missingCore = [];
                 const ifaceList = Array.isArray(rawHitl.interfaces) ? rawHitl.interfaces : [];
                 for (let i = 0; i < ifaceList.length; i += 1) {
@@ -9317,6 +9453,12 @@
                         name: entry.name || '',
                         attachment: entry.attachment || '',
                     };
+                    if (entry.mac !== undefined && entry.mac !== null && String(entry.mac).trim()) {
+                        sanitized.mac = String(entry.mac).trim();
+                    }
+                    if (entry.core_bridge !== undefined && entry.core_bridge !== null && String(entry.core_bridge).trim()) {
+                        sanitized.core_bridge = String(entry.core_bridge).trim();
+                    }
                     const hostInfo = hostInfoLookup.get(sanitized.name) || null;
                     let proxTargetClean = null;
                     const proxTarget = entry.proxmox_target;
@@ -9336,6 +9478,7 @@
                         if (proxTarget.vm_name || proxTarget.label) {
                             proxTargetClean.vm_name = proxTarget.vm_name ?? proxTarget.label ?? '';
                         }
+                        if (proxTarget.label) proxTargetClean.label = proxTarget.label;
                         if (proxTarget.macaddr) proxTargetClean.macaddr = proxTarget.macaddr;
                         if (proxTarget.bridge) proxTargetClean.bridge = proxTarget.bridge;
                         if (proxTarget.model) proxTargetClean.model = proxTarget.model;
@@ -9349,6 +9492,7 @@
                         };
                         const vmName = pickFirst(hostProx.vm_name, hostProx.raw && hostProx.raw.vm_name, hostProx.raw && hostProx.raw.name);
                         if (vmName) proxTargetClean.vm_name = vmName;
+                        if (!proxTargetClean.label && vmName) proxTargetClean.label = vmName;
                         if (hostProx.macaddr) proxTargetClean.macaddr = String(hostProx.macaddr).trim();
                         if (hostProx.bridge) proxTargetClean.bridge = String(hostProx.bridge).trim();
                         if (hostProx.model) proxTargetClean.model = String(hostProx.model).trim();
@@ -9401,6 +9545,10 @@
                         };
                         if (external.vm_node) ext.vm_node = external.vm_node;
                         if (external.vm_name) ext.vm_name = external.vm_name;
+                        if (external.status !== undefined) ext.status = external.status;
+                        if (external.interface_bridge !== undefined) ext.interface_bridge = external.interface_bridge;
+                        if (external.interface_mac !== undefined) ext.interface_mac = external.interface_mac;
+                        if (external.interface_model !== undefined) ext.interface_model = external.interface_model;
                         sanitized.external_vm = ext;
                         const hasCoreSelection = proxTargetClean && proxTargetClean.interface_id;
                         const hasExternalSelection = (ext.vm_key && String(ext.vm_key).trim()) ||
@@ -9416,8 +9564,22 @@
                 if (coreRaw && typeof coreRaw === 'object') {
                     clean.core = {
                         vm_key: coreRaw.vm_key ?? '',
+                        vmid: coreRaw.vmid ?? '',
                         vm_name: coreRaw.vm_name ?? '',
                         vm_node: coreRaw.vm_node ?? '',
+                        grpc_host: coreRaw.grpc_host ?? '',
+                        grpc_port: coreRaw.grpc_port ?? '',
+                        ssh_host: coreRaw.ssh_host ?? '',
+                        ssh_port: coreRaw.ssh_port ?? '',
+                        core_secret_id: coreRaw.core_secret_id ?? null,
+                        validated: coreRaw.validated ?? false,
+                        last_validated_at: coreRaw.last_validated_at ?? '',
+                        stored_at: coreRaw.stored_at ?? '',
+                        last_tested_at: coreRaw.last_tested_at ?? '',
+                        last_tested_status: coreRaw.last_tested_status ?? '',
+                        last_tested_message: coreRaw.last_tested_message ?? '',
+                        last_tested_host: coreRaw.last_tested_host ?? '',
+                        last_tested_port: coreRaw.last_tested_port ?? '',
                         internal_bridge: coreRaw.internal_bridge ?? '',
                         internal_bridge_owner: coreRaw.internal_bridge_owner ?? '',
                     };
@@ -9425,7 +9587,13 @@
                 const proxRaw = rawHitl.proxmox;
                 if (proxRaw && typeof proxRaw === 'object') {
                     clean.proxmox = {
+                        url: proxRaw.url ?? '',
+                        port: proxRaw.port ?? '',
+                        verify_ssl: proxRaw.verify_ssl ?? false,
                         secret_id: proxRaw.secret_id ?? proxRaw.secretId ?? null,
+                        validated: proxRaw.validated ?? false,
+                        last_validated_at: proxRaw.last_validated_at ?? '',
+                        stored_at: proxRaw.stored_at ?? '',
                     };
                 }
                 return { clean, missingCore };
@@ -9444,6 +9612,7 @@
                 updateExternalIfxStatus(detailMessage, 'warning', { busy: false });
                 try { showToast(detailMessage, { autohide: false }); } catch (e) { }
                 try { delete hitlState.bridge_validated; } catch (e) { }
+                try { delete hitlState.bridge_validated_at; } catch (e) { }
                 try { persistEditorState(); } catch (e) { }
                 try { updateProxmoxSummary(idx); } catch (e) { }
                 try { renderMain(); } catch (e) { }
@@ -9478,6 +9647,7 @@
                 updateExternalIfxStatus(errMessage, 'danger');
                 try { showToast(errMessage, { autohide: false }); } catch (e) { }
                 try { delete hitlState.bridge_validated; } catch (e) { }
+                try { delete hitlState.bridge_validated_at; } catch (e) { }
                 try { persistEditorState(); } catch (e) { }
                 try { updateProxmoxSummary(idx); } catch (e) { }
                 try { renderMain(); } catch (e) { }
@@ -9487,8 +9657,22 @@
             const appliedBridgeName = data.bridge_name || bridgeName;
             coreState.internal_bridge = appliedBridgeName;
             try { hitlState.bridge_validated = true; } catch (e) { }
+            try { hitlState.bridge_validated_at = new Date().toISOString(); } catch (e) { }
             const responseOwner = (data.bridge_owner || requestPayload.bridge_owner || '').toString();
             coreState.internal_bridge_owner = responseOwner;
+            try {
+                const ifaces = Array.isArray(hitlState.interfaces) ? hitlState.interfaces : [];
+                ifaces.forEach((iface) => {
+                    if (!iface || typeof iface !== 'object') return;
+                    const ext = iface.external_vm;
+                    const hasMappedExternal = !!(ext && typeof ext === 'object' && ((ext.vm_key || '').toString().trim() || (ext.vmid || '').toString().trim() || (ext.vm_name || '').toString().trim()));
+                    if (!hasMappedExternal) return;
+                    iface.core_bridge = appliedBridgeName;
+                    if (iface.proxmox_target && typeof iface.proxmox_target === 'object') {
+                        iface.proxmox_target.bridge = appliedBridgeName;
+                    }
+                });
+            } catch (e) { }
             window.requestAnimationFrame(() => {
                 try { updateProxmoxSummary(idx); } catch (rafErr) { console.warn('Failed to update Proxmox summary', rafErr); }
             });
@@ -9961,6 +10145,7 @@
             delete core.cached_host_interfaces_metadata;
             delete core.cached_host_interfaces_fetched_at;
             delete hitl.bridge_validated;
+            delete hitl.bridge_validated_at;
 
             if (oldVmKey && (state.host_interfaces_vm_key || '').toString() === oldVmKey) {
                 state.host_interfaces = [];
@@ -10047,6 +10232,7 @@
             hitl.enabled = false;
             hitl.participant_proxmox_url = '';
             delete hitl.bridge_validated;
+            delete hitl.bridge_validated_at;
             if (Array.isArray(hitl.interfaces)) {
                 hitl.interfaces = [];
             }
@@ -10212,6 +10398,7 @@
         const markHitlVerifyFailed = (message) => {
             try {
                 delete hitlState.bridge_validated;
+                delete hitlState.bridge_validated_at;
                 persistEditorState();
                 const hidden = document.getElementById('scenarios_json');
                 if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
@@ -10402,10 +10589,15 @@
                 const clean = {
                     enabled: !!rawHitl.enabled,
                     participant_proxmox_url: (rawHitl.participant_proxmox_url || '').toString().trim(),
+                    participant_ui_url: (rawHitl.participant_ui_url || '').toString().trim(),
+                    participant_url: (rawHitl.participant_url || '').toString().trim(),
+                    participant: (rawHitl.participant || '').toString().trim(),
                     interfaces: [],
                     core: {},
                     proxmox: {},
                 };
+                if (rawHitl.bridge_validated !== undefined) clean.bridge_validated = !!rawHitl.bridge_validated;
+                if (rawHitl.bridge_validated_at !== undefined) clean.bridge_validated_at = rawHitl.bridge_validated_at;
                 const missingCore = [];
                 const ifaceList = Array.isArray(rawHitl.interfaces) ? rawHitl.interfaces : [];
                 for (let i = 0; i < ifaceList.length; i += 1) {
@@ -10417,6 +10609,12 @@
                         name: entry.name || '',
                         attachment: entry.attachment || '',
                     };
+                    if (entry.mac !== undefined && entry.mac !== null && String(entry.mac).trim()) {
+                        sanitized.mac = String(entry.mac).trim();
+                    }
+                    if (entry.core_bridge !== undefined && entry.core_bridge !== null && String(entry.core_bridge).trim()) {
+                        sanitized.core_bridge = String(entry.core_bridge).trim();
+                    }
                     const hostInfo = hostInfoLookup.get(sanitized.name) || null;
                     let proxTargetClean = null;
                     const proxTarget = entry.proxmox_target;
@@ -10436,6 +10634,7 @@
                         if (proxTarget.vm_name || proxTarget.label) {
                             proxTargetClean.vm_name = proxTarget.vm_name ?? proxTarget.label ?? '';
                         }
+                        if (proxTarget.label) proxTargetClean.label = proxTarget.label;
                         if (proxTarget.macaddr) proxTargetClean.macaddr = proxTarget.macaddr;
                         if (proxTarget.bridge) proxTargetClean.bridge = proxTarget.bridge;
                         if (proxTarget.model) proxTargetClean.model = proxTarget.model;
@@ -10449,6 +10648,7 @@
                         };
                         const vmName = pickFirst(hostProx.vm_name, hostProx.raw && hostProx.raw.vm_name, hostProx.raw && hostProx.raw.name);
                         if (vmName) proxTargetClean.vm_name = vmName;
+                        if (!proxTargetClean.label && vmName) proxTargetClean.label = vmName;
                         if (hostProx.macaddr) proxTargetClean.macaddr = String(hostProx.macaddr).trim();
                         if (hostProx.bridge) proxTargetClean.bridge = String(hostProx.bridge).trim();
                         if (hostProx.model) proxTargetClean.model = String(hostProx.model).trim();
@@ -10501,6 +10701,10 @@
                         };
                         if (external.vm_node) ext.vm_node = external.vm_node;
                         if (external.vm_name) ext.vm_name = external.vm_name;
+                        if (external.status !== undefined) ext.status = external.status;
+                        if (external.interface_bridge !== undefined) ext.interface_bridge = external.interface_bridge;
+                        if (external.interface_mac !== undefined) ext.interface_mac = external.interface_mac;
+                        if (external.interface_model !== undefined) ext.interface_model = external.interface_model;
                         sanitized.external_vm = ext;
                         const hasCoreSelection = proxTargetClean && proxTargetClean.interface_id;
                         const hasExternalSelection = (ext.vm_key && String(ext.vm_key).trim()) ||
@@ -10516,8 +10720,22 @@
                 if (coreRaw && typeof coreRaw === 'object') {
                     clean.core = {
                         vm_key: coreRaw.vm_key ?? '',
+                        vmid: coreRaw.vmid ?? '',
                         vm_name: coreRaw.vm_name ?? '',
                         vm_node: coreRaw.vm_node ?? '',
+                        grpc_host: coreRaw.grpc_host ?? '',
+                        grpc_port: coreRaw.grpc_port ?? '',
+                        ssh_host: coreRaw.ssh_host ?? '',
+                        ssh_port: coreRaw.ssh_port ?? '',
+                        core_secret_id: coreRaw.core_secret_id ?? null,
+                        validated: coreRaw.validated ?? false,
+                        last_validated_at: coreRaw.last_validated_at ?? '',
+                        stored_at: coreRaw.stored_at ?? '',
+                        last_tested_at: coreRaw.last_tested_at ?? '',
+                        last_tested_status: coreRaw.last_tested_status ?? '',
+                        last_tested_message: coreRaw.last_tested_message ?? '',
+                        last_tested_host: coreRaw.last_tested_host ?? '',
+                        last_tested_port: coreRaw.last_tested_port ?? '',
                         internal_bridge: coreRaw.internal_bridge ?? '',
                         internal_bridge_owner: coreRaw.internal_bridge_owner ?? '',
                     };
@@ -10525,7 +10743,13 @@
                 const proxRaw = rawHitl.proxmox;
                 if (proxRaw && typeof proxRaw === 'object') {
                     clean.proxmox = {
+                        url: proxRaw.url ?? '',
+                        port: proxRaw.port ?? '',
+                        verify_ssl: proxRaw.verify_ssl ?? false,
                         secret_id: proxRaw.secret_id ?? proxRaw.secretId ?? null,
+                        validated: proxRaw.validated ?? false,
+                        last_validated_at: proxRaw.last_validated_at ?? '',
+                        stored_at: proxRaw.stored_at ?? '',
                     };
                 }
                 return { clean, missingCore };
@@ -10576,9 +10800,21 @@
             const msg = data.message || 'HITL bridge settings verified.';
             try {
                 hitlState.bridge_validated = true;
+                hitlState.bridge_validated_at = new Date().toISOString();
                 if (hitlState.core && typeof hitlState.core === 'object') {
                     hitlState.core.internal_bridge = bridgeName;
                 }
+                const ifaces = Array.isArray(hitlState.interfaces) ? hitlState.interfaces : [];
+                ifaces.forEach((iface) => {
+                    if (!iface || typeof iface !== 'object') return;
+                    const ext = iface.external_vm;
+                    const hasMappedExternal = !!(ext && typeof ext === 'object' && ((ext.vm_key || '').toString().trim() || (ext.vmid || '').toString().trim() || (ext.vm_name || '').toString().trim()));
+                    if (!hasMappedExternal) return;
+                    iface.core_bridge = bridgeName;
+                    if (iface.proxmox_target && typeof iface.proxmox_target === 'object' && !((iface.proxmox_target.bridge || '').toString().trim())) {
+                        iface.proxmox_target.bridge = bridgeName;
+                    }
+                });
                 persistEditorState();
             } catch (e) { }
             try {
@@ -11843,7 +12079,20 @@
             if (!Number.isInteger(idx) || idx < 0) return false;
             const scenLabel = (scenarioName || '').toString().trim();
             if (!scenLabel) return false;
-            const resp = await fetch(`/api/scenario/latest_state?scenario=${encodeURIComponent(scenLabel)}`, {
+            const scenObj = (Array.isArray(state?.scenarios) && idx >= 0 && idx < state.scenarios.length)
+                ? state.scenarios[idx]
+                : null;
+            const pathCandidates = [
+                scenObj && typeof scenObj === 'object' ? (scenObj.saved_xml_path || '') : '',
+                Array.isArray(state?.saved_xml_paths_by_index) ? (state.saved_xml_paths_by_index[idx] || '') : '',
+                state?.result_path || '',
+            ].map(v => (v || '').toString().trim()).filter(Boolean);
+            const preferredXmlPath = pathCandidates.find(p => p.toLowerCase().endsWith('.xml')) || '';
+            const query = new URLSearchParams({ scenario: scenLabel });
+            if (preferredXmlPath) {
+                query.set('xml_path', preferredXmlPath);
+            }
+            const resp = await fetch(`/api/scenario/latest_state?${query.toString()}`, {
                 method: 'GET',
                 credentials: 'same-origin',
                 headers: { 'Accept': 'application/json' },
@@ -11866,10 +12115,66 @@
                     nextHitl = nextScenario.hitl;
                 }
                 if (existingHitl && nextHitl) {
+                    const hasMeaningful = (val) => {
+                        if (val === undefined || val === null) return false;
+                        if (typeof val === 'string') return val.trim() !== '';
+                        if (typeof val === 'boolean') return true;
+                        if (typeof val === 'number') return true;
+                        if (Array.isArray(val)) return val.length > 0;
+                        if (typeof val === 'object') return Object.values(val).some(hasMeaningful);
+                        return false;
+                    };
+                    const mergeMissing = (target, source) => {
+                        if (!target || typeof target !== 'object' || !source || typeof source !== 'object') return target;
+                        Object.keys(source).forEach((key) => {
+                            const tVal = target[key];
+                            const sVal = source[key];
+                            if (tVal && typeof tVal === 'object' && !Array.isArray(tVal)
+                                && sVal && typeof sVal === 'object' && !Array.isArray(sVal)) {
+                                mergeMissing(tVal, sVal);
+                                return;
+                            }
+                            if (!hasMeaningful(tVal) && hasMeaningful(sVal)) {
+                                target[key] = sVal;
+                            }
+                        });
+                        return target;
+                    };
+
                     const existingInterfaces = Array.isArray(existingHitl.interfaces) ? existingHitl.interfaces : [];
                     const nextInterfaces = Array.isArray(nextHitl.interfaces) ? nextHitl.interfaces : [];
                     if (existingInterfaces.length > 0 && nextInterfaces.length === 0) {
                         nextHitl.interfaces = JSON.parse(JSON.stringify(existingInterfaces));
+                    } else if (existingInterfaces.length > 0 && nextInterfaces.length > 0) {
+                        const normalizeIfaceName = (entry) => (entry && typeof entry === 'object' && entry.name)
+                            ? String(entry.name).trim().toLowerCase()
+                            : '';
+                        const existingByName = new Map();
+                        existingInterfaces.forEach((entry) => {
+                            if (!entry || typeof entry !== 'object') return;
+                            const name = normalizeIfaceName(entry);
+                            if (!name) return;
+                            existingByName.set(name, entry);
+                        });
+                        const mergedNameSet = new Set();
+                        const merged = nextInterfaces.map((entry) => {
+                            if (!entry || typeof entry !== 'object') return entry;
+                            const name = normalizeIfaceName(entry);
+                            if (!name) return JSON.parse(JSON.stringify(entry));
+                            mergedNameSet.add(name);
+                            const existingEntry = existingByName.get(name);
+                            if (!existingEntry || typeof existingEntry !== 'object') return entry;
+                            const clone = JSON.parse(JSON.stringify(entry));
+                            mergeMissing(clone, existingEntry);
+                            return clone;
+                        });
+                        existingInterfaces.forEach((entry) => {
+                            if (!entry || typeof entry !== 'object') return;
+                            const name = normalizeIfaceName(entry);
+                            if (!name || mergedNameSet.has(name)) return;
+                            merged.push(JSON.parse(JSON.stringify(entry)));
+                        });
+                        nextHitl.interfaces = merged;
                     }
                     if (existingHitl.enabled === true && nextHitl.enabled !== true) {
                         nextHitl.enabled = true;
@@ -11881,20 +12186,7 @@
                     const existingCore = (existingHitl.core && typeof existingHitl.core === 'object') ? existingHitl.core : null;
                     const nextCore = (nextHitl.core && typeof nextHitl.core === 'object') ? nextHitl.core : (nextHitl.core = {});
                     if (existingCore && nextCore && typeof nextCore === 'object') {
-                        const preserveCoreFields = [
-                            'vm_key', 'vm_name', 'vm_node', 'vmid',
-                            'core_secret_id', 'validated',
-                            'cached_vm_interface_count', 'cached_vm_status',
-                            'last_tested_status', 'last_tested_host', 'last_tested_port', 'last_tested_at', 'last_tested_message',
-                        ];
-                        preserveCoreFields.forEach((key) => {
-                            const nextVal = nextCore[key];
-                            const nextMissing = nextVal === undefined || nextVal === null || (typeof nextVal === 'string' && nextVal.trim() === '');
-                            if (!nextMissing) return;
-                            const existingVal = existingCore[key];
-                            const existingPresent = !(existingVal === undefined || existingVal === null || (typeof existingVal === 'string' && existingVal.trim() === ''));
-                            if (existingPresent) nextCore[key] = existingVal;
-                        });
+                        mergeMissing(nextCore, existingCore);
                     }
 
                     const existingProx = (existingHitl.proxmox && typeof existingHitl.proxmox === 'object') ? existingHitl.proxmox : null;
@@ -11934,15 +12226,7 @@
                             if (!nextProx.last_validated_at && existingProx.last_validated_at) nextProx.last_validated_at = existingProx.last_validated_at;
                             if (!nextProx.last_message && existingProx.last_message) nextProx.last_message = existingProx.last_message;
                         }
-                        const preserveProxFields = ['secret_id', 'validated', 'url', 'username', 'port', 'verify_ssl', 'last_validated_at', 'last_message'];
-                        preserveProxFields.forEach((key) => {
-                            const nextVal = nextProx[key];
-                            const nextMissing = nextVal === undefined || nextVal === null || (typeof nextVal === 'string' && nextVal.trim() === '');
-                            if (!nextMissing) return;
-                            const existingVal = existingProx[key];
-                            const existingPresent = !(existingVal === undefined || existingVal === null || (typeof existingVal === 'string' && existingVal.trim() === ''));
-                            if (existingPresent) nextProx[key] = existingVal;
-                        });
+                        mergeMissing(nextProx, existingProx);
                     }
                 }
             } catch (e) {
@@ -11979,6 +12263,22 @@
             return false;
         }
     }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        window.setTimeout(async () => {
+            try {
+                const idx = Number.isInteger(activeIdx) ? activeIdx : 0;
+                const scenario = Array.isArray(state?.scenarios) ? state.scenarios[idx] : null;
+                const name = (scenario && scenario.name) ? String(scenario.name).trim() : '';
+                if (!name) return;
+                const hydrated = await rehydrateScenarioFromLatestXml(idx, name);
+                if (!hydrated) return;
+                try { persistEditorState(); } catch (e) { }
+                try { render(); } catch (e) { }
+                try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (e) { }
+            } catch (e) { }
+        }, 0);
+    });
 
     function showXmlRehydrateBadge(message = 'Loaded from latest XML', tone = 'info') {
         try {
@@ -12781,30 +13081,6 @@
                 const hitlEnabled = !!hitlToggleWasEnabled;
                 const hitlStep4Applied = !!((core.internal_bridge || '').toString().trim());
 
-                const getVmKeyFromParts = (node, vmid) => {
-                    const n = (node ?? '').toString().trim();
-                    const v = (vmid ?? '').toString().trim();
-                    if (!n || !v) return '';
-                    return `${n}::${v}`;
-                };
-                const findVmInInventory = (vmKey) => {
-                    if (!vmKey) return null;
-                    return proxInventory.find(vm => `${vm?.node ?? ''}::${vm?.vmid ?? ''}` === vmKey) || null;
-                };
-                const resolveInterfaceBridge = (vm, ifaceIdRaw) => {
-                    if (!vm || !ifaceIdRaw) return '';
-                    const ifaceId = (ifaceIdRaw ?? '').toString().trim();
-                    if (!ifaceId) return '';
-                    const ifaces = Array.isArray(vm.interfaces) ? vm.interfaces : [];
-                    const match = ifaces.find((it) => {
-                        const id = (it?.id ?? it?.interface_id ?? it?.iface ?? it?.name ?? '').toString().trim();
-                        return id === ifaceId;
-                    }) || null;
-                    const bridge = (match?.bridge ?? match?.interface_bridge ?? match?.proxmox_bridge ?? match?.raw?.bridge ?? '').toString().trim();
-                    return bridge;
-                };
-
-                const coreVmForBridge = findVmInInventory(coreVmKey);
                 // Step 4 only requires configuring at least one participant attachment (VM + interface).
                 // Do not require *every* HITL interface to be mapped to an external VM.
                 // If the user picked an external VM for any interface, require the external interface id as well.
@@ -12822,29 +13098,14 @@
                         const coreIfaceId = (proxTarget?.interface_id ?? '').toString().trim();
                         const extIfaceId = (ext?.interface_id ?? '').toString().trim();
 
-                        // Builder view may not have access to live inventories; prefer persisted hints.
+                        // Use persisted per-interface bridge metadata; avoid live inference.
                         const coreBridgeHint = (iface?.core_bridge ?? iface?.bridge ?? '').toString().trim();
 
                         const coreBridgeStored = (proxTarget?.bridge ?? '').toString().trim();
                         const extBridgeStored = (ext?.interface_bridge ?? '').toString().trim();
 
-                        const coreBridgeFromHostIface = (() => {
-                            try {
-                                const name = (iface?.name ?? '').toString().trim();
-                                if (!name) return '';
-                                const hostIface = hostLookup.get(name);
-                                if (!hostIface) return '';
-                                return (getBridgeName(hostIface) ?? '').toString().trim();
-                            } catch (e) {
-                                return '';
-                            }
-                        })();
-
-                        const extVmKey = (ext?.vm_key ?? '').toString().trim() || getVmKeyFromParts(ext?.vm_node, ext?.vmid);
-                        const extVmForBridge = findVmInInventory(extVmKey);
-
-                        const coreBridge = coreBridgeHint || coreBridgeStored || coreBridgeFromHostIface || resolveInterfaceBridge(coreVmForBridge, coreIfaceId);
-                        const extBridge = extBridgeStored || resolveInterfaceBridge(extVmForBridge, extIfaceId);
+                        const coreBridge = coreBridgeHint || coreBridgeStored;
+                        const extBridge = extBridgeStored;
 
                         const name = (iface?.name ?? '').toString().trim();
                         return {
@@ -12870,6 +13131,18 @@
                     const extNorm = normalizeBridge(p.extBridge);
                     return !!coreNorm && !!extNorm && coreNorm !== extNorm;
                 });
+                const persistedHitlValidated = !!(hitl && hitl.bridge_validated === true);
+                const persistedHitlValidatedAtRaw = (hitl && hitl.bridge_validated_at) ? String(hitl.bridge_validated_at).trim() : '';
+                const persistedHitlValidatedAtLabel = (() => {
+                    if (!persistedHitlValidatedAtRaw) return '';
+                    try {
+                        const dt = new Date(persistedHitlValidatedAtRaw);
+                        if (Number.isNaN(dt.getTime())) return '';
+                        return dt.toLocaleString();
+                    } catch (e) {
+                        return '';
+                    }
+                })();
 
                 // Mirror Verify prerequisites rather than requiring Apply/Test.
                 const hitlSummaryPrereqsReady = !!(
@@ -12881,7 +13154,10 @@
                     && !proxInventoryError
                     && hitlMappingsSufficient
                 );
-                let hitlReady = !!(hitlSummaryPrereqsReady && !hitlBridgeMismatchKnown);
+                const hitlBridgeAlignmentReady = bridgePairs.length > 0
+                    ? (hitlBridgesKnown && hitlBridgesMatch)
+                    : true;
+                let hitlReady = !!(hitlSummaryPrereqsReady && hitlBridgeAlignmentReady && persistedHitlValidated);
 
                 // Builder view: rely on admin-managed safe signals rather than strict per-interface
                 // mapping completeness (builders may not have inventory details to satisfy it).
@@ -12890,7 +13166,7 @@
                     const builderHitlReady = hitlEnabled
                         ? !!(builderCoreReady && hasHitlInterfaces)
                         : builderCoreReady;
-                    hitlReady = !!(builderHitlReady && !hitlBridgeMismatchKnown);
+                    hitlReady = !!(builderHitlReady && hitlBridgeAlignmentReady);
                 }
 
                 // Builder view: show a single status line, but DO NOT abort renderMain.
@@ -12935,6 +13211,13 @@
                             }
                             if (sectionEl) sectionEl.classList.add('border-info');
                         }
+                        if (badgeEl) {
+                            if (persistedHitlValidated && persistedHitlValidatedAtLabel) {
+                                badgeEl.setAttribute('title', `HITL last validated ${persistedHitlValidatedAtLabel}`);
+                            } else {
+                                badgeEl.removeAttribute('title');
+                            }
+                        }
 
                         const esc = (value) => escapeHtml((value ?? '').toString());
                         const htmlVal = (html) => ({ __html: String(html ?? '') });
@@ -12975,6 +13258,17 @@
                         };
 
                         const coreRows = [];
+                        const coreVerifiedAtRaw = (core && core.last_validated_at) ? String(core.last_validated_at).trim() : '';
+                        const coreVerifiedAtLabel = (() => {
+                            if (!coreVerifiedAtRaw) return '';
+                            try {
+                                const dt = new Date(coreVerifiedAtRaw);
+                                if (Number.isNaN(dt.getTime())) return '';
+                                return dt.toLocaleString();
+                            } catch (e) {
+                                return '';
+                            }
+                        })();
                         const coreStatusLabel = coreValidated
                             ? (IS_BUILDER_VIEW ? 'Verified by admin' : 'Verified')
                             : (coreConfigured
@@ -13009,6 +13303,9 @@
                             coreRows.push(['SSH User', sshUserLabel, coreHasSecret ? (coreValidated ? 'ok' : 'partial') : 'no']);
                         } else {
                             coreRows.push(['SSH User', coreUser ? `${coreUser} — ${coreValidated ? 'Verified' : 'Not verified'}` : 'Not set', coreUser ? (coreValidated ? 'ok' : 'partial') : 'no']);
+                        }
+                        if (coreVerifiedAtLabel) {
+                            coreRows.push(['Last CORE verification', coreVerifiedAtLabel, 'ok']);
                         }
                         coreSummaryEl.innerHTML = renderKvTable(coreTouched ? coreRows : [], 'Not configured');
 
@@ -13132,6 +13429,9 @@
                             ? participantProxmoxUrlRaw
                             : 'Not set';
                         hitlRows.push(['Participant UI', participantUrlValue, participantProxmoxUrlHasValue ? 'ok' : 'no']);
+                        if (persistedHitlValidatedAtLabel) {
+                            hitlRows.push(['Last HITL verification', persistedHitlValidatedAtLabel, 'ok']);
+                        }
                         hitlSummaryEl.innerHTML = renderKvTable(hitlTouched ? hitlRows : [], 'Not configured');
                     }
                 }
@@ -15729,7 +16029,7 @@
                 btn.disabled = true;
                 const originalLabel = btn.innerHTML;
                 btn.innerHTML = 'Refreshing…';
-                try { showToast('Refreshing Proxmox interfaces…', { autohide: true, delay: 1800 }); } catch (e) { }
+                try { showToast('Refreshing compatible Proxmox VMs…', { autohide: true, delay: 1800 }); } catch (e) { }
                 try {
                     await fetchProxmoxInventory(sidx, { force: true });
                 } finally {
@@ -15749,7 +16049,7 @@
                 if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
                 const originalHtml = btn.innerHTML;
                 btn.disabled = true;
-                btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Refreshing';
+                btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Refreshing compatible VMs';
                 try {
                     await fetchProxmoxInventory(sidx, { force: true });
                     try { showToast('Refreshed compatible VM inventory.', { autohide: true, delay: 1800 }); } catch (e) { }

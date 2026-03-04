@@ -27069,14 +27069,24 @@ def _sanitize_hitl_config_hint(value: Any) -> Optional[Dict[str, Any]]:
             prox_target = iface.get('proxmox_target') if isinstance(iface.get('proxmox_target'), dict) else None
             if prox_target:
                 pt: Dict[str, Any] = {}
-                for key in ('node', 'vmid', 'interface_id', 'vm_name', 'macaddr', 'bridge', 'model'):
+                for key in ('node', 'vmid', 'interface_id', 'vm_name', 'label', 'macaddr', 'bridge', 'model'):
                     if key in prox_target:
                         pt[key] = prox_target.get(key)
                 entry['proxmox_target'] = pt
             external = iface.get('external_vm') if isinstance(iface.get('external_vm'), dict) else None
             if external:
                 ext: Dict[str, Any] = {}
-                for key in ('vm_key', 'vmid', 'interface_id', 'interface_bridge', 'vm_node', 'vm_name'):
+                for key in (
+                    'vm_key',
+                    'vmid',
+                    'status',
+                    'interface_id',
+                    'interface_bridge',
+                    'interface_mac',
+                    'interface_model',
+                    'vm_node',
+                    'vm_name',
+                ):
                     if key in external:
                         ext[key] = external.get(key)
                 entry['external_vm'] = ext
@@ -34527,6 +34537,12 @@ def _parse_scenario_editor(se):
     if hitl_el is not None:
         enabled_raw = (hitl_el.get("enabled") or "").strip().lower()
         hitl_info["enabled"] = enabled_raw in ("1", "true", "yes", "on")
+        bridge_validated_raw = (hitl_el.get("bridge_validated") or "").strip().lower()
+        if bridge_validated_raw in ("1", "true", "yes", "on"):
+            hitl_info["bridge_validated"] = True
+        bridge_validated_at_raw = (hitl_el.get("bridge_validated_at") or "").strip()
+        if bridge_validated_at_raw:
+            hitl_info["bridge_validated_at"] = bridge_validated_at_raw
         participant_attr = (
             hitl_el.get('participant_proxmox_url')
             or hitl_el.get('participant_url')
@@ -34548,6 +34564,9 @@ def _parse_scenario_editor(se):
             mac_attr = iface_el.get("mac")
             if mac_attr:
                 entry["mac"] = mac_attr
+            core_bridge_attr = (iface_el.get("core_bridge") or "").strip()
+            if core_bridge_attr:
+                entry["core_bridge"] = core_bridge_attr
             attachment_attr = iface_el.get("attachment") or iface_el.get("attach")
             entry["attachment"] = _normalize_hitl_attachment(attachment_attr)
             ipv4_attr = iface_el.get("ipv4") or iface_el.get("ipv4_addresses")
@@ -34869,6 +34888,9 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                 mac_val = entry.get("mac")
                 if isinstance(mac_val, str) and mac_val.strip():
                     clean["mac"] = mac_val.strip()
+                core_bridge_val = entry.get("core_bridge")
+                if isinstance(core_bridge_val, str) and core_bridge_val.strip():
+                    clean["core_bridge"] = core_bridge_val.strip()
                 clean["attachment"] = _normalize_hitl_attachment(entry.get("attachment"))
                 for attr_key in ("ipv4", "ipv6"):
                     val = entry.get(attr_key)
@@ -34942,6 +34964,11 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
         if hitl and (hitl.get("enabled") or normalized_ifaces or hitl.get("core") or hitl.get("proxmox") or participant_url):
             hitl_el = ET.SubElement(se, "HardwareInLoop")
             hitl_el.set("enabled", "true" if hitl.get("enabled") else "false")
+            if bool(hitl.get("bridge_validated")):
+                hitl_el.set("bridge_validated", "true")
+                bridge_validated_at = str(hitl.get("bridge_validated_at") or "").strip()
+                if bridge_validated_at:
+                    hitl_el.set("bridge_validated_at", bridge_validated_at)
             if participant_url:
                 hitl_el.set('participant_proxmox_url', participant_url)
             hitl_core_cfg = _extract_optional_core_config(hitl.get("core"), include_password=False)
@@ -34992,6 +35019,8 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     iface_el.set("alias", str(alias))
                 if iface.get("mac"):
                     iface_el.set("mac", str(iface["mac"]))
+                if iface.get("core_bridge"):
+                    iface_el.set("core_bridge", str(iface["core_bridge"]))
                 attachment = _normalize_hitl_attachment(iface.get("attachment"))
                 if attachment:
                     iface_el.set("attachment", attachment)
@@ -35916,6 +35945,8 @@ def index():
         snapshot = _load_editor_state_snapshot(current)
         if snapshot:
             payload['editor_snapshot'] = snapshot
+            if snapshot.get('result_path') and not payload.get('result_path'):
+                payload['result_path'] = snapshot.get('result_path')
             if snapshot.get('project_key_hint') and not payload.get('project_key_hint'):
                 payload['project_key_hint'] = snapshot.get('project_key_hint')
             if snapshot.get('scenario_query') and not payload.get('scenario_query'):
@@ -35944,13 +35975,21 @@ def index():
         def _best_xml_for_index() -> str:
             # Strict XML source priority:
             # 1) explicit xml_path query (dock/tab propagated)
-            # 2) latest XML for selected scenario
-            # 3) payload result_path if it is XML
+            # 2) payload result_path if it is XML
+            # 3) latest XML for selected scenario
             try:
                 if xml_query:
                     cand = os.path.abspath(xml_query)
                     if cand.lower().endswith('.xml') and os.path.exists(cand):
                         return cand
+            except Exception:
+                pass
+            try:
+                cand = str(payload.get('result_path') or '').strip()
+                if cand and cand.lower().endswith('.xml'):
+                    cand_abs = os.path.abspath(cand)
+                    if os.path.exists(cand_abs):
+                        return cand_abs
             except Exception:
                 pass
             if scenario_query:
@@ -35960,14 +35999,6 @@ def index():
                         return cand
                 except Exception:
                     pass
-            try:
-                cand = str(payload.get('result_path') or '').strip()
-                if cand and cand.lower().endswith('.xml'):
-                    cand_abs = os.path.abspath(cand)
-                    if os.path.exists(cand_abs):
-                        return cand_abs
-            except Exception:
-                pass
             return ''
 
         xml_hint = _best_xml_for_index()

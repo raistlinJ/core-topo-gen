@@ -679,6 +679,7 @@ def test_save_xml_api_preserves_hitl_validation_state_roundtrip(tmp_path, monkey
                     },
                     "interfaces": [{
                         "name": "en0",
+                        "core_bridge": "vmbr1",
                         "attachment": "existing_router",
                         "proxmox_target": {
                             "node": "pve",
@@ -741,3 +742,4 @@ def test_save_xml_api_preserves_hitl_validation_state_roundtrip(tmp_path, monkey
     assert pve_target.get('interface_id') == 'net0'
     assert ext_vm.get('vm_key') == 'pve::101'
     assert ext_vm.get('interface_bridge') == 'vmbr1'
+    assert interfaces[0].get('core_bridge') == 'vmbr1'

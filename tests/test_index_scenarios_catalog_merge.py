@@ -137,3 +137,48 @@ def test_prepare_payload_admin_merges_hitl_hints_when_scenario_missing_fields(mo
     assert prox.get('validated') is True
     assert core.get('core_secret_id') == 'core-secret-1'
     assert core.get('validated') is True
+
+
+def test_sanitize_hitl_config_hint_preserves_external_interface_metadata():
+    hint = backend._sanitize_hitl_config_hint({
+        'enabled': True,
+        'participant_proxmox_url': 'https://participant.local:8006',
+        'interfaces': [
+            {
+                'name': 'eth1',
+                'attachment': 'proxmox_vm',
+                'external_vm': {
+                    'vm_key': 'pve1::202',
+                    'vmid': '202',
+                    'vm_node': 'pve1',
+                    'vm_name': 'External',
+                    'status': 'running',
+                    'interface_id': 'net1',
+                    'interface_bridge': 'vmbr0',
+                    'interface_mac': 'aa:bb:cc:dd:ee:ff',
+                    'interface_model': 'virtio',
+                },
+                'proxmox_target': {
+                    'node': 'pve1',
+                    'vmid': '101',
+                    'interface_id': 'net0',
+                    'vm_name': 'CORE-VM',
+                    'label': 'CORE-VM',
+                    'macaddr': '11:22:33:44:55:66',
+                    'bridge': 'vmbr1',
+                    'model': 'virtio',
+                },
+            }
+        ],
+    })
+
+    assert isinstance(hint, dict)
+    interfaces = hint.get('interfaces') if isinstance(hint.get('interfaces'), list) else []
+    assert len(interfaces) == 1
+    ext = interfaces[0].get('external_vm') if isinstance(interfaces[0].get('external_vm'), dict) else {}
+    assert ext.get('status') == 'running'
+    assert ext.get('interface_bridge') == 'vmbr0'
+    assert ext.get('interface_mac') == 'aa:bb:cc:dd:ee:ff'
+    assert ext.get('interface_model') == 'virtio'
+    prox_target = interfaces[0].get('proxmox_target') if isinstance(interfaces[0].get('proxmox_target'), dict) else {}
+    assert prox_target.get('label') == 'CORE-VM'
