@@ -35,6 +35,7 @@
   {# Defaults used by JS; Preview tab can override with live editor state. #}
   <input type="hidden" id="scenariosPreviewXmlPath" value="{{ preview_xml_path }}">
   <input type="hidden" id="scenariosPreviewScenario" value="{{ scenario_tab }}">
+  <span id="coretgStateSourceBadge" class="badge text-bg-light border text-muted">State source: XML</span>
 </div>
 
 <div class="position-fixed start-0 end-0 bg-body border-top" style="bottom: var(--coretg-dock-height, 0px); z-index: 1045;">
@@ -83,6 +84,13 @@
   const TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY = 'coretg_topology_signature_by_scenario_v3';
   const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v3';
   const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v3';
+  const STRICT_XML_STATE_MODE = true;
+
+  // Bind the shared Save XML helper early so index-level click handlers can always
+  // find it, even if later portions of this script encounter runtime errors.
+  window.coretgSaveXmlViaApi = function(opts){
+    return saveXmlViaApi(opts);
+  };
 
   function getActiveTabName(){
     try {
@@ -97,6 +105,41 @@
       return 'topology';
     } catch (e) {}
     return 'topology';
+  }
+
+  function _basename(pathValue){
+    try {
+      const p = (pathValue || '').toString().trim();
+      if (!p) return '';
+      const parts = p.replace(/\\/g, '/').split('/').filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : p;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function updateStateSourceBadge(opts){
+    try {
+      const badge = document.getElementById('coretgStateSourceBadge');
+      if (!badge) return;
+      const options = (opts && typeof opts === 'object') ? opts : {};
+      const scenario = (options.scenario || '').toString().trim();
+      const xmlPath = (options.xmlPath || '').toString().trim();
+      const file = _basename(xmlPath);
+      let text = 'State source: XML';
+      if (scenario && file) text = `State source: XML • ${scenario} • ${file}`;
+      else if (scenario) text = `State source: XML • ${scenario}`;
+      else if (file) text = `State source: XML • ${file}`;
+      badge.textContent = text;
+      badge.classList.remove('text-bg-light', 'text-bg-danger', 'border', 'text-muted');
+      if (xmlPath) {
+        badge.classList.add('text-bg-light', 'border', 'text-muted');
+      } else {
+        badge.classList.add('text-bg-danger');
+      }
+      if (xmlPath) badge.title = xmlPath;
+      else badge.title = 'No XML path available (state cannot be confirmed from XML).';
+    } catch (e) {}
   }
 
   function setFixedPreviewButtonMode(mode, scenarioName){
@@ -243,6 +286,10 @@
 
   function readTopologySignatureMap(){
     return readJsonFromLocalStorage(TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function readFlowStateMap(){
+    return readJsonFromLocalStorage(FLOW_STATE_STORAGE_KEY, {});
   }
 
   function getTopologySignatureForScenario(scenarioName){
@@ -438,7 +485,27 @@
     try {
       const scenario = (scenarioName || '').toString().trim();
       if (!scenario) return null;
-      const resp = await fetch('/api/scenario/latest_state?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+      let explicitXmlPath = '';
+      try {
+        explicitXmlPath = (options.xmlPath || options.xml_path || '').toString().trim();
+      } catch (e) { explicitXmlPath = ''; }
+      if (!explicitXmlPath) {
+        try {
+          explicitXmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').toString().trim();
+        } catch (e) { explicitXmlPath = ''; }
+      }
+      if (!explicitXmlPath) {
+        try {
+          explicitXmlPath = (getLatestXmlPathForScenario(scenario) || '').toString().trim();
+        } catch (e) { explicitXmlPath = ''; }
+      }
+
+      let latestStateUrl = '/api/scenario/latest_state?scenario=' + encodeURIComponent(scenario);
+      if (explicitXmlPath) {
+        latestStateUrl += '&xml_path=' + encodeURIComponent(explicitXmlPath);
+      }
+
+      const resp = await fetch(latestStateUrl, { credentials: 'same-origin' });
       let data = null;
       try { data = await resp.json(); } catch (e) { data = null; }
       if (!resp.ok || !data || data.ok !== true) return null;
@@ -446,6 +513,7 @@
       const xmlPath = (data.xml_path || '').toString().trim();
       if (xmlPath) {
         setLatestXmlPathForScenario(scenario, xmlPath);
+        updateStateSourceBadge({ scenario, xmlPath });
         if (options.updateHidden !== false) {
           try {
             const hidden = document.getElementById('scenariosPreviewXmlPath');
@@ -462,12 +530,110 @@
         }
       } catch (e) {}
 
+      const hasMeaningfulValue = (value) => {
+        if (value === null || value === undefined) return false;
+        if (typeof value === 'string') return value.trim() !== '';
+        if (typeof value === 'number') return Number.isFinite(value);
+        if (typeof value === 'boolean') return value === true;
+        if (Array.isArray(value)) return value.length > 0;
+        if (typeof value === 'object') {
+          return Object.values(value).some((entry) => hasMeaningfulValue(entry));
+        }
+        return false;
+      };
+
+      const mergeScenarioWithHitlGuard = (existingScenarioRaw, incomingScenarioRaw) => {
+        const existingScenario = (existingScenarioRaw && typeof existingScenarioRaw === 'object') ? existingScenarioRaw : {};
+        const incomingScenario = (incomingScenarioRaw && typeof incomingScenarioRaw === 'object') ? incomingScenarioRaw : {};
+        const mergedScenario = {
+          ...existingScenario,
+          ...incomingScenario,
+        };
+
+        const incomingHitlRaw = (incomingScenario.hitl && typeof incomingScenario.hitl === 'object') ? incomingScenario.hitl : null;
+        if (incomingHitlRaw) {
+          const mergeHitlSectionGuarded = (currentSectionRaw, incomingSectionRaw, sectionType) => {
+            const currentSection = (currentSectionRaw && typeof currentSectionRaw === 'object') ? currentSectionRaw : {};
+            const incomingSection = (incomingSectionRaw && typeof incomingSectionRaw === 'object') ? incomingSectionRaw : {};
+            const mergedSection = { ...currentSection, ...incomingSection };
+
+            if (sectionType === 'core') {
+              const currentSecret = typeof currentSection.core_secret_id === 'string' ? currentSection.core_secret_id.trim() : '';
+              const incomingSecret = typeof incomingSection.core_secret_id === 'string' ? incomingSection.core_secret_id.trim() : '';
+              if (!incomingSecret && currentSecret) {
+                mergedSection.core_secret_id = currentSecret;
+              }
+              if (currentSection.validated === true && incomingSection.validated !== true) {
+                mergedSection.validated = true;
+              }
+              if (mergedSection.validated === true && !incomingSection.last_validated_at && currentSection.last_validated_at) {
+                mergedSection.last_validated_at = currentSection.last_validated_at;
+              }
+            } else if (sectionType === 'proxmox') {
+              const currentSecret = typeof currentSection.secret_id === 'string' ? currentSection.secret_id.trim() : '';
+              const incomingSecret = typeof incomingSection.secret_id === 'string' ? incomingSection.secret_id.trim() : '';
+              if (!incomingSecret && currentSecret) {
+                mergedSection.secret_id = currentSecret;
+              }
+              if (currentSection.validated === true && incomingSection.validated !== true) {
+                mergedSection.validated = true;
+              }
+              if (mergedSection.validated === true && !incomingSection.last_validated_at && currentSection.last_validated_at) {
+                mergedSection.last_validated_at = currentSection.last_validated_at;
+              }
+            }
+
+            return mergedSection;
+          };
+
+          const incomingCoreRaw = (incomingHitlRaw.core && typeof incomingHitlRaw.core === 'object') ? incomingHitlRaw.core : null;
+          const incomingProxRaw = (incomingHitlRaw.proxmox && typeof incomingHitlRaw.proxmox === 'object') ? incomingHitlRaw.proxmox : null;
+          const hasCorePayload = !!(incomingCoreRaw && Object.values(incomingCoreRaw).some((entry) => hasMeaningfulValue(entry)));
+          const hasProxPayload = !!(incomingProxRaw && Object.values(incomingProxRaw).some((entry) => hasMeaningfulValue(entry)));
+          const hasInterfacesPayload = Array.isArray(incomingHitlRaw.interfaces) && incomingHitlRaw.interfaces.length > 0;
+          const hasParticipantPayload = typeof incomingHitlRaw.participant_proxmox_url === 'string' && incomingHitlRaw.participant_proxmox_url.trim() !== '';
+          const hasEnabledPayload = typeof incomingHitlRaw.enabled === 'boolean';
+
+          if (!(hasCorePayload || hasProxPayload || hasInterfacesPayload || hasParticipantPayload || hasEnabledPayload)) {
+            if (existingScenario.hitl && typeof existingScenario.hitl === 'object') {
+              mergedScenario.hitl = { ...existingScenario.hitl };
+            }
+          } else {
+            const existingHitl = (existingScenario.hitl && typeof existingScenario.hitl === 'object') ? existingScenario.hitl : {};
+            const mergedHitl = { ...existingHitl };
+            if (hasEnabledPayload) {
+              mergedHitl.enabled = incomingHitlRaw.enabled === true;
+            }
+            if (hasCorePayload && incomingHitlRaw.core && typeof incomingHitlRaw.core === 'object') {
+              const currentCore = (mergedHitl.core && typeof mergedHitl.core === 'object') ? mergedHitl.core : {};
+              mergedHitl.core = mergeHitlSectionGuarded(currentCore, incomingHitlRaw.core, 'core');
+            }
+            if (hasProxPayload && incomingHitlRaw.proxmox && typeof incomingHitlRaw.proxmox === 'object') {
+              const currentProx = (mergedHitl.proxmox && typeof mergedHitl.proxmox === 'object') ? mergedHitl.proxmox : {};
+              mergedHitl.proxmox = mergeHitlSectionGuarded(currentProx, incomingHitlRaw.proxmox, 'proxmox');
+            }
+            if (hasInterfacesPayload && Array.isArray(incomingHitlRaw.interfaces)) {
+              mergedHitl.interfaces = incomingHitlRaw.interfaces;
+            }
+            if (hasParticipantPayload) {
+              mergedHitl.participant_proxmox_url = incomingHitlRaw.participant_proxmox_url;
+            }
+            mergedScenario.hitl = mergedHitl;
+          }
+        } else if (existingScenario.hitl && typeof existingScenario.hitl === 'object') {
+          mergedScenario.hitl = { ...existingScenario.hitl };
+        }
+
+        return mergedScenario;
+      };
+
       try {
-        const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
-        if (projectStateMap && typeof projectStateMap === 'object') {
-          const key = resolvePreferredProjectKey(projectStateMap);
-          const entry = key ? projectStateMap[key] : null;
-          if (entry && typeof entry === 'object' && Array.isArray(entry.scenarios)) {
+        if (!STRICT_XML_STATE_MODE) {
+          const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
+          if (projectStateMap && typeof projectStateMap === 'object') {
+            const key = resolvePreferredProjectKey(projectStateMap);
+            const entry = key ? projectStateMap[key] : null;
+            if (entry && typeof entry === 'object' && Array.isArray(entry.scenarios)) {
             const normScenario = normalizeScenarioKey(scenario);
             const nextEntry = { ...entry };
             const scenarios = entry.scenarios.map((s) => (s && typeof s === 'object') ? { ...s } : s);
@@ -475,64 +641,7 @@
             if (idx >= 0 && data.scenario_state && typeof data.scenario_state === 'object') {
               const existingScenario = (scenarios[idx] && typeof scenarios[idx] === 'object') ? scenarios[idx] : null;
               const incomingScenario = { ...data.scenario_state };
-              const mergedScenario = {
-                ...(existingScenario || {}),
-                ...incomingScenario,
-              };
-
-              const hasMeaningfulValue = (value) => {
-                if (value === null || value === undefined) return false;
-                if (typeof value === 'string') return value.trim() !== '';
-                if (typeof value === 'number') return Number.isFinite(value);
-                if (typeof value === 'boolean') return value === true;
-                if (Array.isArray(value)) return value.length > 0;
-                if (typeof value === 'object') {
-                  return Object.values(value).some((entry) => hasMeaningfulValue(entry));
-                }
-                return false;
-              };
-
-              const incomingHitlRaw = (incomingScenario.hitl && typeof incomingScenario.hitl === 'object') ? incomingScenario.hitl : null;
-              if (incomingHitlRaw) {
-                const incomingCoreRaw = (incomingHitlRaw.core && typeof incomingHitlRaw.core === 'object') ? incomingHitlRaw.core : null;
-                const incomingProxRaw = (incomingHitlRaw.proxmox && typeof incomingHitlRaw.proxmox === 'object') ? incomingHitlRaw.proxmox : null;
-                const hasCorePayload = !!(incomingCoreRaw && Object.values(incomingCoreRaw).some((entry) => hasMeaningfulValue(entry)));
-                const hasProxPayload = !!(incomingProxRaw && Object.values(incomingProxRaw).some((entry) => hasMeaningfulValue(entry)));
-                const hasInterfacesPayload = Array.isArray(incomingHitlRaw.interfaces) && incomingHitlRaw.interfaces.length > 0;
-                const hasParticipantPayload = typeof incomingHitlRaw.participant_proxmox_url === 'string' && incomingHitlRaw.participant_proxmox_url.trim() !== '';
-                const hasEnabledPayload = typeof incomingHitlRaw.enabled === 'boolean';
-
-                if (!(hasCorePayload || hasProxPayload || hasInterfacesPayload || hasParticipantPayload || hasEnabledPayload)) {
-                  if (existingScenario && existingScenario.hitl && typeof existingScenario.hitl === 'object') {
-                    mergedScenario.hitl = { ...existingScenario.hitl };
-                  }
-                } else {
-                  const existingHitl = (existingScenario && existingScenario.hitl && typeof existingScenario.hitl === 'object') ? existingScenario.hitl : {};
-                  const mergedHitl = { ...existingHitl };
-                  if (hasEnabledPayload) {
-                    mergedHitl.enabled = incomingHitlRaw.enabled === true;
-                  }
-                  if (hasCorePayload && incomingHitlRaw.core && typeof incomingHitlRaw.core === 'object') {
-                    const currentCore = (mergedHitl.core && typeof mergedHitl.core === 'object') ? mergedHitl.core : {};
-                    mergedHitl.core = { ...currentCore, ...incomingHitlRaw.core };
-                  }
-                  if (hasProxPayload && incomingHitlRaw.proxmox && typeof incomingHitlRaw.proxmox === 'object') {
-                    const currentProx = (mergedHitl.proxmox && typeof mergedHitl.proxmox === 'object') ? mergedHitl.proxmox : {};
-                    mergedHitl.proxmox = { ...currentProx, ...incomingHitlRaw.proxmox };
-                  }
-                  if (hasInterfacesPayload && Array.isArray(incomingHitlRaw.interfaces)) {
-                    mergedHitl.interfaces = incomingHitlRaw.interfaces;
-                  }
-                  if (hasParticipantPayload) {
-                    mergedHitl.participant_proxmox_url = incomingHitlRaw.participant_proxmox_url;
-                  }
-                  mergedScenario.hitl = mergedHitl;
-                }
-              } else if (existingScenario && existingScenario.hitl && typeof existingScenario.hitl === 'object') {
-                mergedScenario.hitl = { ...existingScenario.hitl };
-              }
-
-              scenarios[idx] = mergedScenario;
+              scenarios[idx] = mergeScenarioWithHitlGuard(existingScenario, incomingScenario);
             }
             nextEntry.scenarios = scenarios;
             if (data.core && typeof data.core === 'object') {
@@ -541,7 +650,41 @@
             nextEntry.updated_at = Date.now();
             projectStateMap[key] = nextEntry;
             localStorage.setItem(PROJECT_STATE_STORAGE_KEY, JSON.stringify(projectStateMap));
+            }
           }
+        }
+      } catch (e) {}
+
+      try {
+        const scenarioKey = normalizeScenarioKey(scenario);
+        const incomingScenario = (data.scenario_state && typeof data.scenario_state === 'object') ? { ...data.scenario_state } : null;
+        const incomingCore = (data.core && typeof data.core === 'object') ? { ...data.core } : null;
+        if (scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {
+          const scenarios = window.state.scenarios;
+          const idx = scenarios.findIndex((s) => normalizeScenarioKey((s && s.name) ? s.name : '') === scenarioKey);
+          if (idx >= 0) {
+            const existingScenario = (scenarios[idx] && typeof scenarios[idx] === 'object') ? scenarios[idx] : {};
+            scenarios[idx] = mergeScenarioWithHitlGuard(existingScenario, incomingScenario);
+          }
+          if (incomingCore) {
+            window.state.core = { ...(window.state.core && typeof window.state.core === 'object' ? window.state.core : {}), ...incomingCore };
+          }
+          if (Number.isInteger(window.state.active_index) && window.state.active_index >= 0 && window.state.active_index < scenarios.length) {
+            const active = scenarios[window.state.active_index];
+            if (normalizeScenarioKey((active && active.name) ? active.name : '') === scenarioKey) {
+              try {
+                if (typeof window.renderMain === 'function') window.renderMain();
+                else if (typeof window.render === 'function') window.render();
+              } catch (e) {}
+            }
+          }
+        }
+        if (incomingScenario && (!window.state || typeof window.state !== 'object' || !Array.isArray(window.state.scenarios) || !window.state.scenarios.length)) {
+          window.state = {
+            scenarios: [incomingScenario],
+            core: incomingCore || null,
+            active_index: 0,
+          };
         }
       } catch (e) {}
 
@@ -586,6 +729,7 @@
   }
 
   function resolvePreferredProjectKey(projectStateMap){
+    if (STRICT_XML_STATE_MODE) return '';
     try {
       const liveKey = (window.currentProjectKey || '').toString().trim();
       if (liveKey && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[liveKey]) {
@@ -626,6 +770,18 @@
   }
 
   function getCurrentProjectSnapshot(){
+    if (STRICT_XML_STATE_MODE) {
+      try {
+        if (window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios) && window.state.scenarios.length) {
+          return {
+            scenarios: window.state.scenarios,
+            core: (window.state.core && typeof window.state.core === 'object') ? window.state.core : null,
+            active_index: Number.isInteger(window.state.active_index) ? window.state.active_index : 0,
+          };
+        }
+      } catch (e) {}
+      return null;
+    }
     const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
     const key = resolvePreferredProjectKey(projectStateMap);
     if (key && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[key]) {
@@ -730,6 +886,18 @@
   }
 
   function syncScenarioTabLinks(scenarioName){
+      function syncCurrentScenarioUrl(scenarioName, xmlPath){
+        try {
+          const scen = (scenarioName || '').toString().trim();
+          const path = (xmlPath || '').toString().trim();
+          const url = new URL(window.location.href);
+          if (scen) url.searchParams.set('scenario', scen);
+          else url.searchParams.delete('scenario');
+          if (path) url.searchParams.set('xml_path', path);
+          else url.searchParams.delete('xml_path');
+          window.history.replaceState({}, '', url.pathname + (url.search ? url.search : '') + (url.hash || ''));
+        } catch (e) {}
+      }
     try {
       const scen = (scenarioName || '').toString().trim();
       let xmlPath = '';
@@ -754,9 +922,14 @@
           const url = new URL(href, window.location.origin);
           if (scen) url.searchParams.set('scenario', scen);
           else url.searchParams.delete('scenario');
-          if (xmlPath && (url.pathname.includes('/scenarios/flag-sequencing') || url.pathname.includes('/scenarios/preview'))){
+          const isScenarioTabRoute = (
+            url.pathname === '/' ||
+            url.pathname.includes('/scenarios/flag-sequencing') ||
+            url.pathname.includes('/scenarios/preview')
+          );
+          if (xmlPath && isScenarioTabRoute){
             url.searchParams.set('xml_path', xmlPath);
-          } else if (url.pathname.includes('/scenarios/flag-sequencing') || url.pathname.includes('/scenarios/preview')) {
+          } else if (isScenarioTabRoute) {
             url.searchParams.delete('xml_path');
           }
           const next = url.pathname + (url.search ? url.search : '') + (url.hash || '');
@@ -775,20 +948,38 @@
       if (scen) {
         try { await refreshScenarioStateFromXml(scen, { updateHidden: true }); } catch (e) {}
       }
+      try {
+        const xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').toString().trim();
+        updateStateSourceBadge({ scenario: scen, xmlPath });
+      } catch (e) {}
       syncScenarioTabLinks(scen);
     } catch (e) {}
-  }
-
-  function readFlowStateMap(){
-    return readJsonFromLocalStorage(FLOW_STATE_STORAGE_KEY, {});
   }
 
   function getSavedFlowStateForScenario(scenarioName){
     try {
       const key = normalizeScenarioKey(scenarioName);
       if (!key) return null;
-      const map = readFlowStateMap();
-      const entry = (map && typeof map === 'object') ? map[key] : null;
+      let entry = null;
+      try {
+        const scenarios = (window.state && Array.isArray(window.state.scenarios)) ? window.state.scenarios : [];
+        const idx = scenarios.findIndex((s) => normalizeScenarioKey((s && s.name) ? s.name : '') === key);
+        if (idx >= 0) {
+          const scen = scenarios[idx];
+          if (scen && typeof scen.flow_state === 'object' && scen.flow_state) {
+            entry = scen.flow_state;
+          }
+        }
+      } catch (e) { entry = null; }
+      if (!entry || typeof entry !== 'object') {
+        try {
+          const map = readFlowStateMap();
+          const fromMap = (map && typeof map === 'object') ? map[key] : null;
+          if (fromMap && typeof fromMap === 'object') {
+            entry = fromMap;
+          }
+        } catch (e) { entry = entry; }
+      }
       if (!entry || typeof entry !== 'object') return null;
       const scenario = (entry.scenario || scenarioName || '').toString();
       const preset = (entry.preset || '').toString();
@@ -805,11 +996,11 @@
         preset,
         length: length || chain_ids.length,
         chain_ids,
-        flag_assignments,
         allow_node_duplicates,
         initial_facts,
         goal_facts,
         flow_enabled,
+        flag_assignments,
       };
     } catch (e) {
       return null;
@@ -820,10 +1011,8 @@
     try {
       const key = normalizeScenarioKey(scenarioName);
       if (!key) return;
-      const map = readFlowStateMap();
-      const next = (map && typeof map === 'object') ? map : {};
       const s = (state && typeof state === 'object') ? state : {};
-      next[key] = {
+      const normalized = {
         scenario: (scenarioName || '').toString().trim(),
         preset: (s.preset || '').toString(),
         length: Number.isFinite(+s.length) ? (+s.length) : null,
@@ -835,7 +1024,19 @@
         flow_enabled: (s.flow_enabled === true) ? true : (s.flow_enabled === false ? false : undefined),
         updated_at: Date.now(),
       };
-      localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));
+      try {
+        const scenarios = (window.state && Array.isArray(window.state.scenarios)) ? window.state.scenarios : [];
+        const idx = scenarios.findIndex((sc) => normalizeScenarioKey((sc && sc.name) ? sc.name : '') === key);
+        if (idx >= 0 && scenarios[idx] && typeof scenarios[idx] === 'object') {
+          scenarios[idx].flow_state = normalized;
+        }
+      } catch (e) {}
+      try {
+        const map = readFlowStateMap();
+        const next = (map && typeof map === 'object') ? map : {};
+        next[key] = normalized;
+        localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));
+      } catch (e) {}
     } catch (e) {}
   }
 
@@ -860,8 +1061,14 @@
 
   function resolveScenarioNameForSave(){
     try {
+      const hinted = resolveScenarioNameHint();
+      if (hinted) return hinted;
+    } catch (e) {}
+    try {
       if (window.state && Array.isArray(window.state.scenarios)) {
-        const idx = (typeof window.state.active_index === 'number') ? window.state.active_index : 0;
+        const idx = Number.isInteger(window.state.active_index)
+          ? window.state.active_index
+          : (Number.isInteger(window.state.activeIdx) ? window.state.activeIdx : 0);
         const sc = window.state.scenarios[idx] || window.state.scenarios[0];
         const nm = (sc && sc.name) ? String(sc.name).trim() : '';
         if (nm) return nm;
@@ -880,7 +1087,20 @@
     // Prefer in-memory editor state when present (Topology page), else fall back to local snapshot.
     try {
       if (window.state && Array.isArray(window.state.scenarios) && window.state.scenarios.length) {
-        const active_index = (typeof window.state.active_index === 'number') ? window.state.active_index : 0;
+        const scenarioName = resolveScenarioNameForSave();
+        const scenarioNorm = normalizeScenarioKey(scenarioName || '');
+        let active_index = Number.isInteger(window.state.active_index)
+          ? window.state.active_index
+          : (Number.isInteger(window.state.activeIdx) ? window.state.activeIdx : 0);
+        try {
+          if (scenarioNorm) {
+            const idxByName = window.state.scenarios.findIndex((sc) => normalizeScenarioKey((sc && sc.name) ? sc.name : '') === scenarioNorm);
+            if (idxByName >= 0) {
+              active_index = idxByName;
+              try { window.state.active_index = idxByName; } catch (e) {}
+            }
+          }
+        } catch (e) {}
 
         // Topology UX: when the user saves, freeze any visible "Random" dropdowns into
         // deterministic concrete values and re-render so the UI reflects what was saved.
@@ -915,6 +1135,15 @@
         const project_key_hint = (window.currentProjectKey || '').toString().trim();
         const scenario_query = (typeof window.resolveScenarioQueryHint === 'function') ? window.resolveScenarioQueryHint() : '';
         const scenariosOut = Array.isArray(window.state.scenarios) ? window.state.scenarios.map(s => (s && typeof s === 'object') ? s : {}) : [];
+        try {
+          if (scenarioNorm) {
+            const idxByName = scenariosOut.findIndex((sc) => normalizeScenarioKey((sc && sc.name) ? sc.name : '') === scenarioNorm);
+            if (idxByName >= 0) {
+              active_index = idxByName;
+              try { window.state.active_index = idxByName; } catch (e) {}
+            }
+          }
+        } catch (e) {}
         try {
           if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
             scenariosOut.forEach((sc) => {
@@ -1226,6 +1455,7 @@
       const scenarioName = resolveScenarioNameForSave();
       if (scenarioName) {
         setLatestXmlPathForScenario(scenarioName, xmlPath);
+        syncCurrentScenarioUrl(scenarioName, xmlPath);
         try { syncScenarioTabLinks(scenarioName); } catch (e) {}
       }
     } catch (e) {}
@@ -1380,7 +1610,11 @@
     try {
       const scenarioName = resolveScenarioNameForSave();
       if (scenarioName) {
-        await refreshScenarioStateFromXml(scenarioName, { updateHidden: true });
+        try {
+          const hidden = document.getElementById('scenariosPreviewXmlPath');
+          if (hidden && typeof hidden.value === 'string') hidden.value = xmlPath;
+        } catch (e) {}
+        try { updateStateSourceBadge({ scenario: scenarioName, xmlPath }); } catch (e) {}
       }
     } catch (e) {}
     try {
@@ -1456,7 +1690,6 @@
   }
 
   window.coretgPostJson = postJson;
-  window.coretgSaveXmlViaApi = saveXmlViaApi;
   window.coretgSaveAllAndGoPreview = saveAllAndGoPreview;
   window.coretgGetSavedFlowStateForScenario = getSavedFlowStateForScenario;
   window.coretgSetSavedFlowStateForScenario = setSavedFlowStateForScenario;
@@ -1468,6 +1701,7 @@
   window.coretgSetSeedForScenario = setSeedForScenario;
   window.coretgGetPreviewPlanPathForScenario = getPreviewPlanPathForScenario;
   window.coretgSetPreviewPlanPathForScenario = setPreviewPlanPathForScenario;
+  window.coretgUpdateStateSourceBadge = updateStateSourceBadge;
   window.coretgIsFlowDirtyForScenario = isFlowDirtyForScenario;
   window.coretgSetFlowDirtyForScenario = setFlowDirtyForScenario;
 

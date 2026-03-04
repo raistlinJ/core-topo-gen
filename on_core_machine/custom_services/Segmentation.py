@@ -11,13 +11,13 @@ class SegmentationService(CoreService):
     #directories: list[str] = ["/usr/local/core"]
     # files that this service should generate, defaults to nodes home directory
     # or can provide an absolute path to a mounted directory
-    files: list[str] = ["runsegmentation.sh"]
+    files: list[str] = ["/runsegmentation.sh"]
     # executables that should exist on path, that this service depends on
     executables: list[str] = []
     # other services that this service depends on, defines service start order
     dependencies: list[str] = ["CoreTGPrereqs"]
     # commands to run to start this service
-    startup: list[str] = ["/bin/bash runsegmentation.sh &"]
+    startup: list[str] = ["/bin/bash /runsegmentation.sh &"]
     # commands to run to validate this service
     validate: list[str] = []
     # commands to run to stop this service

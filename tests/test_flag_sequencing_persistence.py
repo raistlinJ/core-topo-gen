@@ -384,6 +384,83 @@ def test_attackflow_preview_prefers_runtime_session_ips_for_chain_and_resolved_i
         shutil.rmtree(plan_dir, ignore_errors=True)
 
 
+def test_save_flow_state_disabled_clears_flow_state_and_planpreview_metadata_flow(tmp_path, monkeypatch):
+    app_backend.app.config['TESTING'] = True
+    client = app_backend.app.test_client()
+
+    login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert login_resp.status_code in (302, 303)
+
+    scenario_name = 'FlowDisableClearScenario'
+    scenario_norm = app_backend._normalize_scenario_label(scenario_name)
+
+    xml_path = tmp_path / f'{scenario_name}.xml'
+    xml_path.write_text(
+        '<Scenarios>'
+        f'<Scenario name="{scenario_name}"><ScenarioEditor/></Scenario>'
+        '</Scenarios>',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(
+        app_backend,
+        '_latest_xml_path_for_scenario',
+        lambda norm: str(xml_path) if norm == scenario_norm else None,
+    )
+
+    payload = {
+        'full_preview': {'seed': 7, 'hosts': []},
+        'metadata': {
+            'xml_path': str(xml_path),
+            'scenario': scenario_name,
+            'flow': {
+                'scenario': scenario_name,
+                'length': 2,
+                'chain': [{'id': 'h1'}, {'id': 'h2'}],
+                'flag_assignments': [{'node_id': 'h1', 'id': 'g1'}, {'node_id': 'h2', 'id': 'g2'}],
+            },
+        },
+    }
+    ok, err = app_backend._update_plan_preview_in_xml(str(xml_path), scenario_name, payload)
+    assert ok, err
+
+    flow_state_enabled = {
+        'scenario': scenario_name,
+        'flow_enabled': True,
+        'chain_ids': ['h1', 'h2'],
+        'length': 2,
+        'flag_assignments': [{'node_id': 'h1', 'id': 'g1'}, {'node_id': 'h2', 'id': 'g2'}],
+    }
+    ok2, err2 = app_backend._update_flow_state_in_xml(str(xml_path), scenario_name, flow_state_enabled)
+    assert ok2, err2
+
+    disable_payload = {
+        'scenario': scenario_name,
+        'flow_enabled': False,
+        'chain_ids': ['h1', 'h2'],
+        'length': 2,
+        'flag_assignments': [{'node_id': 'h1', 'id': 'g1'}, {'node_id': 'h2', 'id': 'g2'}],
+    }
+    save_resp = client.post(
+        '/api/flag-sequencing/save_flow_state_to_xml',
+        data=json.dumps({'xml_path': str(xml_path), 'scenario': scenario_name, 'flow_state': disable_payload}),
+        content_type='application/json',
+    )
+    assert save_resp.status_code == 200, save_resp.get_json()
+
+    xml_flow = app_backend._flow_state_from_xml_path(str(xml_path), scenario_name)
+    assert isinstance(xml_flow, dict)
+    assert xml_flow.get('flow_enabled') is False
+    assert (xml_flow.get('chain_ids') or []) == []
+    assert (xml_flow.get('flag_assignments') or []) == []
+
+    plan_after = app_backend._load_plan_preview_from_xml(str(xml_path), scenario_name)
+    assert isinstance(plan_after, dict)
+    meta_after = plan_after.get('metadata') if isinstance(plan_after.get('metadata'), dict) else {}
+    assert isinstance(meta_after, dict)
+    assert 'flow' not in meta_after
+
+
 def test_attackflow_preview_returns_vuln_assignment_with_flag_inject(tmp_path):
     app_backend.app.config['TESTING'] = True
     client = app_backend.app.test_client()

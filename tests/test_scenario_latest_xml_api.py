@@ -190,3 +190,81 @@ def test_latest_xml_path_for_scenario_ignores_run_history_xml_without_scenario_n
     resolved = backend._latest_xml_path_for_scenario(scenario_norm)
 
     assert resolved is None
+
+
+def test_api_latest_state_strict_xml_does_not_merge_hints(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp import app_backend as backend
+
+    scenario_name = 'Anatest'
+    scen_norm = backend._normalize_scenario_label(scenario_name)
+
+    xml_path = tmp_path / 'Anatest.xml'
+    xml_path.write_text(
+        '<Scenarios><Scenario name="Anatest"><ScenarioEditor><HardwareInLoop enabled="true"/></ScenarioEditor></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(backend, '_latest_xml_path_for_scenario', lambda _norm: str(xml_path))
+    monkeypatch.setattr(
+        backend,
+        '_load_scenario_hitl_validation_from_disk',
+        lambda: {
+            scen_norm: {
+                'proxmox': {'secret_id': 'prox-secret-1', 'validated': True},
+                'core': {'core_secret_id': 'core-secret-1', 'validated': True, 'vm_key': 'pve::101'},
+            }
+        },
+    )
+    monkeypatch.setattr(backend, '_load_scenario_hitl_config_from_disk', lambda: {})
+
+    resp = client.get('/api/scenario/latest_state', query_string={'scenario': scenario_name})
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+    scenario_state = data.get('scenario_state') or {}
+    hitl = scenario_state.get('hitl') or {}
+    prox = hitl.get('proxmox') or {}
+    core = hitl.get('core') or {}
+
+    assert prox.get('secret_id') in (None, '')
+    assert prox.get('validated') in (None, False)
+    assert core.get('core_secret_id') in (None, '')
+    assert core.get('validated') in (None, False)
+
+
+def test_api_latest_state_prefers_explicit_xml_path_over_latest_lookup(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp import app_backend as backend
+
+    scenario_name = 'OrderCheck'
+    stale_xml = tmp_path / 'stale.xml'
+    fresh_xml = tmp_path / 'fresh.xml'
+
+    stale_xml.write_text(
+        '<Scenarios><Scenario name="OrderCheck"><ScenarioEditor><HardwareInLoop enabled="false"/></ScenarioEditor></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+    fresh_xml.write_text(
+        '<Scenarios><Scenario name="OrderCheck"><ScenarioEditor><HardwareInLoop enabled="true"/></ScenarioEditor></Scenario></Scenarios>',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(backend, '_latest_xml_path_for_scenario', lambda _norm: str(stale_xml))
+
+    resp = client.get(
+        '/api/scenario/latest_state',
+        query_string={'scenario': scenario_name, 'xml_path': str(fresh_xml)},
+    )
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+    assert data.get('xml_path') == str(fresh_xml)
+
+    scenario_state = data.get('scenario_state') or {}
+    hitl = scenario_state.get('hitl') or {}
+    assert hitl.get('enabled') is True

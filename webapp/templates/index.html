@@ -1238,11 +1238,10 @@
     const IS_ADMIN_USER = (CORETG_USER_ROLE || '') === 'admin';
     const SCENARIOS_ACTIVE_TAB = '{{ scenarios_active_tab }}';
     window.CORETG_SCENARIOS_ACTIVE_TAB = SCENARIOS_ACTIVE_TAB;
-    // Local editor state is only trusted for admins.
-    // Builder/participant roles must rely on server-restricted scenario lists.
-    const USE_LOCAL_EDITOR_STATE = IS_ADMIN_USER && !IS_BUILDER_VIEW;
-    // Builder view is read-only; never write local snapshots from it.
-    const ALLOW_LOCAL_EDITOR_PERSISTENCE = IS_ADMIN_USER && !IS_BUILDER_VIEW;
+    // Strict XML mode: Scenarios pages always load from XML/server snapshot and
+    // never from browser-local editor cache.
+    const USE_LOCAL_EDITOR_STATE = false;
+    const ALLOW_LOCAL_EDITOR_PERSISTENCE = false;
     const BUILDER_BACKEND_UNAVAILABLE_MESSAGE = 'Backend temporarily unavailable. Please ask an admin.';
     window.IS_BUILDER_VIEW = IS_BUILDER_VIEW;
     const DEFAULT_INTERNAL_BRIDGE_NAME = 'corebridge';
@@ -2109,11 +2108,13 @@
             core.vm_node = (core.vm_node ?? '').toString();
             core.grpc_host = (core.grpc_host ?? '').toString().trim();
             if (!core.grpc_host) core.grpc_host = 'localhost';
+            core.host = core.grpc_host;
             core.ssh_host = (core.ssh_host ?? '').toString();
             const sshPort = parseInt(core.ssh_port, 10);
             core.ssh_port = Number.isFinite(sshPort) && sshPort > 0 ? sshPort : 22;
             const grpcPort = parseInt(core.grpc_port, 10);
             core.grpc_port = Number.isFinite(grpcPort) && grpcPort > 0 ? grpcPort : 50051;
+            core.port = core.grpc_port;
             core.ssh_username = (core.ssh_username ?? '').toString();
             core.ssh_password = (core.ssh_password ?? '').toString();
             core.internal_bridge = (core.internal_bridge ?? '').toString().trim();
@@ -5209,11 +5210,10 @@
                 saveBtn.disabled = true;
                 saveBtn.textContent = 'Saving…';
                 try {
-                    if (typeof window.coretgSaveXmlViaApi === 'function') {
-                        await window.coretgSaveXmlViaApi();
-                    } else if (typeof window.autoSaveXml === 'function') {
-                        await window.autoSaveXml();
+                    if (typeof autoSaveXml !== 'function') {
+                        throw new Error('Save is unavailable on this page.');
                     }
+                    await autoSaveXml();
                     hideUnsavedChangesModal();
                     proceedUnsavedNavigation();
                 } catch (e) {
@@ -7502,39 +7502,6 @@
                     try { await persistFlowPlanAfterSave(); } catch (e) { }
                     resolve();
                 };
-                const legacySave = () => {
-                    const formData = new FormData();
-                    formData.append('scenarios_json', scenariosJsonInput.value);
-                    if (coreJsonInput) {
-                        formData.append('core_json', coreJsonInput.value);
-                    }
-                    formData.append('project_key_hint', projectKeyHint);
-                    formData.append('scenario_query', scenarioQueryHint || '');
-                    return fetch('/save_xml', { method: 'POST', body: formData, credentials: 'same-origin' })
-                        .then(r => r.text())
-                        .then(html => {
-                            try {
-                                const parser = new DOMParser();
-                                const doc = parser.parseFromString(html, 'text/html');
-                                const payloadScript = doc.querySelector('#payload-data');
-                                if (payloadScript) {
-                                    const newPayload = JSON.parse(payloadScript.textContent || 'null');
-                                    if (newPayload) {
-                                        if (newPayload.core) {
-                                            applyCoreUpdate(newPayload.core);
-                                        }
-                                        if (newPayload.result_path) {
-                                            applyResultPath(newPayload.result_path);
-                                            finalizeSuccess();
-                                            return;
-                                        }
-                                    }
-                                }
-                                reject(new Error('Could not detect saved XML path in response'));
-                            } catch (e) { reject(e); }
-                        })
-                        .catch(err => reject(err));
-                };
                 const apiSave = () => {
                     try { logInfo('[xml-save] Saving XML (JSON API, modal save)'); } catch (e) { }
                     return fetch('/save_xml_api', {
@@ -7573,11 +7540,7 @@
                         await finalizeSuccess();
                     });
                 };
-                apiSave().catch(err => {
-                    console.warn('save_xml_api failed, falling back to legacy save_xml', err);
-                    try { logWarn(`[xml-save] save_xml_api failed; falling back to legacy save (${err?.message || err})`); } catch (e) { }
-                    legacySave();
-                });
+                apiSave().catch(err => reject(err));
             } catch (e) { reject(e); }
         });
     }
@@ -7633,29 +7596,11 @@
             const btn = document.getElementById(buttonId);
             if (!btn || btn.dataset.modalSaveBound === '1') return;
             const busyHtml = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Saving…';
-            const doFallbackSubmit = () => {
-                const editorForm = document.getElementById('editorForm');
-                if (!editorForm) return Promise.reject(new Error('Editor form not found'));
-                return new Promise((resolve) => {
-                    try {
-                        if (typeof editorForm.requestSubmit === 'function') {
-                            editorForm.requestSubmit();
-                        } else {
-                            editorForm.submit();
-                        }
-                        resolve();
-                    } catch (err) {
-                        console.warn('Fallback submit failed', err);
-                        resolve();
-                    }
-                });
-            };
             const runSave = async () => {
-                if (typeof autoSaveXml === 'function') {
-                    await autoSaveXml();
-                } else {
-                    await doFallbackSubmit();
+                if (typeof autoSaveXml !== 'function') {
+                    throw new Error('Save is unavailable on this page.');
                 }
+                await autoSaveXml();
             };
             const closeParentModal = () => {
                 try {
@@ -9815,58 +9760,6 @@
             });
 
             if (result && result.ok) {
-                // Ensure the CORE VM host interface catalog is loaded and consistent.
-                try {
-                    verifySetStatus('Loading CORE VM interfaces…');
-                    const refreshRes = await refreshHostInterfacesForScenario(sidx, {
-                        reason: 'core_verify',
-                        silent: true,
-                        timeoutMs: HOST_INTERFACES_REQUEST_TIMEOUT_MS,
-                        setStatus: (message, tone) => {
-                            try { verifyLog(`[interfaces] ${message}`); } catch (_) { }
-                        },
-                    });
-                    if (!refreshRes || !refreshRes.ok) {
-                        const msg = (refreshRes && refreshRes.message) ? refreshRes.message : 'Failed to load CORE VM interfaces.';
-                        verifyLog(`FAILED: ${msg}`);
-                        verifyFinish({ ok: false, message: msg });
-                        markCoreVerifyFailed(msg);
-                        return { ok: false, message: msg };
-                    }
-                    try { bindHostInterfacesToScenarioCache(sidx); } catch (e) { }
-                    const catalog = getEffectiveHostInterfacesForScenario(sidx);
-                    if (!Array.isArray(catalog) || catalog.length < 1) {
-                        const msg = 'CORE VM interface catalog is empty. Refresh interfaces and retry verification.';
-                        verifyLog(`FAILED: ${msg}`);
-                        verifyFinish({ ok: false, message: msg });
-                        markCoreVerifyFailed(msg);
-                        return { ok: false, message: msg };
-                    }
-
-                    // If Step 3 already has selected interfaces, confirm they still exist.
-                    const selected = Array.isArray(hitlState.interfaces) ? hitlState.interfaces : [];
-                    const selectedNames = selected
-                        .map(entry => (entry && entry.name) ? String(entry.name).trim() : '')
-                        .filter(Boolean);
-                    if (selectedNames.length) {
-                        const catalogNames = new Set(catalog.map(item => (item && item.name) ? String(item.name).trim() : '').filter(Boolean));
-                        const missing = selectedNames.filter(name => !catalogNames.has(name));
-                        if (missing.length) {
-                            const msg = `One or more selected HITL interfaces no longer exist on the CORE VM: ${missing.join(', ')}`;
-                            verifyLog(`FAILED: ${msg}`);
-                            verifyFinish({ ok: false, message: msg });
-                            markCoreVerifyFailed(msg);
-                            return { ok: false, message: msg };
-                        }
-                    }
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : 'Failed while validating CORE VM interface catalog.';
-                    verifyLog(`FAILED: ${msg}`);
-                    verifyFinish({ ok: false, message: msg });
-                    markCoreVerifyFailed(msg);
-                    return { ok: false, message: msg };
-                }
-
                 let hasAdvancedFailures = false;
                 const formatAdvancedCheckLines = (advObj) => {
                     if (!advObj || typeof advObj !== 'object') return [];
@@ -10069,7 +9962,11 @@
     }
 
     async function clearScenarioHitlConfig(sidx, options = {}) {
-        const { triggerButton = null } = options;
+        const {
+            triggerButton = null,
+            skipToast = false,
+            successMessage = 'Cleared HITL config (interfaces/bridge).',
+        } = options;
         if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
             return { ok: false, message: 'Scenario unavailable' };
         }
@@ -10096,6 +9993,7 @@
             const scenario = state.scenarios[sidx];
             const hitl = ensureHitlStateForScenario(scenario);
             const core = hitl.core || (hitl.core = {});
+            const vmKey = (core.vm_key || '').toString();
 
             // Clear Steps 3–5 config while keeping Step 2 CORE VM selection.
             hitl.enabled = false;
@@ -10106,6 +10004,22 @@
             }
             delete core.internal_bridge;
             delete core.internal_bridge_owner;
+            delete core.cached_host_interfaces;
+            delete core.cached_host_interfaces_vm_key;
+            delete core.cached_host_interfaces_source;
+            delete core.cached_host_interfaces_metadata;
+            delete core.cached_host_interfaces_fetched_at;
+            delete core.last_interfaces_refresh;
+            delete core.last_interfaces_attempt;
+            delete core.last_interfaces_error;
+
+            if ((state.host_interfaces_vm_key || '').toString() === vmKey) {
+                state.host_interfaces = [];
+                state.host_interfaces_vm_key = '';
+                state.host_interfaces_source = null;
+                state.host_interfaces_metadata = null;
+                state.host_interfaces_fetched_at = null;
+            }
 
             persistEditorState();
             try { await flushServerSnapshotPersistNow(); } catch (_) { }
@@ -10126,7 +10040,9 @@
             }
 
             render();
-            try { showToast('Cleared HITL config (interfaces/bridge).', { autohide: true, delay: 2500 }); } catch (_) { }
+            if (!skipToast) {
+                try { showToast(successMessage, { autohide: true, delay: 2500 }); } catch (_) { }
+            }
             return { ok: true };
         } catch (err) {
             const msg = err instanceof Error ? err.message : 'Failed to clear HITL config.';
@@ -10660,6 +10576,9 @@
             const sanitized = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
             if (coreState[field] !== sanitized) {
                 coreState[field] = sanitized;
+                if (field === 'grpc_port') {
+                    coreState.port = sanitized;
+                }
                 dirty = true;
             }
         } else if (field === 'ssh_host' || field === 'venv_bin' || field === 'ssh_username' || field === 'ssh_password') {
@@ -10688,6 +10607,9 @@
             const value = inputEl.value || '';
             if ((coreState[field] || '') !== value) {
                 coreState[field] = value;
+                if (field === 'grpc_host') {
+                    coreState.host = value;
+                }
                 dirty = true;
             }
         }
@@ -11377,7 +11299,7 @@
         }
         const statusEl = document.querySelector(`[data-hitl-core-status="${sidx}"]`);
 
-        await validateCoreConnection(sidx, {
+        const coreSaveResult = await validateCoreConnection(sidx, {
             triggerButton,
             workingLabel: 'Validating…',
             statusEl,
@@ -11396,6 +11318,11 @@
             advAutoKillSessions: advAutoKill,
             showSummaryOnSuccess: true,
         });
+
+        if (coreSaveResult && coreSaveResult.ok) {
+            try { await clearScenarioHitlConfig(sidx, { skipToast: true }); } catch (_) { }
+            try { showToast('CORE connection saved. Step 3/4 was cleared; configure HITL again.', { autohide: true, delay: 3200 }); } catch (_) { }
+        }
     }
 
     function wireCoreConnectionSaveButton() {
@@ -18971,33 +18898,29 @@
                 scenarioQueryInput.value = resolveScenarioQueryHint();
             }
             persistEditorState();
-            if (typeof autoSaveXml === 'function') {
-                try {
-                    await autoSaveXml();
-                    setSaveXmlBusy(false);
-                    setSaveXmlToastBusy(false);
-                    flashSaveXmlSaved();
-                    // Auto-save updates dock preview + layout; restore viewport to where the user was.
-                    try {
-                        await new Promise(requestAnimationFrame);
-                        window.scrollTo({ top: scrollYBeforeSave, left: 0, behavior: 'auto' });
-                    } catch (_) {
-                        try { window.scrollTo(0, scrollYBeforeSave); } catch (_) { }
-                    }
-                    try { showToast('XML saved.', { autohide: true, delay: 2200 }); } catch (_) { }
-                    return;
-                } catch (err) {
-                    console.warn('Auto Save XML failed, falling back to full form submit', err);
-                    setSaveXmlToastBusy(false);
-                    try { showToast('Auto-save failed; submitting form…', { autohide: true, delay: 2600 }); } catch (_) { }
-                }
-            }
-            editorForm.removeEventListener('submit', handleEditorFormSubmit);
             try {
-                editorForm.submit();
-            } finally {
-                editorForm.addEventListener('submit', handleEditorFormSubmit);
+                if (typeof autoSaveXml !== 'function') {
+                    throw new Error('Save is unavailable on this page.');
+                }
+                await autoSaveXml();
+            } catch (saveErr) {
+                setSaveXmlBusy(false);
+                setSaveXmlToastBusy(false);
+                const msg = (saveErr && saveErr.message) ? saveErr.message : 'Save failed.';
+                try { showToast(msg, { force: true, autohide: false }); } catch (_) { }
+                return;
             }
+            setSaveXmlBusy(false);
+            setSaveXmlToastBusy(false);
+            flashSaveXmlSaved();
+            try {
+                await new Promise(requestAnimationFrame);
+                window.scrollTo({ top: scrollYBeforeSave, left: 0, behavior: 'auto' });
+            } catch (_) {
+                try { window.scrollTo(0, scrollYBeforeSave); } catch (_) { }
+            }
+            try { showToast('XML saved.', { autohide: true, delay: 2200 }); } catch (_) { }
+            return;
         };
         editorForm.addEventListener('submit', handleEditorFormSubmit);
     }
@@ -19030,17 +18953,16 @@
                             if (!proceed) return;
                         }
                     } catch (e) { }
-                    if (typeof window.coretgSaveXmlViaApi !== 'function') {
-                        alert('Save helper unavailable; refresh and try again.');
-                        return;
-                    }
                     // Mirror existing UX: show busy indicator while saving.
                     try { setSaveXmlBusy(true); } catch (e) { }
                     try { setSaveXmlToastBusy(true); } catch (e) { }
                     const scrollYBeforeSave = (typeof window !== 'undefined')
                         ? (window.scrollY || window.pageYOffset || 0)
                         : 0;
-                    const xmlPath = await window.coretgSaveXmlViaApi();
+                    if (typeof autoSaveXml !== 'function') {
+                        throw new Error('Save is unavailable on this page.');
+                    }
+                    const xmlPath = await autoSaveXml();
                     try { setSaveXmlBusy(false); } catch (e) { }
                     try { setSaveXmlToastBusy(false); } catch (e) { }
                     try { flashSaveXmlSaved(); } catch (e) { }
@@ -19260,11 +19182,15 @@
                     try { showToast('Refreshing Proxmox VM inventory…', { autohide: true, delay: 1500 }); } catch (e) { }
                     await fetchProxmoxInventory(sidx, { force: true });
                 }
+
+                // Step 1 saved successfully: Step 3/4 depends on Steps 1+2 and must be reconfigured.
+                try { await clearScenarioHitlConfig(sidx, { skipToast: true }); } catch (_) { }
+
                 if (proxPassInput) proxPassInput.value = '';
                 const successMessage = data?.message || 'Proxmox credentials validated and stored securely.';
                 const successTone = rememberCreds ? 'success' : 'warning';
                 setProxAssignHint(successMessage, successTone);
-                try { showToast(successMessage, { autohide: true, delay: 2500 }); } catch (e) { }
+                try { showToast(`${successMessage} Step 3/4 was cleared; configure HITL again.`, { autohide: true, delay: 3200 }); } catch (e) { }
                 const modalInstance = window.bootstrap ? bootstrap.Modal.getInstance(proxAssignModal) : null;
                 setTimeout(() => { modalInstance?.hide(); }, 400);
             } catch (err) {
@@ -21166,12 +21092,12 @@
     // Save XML via JSON API without navigation
     async function saveXmlAjax() {
         try {
-            if (typeof window.coretgSaveXmlViaApi !== 'function') {
-                try { logWarn('[xml-save] Shared save helper unavailable'); } catch (e) { }
+            if (typeof autoSaveXml !== 'function') {
+                try { logWarn('[xml-save] Local auto-save unavailable'); } catch (e) { }
                 return false;
             }
-            try { logInfo('[xml-save] Saving XML via shared coretgSaveXmlViaApi'); } catch (e) { }
-            const xmlPath = await window.coretgSaveXmlViaApi();
+            try { logInfo('[xml-save] Saving XML via local autoSaveXml'); } catch (e) { }
+            const xmlPath = await autoSaveXml();
             if (xmlPath && typeof xmlPath === 'string' && xmlPath.trim().endsWith('.xml')) {
                 return true;
             }

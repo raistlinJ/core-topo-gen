@@ -464,7 +464,9 @@ _DEFAULT_HITL_ATTACHMENT = "existing_router"
 
 _CORE_FIELD_KEYS = (
     'host',
+    'grpc_host',
     'port',
+    'grpc_port',
     'ssh_enabled',
     'ssh_host',
     'ssh_port',
@@ -5001,9 +5003,10 @@ def _stale_core_veth_cleanup_command() -> str:
 def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[str, Any]:
     base = raw if isinstance(raw, dict) else {}
     nested = base.get('ssh') if isinstance(base.get('ssh'), dict) else {}
-    host = str(base.get('host') or CORE_HOST or 'localhost')
+    host = str(base.get('grpc_host') or base.get('host') or CORE_HOST or 'localhost')
     try:
-        port = int(base.get('port') if base.get('port') not in (None, '') else CORE_PORT)
+        port_source = base.get('grpc_port') if base.get('grpc_port') not in (None, '') else base.get('port')
+        port = int(port_source if port_source not in (None, '') else CORE_PORT)
     except Exception:
         port = CORE_PORT
     ssh_enabled = True
@@ -5042,7 +5045,9 @@ def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[s
             venv_user_override = bool(venv_bin and default_venv and venv_bin != default_venv)
     cfg: Dict[str, Any] = {
         'host': host,
+        'grpc_host': host,
         'port': port,
+        'grpc_port': port,
         'ssh_enabled': ssh_enabled,
         'ssh_host': ssh_host,
         'ssh_port': ssh_port,
@@ -5081,7 +5086,7 @@ def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -
             return val.strip() != ''
         return True
 
-    significant_keys = ('host', 'port', 'ssh_host', 'ssh_port', 'ssh_username')
+    significant_keys = ('host', 'port', 'grpc_host', 'grpc_port', 'ssh_host', 'ssh_port', 'ssh_username')
     metadata_signal_keys = ('vm_key', 'vm_name', 'vm_node', 'core_secret_id')
     has_signal = any(_has_value(candidate.get(key)) for key in significant_keys)
     if not has_signal:
@@ -5098,7 +5103,7 @@ def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -
 
     provided_fields: Dict[str, Any] = {
         key: candidate.get(key)
-        for key in ('host', 'port', 'ssh_host', 'ssh_port', 'ssh_username', 'venv_bin', 'venv_user_override')
+        for key in ('host', 'port', 'grpc_host', 'grpc_port', 'ssh_host', 'ssh_port', 'ssh_username', 'venv_bin', 'venv_user_override')
     }
     if include_password:
         provided_fields['ssh_password'] = candidate.get('ssh_password')
@@ -5109,8 +5114,14 @@ def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -
         if key in {'host', 'port', 'ssh_enabled', 'ssh_host', 'ssh_port', 'ssh_username', 'ssh_password', 'venv_bin', 'venv_user_override', 'ssh'}:
             continue
         extras[key] = value
+    grpc_host_provided = _has_value(provided_fields.get('grpc_host'))
+    grpc_port_provided = _has_value(provided_fields.get('grpc_port'))
     for field, original in provided_fields.items():
         if field == 'ssh_password' and not include_password:
+            continue
+        if field == 'host' and grpc_host_provided:
+            continue
+        if field == 'port' and grpc_port_provided:
             continue
         if not _has_value(original):
             normalized.pop(field, None)
@@ -5164,6 +5175,14 @@ def _merge_core_configs(*configs: Any, include_password: bool = True) -> Dict[st
                 normalized = {'ssh_password': cfg.get('ssh_password')}
             else:
                 continue
+        norm_host = normalized.get('grpc_host') if normalized.get('grpc_host') not in (None, '') else normalized.get('host')
+        if norm_host not in (None, ''):
+            normalized['host'] = norm_host
+            normalized['grpc_host'] = norm_host
+        norm_port = normalized.get('grpc_port') if normalized.get('grpc_port') not in (None, '') else normalized.get('port')
+        if norm_port not in (None, ''):
+            normalized['port'] = norm_port
+            normalized['grpc_port'] = norm_port
         for key, value in normalized.items():
             if key in _CORE_FIELD_KEYS:
                 merged[key] = value
@@ -8582,7 +8601,8 @@ def _apply_hitl_config_to_full_preview(full_preview: Dict[str, Any], hitl_cfg: D
     full_preview['hitl_enabled'] = bool(hitl_cfg.get('enabled'))
     full_preview['hitl_scenario_key'] = hitl_cfg.get('scenario_key')
     if hitl_cfg.get('core'):
-        full_preview['hitl_core'] = hitl_cfg.get('core')
+        core_for_preview = _extract_optional_core_config(hitl_cfg.get('core'), include_password=False)
+        full_preview['hitl_core'] = core_for_preview if isinstance(core_for_preview, dict) else hitl_cfg.get('core')
     _merge_hitl_preview_with_full_preview(full_preview, hitl_cfg)
 
 """Flask web backend for core-topo-gen.
@@ -12241,9 +12261,24 @@ def api_flow_save_flow_state_to_xml():
     except Exception:
         prior_flow_state = None
 
+    snap_before = _xml_trace_snapshot(xml_path, scenario_label)
+
     if clear_state:
         ok, msg = _clear_flow_state_in_xml(xml_path, scenario_label)
     else:
+        try:
+            if (
+                isinstance(flow_state, dict)
+                and ('flow_enabled' in flow_state)
+                and (_coerce_bool(flow_state.get('flow_enabled')) is False)
+            ):
+                flow_state = dict(flow_state)
+                flow_state['chain_ids'] = []
+                flow_state['length'] = 0
+                flow_state['flag_assignments'] = []
+                flow_state['flags_enabled'] = False
+        except Exception:
+            pass
         try:
             prev_enabled = None
             next_enabled = None
@@ -12259,7 +12294,48 @@ def api_flow_save_flow_state_to_xml():
         flow_state = _enrich_flow_state_with_artifacts(flow_state)
         ok, msg = _update_flow_state_in_xml(xml_path, scenario_label, flow_state)
     if not ok:
+        try:
+            app.logger.warning(
+                '[flow.save_flow_state_to_xml] scenario=%s clear=%s ok=%s msg=%s before=%s',
+                _normalize_scenario_label(scenario_label),
+                bool(clear_state),
+                bool(ok),
+                msg,
+                snap_before,
+            )
+        except Exception:
+            pass
         return jsonify({'ok': False, 'error': msg}), 422
+    try:
+        clear_plan_flow = bool(clear_state)
+        if (
+            (not clear_plan_flow)
+            and isinstance(flow_state, dict)
+            and ('flow_enabled' in flow_state)
+            and (_coerce_bool(flow_state.get('flow_enabled')) is False)
+        ):
+            clear_plan_flow = True
+        if clear_plan_flow:
+            _clear_plan_preview_flow_metadata_in_xml(xml_path, scenario_label)
+    except Exception:
+        pass
+    try:
+        snap_after = _xml_trace_snapshot(xml_path, scenario_label)
+        chain_len = None
+        try:
+            chain_len = len(flow_state.get('chain_ids') or []) if isinstance(flow_state, dict) else None
+        except Exception:
+            chain_len = None
+        app.logger.info(
+            '[flow.save_flow_state_to_xml] scenario=%s clear=%s requested_chain_len=%s before=%s after=%s',
+            _normalize_scenario_label(scenario_label),
+            bool(clear_state),
+            chain_len,
+            snap_before,
+            snap_after,
+        )
+    except Exception:
+        pass
     return jsonify({'ok': True, 'xml_path': xml_path})
 
 
@@ -14581,6 +14657,33 @@ def flow_page():
         except Exception:
             active_scenario_xml_path = ''
 
+    # Keep Scenario list consistent with Topology/VM Access: when an XML snapshot is
+    # selected, drive the page scenario list from that XML (single source of truth).
+    xml_scenario_names: list[str] = []
+    try:
+        if active_scenario_xml_path and os.path.isfile(active_scenario_xml_path):
+            parsed_for_names = _parse_scenarios_xml(active_scenario_xml_path)
+            scen_list_for_names = parsed_for_names.get('scenarios') if isinstance(parsed_for_names, dict) else None
+            if isinstance(scen_list_for_names, list):
+                for sc in scen_list_for_names:
+                    if not isinstance(sc, dict):
+                        continue
+                    nm = str(sc.get('name') or '').strip()
+                    if nm:
+                        xml_scenario_names.append(nm)
+                    hitl = sc.get('hitl') if isinstance(sc.get('hitl'), dict) else None
+                    participant_url = str((hitl or {}).get('participant_proxmox_url') or '').strip()
+                    if nm and participant_url:
+                        scenario_participant_urls[_normalize_scenario_label(nm)] = participant_url
+    except Exception:
+        xml_scenario_names = []
+
+    if xml_scenario_names:
+        scenario_names = xml_scenario_names
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+        active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+
     xml_preview = ''
     flow_state_by_scenario: dict[str, Any] = {}
     try:
@@ -14602,6 +14705,22 @@ def flow_page():
                 flow_state_by_scenario = {}
     except Exception:
         xml_preview = ''
+
+    try:
+        snap = _xml_trace_snapshot(active_scenario_xml_path, active_scenario)
+        app.logger.info(
+            '[flow.page] scenario=%s xml=%s exists=%s mtime=%s sha12=%s flow_chain_len=%s flow_enabled=%s flow_state_entries=%s',
+            _normalize_scenario_label(active_scenario),
+            snap.get('xml_path'),
+            snap.get('exists'),
+            snap.get('mtime'),
+            snap.get('sha12'),
+            snap.get('flow_chain_len'),
+            snap.get('flow_enabled'),
+            len(flow_state_by_scenario or {}),
+        )
+    except Exception:
+        pass
 
     return render_template(
         'flow.html',
@@ -14664,17 +14783,44 @@ def scenarios_preview_page():
         except Exception:
             xml_path_abs = ''
 
+    # Keep Scenario list consistent with Topology/VM Access by deriving it from the
+    # selected XML snapshot whenever one is available.
+    xml_scenario_names: list[str] = []
+    try:
+        if xml_path_abs and os.path.isfile(xml_path_abs):
+            parsed_for_names = _parse_scenarios_xml(xml_path_abs)
+            scen_list_for_names = parsed_for_names.get('scenarios') if isinstance(parsed_for_names, dict) else None
+            if isinstance(scen_list_for_names, list):
+                for sc in scen_list_for_names:
+                    if not isinstance(sc, dict):
+                        continue
+                    nm = str(sc.get('name') or '').strip()
+                    if nm:
+                        xml_scenario_names.append(nm)
+    except Exception:
+        xml_scenario_names = []
+
+    if xml_scenario_names:
+        scenario_names = xml_scenario_names
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+        active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+
     scenario_xml_by_name: dict[str, str] = {}
     try:
+        if xml_path_abs and isinstance(scenario_names, list):
+            for nm in scenario_names:
+                scenario_xml_by_name[str(nm)] = xml_path_abs
         if isinstance(scenario_names, list) and isinstance(scenario_paths, dict):
             for nm in scenario_names:
                 try:
                     nm_norm = _normalize_scenario_label(nm)
                     raw_path = scenario_paths.get(nm_norm) or scenario_paths.get(nm) or ''
                     chosen = _select_existing_path(raw_path) or ''
-                    scenario_xml_by_name[str(nm)] = os.path.abspath(chosen) if chosen else ''
+                    if chosen:
+                        scenario_xml_by_name[str(nm)] = os.path.abspath(chosen)
                 except Exception:
-                    scenario_xml_by_name[str(nm)] = ''
+                    scenario_xml_by_name.setdefault(str(nm), '')
     except Exception:
         scenario_xml_by_name = {}
 
@@ -14685,6 +14831,21 @@ def scenarios_preview_page():
                 xml_preview = f.read()
     except Exception:
         xml_preview = ''
+
+    try:
+        snap = _xml_trace_snapshot(xml_path_abs, active_scenario)
+        app.logger.info(
+            '[flow.preview_page] scenario=%s xml=%s exists=%s mtime=%s sha12=%s flow_chain_len=%s flow_enabled=%s',
+            _normalize_scenario_label(active_scenario),
+            snap.get('xml_path'),
+            snap.get('exists'),
+            snap.get('mtime'),
+            snap.get('sha12'),
+            snap.get('flow_chain_len'),
+            snap.get('flow_enabled'),
+        )
+    except Exception:
+        pass
 
     return render_template(
         'scenarios_preview.html',
@@ -19443,18 +19604,13 @@ def api_flow_sequence_preview_plan():
             disallow_generator_reuse=(not allow_node_duplicates),
         )
         if (not flag_assignments) and (not allow_node_duplicates):
-            # Fallback: allow generator reuse if unique generators are insufficient.
-            flag_assignments = _flow_compute_flag_assignments(
-                preview,
-                chain_nodes,
-                scenario_label or scenario_norm,
-                initial_facts_override=initial_facts_override,
-                goal_facts_override=goal_facts_override,
-                seed_override=seed_override,
-                disallow_generator_reuse=False,
-            )
-            if flag_assignments:
-                warning = warning or 'Not enough unique generators for this chain length; generator reuse was enabled.'
+            return jsonify({
+                'ok': False,
+                'error': 'Not enough unique generators for this chain length while duplicates are disabled. Reduce chain length or enable duplicates.',
+                'scenario': scenario_label or scenario_norm,
+                'length': len(chain_nodes or []),
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
+            }), 422
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Presets force an intended generator order and should not be reordered.
@@ -23797,6 +23953,7 @@ def api_flow_save_flow_substitutions():
             return jsonify({'ok': False, 'error': 'Failed to persist flow-modified preview plan: XML path not found.'}), 500
         if isinstance(meta2, dict):
             meta2['xml_path'] = xml_target
+        snap_before = _xml_trace_snapshot(xml_target, scenario_label or scenario_norm)
         out_payload = {
             'full_preview': preview,
             'metadata': meta2,
@@ -23811,6 +23968,16 @@ def api_flow_save_flow_substitutions():
         out_path = xml_target
         try:
             _planner_set_plan(scenario_norm, plan_path=xml_target, xml_path=xml_target, seed=(meta2 or {}).get('seed'))
+        except Exception:
+            pass
+        try:
+            snap_after = _xml_trace_snapshot(xml_target, scenario_label or scenario_norm)
+            app.logger.info(
+                '[flow.save_flow_substitutions.persist] scenario=%s before=%s after=%s',
+                scenario_norm,
+                snap_before,
+                snap_after,
+            )
         except Exception:
             pass
     except Exception as e:
@@ -27059,6 +27226,97 @@ def _load_scenario_hitl_config_from_disk() -> dict[str, Dict[str, Any]]:
     return out
 
 
+def _merge_hitl_hints_into_scenario_state(
+    scenario: Dict[str, Any],
+    scenario_norm: str,
+    *,
+    validation_hints: Optional[Dict[str, Dict[str, Any]]] = None,
+    config_hints: Optional[Dict[str, Dict[str, Any]]] = None,
+    include_builder_fallback: bool = False,
+) -> Dict[str, Any]:
+    if not isinstance(scenario, dict):
+        return scenario
+    norm = _normalize_scenario_label(scenario_norm)
+    if not norm:
+        norm = _normalize_scenario_label(scenario.get('name'))
+    if not norm:
+        return scenario
+
+    hv_map = validation_hints if isinstance(validation_hints, dict) else _load_scenario_hitl_validation_from_disk()
+    hc_map = config_hints if isinstance(config_hints, dict) else _load_scenario_hitl_config_from_disk()
+
+    validation_hint = hv_map.get(norm) if isinstance(hv_map, dict) else None
+    if (not isinstance(validation_hint, dict) or not validation_hint) and include_builder_fallback and isinstance(hv_map, dict):
+        validation_hint = _select_builder_hitl_fallback(hv_map)
+    config_hint = hc_map.get(norm) if isinstance(hc_map, dict) else None
+    if (not isinstance(config_hint, dict) or not config_hint) and include_builder_fallback and isinstance(hc_map, dict):
+        config_hint = _select_builder_hitl_fallback(hc_map)
+
+    if not (isinstance(validation_hint, dict) and validation_hint) and not (isinstance(config_hint, dict) and config_hint):
+        return scenario
+
+    def _is_missing(value: Any) -> bool:
+        return value in (None, '', False)
+
+    merged = dict(scenario)
+    hitl_meta = merged.get('hitl') if isinstance(merged.get('hitl'), dict) else {}
+    hitl_meta = dict(hitl_meta)
+
+    if isinstance(validation_hint, dict) and validation_hint:
+        prox_hint = validation_hint.get('proxmox') if isinstance(validation_hint.get('proxmox'), dict) else None
+        if isinstance(prox_hint, dict) and prox_hint:
+            prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+            prox_state = dict(prox_state)
+            for key, value in prox_hint.items():
+                if key not in prox_state or _is_missing(prox_state.get(key)):
+                    prox_state[key] = value
+            hitl_meta['proxmox'] = prox_state
+
+        core_hint = validation_hint.get('core') if isinstance(validation_hint.get('core'), dict) else None
+        if isinstance(core_hint, dict) and core_hint:
+            core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+            core_state = dict(core_state)
+            for key, value in core_hint.items():
+                if key not in core_state or _is_missing(core_state.get(key)):
+                    core_state[key] = value
+            hitl_meta['core'] = core_state
+
+    if isinstance(config_hint, dict) and config_hint:
+        try:
+            participant_cfg = _normalize_participant_proxmox_url(config_hint.get('participant_proxmox_url'))
+            if participant_cfg:
+                for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                    if key not in hitl_meta or _is_missing(hitl_meta.get(key)):
+                        hitl_meta[key] = participant_cfg
+        except Exception:
+            pass
+        if 'enabled' in config_hint and ('enabled' not in hitl_meta or hitl_meta.get('enabled') is None):
+            hitl_meta['enabled'] = bool(config_hint.get('enabled'))
+        if isinstance(config_hint.get('interfaces'), list) and not isinstance(hitl_meta.get('interfaces'), list):
+            hitl_meta['interfaces'] = config_hint.get('interfaces')
+
+        cfg_prox = config_hint.get('proxmox') if isinstance(config_hint.get('proxmox'), dict) else None
+        if isinstance(cfg_prox, dict) and cfg_prox:
+            prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+            prox_state = dict(prox_state)
+            for key, value in cfg_prox.items():
+                if key not in prox_state or _is_missing(prox_state.get(key)):
+                    prox_state[key] = value
+            hitl_meta['proxmox'] = prox_state
+
+        cfg_core = config_hint.get('core') if isinstance(config_hint.get('core'), dict) else None
+        if isinstance(cfg_core, dict) and cfg_core:
+            core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+            core_state = dict(core_state)
+            for key, value in cfg_core.items():
+                if key not in core_state or _is_missing(core_state.get(key)):
+                    core_state[key] = value
+            hitl_meta['core'] = core_state
+
+    merged['hitl'] = hitl_meta
+    return merged
+
+
 def _merge_hitl_config_map_into_scenario_catalog(hitl_configs: Dict[str, Dict[str, Any]]) -> None:
     if not isinstance(hitl_configs, dict) or not hitl_configs:
         return
@@ -30020,6 +30278,33 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                 interfaces_norm.append(iface_norm)
         hitl_norm['interfaces'] = interfaces_norm
         hitl_norm['core'] = _extract_optional_core_config(hitl_norm.get('core'), include_password=True)
+
+        prox_raw = hitl_norm.get('proxmox') if isinstance(hitl_norm.get('proxmox'), dict) else {}
+        prox_norm: Dict[str, Any] = {}
+        for key in ('url', 'port', 'verify_ssl', 'secret_id', 'validated', 'last_validated_at', 'stored_at', 'last_message', 'remember_credentials', 'inventory'):
+            if key in prox_raw:
+                prox_norm[key] = prox_raw.get(key)
+        if isinstance(prox_norm.get('url'), str):
+            prox_norm['url'] = prox_norm['url'].strip()
+        if isinstance(prox_norm.get('secret_id'), str):
+            prox_norm['secret_id'] = prox_norm['secret_id'].strip() or None
+        if 'port' in prox_norm:
+            try:
+                prox_norm['port'] = int(prox_norm.get('port'))
+            except Exception:
+                prox_norm.pop('port', None)
+        if 'verify_ssl' in prox_norm:
+            prox_norm['verify_ssl'] = _coerce_bool(prox_norm.get('verify_ssl'))
+        if 'validated' in prox_norm:
+            prox_norm['validated'] = _coerce_bool(prox_norm.get('validated'))
+        if 'remember_credentials' in prox_norm:
+            prox_norm['remember_credentials'] = _coerce_bool(prox_norm.get('remember_credentials'))
+        for ts_key in ('last_validated_at', 'stored_at'):
+            if ts_key in prox_norm and not isinstance(prox_norm.get(ts_key), str):
+                prox_norm[ts_key] = None
+        if prox_norm:
+            hitl_norm['proxmox'] = prox_norm
+
         scen_norm['hitl'] = hitl_norm
 
         normalized_scenarios.append(scen_norm)
@@ -33776,6 +34061,53 @@ def api_latest_xml_for_scenario():
         return jsonify({'ok': False, 'error': str(exc)}), 500
 
 
+def _xml_trace_snapshot(xml_path: str | None, scenario_label: str | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        'xml_path': str(xml_path or ''),
+        'exists': False,
+        'mtime': 0.0,
+        'size': 0,
+        'sha12': '',
+        'flow_chain_len': None,
+        'flow_enabled': None,
+        'flow_updated_at': None,
+    }
+    try:
+        path = _abs_path_or_original(str(xml_path or '').strip())
+    except Exception:
+        path = ''
+    if not path:
+        return out
+    out['xml_path'] = path
+    try:
+        if not os.path.exists(path):
+            return out
+        out['exists'] = True
+        out['mtime'] = float(os.path.getmtime(path))
+        out['size'] = int(os.path.getsize(path))
+        h = hashlib.sha256()
+        with open(path, 'rb') as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        out['sha12'] = h.hexdigest()[:12]
+    except Exception:
+        pass
+    try:
+        fs = _flow_state_from_xml_path(path, scenario_label)
+        if isinstance(fs, dict):
+            chain_ids = fs.get('chain_ids') if isinstance(fs.get('chain_ids'), list) else []
+            out['flow_chain_len'] = len(chain_ids)
+            if 'flow_enabled' in fs:
+                out['flow_enabled'] = _coerce_bool(fs.get('flow_enabled'))
+            out['flow_updated_at'] = fs.get('updated_at')
+    except Exception:
+        pass
+    return out
+
+
 @app.route('/api/scenario/latest_state', methods=['GET'])
 def api_latest_state_for_scenario():
     scenario = (request.args.get('scenario') or '').strip()
@@ -33783,7 +34115,15 @@ def api_latest_state_for_scenario():
         return jsonify({'ok': False, 'error': 'scenario required'}), 400
     try:
         scen_norm = _normalize_scenario_label(scenario)
-        xml_path = _latest_xml_path_for_scenario(scen_norm)
+        requested_xml_path = (request.args.get('xml_path') or '').strip()
+        xml_path = ''
+        if requested_xml_path:
+            requested_abs = _abs_path_or_original(requested_xml_path)
+            if not requested_abs or not os.path.exists(requested_abs):
+                return jsonify({'ok': False, 'error': 'requested xml_path not found'}), 404
+            xml_path = requested_abs
+        if not xml_path:
+            xml_path = _latest_xml_path_for_scenario(scen_norm)
         if not xml_path:
             return jsonify({'ok': False, 'error': 'No XML found'}), 404
         parsed = _parse_scenarios_xml(xml_path)
@@ -33808,6 +34148,21 @@ def api_latest_state_for_scenario():
             xml_mtime = float(os.path.getmtime(xml_path))
         except Exception:
             xml_mtime = 0.0
+
+        try:
+            fs_dbg = selected.get('flow_state') if isinstance(selected, dict) and isinstance(selected.get('flow_state'), dict) else {}
+            chain_dbg = fs_dbg.get('chain_ids') if isinstance(fs_dbg.get('chain_ids'), list) else []
+            app.logger.info(
+                '[flow.latest_state] scenario=%s requested_xml=%s resolved_xml=%s mtime=%s flow_chain_len=%s flow_enabled=%s',
+                scen_norm,
+                (requested_xml_path or ''),
+                xml_path,
+                xml_mtime,
+                len(chain_dbg),
+                (fs_dbg.get('flow_enabled') if isinstance(fs_dbg, dict) else None),
+            )
+        except Exception:
+            pass
 
         return jsonify({
             'ok': True,
@@ -34001,6 +34356,27 @@ def _clear_flow_state_in_xml(xml_path: str, scenario_label: str | None) -> tuple
         return False, f'failed to update xml: {e}'
 
 
+def _clear_plan_preview_flow_metadata_in_xml(xml_path: str, scenario_label: str | None) -> tuple[bool, str]:
+    """Remove metadata.flow from ScenarioEditor/PlanPreview payload in XML."""
+    xml_path = _abs_path_or_original(xml_path)
+    if not xml_path or not os.path.exists(xml_path):
+        return False, 'xml_path not found'
+    payload = _load_plan_preview_from_xml(xml_path, scenario_label)
+    if not isinstance(payload, dict):
+        return True, 'ok'
+    try:
+        meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+        if isinstance(meta, dict) and ('flow' in meta):
+            meta = dict(meta)
+            meta.pop('flow', None)
+            payload = dict(payload)
+            payload['metadata'] = meta
+            return _update_plan_preview_in_xml(xml_path, scenario_label, payload)
+        return True, 'ok'
+    except Exception as e:
+        return False, f'failed to clear plan flow metadata: {e}'
+
+
 def _update_plan_preview_in_xml(
     xml_path: str,
     scenario_label: str | None,
@@ -34147,7 +34523,7 @@ def _parse_scenario_editor(se):
     if base is not None:
         scen["base"]["filepath"] = base.get("filepath", "")
     hitl_el = se.find("HardwareInLoop")
-    hitl_info: Dict[str, Any] = {"enabled": False, "interfaces": [], "core": None}
+    hitl_info: Dict[str, Any] = {"enabled": False, "interfaces": [], "core": None, "proxmox": None}
     if hitl_el is not None:
         enabled_raw = (hitl_el.get("enabled") or "").strip().lower()
         hitl_info["enabled"] = enabled_raw in ("1", "true", "yes", "on")
@@ -34180,13 +34556,70 @@ def _parse_scenario_editor(se):
             ipv6_attr = iface_el.get("ipv6") or iface_el.get("ipv6_addresses")
             if ipv6_attr:
                 entry["ipv6"] = [p.strip() for p in ipv6_attr.split(',') if p.strip()]
+
+            prox_target = {
+                "node": (iface_el.get("pve_node") or "").strip(),
+                "vmid": (iface_el.get("pve_vmid") or "").strip(),
+                "interface_id": (iface_el.get("pve_interface_id") or "").strip(),
+                "macaddr": (iface_el.get("pve_macaddr") or "").strip(),
+                "bridge": (iface_el.get("pve_bridge") or "").strip(),
+                "model": (iface_el.get("pve_model") or "").strip(),
+                "vm_name": (iface_el.get("pve_vm_name") or "").strip(),
+                "label": (iface_el.get("pve_label") or "").strip(),
+            }
+            if any(v for v in prox_target.values()):
+                entry["proxmox_target"] = prox_target
+
+            external_vm = {
+                "vm_key": (iface_el.get("ext_vm_key") or "").strip(),
+                "vm_node": (iface_el.get("ext_vm_node") or "").strip(),
+                "vm_name": (iface_el.get("ext_vm_name") or "").strip(),
+                "vmid": (iface_el.get("ext_vmid") or "").strip(),
+                "status": (iface_el.get("ext_status") or "").strip(),
+                "interface_id": (iface_el.get("ext_interface_id") or "").strip(),
+                "interface_bridge": (iface_el.get("ext_interface_bridge") or "").strip(),
+                "interface_mac": (iface_el.get("ext_interface_mac") or "").strip(),
+                "interface_model": (iface_el.get("ext_interface_model") or "").strip(),
+            }
+            if any(v for v in external_vm.values()):
+                entry["external_vm"] = external_vm
             interfaces.append(entry)
         hitl_info["interfaces"] = interfaces
         core_el = hitl_el.find("CoreConnection")
         if core_el is not None:
             core_cfg = _extract_optional_core_config(dict(core_el.attrib), include_password=False)
             if core_cfg:
+                if "validated" in core_cfg:
+                    core_cfg["validated"] = _coerce_bool(core_cfg.get("validated"))
+                if isinstance(core_cfg.get("core_secret_id"), str):
+                    core_cfg["core_secret_id"] = core_cfg["core_secret_id"].strip() or None
                 hitl_info["core"] = core_cfg
+        prox_el = hitl_el.find("ProxmoxConnection")
+        if prox_el is not None:
+            prox_cfg: Dict[str, Any] = {}
+            for key in ("url", "port", "verify_ssl", "secret_id", "validated", "last_validated_at", "stored_at", "username", "remember_credentials", "last_message"):
+                if key in prox_el.attrib:
+                    prox_cfg[key] = prox_el.get(key)
+            if isinstance(prox_cfg.get("secret_id"), str):
+                prox_cfg["secret_id"] = prox_cfg["secret_id"].strip() or None
+            if isinstance(prox_cfg.get("username"), str):
+                prox_cfg["username"] = prox_cfg["username"].strip() or None
+            if isinstance(prox_cfg.get("port"), str):
+                try:
+                    prox_cfg["port"] = int(str(prox_cfg["port"]).strip())
+                except Exception:
+                    pass
+            if "verify_ssl" in prox_cfg:
+                v = str(prox_cfg.get("verify_ssl") or "").strip().lower()
+                prox_cfg["verify_ssl"] = v in ("1", "true", "yes", "on")
+            if "validated" in prox_cfg:
+                v = str(prox_cfg.get("validated") or "").strip().lower()
+                prox_cfg["validated"] = v in ("1", "true", "yes", "on")
+            if "remember_credentials" in prox_cfg:
+                v = str(prox_cfg.get("remember_credentials") or "").strip().lower()
+                prox_cfg["remember_credentials"] = v in ("1", "true", "yes", "on")
+            if prox_cfg:
+                hitl_info["proxmox"] = prox_cfg
     scen["hitl"] = hitl_info
 
     # Flag Sequencing flow state (resolved values, chain selections).
@@ -34374,10 +34807,12 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
     root = ET.Element("Scenarios")
     core_cfg = _normalize_core_config(data_dict.get('core'), include_password=False)
     core_el = ET.SubElement(root, 'CoreConnection')
-    core_el.set('host', str(core_cfg.get('host') or ''))
-    core_el.set('port', str(core_cfg.get('port') or ''))
+    core_host = core_cfg.get('grpc_host') or core_cfg.get('host') or ''
+    core_port = core_cfg.get('grpc_port') if core_cfg.get('grpc_port') not in (None, '') else core_cfg.get('port')
+    core_el.set('host', str(core_host))
+    core_el.set('port', str(core_port or ''))
     core_el.set('ssh_enabled', 'true' if core_cfg.get('ssh_enabled') else 'false')
-    core_el.set('ssh_host', str(core_cfg.get('ssh_host') or core_cfg.get('host') or ''))
+    core_el.set('ssh_host', str(core_cfg.get('ssh_host') or core_host or ''))
     core_el.set('ssh_port', str(core_cfg.get('ssh_port') or ''))
     core_el.set('ssh_username', str(core_cfg.get('ssh_username') or ''))
     for idx, scen in enumerate(data_dict.get("scenarios", [])):
@@ -34445,6 +34880,51 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                         items = [str(p).strip() for p in val if str(p).strip()]
                         if items:
                             clean[attr_key] = items
+
+                prox_target_raw = entry.get("proxmox_target") if isinstance(entry.get("proxmox_target"), dict) else None
+                if isinstance(prox_target_raw, dict):
+                    prox_target_clean: Dict[str, Any] = {}
+                    for src, dst in (
+                        ("node", "node"),
+                        ("vmid", "vmid"),
+                        ("interface_id", "interface_id"),
+                        ("macaddr", "macaddr"),
+                        ("bridge", "bridge"),
+                        ("model", "model"),
+                        ("vm_name", "vm_name"),
+                        ("label", "label"),
+                    ):
+                        val = prox_target_raw.get(src)
+                        if val in (None, ""):
+                            continue
+                        sval = str(val).strip()
+                        if sval:
+                            prox_target_clean[dst] = sval
+                    if prox_target_clean:
+                        clean["proxmox_target"] = prox_target_clean
+
+                external_vm_raw = entry.get("external_vm") if isinstance(entry.get("external_vm"), dict) else None
+                if isinstance(external_vm_raw, dict):
+                    external_vm_clean: Dict[str, Any] = {}
+                    for src, dst in (
+                        ("vm_key", "vm_key"),
+                        ("vm_node", "vm_node"),
+                        ("vm_name", "vm_name"),
+                        ("vmid", "vmid"),
+                        ("status", "status"),
+                        ("interface_id", "interface_id"),
+                        ("interface_bridge", "interface_bridge"),
+                        ("interface_mac", "interface_mac"),
+                        ("interface_model", "interface_model"),
+                    ):
+                        val = external_vm_raw.get(src)
+                        if val in (None, ""):
+                            continue
+                        sval = str(val).strip()
+                        if sval:
+                            external_vm_clean[dst] = sval
+                    if external_vm_clean:
+                        clean["external_vm"] = external_vm_clean
                 normalized_ifaces.append(clean)
         for iface in normalized_ifaces:
             if "attachment" not in iface:
@@ -34459,7 +34939,7 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
         else:
             participant_url = ''
 
-        if hitl and (hitl.get("enabled") or normalized_ifaces or hitl.get("core") or participant_url):
+        if hitl and (hitl.get("enabled") or normalized_ifaces or hitl.get("core") or hitl.get("proxmox") or participant_url):
             hitl_el = ET.SubElement(se, "HardwareInLoop")
             hitl_el.set("enabled", "true" if hitl.get("enabled") else "false")
             if participant_url:
@@ -34467,10 +34947,12 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
             hitl_core_cfg = _extract_optional_core_config(hitl.get("core"), include_password=False)
             if hitl_core_cfg:
                 hitl_core_el = ET.SubElement(hitl_el, "CoreConnection")
-                hitl_core_el.set("host", str(hitl_core_cfg.get("host") or ""))
-                hitl_core_el.set("port", str(hitl_core_cfg.get("port") or ""))
+                hitl_core_host = hitl_core_cfg.get("grpc_host") or hitl_core_cfg.get("host") or ""
+                hitl_core_port = hitl_core_cfg.get("grpc_port") if hitl_core_cfg.get("grpc_port") not in (None, "") else hitl_core_cfg.get("port")
+                hitl_core_el.set("host", str(hitl_core_host))
+                hitl_core_el.set("port", str(hitl_core_port or ""))
                 hitl_core_el.set("ssh_enabled", "true" if hitl_core_cfg.get("ssh_enabled") else "false")
-                hitl_core_el.set("ssh_host", str(hitl_core_cfg.get("ssh_host") or hitl_core_cfg.get("host") or ""))
+                hitl_core_el.set("ssh_host", str(hitl_core_cfg.get("ssh_host") or hitl_core_host or ""))
                 hitl_core_el.set("ssh_port", str(hitl_core_cfg.get("ssh_port") or ""))
                 hitl_core_el.set("ssh_username", str(hitl_core_cfg.get("ssh_username") or ""))
                 for extra_key, extra_val in hitl_core_cfg.items():
@@ -34480,6 +34962,25 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                         hitl_core_el.set(str(extra_key), str(extra_val))
                     except Exception:
                         continue
+            prox_raw = hitl.get("proxmox") if isinstance(hitl, dict) else None
+            if isinstance(prox_raw, dict):
+                prox_clean: Dict[str, Any] = {}
+                for key in ("url", "port", "verify_ssl", "secret_id", "validated", "last_validated_at", "stored_at", "username", "remember_credentials", "last_message"):
+                    if key in prox_raw:
+                        prox_clean[key] = prox_raw.get(key)
+                if isinstance(prox_clean.get("secret_id"), str):
+                    prox_clean["secret_id"] = prox_clean["secret_id"].strip() or None
+                if isinstance(prox_clean.get("username"), str):
+                    prox_clean["username"] = prox_clean["username"].strip() or None
+                if prox_clean:
+                    prox_el = ET.SubElement(hitl_el, "ProxmoxConnection")
+                    for key, value in prox_clean.items():
+                        if value in (None, ""):
+                            continue
+                        if isinstance(value, bool):
+                            prox_el.set(str(key), "true" if value else "false")
+                        else:
+                            prox_el.set(str(key), str(value))
             for iface in normalized_ifaces:
                 name = iface.get("name")
                 if not name:
@@ -34504,6 +35005,43 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     joined6 = ",".join(str(p) for p in ipv6_vals if p)
                     if joined6:
                         iface_el.set("ipv6", joined6)
+
+                prox_target = iface.get("proxmox_target") if isinstance(iface.get("proxmox_target"), dict) else None
+                if isinstance(prox_target, dict):
+                    attr_map = {
+                        "node": "pve_node",
+                        "vmid": "pve_vmid",
+                        "interface_id": "pve_interface_id",
+                        "macaddr": "pve_macaddr",
+                        "bridge": "pve_bridge",
+                        "model": "pve_model",
+                        "vm_name": "pve_vm_name",
+                        "label": "pve_label",
+                    }
+                    for src_key, xml_attr in attr_map.items():
+                        val = prox_target.get(src_key)
+                        if val in (None, ""):
+                            continue
+                        iface_el.set(xml_attr, str(val))
+
+                external_vm = iface.get("external_vm") if isinstance(iface.get("external_vm"), dict) else None
+                if isinstance(external_vm, dict):
+                    attr_map = {
+                        "vm_key": "ext_vm_key",
+                        "vm_node": "ext_vm_node",
+                        "vm_name": "ext_vm_name",
+                        "vmid": "ext_vmid",
+                        "status": "ext_status",
+                        "interface_id": "ext_interface_id",
+                        "interface_bridge": "ext_interface_bridge",
+                        "interface_mac": "ext_interface_mac",
+                        "interface_model": "ext_interface_model",
+                    }
+                    for src_key, xml_attr in attr_map.items():
+                        val = external_vm.get(src_key)
+                        if val in (None, ""):
+                            continue
+                        iface_el.set(xml_attr, str(val))
 
         # Flag Sequencing flow state (resolved values, chain selections).
         try:
@@ -35336,10 +35874,13 @@ def _summarize_planner_scenarios(xml_path: str) -> Dict[str, Any]:
 def index():
     current = _current_user()
     scenario_query = ''
+    xml_query = ''
     try:
         scenario_query = (request.args.get('scenario') or '').strip()
+        xml_query = (request.args.get('xml_path') or '').strip()
     except Exception:
         scenario_query = ''
+        xml_query = ''
     if current and _is_participant_role(current.get('role')):
         target_args = {'scenario': scenario_query} if scenario_query else {}
         return redirect(url_for('participant_ui_page', **target_args))
@@ -35401,57 +35942,33 @@ def index():
                 return True
 
         def _best_xml_for_index() -> str:
-            xml_hint = ''
+            # Strict XML source priority:
+            # 1) explicit xml_path query (dock/tab propagated)
+            # 2) latest XML for selected scenario
+            # 3) payload result_path if it is XML
+            try:
+                if xml_query:
+                    cand = os.path.abspath(xml_query)
+                    if cand.lower().endswith('.xml') and os.path.exists(cand):
+                        return cand
+            except Exception:
+                pass
             if scenario_query:
-                xml_hint = _latest_xml_path_for_scenario(_normalize_scenario_label(scenario_query)) or ''
-            if not xml_hint:
-                snap = payload.get('editor_snapshot') if isinstance(payload.get('editor_snapshot'), dict) else {}
-                idx = None
                 try:
-                    idx = snap.get('active_index')
-                    if isinstance(idx, str) and idx.isdigit():
-                        idx = int(idx)
-                except Exception:
-                    idx = None
-                try:
-                    by_index = snap.get('saved_xml_paths_by_index') if isinstance(snap.get('saved_xml_paths_by_index'), list) else []
-                    if isinstance(idx, int) and 0 <= idx < len(by_index):
-                        cand = str(by_index[idx] or '').strip()
-                        if cand and cand.lower().endswith('.xml'):
-                            xml_hint = cand
-                except Exception:
-                    xml_hint = ''
-                if xml_hint and _is_autosave_xml_path(xml_hint):
-                    try:
-                        scenarios_list = payload.get('scenarios') if isinstance(payload.get('scenarios'), list) else []
-                        if isinstance(idx, int) and 0 <= idx < len(scenarios_list) and isinstance(scenarios_list[idx], dict):
-                            nm = str(scenarios_list[idx].get('name') or '').strip()
-                            if nm:
-                                preferred = _latest_xml_path_for_scenario(_normalize_scenario_label(nm)) or ''
-                                if preferred and not _is_autosave_xml_path(preferred):
-                                    xml_hint = preferred
-                    except Exception:
-                        pass
-            if not xml_hint:
-                try:
-                    scenarios_list = payload.get('scenarios') if isinstance(payload.get('scenarios'), list) else []
-                    first_name = ''
-                    if scenarios_list and isinstance(scenarios_list[0], dict):
-                        first_name = str(scenarios_list[0].get('name') or '').strip()
-                    if first_name:
-                        xml_hint = _latest_xml_path_for_scenario(_normalize_scenario_label(first_name)) or ''
-                except Exception:
-                    xml_hint = ''
-            if xml_hint and _is_autosave_xml_path(xml_hint):
-                # Prefer non-autosave XML when available.
-                try:
-                    if scenario_query:
-                        preferred = _latest_xml_path_for_scenario(_normalize_scenario_label(scenario_query)) or ''
-                        if preferred and not _is_autosave_xml_path(preferred):
-                            xml_hint = preferred
+                    cand = _latest_xml_path_for_scenario(_normalize_scenario_label(scenario_query)) or ''
+                    if cand and os.path.exists(cand):
+                        return cand
                 except Exception:
                     pass
-            return xml_hint
+            try:
+                cand = str(payload.get('result_path') or '').strip()
+                if cand and cand.lower().endswith('.xml'):
+                    cand_abs = os.path.abspath(cand)
+                    if os.path.exists(cand_abs):
+                        return cand_abs
+            except Exception:
+                pass
+            return ''
 
         xml_hint = _best_xml_for_index()
         if xml_hint and os.path.exists(xml_hint):
@@ -35461,8 +35978,7 @@ def index():
                 if isinstance(parsed.get('core'), dict):
                     payload['core'] = parsed.get('core')
                 payload['result_path'] = xml_hint
-                if not payload.get('project_key_hint'):
-                    payload['project_key_hint'] = xml_hint
+                payload['project_key_hint'] = xml_hint
                 payload['_xml_forced'] = True
                 try:
                     app.logger.info('[index] forced scenarios from xml: %s', xml_hint)
@@ -35470,77 +35986,6 @@ def index():
                     pass
     except Exception:
         pass
-
-    # If the payload has no scenarios (or only skeletal scenarios) after refresh,
-    # attempt to hydrate from the latest saved XML path (non-autosave) so the
-    # Topology editor is not blank.
-    try:
-        if not payload.get('_xml_forced'):
-            scenarios_present = isinstance(payload.get('scenarios'), list) and bool(payload.get('scenarios'))
-            scenarios_list = payload.get('scenarios') if isinstance(payload.get('scenarios'), list) else []
-            has_only_skeletal = bool(scenarios_list) and all(_scenario_is_skeletal(s) for s in scenarios_list if isinstance(s, dict))
-            catalog_stub = bool(payload.get('_catalog_stub'))
-            if (not scenarios_present) or has_only_skeletal or catalog_stub:
-                snap = payload.get('editor_snapshot') if isinstance(payload.get('editor_snapshot'), dict) else {}
-                xml_hint = ''
-                try:
-                    idx = snap.get('active_index')
-                    if isinstance(idx, str) and idx.isdigit():
-                        idx = int(idx)
-                except Exception:
-                    idx = None
-                try:
-                    by_index = snap.get('saved_xml_paths_by_index') if isinstance(snap.get('saved_xml_paths_by_index'), list) else []
-                    if isinstance(idx, int) and 0 <= idx < len(by_index):
-                        cand = str(by_index[idx] or '').strip()
-                        if cand and cand.lower().endswith('.xml') and not _is_autosave_xml_path(cand):
-                            xml_hint = cand
-                except Exception:
-                    xml_hint = ''
-                if not xml_hint:
-                    try:
-                        cand = str(snap.get('result_path') or '').strip()
-                        if cand and cand.lower().endswith('.xml') and not _is_autosave_xml_path(cand):
-                            xml_hint = cand
-                    except Exception:
-                        xml_hint = ''
-                if not xml_hint:
-                    try:
-                        cand = str(payload.get('result_path') or '').strip()
-                        if cand and cand.lower().endswith('.xml') and not _is_autosave_xml_path(cand):
-                            xml_hint = cand
-                    except Exception:
-                        xml_hint = ''
-                if not xml_hint:
-                    try:
-                        # Best-effort: fall back to latest catalog XML for the first scenario name.
-                        first_name = ''
-                        if scenarios_list and isinstance(scenarios_list[0], dict):
-                            first_name = str(scenarios_list[0].get('name') or '').strip()
-                        if first_name:
-                            xml_hint = _latest_xml_path_for_scenario(_normalize_scenario_label(first_name)) or ''
-                    except Exception:
-                        xml_hint = ''
-
-                if xml_hint and os.path.exists(xml_hint):
-                    parsed = _parse_scenarios_xml(xml_hint)
-                    if isinstance(parsed, dict) and isinstance(parsed.get('scenarios'), list) and parsed.get('scenarios'):
-                        payload['scenarios'] = parsed.get('scenarios')
-                        if isinstance(parsed.get('core'), dict) and not isinstance(payload.get('core'), dict):
-                            payload['core'] = parsed.get('core')
-                        payload['result_path'] = xml_hint
-                        if not payload.get('project_key_hint'):
-                            payload['project_key_hint'] = xml_hint
-                        try:
-                            app.logger.info('[index] hydrated scenarios from xml: %s', xml_hint)
-                        except Exception:
-                            pass
-    except Exception:
-        pass
-
-    # Keep VM/Access + Topology scenario list in sync with Scenarios tabs/catalog
-    # even when active XML hydration currently contains only one scenario.
-    payload = _merge_catalog_scenario_stubs_into_payload(payload)
 
     # Populate XML preview on initial load so the dock isn't blank after refresh.
     xml_text = ""
@@ -45588,9 +46033,11 @@ def test_core():
         scenario_vm_id = str(scenario_vm_id_raw).strip() if isinstance(scenario_vm_id_raw, (str, int)) else ''
         if not scenario_vm_node and scenario_vm_key and '::' in scenario_vm_key:
             scenario_vm_node = scenario_vm_key.split('::', 1)[0].strip()
+        # Validation must use only what the user submitted in the CORE dialog.
+        # Do not merge host/port/SSH connection fields from scenario HITL metadata,
+        # which may contain stale values from prior sessions.
         cfg = _merge_core_configs(
             data.get('core') if isinstance(data.get('core'), dict) else None,
-            scenario_core_dict,
             direct_override if direct_override else None,
             include_password=True,
         )

@@ -16,10 +16,10 @@ class CoreTGPrereqsService(CoreService):
 
     name: str = "CoreTGPrereqs"
     group: str = "Simple"
-    files: list[str] = ["runprereqs.sh"]
+    files: list[str] = ["/runprereqs.sh"]
     executables: list[str] = []
     dependencies: list[str] = []
-    startup: list[str] = ["/bin/sh runprereqs.sh"]
+    startup: list[str] = ["/bin/sh /runprereqs.sh"]
     validate: list[str] = []
     shutdown: list[str] = []
     validation_mode: ServiceMode = ServiceMode.NON_BLOCKING
@@ -30,7 +30,7 @@ class CoreTGPrereqsService(CoreService):
         return r"""#!/bin/sh
 set -eu
 
-LOG="prereqs_output.txt"
+LOG="/tmp/coretg_prereqs_output.txt"
 
 log() {
   echo "[CoreTGPrereqs] $*" >> "$LOG"

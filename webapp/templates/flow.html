@@ -776,13 +776,15 @@
     try {
       const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
       if (!scenario) return false;
-      const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      const chain_ids = (!flowEnabled)
+        ? []
+        : (Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : []);
       const flowStatePayload = {
         scenario,
         preset: (presetEl && presetEl.value) ? String(presetEl.value).trim() : '',
         length: chain_ids.length,
         chain_ids: chain_ids,
-        flag_assignments: buildPersistAssignments(chain_ids),
+        flag_assignments: (!flowEnabled) ? [] : buildPersistAssignments(chain_ids),
         allow_node_duplicates: !!allowNodeDuplicates,
         initial_facts: flowInitialFactsOverride,
         goal_facts: flowGoalFactsOverride,
@@ -1267,52 +1269,88 @@
     return null;
   }
 
-  function getSavedFlowStateForScenario(scenarioName) {
-    const hasAuthoritativeXmlPath = (name) => {
-      try {
-        if (!name || typeof window.coretgGetLatestXmlPathForScenario !== 'function') return false;
-        const p = String(window.coretgGetLatestXmlPathForScenario(name) || '').trim();
-        return !!p;
-      } catch (e) {
-        return false;
-      }
-    };
+  function hasAuthoritativeXmlPathForScenario(scenarioName) {
+    try {
+      if (!scenarioName || typeof window.coretgGetLatestXmlPathForScenario !== 'function') return false;
+      const p = String(window.coretgGetLatestXmlPathForScenario(scenarioName) || '').trim();
+      return !!p;
+    } catch (e) {
+      return false;
+    }
+  }
 
+  function getSavedFlowStateForScenario(scenarioName) {
     const isUsableState = (state) => {
       if (!state || typeof state !== 'object') return false;
       if (Array.isArray(state.chain_ids) && state.chain_ids.length) return true;
       if (state.flow_enabled === false) return true;
+      if (Object.prototype.hasOwnProperty.call(state, 'topology_dirty')) return true;
       return false;
     };
 
     try {
       const fromServer = getFlowStateForScenario(scenarioName);
-      let fromLocal = null;
-      if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
-        fromLocal = window.coretgGetSavedFlowStateForScenario(scenarioName);
-      }
-
       const serverUsable = isUsableState(fromServer);
-      const localUsable = isUsableState(fromLocal);
-      const xmlAuthoritative = hasAuthoritativeXmlPath(scenarioName);
+      const xmlAuthoritative = hasAuthoritativeXmlPathForScenario(scenarioName);
 
       if (xmlAuthoritative) {
         if (serverUsable) return fromServer;
         return null;
       }
 
-      if (serverUsable && localUsable) {
-        return fromServer;
-      }
-
       if (serverUsable) return fromServer;
-      if (localUsable) return fromLocal;
+      try {
+        const fromShared = (typeof window.coretgGetSavedFlowStateForScenario === 'function')
+          ? window.coretgGetSavedFlowStateForScenario(scenarioName)
+          : null;
+        if (isUsableState(fromShared)) return fromShared;
+      } catch (e) { }
     } catch (e) { }
     return null;
   }
 
   async function restoreSavedFlowForScenario(scenarioName) {
+    try {
+      console.debug('[flow.restore] start', {
+        scenario: scenarioName,
+        hasXmlPath: hasAuthoritativeXmlPathForScenario(scenarioName),
+        xmlPath: (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(scenarioName) : '',
+      });
+    } catch (e) { }
+    try {
+      if (hasAuthoritativeXmlPathForScenario(scenarioName) && typeof window.coretgRefreshScenarioStateFromXml === 'function') {
+        const xmlPath = (typeof window.coretgGetLatestXmlPathForScenario === 'function')
+          ? String(window.coretgGetLatestXmlPathForScenario(scenarioName) || '').trim()
+          : '';
+        const latest = await window.coretgRefreshScenarioStateFromXml(scenarioName, { updateHidden: true, xml_path: xmlPath });
+        const scenState = (latest && latest.scenario_state && typeof latest.scenario_state === 'object') ? latest.scenario_state : null;
+        const fs = (scenState && scenState.flow_state && typeof scenState.flow_state === 'object') ? scenState.flow_state : null;
+        try {
+          console.debug('[flow.restore] xml refresh', {
+            scenario: scenarioName,
+            xmlPath,
+            hasScenarioState: !!scenState,
+            flowChainLen: Array.isArray(fs && fs.chain_ids) ? fs.chain_ids.length : 0,
+            flowEnabled: fs && Object.prototype.hasOwnProperty.call(fs, 'flow_enabled') ? fs.flow_enabled : undefined,
+          });
+        } catch (e) { }
+        if (fs) {
+          const key = normalizeScenarioNorm(scenarioName);
+          if (key) flowStateByScenario[key] = fs;
+        }
+      }
+    } catch (e) { }
+
     const saved = getSavedFlowStateForScenario(scenarioName);
+    try {
+      console.debug('[flow.restore] selected state', {
+        scenario: scenarioName,
+        hasSaved: !!saved,
+        chainLen: Array.isArray(saved && saved.chain_ids) ? saved.chain_ids.length : 0,
+        flowEnabled: saved && Object.prototype.hasOwnProperty.call(saved, 'flow_enabled') ? saved.flow_enabled : undefined,
+        topologyDirty: saved && Object.prototype.hasOwnProperty.call(saved, 'topology_dirty') ? saved.topology_dirty : undefined,
+      });
+    } catch (e) { }
     syncTopologyDirtyFromFlowState(saved);
     if (topologyDirty) {
       try {
@@ -1357,6 +1395,14 @@
     showLoading('Restoring saved flow…');
     try {
       const data = await fetchJson('/api/flag-sequencing/attackflow_preview?' + params.toString());
+      try {
+        console.debug('[flow.restore] attackflow_preview response', {
+          scenario: scenarioName,
+          chainLen: Array.isArray(data && data.chain) ? data.chain.length : 0,
+          flowValid: !!(data && data.flow_valid),
+          flowErrors: Array.isArray(data && data.flow_errors) ? data.flow_errors : [],
+        });
+      } catch (e) { }
       currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
       currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
@@ -1390,9 +1436,15 @@
       return true;
     } catch (err) {
       try {
+        console.error('[flow.restore] failed', {
+          scenario: scenarioName,
+          message: String(err && err.message || err),
+          payload: err && err.payload ? err.payload : null,
+        });
+      } catch (e) { }
+      try {
         const msg = String(err && err.message || '').toLowerCase();
         if (msg.includes('preview plan not embedded') || msg.includes('no xml found') || msg.includes('404')) {
-          setTopologyDirtyState(true, 'topology_or_ip_changed');
           currentChain = [];
           currentFlagAssignments = [];
           selectedChainIndex = -1;
@@ -2052,14 +2104,7 @@
         updateMeta();
         return path;
       }
-    } catch (e) {
-      try {
-        const msg = String(e && e.message || '').toLowerCase();
-        if (msg.includes('preview plan not embedded') || msg.includes('no xml found') || msg.includes('404')) {
-          setTopologyDirtyState(true, 'topology_or_ip_changed');
-        }
-      } catch (ex) { }
-    }
+    } catch (e) { }
     try {
       flowEligible = true;
       updateFlowEnabledUi();
@@ -2266,6 +2311,93 @@
       throw err;
     }
     return data;
+  }
+
+  async function saveXmlViaFlowState(scenarioName) {
+    const scenario = (scenarioName || activeScenario || '').toString().trim();
+    const scenarios = (window.state && Array.isArray(window.state.scenarios)) ? window.state.scenarios : [];
+    if (!scenarios.length) {
+      throw new Error('No topology state is available to save from this page. Save from Topology/VM Access first.');
+    }
+
+    let activeIndex = 0;
+    if (scenario) {
+      const norm = String(scenario || '').trim().toLowerCase();
+      const idx = scenarios.findIndex((sc) => String((sc && sc.name) || '').trim().toLowerCase() === norm);
+      if (idx >= 0) activeIndex = idx;
+    }
+
+    const payload = {
+      scenarios,
+      active_index: activeIndex,
+    };
+    if (window.state && window.state.core && typeof window.state.core === 'object') {
+      payload.core = window.state.core;
+    }
+
+    const resp = await fetch('/save_xml_api', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data || data.ok === false) {
+      const message = (data && (data.error || data.message)) ? (data.error || data.message) : ('HTTP ' + resp.status);
+      throw new Error(message);
+    }
+
+    const xmlPath = String(data.result_path || '').trim();
+    if (!xmlPath) {
+      throw new Error('Save did not return xml_path');
+    }
+
+    try {
+      if (window.state && typeof window.state === 'object') {
+        window.state.result_path = xmlPath;
+      }
+    } catch (e) { }
+    try {
+      const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+      if (xmlPathInput) xmlPathInput.value = xmlPath;
+    } catch (e) { }
+
+    return xmlPath;
+  }
+
+  async function resolveXmlPathForSaveWithFallback(scenarioName, options) {
+    const opts = (options && typeof options === 'object') ? options : {};
+    const attemptSave = opts.attemptSave !== false;
+    const scenario = (scenarioName || activeScenario || '').toString().trim();
+    let xmlPath = '';
+
+    try {
+      if (scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+        xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
+      }
+    } catch (e) { xmlPath = ''; }
+
+    if (!xmlPath) {
+      try {
+        xmlPath = String(document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+      } catch (e) { xmlPath = ''; }
+    }
+
+    if (!xmlPath && attemptSave) {
+      xmlPath = await saveXmlViaFlowState(scenario);
+    }
+
+    if (!xmlPath && scenario) {
+      try {
+        const latestResp = await fetch('/api/scenario/latest_xml?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+        const latestData = await latestResp.json().catch(() => null);
+        if (latestResp.ok && latestData) {
+          xmlPath = String(latestData.xml_path || '').trim();
+        }
+      } catch (e) { xmlPath = ''; }
+    }
+
+    return xmlPath;
   }
 
   function chainFeasibility(assignments) {
@@ -8012,7 +8144,7 @@
     if (metaStatsEl) metaStatsEl.textContent = '';
     if (jsonEl) jsonEl.textContent = '';
 
-    const progressSteps = ['Testing connection', 'Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values', 'Saving resolved data'];
+    const progressSteps = ['Saving XML', 'Testing connection', 'Generating preview plan', 'Sequencing chain', 'Resolving values', 'Saving resolved data'];
     let resolvedOk = false;
     let usedBestEffort = false;
     const saveAfterResolve = (options && options.saveAfterResolve !== undefined)
@@ -8031,20 +8163,6 @@
           setStatus('Generate cancelled.', false);
           return;
         }
-        if (typeof window.coretgSaveXmlViaApi !== 'function' || typeof window.coretgPostJson !== 'function') {
-          throw new Error('Save helper unavailable; refresh and try again.');
-        }
-
-        setStatus('Testing connection…', false);
-        showLoading('Testing connection…');
-        setLoadingSteps(progressSteps, 0);
-        clearLoadingLog();
-        appendLoadingLog('Checking CORE VM connectivity');
-        const testResp = await postJson('/api/flag-sequencing/test_core_connection', { scenario });
-        if (!testResp || !testResp.ok) {
-          throw new Error((testResp && testResp.error) ? testResp.error : 'CORE VM connection failed');
-        }
-        appendLoadingLog('CORE VM connection OK');
 
         let xmlPath = '';
         const hasTopologyState = !!(
@@ -8057,16 +8175,16 @@
         if (hasTopologyState) {
           setStatus('Saving XML…', false);
           showLoading('Saving XML…');
-          setLoadingSteps(progressSteps, 1);
+          setLoadingSteps(progressSteps, 0);
           appendLoadingLog(`Preset: ${preset || 'Random'} | Length: ${length}`);
-          xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+          xmlPath = await saveXmlViaFlowState(scenario);
           if (!xmlPath) {
             throw new Error('Save did not return xml_path');
           }
         } else {
           setStatus('Using saved XML…', false);
           showLoading('Using saved XML…');
-          setLoadingSteps(progressSteps, 1);
+          setLoadingSteps(progressSteps, 0);
           appendLoadingLog('No live Topology editor state on this tab; reusing latest saved XML');
           try {
             if (scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
@@ -8095,6 +8213,17 @@
           const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
           if (xmlPathInput) xmlPathInput.value = String(xmlPath);
         } catch (e) { }
+
+        setStatus('Testing connection…', false);
+        showLoading('Testing connection…');
+        setLoadingSteps(progressSteps, 1);
+        clearLoadingLog();
+        appendLoadingLog('Checking CORE VM connectivity');
+        const testResp = await postJson('/api/flag-sequencing/test_core_connection', { scenario, xml_path: xmlPath });
+        if (!testResp || !testResp.ok) {
+          throw new Error((testResp && testResp.error) ? testResp.error : 'CORE VM connection failed');
+        }
+        appendLoadingLog('CORE VM connection OK');
 
         setStatus('Generating preview plan…', false);
         showLoading('Generating preview plan…');
@@ -8464,29 +8593,25 @@
                 setStatus('Saving XML…', false);
                 setLoadingSteps(progressSteps, 5);
                 appendLoadingLog('Saving XML with resolved values');
-                if (typeof window.coretgSaveXmlViaApi === 'function') {
-                  const xmlPath2 = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
-                  if (xmlPath2) {
-                    try {
-                      const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
-                      if (xmlPathInput) xmlPathInput.value = String(xmlPath2);
-                    } catch (e) { }
-                    try {
-                      if (downloadXmlEl) {
-                        downloadXmlEl.disabled = false;
-                        downloadXmlEl.removeAttribute('title');
-                      }
-                    } catch (e) { }
-                    try { await saveFlowStateToXml(xmlPath2); } catch (e) { }
-                    savedXmlWithGeneratedChain = true;
-                    showAutoSaveBadge('Auto-saved XML after generate');
-                    try { await refreshXmlDockPreview({ force: true }); } catch (e) { }
-                    appendLoadingLog('Saved XML after resolve.');
-                  } else {
-                    appendLoadingLog('Save XML after resolve did not return a path.');
-                  }
+                const xmlPath2 = await resolveXmlPathForSaveWithFallback(scenario, { attemptSave: true });
+                if (xmlPath2) {
+                  try {
+                    const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+                    if (xmlPathInput) xmlPathInput.value = String(xmlPath2);
+                  } catch (e) { }
+                  try {
+                    if (downloadXmlEl) {
+                      downloadXmlEl.disabled = false;
+                      downloadXmlEl.removeAttribute('title');
+                    }
+                  } catch (e) { }
+                  try { await saveFlowStateToXml(xmlPath2); } catch (e) { }
+                  savedXmlWithGeneratedChain = true;
+                  showAutoSaveBadge('Auto-saved XML after generate');
+                  try { await refreshXmlDockPreview({ force: true }); } catch (e) { }
+                  appendLoadingLog('Saved XML after resolve.');
                 } else {
-                  appendLoadingLog('Save helper unavailable; skipped post-resolve save.');
+                  appendLoadingLog('Save XML after resolve did not return a path.');
                 }
               } catch (e) {
                 appendLoadingLog('Save after resolve failed: ' + String(e && e.message || e));
@@ -8808,12 +8933,9 @@
           throw resolveCheckErr;
         }
       } else {
-        if (typeof window.coretgSaveXmlViaApi !== 'function') {
-          throw new Error('Save helper unavailable; refresh and try again.');
-        }
-        xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+        xmlPath = await resolveXmlPathForSaveWithFallback(scenario, { attemptSave: true });
         if (!xmlPath) {
-          throw new Error('Save did not return xml_path');
+          throw new Error('No XML path available. Save XML from Topology/VM Access first.');
         }
       }
 
@@ -8867,10 +8989,6 @@
         return;
       }
       persistFlowState();
-      if (typeof window.coretgSaveXmlViaApi !== 'function' || typeof window.coretgPostJson !== 'function') {
-        setStatus('Save helper unavailable; refresh and try again.', true);
-        return;
-      }
 
       if (execEl) execEl.disabled = true;
       setStatus('Saving flow state…', false);
@@ -8887,14 +9005,11 @@
         } catch (e) { xmlPath = ''; }
       }
       if (!xmlPath) {
-        if (typeof window.coretgSaveXmlViaApi !== 'function') {
-          throw new Error('Save helper unavailable; refresh and try again.');
-        }
         setStatus('Saving XML…', false);
         showLoading('Saving XML…');
-        xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+        xmlPath = await resolveXmlPathForSaveWithFallback(scenario, { persistPreviewPlan: false });
         if (!xmlPath) {
-          throw new Error('Save did not return xml_path');
+          throw new Error('No XML path available. Save XML from Topology/VM Access first.');
         }
       }
 
@@ -8946,12 +9061,12 @@
         } catch (e) { xmlPath = ''; }
       }
       if (!xmlPath) {
-        if (typeof window.coretgSaveXmlViaApi !== 'function') {
-          setStatus('Save helper unavailable; refresh and try again.', true);
-          return;
-        }
         showLoading('Saving XML…');
-        xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+        xmlPath = await resolveXmlPathForSaveWithFallback(scenario, { persistPreviewPlan: false });
+      }
+      if (!xmlPath) {
+        setStatus('No XML path available. Save XML from Topology/VM Access first.', true);
+        return;
       }
       if (xmlPath) {
         let hintResolveFailed = false;
@@ -9028,15 +9143,12 @@
         } catch (e) { xmlPath = ''; }
       }
       if (!xmlPath) {
-        if (typeof window.coretgSaveXmlViaApi !== 'function') {
-          throw new Error('Save helper unavailable; refresh and try again.');
-        }
         setStatus('Saving XML…', false);
         showLoading('Saving XML…');
-        xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
+        xmlPath = await resolveXmlPathForSaveWithFallback(scenario, { persistPreviewPlan: false });
       }
       if (!xmlPath) {
-        throw new Error('Save did not return xml_path');
+        throw new Error('No XML path available. Save XML from Topology/VM Access first.');
       }
       updateMeta();
       try {
@@ -9533,7 +9645,7 @@
   document.addEventListener('DOMContentLoaded', () => {
     const link = document.getElementById('scenariosPreviewTabLink');
     if (!link) return;
-    link.addEventListener('click', (ev) => {
+    link.addEventListener('click', async (ev) => {
       try {
         ev.preventDefault();
         const xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
@@ -9543,6 +9655,9 @@
           alert('Save XML first to preview.');
           return;
         }
+        try {
+          await saveFlowStateToXml(xmlPath);
+        } catch (e) { }
         const baseUrl = String(link.dataset?.previewBaseUrl || '/scenarios/preview');
         const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
         window.location.href = url;

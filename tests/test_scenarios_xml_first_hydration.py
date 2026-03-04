@@ -73,7 +73,8 @@ def test_scenarios_tabs_refreshes_latest_state_from_xml_on_load():
 
     expected_snippets = [
         "async function refreshScenarioStateFromXml(scenarioName, opts)",
-        "fetch('/api/scenario/latest_state?scenario=' + encodeURIComponent(scenario)",
+        "latestStateUrl += '&xml_path=' + encodeURIComponent(explicitXmlPath);",
+        "const resp = await fetch(latestStateUrl, { credentials: 'same-origin' });",
         "setLatestXmlPathForScenario(scenario, xmlPath);",
         "window.coretgRefreshScenarioStateFromXml = refreshScenarioStateFromXml;",
         "await refreshScenarioStateFromXml(scen, { updateHidden: true });",
@@ -87,12 +88,28 @@ def test_scenarios_tabs_xml_refresh_does_not_clobber_hitl_with_empty_payload() -
     text = TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
 
     expected_snippets = [
+        "const mergeScenarioWithHitlGuard = (existingScenarioRaw, incomingScenarioRaw) => {",
+        "const mergeHitlSectionGuarded = (currentSectionRaw, incomingSectionRaw, sectionType) => {",
         "const hasCorePayload = !!(incomingCoreRaw && Object.values(incomingCoreRaw).some((entry) => hasMeaningfulValue(entry)));",
         "if (!(hasCorePayload || hasProxPayload || hasInterfacesPayload || hasParticipantPayload || hasEnabledPayload)) {",
         "mergedScenario.hitl = { ...existingScenario.hitl };",
-        "mergedHitl.core = { ...currentCore, ...incomingHitlRaw.core };",
-        "mergedHitl.proxmox = { ...currentProx, ...incomingHitlRaw.proxmox };",
+        "mergedHitl.core = mergeHitlSectionGuarded(currentCore, incomingHitlRaw.core, 'core');",
+        "mergedHitl.proxmox = mergeHitlSectionGuarded(currentProx, incomingHitlRaw.proxmox, 'proxmox');",
+        "scenarios[idx] = mergeScenarioWithHitlGuard(existingScenario, incomingScenario);",
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing HITL-safe XML refresh merge snippets in scenarios tabs: " + "; ".join(missing)
+
+
+def test_scenarios_tabs_xml_refresh_updates_live_window_state() -> None:
+    text = TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "if (scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {",
+        "scenarios[idx] = mergeScenarioWithHitlGuard(existingScenario, incomingScenario);",
+        "if (typeof window.renderMain === 'function') window.renderMain();",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing live window.state XML rehydrate snippets: " + "; ".join(missing)

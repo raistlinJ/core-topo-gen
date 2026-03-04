@@ -86,7 +86,7 @@ def test_flow_restore_prefers_xml_authoritative_state() -> None:
     text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
-        "const xmlAuthoritative = hasAuthoritativeXmlPath(scenarioName);",
+        "const xmlAuthoritative = hasAuthoritativeXmlPathForScenario(scenarioName);",
         "if (xmlAuthoritative) {",
         "if (serverUsable) return fromServer;",
         "return null;",
@@ -94,3 +94,71 @@ def test_flow_restore_prefers_xml_authoritative_state() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing XML-authoritative flow restore snippets: " + "; ".join(missing)
+
+
+def test_flow_restore_refreshes_xml_before_state_selection() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "if (hasAuthoritativeXmlPathForScenario(scenarioName) && typeof window.coretgRefreshScenarioStateFromXml === 'function') {",
+        "const latest = await window.coretgRefreshScenarioStateFromXml(scenarioName, { updateHidden: true, xml_path: xmlPath });",
+        "if (key) flowStateByScenario[key] = fs;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Flow restore should refresh XML-backed scenario state first: " + "; ".join(missing)
+
+
+def test_flow_restore_emits_debug_logs_for_roundtrip_diagnostics() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "console.debug('[flow.restore] start'",
+        "console.debug('[flow.restore] xml refresh'",
+        "console.debug('[flow.restore] selected state'",
+        "console.debug('[flow.restore] attackflow_preview response'",
+        "console.error('[flow.restore] failed'",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing flow restore debug logging snippets: " + "; ".join(missing)
+
+
+def test_flow_save_to_xml_clears_chain_when_disabled() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const chain_ids = (!flowEnabled)",
+        "flag_assignments: (!flowEnabled) ? [] : buildPersistAssignments(chain_ids),",
+        "flow_enabled: !!flowEnabled,",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Disabled flow saves should clear chain/assignments in XML payload: " + "; ".join(missing)
+
+
+def test_flow_state_with_topology_dirty_field_is_usable_on_restore() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippet = "if (Object.prototype.hasOwnProperty.call(state, 'topology_dirty')) return true;"
+    assert expected_snippet in text, "Flow restore should treat topology_dirty-bearing flow_state as usable"
+
+
+def test_flow_refresh_does_not_mark_dirty_from_preview_plan_fetch_errors() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    forbidden_snippet = "setTopologyDirtyState(true, 'topology_or_ip_changed');"
+    assert forbidden_snippet not in text, "Transient preview-plan fetch errors should not force topology_dirty on refresh"
+
+
+def test_flow_preview_tab_persists_flow_state_before_redirect() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "link.addEventListener('click', async (ev) => {",
+        "await saveFlowStateToXml(xmlPath);",
+        "window.location.href = url;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Preview-tab navigation should persist flow state before redirect: " + "; ".join(missing)

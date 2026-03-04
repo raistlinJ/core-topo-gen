@@ -48,3 +48,92 @@ def test_merge_catalog_scenario_stubs_into_payload_adds_missing_names():
 
     assert 'NewScenario1' in names
     assert 'NewScenario12' in names
+
+
+def test_prepare_payload_preserves_hitl_proxmox_validation_state(monkeypatch):
+    monkeypatch.setattr(
+        backend,
+        '_scenario_catalog_for_user',
+        lambda history, user=None: (
+            ['Anatest'],
+            {'anatest': {'/tmp/Anatest.xml'}},
+            {},
+        ),
+    )
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'Anatest',
+                'density_count': 10,
+                'sections': {'Node Information': {'items': []}},
+                'hitl': {
+                    'enabled': True,
+                    'proxmox': {
+                        'url': 'https://proxmox.local',
+                        'port': 8006,
+                        'verify_ssl': False,
+                        'secret_id': 'prox-secret-1',
+                        'validated': True,
+                        'last_validated_at': '2026-03-03T00:00:00',
+                    },
+                },
+            }
+        ]
+    }
+
+    out = backend._prepare_payload_for_index(payload, user=None)
+    scenarios = out.get('scenarios') if isinstance(out.get('scenarios'), list) else []
+    anatest = next((s for s in scenarios if isinstance(s, dict) and str(s.get('name') or '') == 'Anatest'), {})
+    hitl = anatest.get('hitl') if isinstance(anatest.get('hitl'), dict) else {}
+    prox = hitl.get('proxmox') if isinstance(hitl.get('proxmox'), dict) else {}
+
+    assert prox.get('secret_id') == 'prox-secret-1'
+    assert prox.get('validated') is True
+    assert prox.get('url') == 'https://proxmox.local'
+
+
+def test_prepare_payload_admin_merges_hitl_hints_when_scenario_missing_fields(monkeypatch):
+    monkeypatch.setattr(
+        backend,
+        '_scenario_catalog_for_user',
+        lambda history, user=None: (
+            ['Anatest'],
+            {'anatest': {'/tmp/Anatest.xml'}},
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        '_load_scenario_hitl_validation_from_disk',
+        lambda: {
+            'anatest': {
+                'proxmox': {'secret_id': 'prox-secret-1', 'validated': True},
+                'core': {'core_secret_id': 'core-secret-1', 'validated': True, 'vm_key': 'pve::101'},
+            }
+        },
+    )
+    monkeypatch.setattr(backend, '_load_scenario_hitl_config_from_disk', lambda: {})
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'Anatest',
+                'sections': {'Node Information': {'items': []}},
+                'density_count': 10,
+                'hitl': {'enabled': True},
+            }
+        ]
+    }
+
+    out = backend._prepare_payload_for_index(payload, user=None)
+    scenarios = out.get('scenarios') if isinstance(out.get('scenarios'), list) else []
+    anatest = next((s for s in scenarios if isinstance(s, dict) and str(s.get('name') or '') == 'Anatest'), {})
+    hitl = anatest.get('hitl') if isinstance(anatest.get('hitl'), dict) else {}
+    prox = hitl.get('proxmox') if isinstance(hitl.get('proxmox'), dict) else {}
+    core = hitl.get('core') if isinstance(hitl.get('core'), dict) else {}
+
+    assert prox.get('secret_id') == 'prox-secret-1'
+    assert prox.get('validated') is True
+    assert core.get('core_secret_id') == 'core-secret-1'
+    assert core.get('validated') is True

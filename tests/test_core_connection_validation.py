@@ -72,6 +72,118 @@ def test_require_core_ssh_credentials_trims_fields():
     assert cfg['ssh_password'] == ' pw '
 
 
+def test_normalize_core_config_uses_grpc_fields_when_host_missing():
+    cfg = backend._normalize_core_config({
+        'grpc_host': 'arlsouth1.utep.edu',
+        'grpc_port': 50051,
+        'ssh_host': 'arlsouth1.utep.edu',
+        'ssh_port': 22,
+        'ssh_username': 'core',
+        'ssh_password': 'pw',
+    }, include_password=True)
+
+    assert cfg['host'] == 'arlsouth1.utep.edu'
+    assert cfg['port'] == 50051
+
+
+def test_normalize_core_config_prefers_grpc_fields_over_legacy_host():
+    cfg = backend._normalize_core_config({
+        'host': '10.0.0.5',
+        'port': 50051,
+        'grpc_host': 'arlsouth1.utep.edu',
+        'grpc_port': 50051,
+        'ssh_host': 'arlsouth1.utep.edu',
+        'ssh_port': 10000,
+        'ssh_username': 'corevm',
+    }, include_password=False)
+
+    assert cfg['host'] == 'arlsouth1.utep.edu'
+    assert cfg['port'] == 50051
+    assert cfg['grpc_host'] == 'arlsouth1.utep.edu'
+    assert cfg['grpc_port'] == 50051
+
+
+def test_extract_optional_core_config_accepts_grpc_fields_signal():
+    cfg = backend._extract_optional_core_config({
+        'grpc_host': 'arlsouth1.utep.edu',
+        'grpc_port': 50051,
+        'vm_key': 'pve1::101',
+    }, include_password=False)
+
+    assert isinstance(cfg, dict)
+    assert cfg.get('host') == 'arlsouth1.utep.edu'
+    assert cfg.get('port') == 50051
+
+
+def test_build_scenarios_xml_canonicalizes_hitl_host_from_grpc_host():
+    tree = backend._build_scenarios_xml({
+        'core': {
+            'host': '10.0.0.5',
+            'grpc_host': 'localhost',
+            'port': 50051,
+            'grpc_port': 50051,
+            'ssh_enabled': True,
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+        },
+        'scenarios': [{
+            'name': 'Anatest',
+            'base': {'filepath': '/tmp/base.imn'},
+            'sections': {},
+            'hitl': {
+                'enabled': True,
+                'core': {
+                    'host': '10.0.0.5',
+                    'grpc_host': 'localhost',
+                    'port': 50051,
+                    'grpc_port': 50051,
+                    'ssh_enabled': True,
+                    'ssh_host': 'arlsouth1.utep.edu',
+                    'ssh_port': 10000,
+                    'ssh_username': 'corevm',
+                },
+            },
+        }],
+    })
+
+    root = tree.getroot()
+    global_core = root.find('CoreConnection')
+    assert global_core is not None
+    assert global_core.get('host') == 'localhost'
+
+    hitl_core = root.find('./Scenario/ScenarioEditor/HardwareInLoop/CoreConnection')
+    assert hitl_core is not None
+    assert hitl_core.get('host') == 'localhost'
+    assert hitl_core.get('port') == '50051'
+
+
+def test_apply_hitl_config_to_full_preview_canonicalizes_hitl_core_host():
+    full_preview = {}
+    hitl_cfg = {
+        'enabled': True,
+        'scenario_key': 'Anatest',
+        'interfaces': [{'name': 'ens19'}],
+        'core': {
+            'validated': True,
+            'host': '10.0.0.5',
+            'port': 50051,
+            'grpc_host': 'localhost',
+            'grpc_port': 50051,
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+        },
+    }
+
+    backend._apply_hitl_config_to_full_preview(full_preview, hitl_cfg, 'Anatest')
+
+    core = full_preview.get('hitl_core')
+    assert isinstance(core, dict)
+    assert core.get('host') == 'localhost'
+    assert core.get('port') == 50051
+
+
 def test_test_core_requires_vm_selection(client, monkeypatch):
     monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
     monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
@@ -219,6 +331,71 @@ def test_test_core_success_includes_vm_metadata(client, monkeypatch):
     assert 'VM CORE VM' in data['message']
     assert saved_payloads and saved_payloads[0]['vm_key'] == 'pve1::101'
     assert saved_payloads[0]['vmid'] == 101
+
+
+def test_test_core_uses_dialog_core_fields_only(client, monkeypatch):
+    captured_cfg = {}
+
+    @contextmanager
+    def _capture_core_connection(cfg):
+        captured_cfg.update(cfg)
+        yield '127.0.0.1', 6000
+
+    monkeypatch.setattr(backend, '_core_connection', _capture_core_connection)
+    monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
+    monkeypatch.setattr(backend, '_load_core_credentials', lambda *_args, **_kwargs: None)
+
+    def _fake_save(payload):
+        return {
+            'identifier': 'secret-dialog-only',
+            'scenario_name': payload.get('scenario_name'),
+            'scenario_index': payload.get('scenario_index'),
+            'host': payload['grpc_host'],
+            'port': payload['grpc_port'],
+            'grpc_host': payload['grpc_host'],
+            'grpc_port': payload['grpc_port'],
+            'ssh_host': payload['ssh_host'],
+            'ssh_port': payload['ssh_port'],
+            'ssh_username': payload['ssh_username'],
+            'ssh_enabled': payload['ssh_enabled'],
+            'vm_key': payload.get('vm_key'),
+            'vm_name': payload.get('vm_name'),
+            'vm_node': payload.get('vm_node'),
+            'vmid': payload.get('vmid'),
+            'stored_at': '2025-10-28T00:00:00Z',
+        }
+
+    monkeypatch.setattr(backend, '_save_core_credentials', _fake_save)
+
+    payload = {
+        'core': {
+            'host': 'arlsouth1.utep.edu',
+            'port': 50051,
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 22,
+            'ssh_username': 'core',
+            'ssh_password': 'pw',
+        },
+        'scenario_name': 'Scenario Delta',
+        'scenario_index': 0,
+        'hitl_core': {
+            'host': '10.0.0.5',
+            'port': 50051,
+            'ssh_host': '10.0.0.5',
+            'vm_key': 'pve1::101',
+            'vm_node': 'pve1',
+            'vm_name': 'CORE VM',
+            'vmid': 101,
+        },
+    }
+
+    resp = client.post('/test_core', json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['ok'] is True
+    assert data['host'] == 'arlsouth1.utep.edu'
+    assert captured_cfg.get('host') == 'arlsouth1.utep.edu'
+    assert captured_cfg.get('ssh_host') == 'arlsouth1.utep.edu'
 
 
 def test_test_core_install_custom_services_triggers_installer(client, monkeypatch):

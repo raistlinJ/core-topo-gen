@@ -561,3 +561,104 @@ def test_save_xml_api_marks_topology_dirty_when_topology_changes(tmp_path, monke
     flow_state = scen0.get('flow_state') or {}
     assert flow_state.get('topology_dirty') is True
     assert flow_state.get('topology_dirty_reason') == 'topology_or_ip_changed'
+
+
+def test_save_xml_api_preserves_hitl_validation_state_roundtrip(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "base": {"filepath": ""},
+                "hitl": {
+                    "enabled": True,
+                    "core": {
+                        "vm_key": "pve::101",
+                        "vm_node": "pve",
+                        "core_secret_id": "core-secret-1",
+                        "validated": True,
+                        "last_validated_at": "2026-03-03T00:00:00",
+                    },
+                    "proxmox": {
+                        "url": "https://proxmox.local",
+                        "username": "root@pam",
+                        "port": 8006,
+                        "verify_ssl": False,
+                        "remember_credentials": True,
+                        "secret_id": "prox-secret-1",
+                        "validated": True,
+                        "last_validated_at": "2026-03-03T00:00:00",
+                    },
+                    "interfaces": [{
+                        "name": "en0",
+                        "attachment": "existing_router",
+                        "proxmox_target": {
+                            "node": "pve",
+                            "vmid": "101",
+                            "interface_id": "net0",
+                            "bridge": "vmbr1",
+                            "vm_name": "participant-1",
+                        },
+                        "external_vm": {
+                            "vm_key": "pve::101",
+                            "vm_node": "pve",
+                            "vm_name": "participant-1",
+                            "vmid": "101",
+                            "interface_id": "net0",
+                            "interface_bridge": "vmbr1",
+                        },
+                    }],
+                },
+                "sections": {
+                    "Node Information": {"density": 0, "items": []},
+                    "Routing": {"density": 0.5, "items": []},
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+    path = data.get('result_path')
+    assert path and os.path.exists(path)
+
+    parsed = backend._parse_scenarios_xml(path)
+    scen0 = (parsed.get('scenarios') or [])[0]
+    hitl = scen0.get('hitl') or {}
+    core = hitl.get('core') or {}
+    prox = hitl.get('proxmox') or {}
+
+    assert core.get('core_secret_id') == 'core-secret-1'
+    assert core.get('validated') is True
+    assert core.get('vm_key') == 'pve::101'
+
+    assert prox.get('secret_id') == 'prox-secret-1'
+    assert prox.get('validated') is True
+    assert prox.get('url') == 'https://proxmox.local'
+    assert prox.get('username') == 'root@pam'
+    assert prox.get('remember_credentials') is True
+
+    interfaces = hitl.get('interfaces') or []
+    assert interfaces and interfaces[0].get('name') == 'en0'
+    pve_target = interfaces[0].get('proxmox_target') or {}
+    ext_vm = interfaces[0].get('external_vm') or {}
+    assert pve_target.get('node') == 'pve'
+    assert pve_target.get('interface_id') == 'net0'
+    assert ext_vm.get('vm_key') == 'pve::101'
+    assert ext_vm.get('interface_bridge') == 'vmbr1'
