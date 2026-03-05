@@ -26,6 +26,7 @@ Recommended prompt flow:
 3. Ask AI to update `manifest.yaml` only if output keys changed.
 4. Run local `scripts/run_flag_generator.py` test.
 5. Run installed-pack Execute parity check.
+6. If route or API payload behavior changed during implementation, update `API.md` and `docs/openapi.yaml` before merge.
 
 Use the copy/paste templates in [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md).
 If you are using desktop chat tools, follow [Using ChatGPT or Claude Desktop](AI_PROMPT_TEMPLATES.md#using-chatgpt-or-claude-desktop).

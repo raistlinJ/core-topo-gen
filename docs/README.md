@@ -22,3 +22,4 @@ Use this page to navigate the main project documentation.
 - [Flag Generator Notes](FLAG_GENERATORS.md)
 - [AI Prompt Templates](AI_PROMPT_TEMPLATES.md)
 - [REST API Reference](../API.md)
+- Participant UI endpoints and schemas are documented in both [REST API Reference](../API.md) and [OpenAPI Spec](openapi.yaml).

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Core Topology Generator Web API
-  version: "2026-01-13"
+  version: "2026-03-05"
   description: >-
     OpenAPI specification for the CORE topology generator web backend. The API
     combines JSON endpoints used by the web UI with a set of HTML form
@@ -533,6 +533,12 @@ paths:
       tags:
         - Scenario Editor
       summary: Save Scenario Editor payload via JSON
+      description: >-
+        Persists the Scenario Editor payload to XML.
+        When topology/IP edits invalidate a previously saved Flow chain, the server
+        marks the scenario `flow_state.topology_dirty=true` and clears chain fields
+        (`chain_ids`, `length`, `flag_assignments`, `flags_enabled`) to avoid stale
+        sequencing reuse.
       requestBody:
         required: true
         content:
@@ -658,6 +664,10 @@ paths:
       tags:
         - Runs
       summary: Retrieve asynchronous run status
+      description: >-
+        Returns current state for an async execute job.
+        A `404` response indicates the run id is unknown/stale and should be treated
+        as terminal by clients (stop polling).
       parameters:
         - name: run_id
           in: path
@@ -1689,6 +1699,55 @@ paths:
             text/html:
               schema:
                 type: string
+  /participant-ui:
+    get:
+      tags:
+        - Participant UI
+        - UI Pages
+      summary: Render the Participant Console page
+      description: >-
+        Renders the Participant UI HTML page.
+        Initial scenario selection priority is: incoming `?scenario=...` request,
+        then locally remembered last selection, then first listed scenario.
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional scenario display name or normalized label hint.
+      responses:
+        '200':
+          description: Participant UI HTML.
+          content:
+            text/html:
+              schema:
+                type: string
+  /participant-ui/gateway:
+    get:
+      tags:
+        - Participant UI
+      summary: Resolve nearest gateway for a participant scenario
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Scenario label (display or normalized). Defaults to current selected scenario.
+      responses:
+        '200':
+          description: Gateway lookup result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParticipantUiGatewayResponse'
+        '403':
+          description: Scenario not assigned for restricted users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /participant-ui/details:
     get:
       tags:
@@ -1737,6 +1796,65 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /participant-ui/stats:
+    get:
+      tags:
+        - Participant UI
+      summary: Retrieve Participant UI open-count stats
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Scenario label (display or normalized). Defaults to current selected scenario.
+      responses:
+        '200':
+          description: Scenario and totals open-count telemetry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParticipantUiStatsResponse'
+  /participant-ui/record-open:
+    post:
+      tags:
+        - Participant UI
+      summary: Record that a participant link was opened
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ParticipantUiRecordOpenRequest'
+      responses:
+        '200':
+          description: Open count recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParticipantUiRecordOpenResponse'
+        '400':
+          description: Missing or invalid href.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /participant-ui/open:
+    get:
+      tags:
+        - Participant UI
+      summary: Redirect to the participant URL for a scenario
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to participant URL.
+        '404':
+          description: No participant URL available for the resolved scenario.
   /users:
     get:
       tags:
@@ -3601,3 +3719,79 @@ components:
           items:
             type: string
       additionalProperties: true
+
+    ParticipantUiGatewayResponse:
+      type: object
+      required:
+        - ok
+        - scenario_norm
+        - nearest_gateway
+      properties:
+        ok:
+          type: boolean
+        scenario_norm:
+          type: string
+        nearest_gateway:
+          type: string
+
+    ParticipantUiStatsResponse:
+      type: object
+      required:
+        - ok
+        - scenario_norm
+        - scenario
+        - totals
+      properties:
+        ok:
+          type: boolean
+        scenario_norm:
+          type: string
+        scenario:
+          type: object
+          properties:
+            open_count:
+              type: integer
+            last_open_ts:
+              type: string
+              nullable: true
+          additionalProperties: true
+        totals:
+          type: object
+          properties:
+            open_count:
+              type: integer
+            last_open_ts:
+              type: string
+              nullable: true
+          additionalProperties: true
+
+    ParticipantUiRecordOpenRequest:
+      type: object
+      required:
+        - href
+      properties:
+        scenario_norm:
+          type: string
+          nullable: true
+        href:
+          type: string
+
+    ParticipantUiRecordOpenResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario_norm:
+          type: string
+          nullable: true
+        last_open_ts:
+          type: string
+          nullable: true
+        totals:
+          type: object
+          additionalProperties: true
+        scenario:
+          type: object
+          additionalProperties: true

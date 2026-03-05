@@ -42,6 +42,7 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 - [Planning Preview](#planning-preview)
 - [Flag Sequencing (Flow)](#flag-sequencing-flow)
 - [Run Execution & Reports](#run-execution--reports)
+- [Participant UI](#participant-ui)
 - [Script Inspection](#script-inspection)
 - [Docker Helpers](#docker-helpers)
 - [CORE Session Management](#core-session-management)
@@ -67,6 +68,10 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 
 `POST /save_xml_api`
 : JSON body `{ "scenarios": [...], "active_index"?: int }`. Returns `{ "ok": true, "result_path": ".../scenarios.xml" }` on success or `{ "ok": false, "error": "..." }` with HTTP 400/500 on failure.
+
+Flow-state persistence notes for `save_xml` / `save_xml_api`:
+- When topology/IP planning changes are detected for a scenario, the server marks `flow_state.topology_dirty=true` and clears chain payload fields (`chain_ids=[]`, `length=0`, `flag_assignments=[]`, `flags_enabled=false`) so stale chains are not reused.
+- Flow persistence canonicalizes chain representation to `chain_ids` (legacy `chain` values are normalized server-side when possible).
 
 `GET /api/host_interfaces`
 : Returns `{ "interfaces": [...] }` describing host NICs on the web host (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs.
@@ -409,6 +414,9 @@ Parity note:
 }
 ```
 
+Polling semantics:
+- `404` means the run id is unknown/stale and should be treated as terminal by clients (stop polling and surface a clear status).
+
 When a run completes and validation finds issues, `validation_summary.error_logs` includes downloadable `.log` artifacts (for example `docker_not_running.log`, `injects_missing.log`, and `run_output.log`) with `url` fields that point to `/download_report?path=...`.
 
 Parity note:
@@ -437,6 +445,34 @@ Parity note:
 : JSON body `{ "name": "Scenario" }`. Removes all history entries tied to the scenario name and deletes associated artifacts under `outputs/`. Returns `{ "removed": <count>, "error"?: string }`.
 
 **Report path detection:** The backend parses the CLI log line `Scenario report written to ...`. If missing, it falls back to the most recent `./reports/scenario_report_*.md`.
+
+### Participant UI
+
+`GET /participant-ui`
+: Renders the Participant Console page.
+
+Selection precedence:
+- If `?scenario=<name>` is provided, that incoming scenario selection is prioritized.
+- Otherwise, the client restores the last locally remembered scenario selection.
+- If neither is available, the first listed scenario is selected.
+
+`GET /participant-ui/details`
+: Returns the scenario status/details JSON used by the Participant dashboard cards (`gateway`, execute status, session info, counts, subnets, vulnerability IPs).
+
+`GET /participant-ui/topology`
+: Returns graph JSON (`nodes`, `links`, optional `flow`) derived from the latest session XML for the selected scenario.
+
+`GET /participant-ui/gateway`
+: Returns `{ "ok": true, "scenario_norm": "...", "nearest_gateway": "..." }`.
+
+`GET /participant-ui/stats`
+: Returns per-scenario and global Participant open stats.
+
+`POST /participant-ui/record-open`
+: JSON `{ "scenario_norm": "...", "href": "..." }`. Records open counters/timestamps.
+
+`GET /participant-ui/open`
+: Resolves and redirects to the participant URL for a scenario. Returns `404` when no URL is configured.
 
 ### Script Inspection
 

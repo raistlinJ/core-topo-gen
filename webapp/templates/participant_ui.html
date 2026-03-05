@@ -1159,8 +1159,21 @@
   let storedNorm = '';
   try { storedNorm = window.localStorage.getItem('participant_ui_last_scenario_norm') || ''; } catch(e) { storedNorm = ''; }
 
-  const initialTarget = scenarioItems.find(el => storedNorm && el.getAttribute('data-scenario-norm') === storedNorm)
-    || scenarioItems.find(el => el.getAttribute('data-scenario-norm') === currentNorm)
+  const incomingScenarioRequested = (() => {
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const raw = (params.get('scenario') || '').toString().trim();
+      return raw;
+    } catch(e) {
+      return '';
+    }
+  })();
+  const hasIncomingScenario = !!incomingScenarioRequested;
+
+  const initialTarget = (hasIncomingScenario
+      ? scenarioItems.find(el => el.getAttribute('data-scenario-norm') === currentNorm)
+      : null)
+    || scenarioItems.find(el => storedNorm && el.getAttribute('data-scenario-norm') === storedNorm)
     || scenarioItems[0];
   if(initialTarget){
     activateFromElement(initialTarget);

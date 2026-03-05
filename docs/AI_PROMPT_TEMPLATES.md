@@ -25,8 +25,19 @@ Use this sequence every time:
 3. Prompt AI to modify only `generator.py` (and optionally README).
 4. Run local runner test (`scripts/run_flag_generator.py`).
 5. Install as Generator Pack and validate Execute parity.
+6. If you add or change backend routes, update both `API.md` and `docs/openapi.yaml` in the same change.
 
 If you skip steps 2 or 5, most drift bugs come back.
+
+## API doc sync rule (AI scaffolding)
+
+When AI-generated changes touch backend HTTP behavior, keep docs in lockstep:
+
+- Update human-readable API reference: `API.md`
+- Update machine-readable contract: `docs/openapi.yaml`
+- Include behavior-level notes when clients depend on them (for example polling termination semantics or selection-priority rules)
+
+This prevents UI/client drift and keeps generated integrations accurate.
 
 ## Using ChatGPT or Claude Desktop
 
