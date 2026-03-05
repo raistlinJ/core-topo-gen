@@ -1035,7 +1035,6 @@
         const map = readFlowStateMap();
         const next = (map && typeof map === 'object') ? map : {};
         next[key] = normalized;
-        localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));
       } catch (e) {}
     } catch (e) {}
   }

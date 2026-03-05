@@ -1358,6 +1358,8 @@ def _should_force_service_workdir_root(service: Dict[str, object]) -> bool:
 	# non-root working directory for startup and fail if forced to '/'.
 	try:
 		img = str(image_ref or '').lower().strip()
+		if 'nginx' in img:
+			return True
 		if 'weblogic' in img:
 			return True
 	except Exception:

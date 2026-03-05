@@ -2308,22 +2308,7 @@
         const sourceCoreRaw = (sourceHitlRaw.core && typeof sourceHitlRaw.core === 'object') ? sourceHitlRaw.core : null;
         const sourceProxRaw = (sourceHitlRaw.proxmox && typeof sourceHitlRaw.proxmox === 'object') ? sourceHitlRaw.proxmox : null;
         const sourceInterfacesRaw = Array.isArray(sourceHitlRaw.interfaces) ? sourceHitlRaw.interfaces : [];
-        const hasCorePayload = !!(sourceCoreRaw && [
-            sourceCoreRaw.vm_key,
-            sourceCoreRaw.vm_name,
-            sourceCoreRaw.vm_node,
-            sourceCoreRaw.internal_bridge,
-            sourceCoreRaw.internal_bridge_owner,
-            sourceCoreRaw.core_secret_id,
-            sourceCoreRaw.last_validated_at,
-            sourceCoreRaw.stored_at,
-            sourceCoreRaw.last_tested_at,
-            sourceCoreRaw.last_tested_status,
-            sourceCoreRaw.last_tested_message,
-            sourceCoreRaw.last_tested_host,
-            sourceCoreRaw.last_tested_port,
-            sourceCoreRaw.validated === true,
-        ].some((entry) => hasMeaningfulValue(entry)));
+        const hasCorePayload = !!(sourceCoreRaw && Object.values(sourceCoreRaw).some((entry) => hasMeaningfulValue(entry)));
         const hasProxPayload = !!(sourceProxRaw && [
             sourceProxRaw.url,
             sourceProxRaw.username,

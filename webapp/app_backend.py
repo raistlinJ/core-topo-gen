@@ -14608,17 +14608,10 @@ def flow_page():
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
 
     # Best-effort: provide the saved scenario XML path so the shared Preview button can work from this page.
-    # Prefer explicit xml_path first (tab handoff pin), then latest XML by scenario,
-    # then catalog fallback.
+    # Prefer latest XML by scenario first, then explicit xml_path hint, then
+    # catalog fallback.
     active_scenario_xml_path = ''
     xml_path = (request.args.get('xml_path') or '').strip()
-    try:
-        if xml_path:
-            xml_path_abs = os.path.abspath(xml_path)
-            if os.path.exists(xml_path_abs):
-                active_scenario_xml_path = xml_path_abs
-    except Exception:
-        active_scenario_xml_path = ''
     if not active_scenario_xml_path:
         try:
             if scenario_norm:
@@ -14629,6 +14622,13 @@ def flow_page():
                         active_scenario_xml_path = latest_abs
         except Exception:
             active_scenario_xml_path = ''
+    try:
+        if (not active_scenario_xml_path) and xml_path:
+            xml_path_abs = os.path.abspath(xml_path)
+            if os.path.exists(xml_path_abs):
+                active_scenario_xml_path = xml_path_abs
+    except Exception:
+        active_scenario_xml_path = ''
     if not active_scenario_xml_path:
         try:
             if scenario_norm and isinstance(scenario_paths, dict):
@@ -14733,17 +14733,10 @@ def scenarios_preview_page():
             scenario_norm = _normalize_scenario_label(scenario_names[0])
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
 
-    # Prefer explicit xml_path first (tab handoff pin). Fallback to latest XML by
-    # scenario, then catalog path for active scenario.
+    # Prefer latest XML by scenario first, then explicit xml_path hint, then
+    # catalog path for active scenario.
     xml_path = (request.args.get('xml_path') or '').strip()
     xml_path_abs = ''
-    try:
-        if xml_path:
-            xml_path_abs = os.path.abspath(xml_path)
-            if not os.path.exists(xml_path_abs):
-                xml_path_abs = ''
-    except Exception:
-        xml_path_abs = ''
     if not xml_path_abs:
         try:
             if scenario_norm:
@@ -14754,6 +14747,13 @@ def scenarios_preview_page():
                         xml_path_abs = latest_abs
         except Exception:
             xml_path_abs = ''
+    try:
+        if (not xml_path_abs) and xml_path:
+            xml_path_abs = os.path.abspath(xml_path)
+            if not os.path.exists(xml_path_abs):
+                xml_path_abs = ''
+    except Exception:
+        xml_path_abs = ''
     if not xml_path_abs:
         try:
             p = ''
@@ -15979,13 +15979,24 @@ def api_flow_revalidate_flow():
                 'inject_files': entry.get('inject_files'),
             })
 
-        payload = _run_remote_python_json(
-            flow_core_cfg,
-            _remote_flow_artifacts_validation_script(
+        validation_script = None
+        try:
+            validation_script = _remote_flow_artifacts_validation_script(
                 check_items,
                 scenario_label=scenario_norm,
                 sudo_password=flow_core_cfg.get('ssh_password'),
-            ),
+            )
+        except TypeError:
+            # Backward-compatible shim for tests/helpers that monkeypatch this helper
+            # with the older signature that does not accept sudo_password.
+            validation_script = _remote_flow_artifacts_validation_script(
+                check_items,
+                scenario_label=scenario_norm,
+            )
+
+        payload = _run_remote_python_json(
+            flow_core_cfg,
+            validation_script,
             logger=app.logger,
             label='flow.revalidate.artifacts',
             timeout=60.0,
@@ -17257,6 +17268,15 @@ def _flow_enrich_saved_flag_assignments(
                     a2['hint_overrides'] = ovr
                     a2['hints'] = ovr
                     a2['hint'] = ovr[0] if ovr else ''
+        except Exception:
+            pass
+
+        # User-authored hint overrides are authoritative. Keep next-node linkage
+        # metadata fresh, but do not re-render template hints over custom text.
+        try:
+            if isinstance(a2.get('hint_overrides'), list):
+                out.append(a2)
+                continue
         except Exception:
             pass
 
@@ -18699,6 +18719,28 @@ def api_flow_attackflow_preview():
     nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
     stats = _flow_compose_docker_stats(nodes)
 
+    runtime_ip_by_id: dict[str, str] = {}
+    try:
+        session_xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
+    except Exception:
+        session_xml_path = None
+    try:
+        if session_xml_path and os.path.exists(str(session_xml_path)):
+            runtime_nodes, _runtime_links, _runtime_adj = _build_topology_graph_from_session_xml(str(session_xml_path))
+            for rn in (runtime_nodes or []):
+                if not isinstance(rn, dict):
+                    continue
+                rid = str(rn.get('id') or rn.get('node_id') or '').strip()
+                if not rid:
+                    continue
+                rip = _first_valid_ipv4(
+                    rn.get('ip4') or rn.get('ipv4') or rn.get('ip') or rn.get('ips') or rn.get('ipv4s') or ''
+                )
+                if rip:
+                    runtime_ip_by_id[rid] = rip
+    except Exception:
+        runtime_ip_by_id = {}
+
     # If the latest plan is flow-modified, prefer the saved chain order.
     chain_nodes: list[dict[str, Any]] = []
     used_saved_chain = False
@@ -18805,13 +18847,12 @@ def api_flow_attackflow_preview():
                 if not isinstance(h, dict):
                     continue
                 try:
-                    ip_val = _preview_host_ip4_any(h)
+                    ip_val = runtime_ip_by_id.get(nid) or _preview_host_ip4_any(h)
                 except Exception:
                     ip_val = ''
                 if ip_val:
-                    if not (n.get('ip4') or n.get('ipv4') or n.get('ip') or n.get('address')):
-                        n['ip4'] = ip_val
-                        n['ipv4'] = ip_val
+                    n['ip4'] = ip_val
+                    n['ipv4'] = ip_val
                 try:
                     ifaces = h.get('interfaces') if isinstance(h.get('interfaces'), list) else None
                 except Exception:
@@ -18825,7 +18866,7 @@ def api_flow_attackflow_preview():
     host_ip_map: dict[str, str] = {}
     try:
         for hid, h in (host_by_id or {}).items():
-            ip_val = _preview_host_ip4_any(h)
+            ip_val = runtime_ip_by_id.get(str(hid)) or _preview_host_ip4_any(h)
             if ip_val:
                 host_ip_map[str(hid)] = ip_val
     except Exception:
@@ -19231,7 +19272,7 @@ def api_flow_attackflow_preview():
             if not nid:
                 continue
             host = host_by_id.get(nid)
-            preview_ip4 = _preview_host_ip4(host) if isinstance(host, dict) else ''
+            preview_ip4 = runtime_ip_by_id.get(nid) or (_preview_host_ip4(host) if isinstance(host, dict) else '')
             if not preview_ip4:
                 try:
                     node = next((n for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip() == nid), None)
@@ -19267,7 +19308,7 @@ def api_flow_attackflow_preview():
     host_ip_map: dict[str, str] = {}
     try:
         for hid, h in (host_by_id or {}).items():
-            ip_val = _preview_host_ip4(h) if isinstance(h, dict) else ''
+            ip_val = runtime_ip_by_id.get(str(hid)) or (_preview_host_ip4(h) if isinstance(h, dict) else '')
             if ip_val:
                 host_ip_map[str(hid)] = ip_val
     except Exception:
@@ -19280,7 +19321,7 @@ def api_flow_attackflow_preview():
                 continue
             nid = str(n.get('id') or '').strip()
             h = host_by_id.get(nid) if nid else None
-            ip_val = _preview_host_ip4(h) if isinstance(h, dict) else ''
+            ip_val = runtime_ip_by_id.get(nid) or (_preview_host_ip4(h) if isinstance(h, dict) else '')
             if not ip_val:
                 ip_val = _first_valid_ipv4(n.get('ip4') or n.get('ipv4') or n.get('ip') or '')
             ifaces = None
@@ -30375,10 +30416,16 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     # merge admin-managed HITL validation hints into scenarios so builder cannot
     # appear "unassigned" when admin has already selected a CORE VM.
     try:
-        view_mode = getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)
+        view_mode = getattr(g, 'ui_view_mode', None)
     except Exception:
-        view_mode = _UI_VIEW_DEFAULT
-    if view_mode == 'builder':
+        view_mode = None
+    if not isinstance(view_mode, str) or not view_mode.strip():
+        try:
+            role_hint = (user.get('role') if isinstance(user, dict) else None) or 'admin'
+            view_mode = _default_ui_view_mode_for_role(role_hint)
+        except Exception:
+            view_mode = 'admin'
+    if view_mode != 'participant':
         try:
             hitl_validation_hints = _load_scenario_hitl_validation_from_disk()
             builder_hitl_fallback = _select_builder_hitl_fallback(hitl_validation_hints)
@@ -30457,13 +30504,17 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                 if isinstance(cfg_prox, dict) and cfg_prox:
                     prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
                     prox_state = dict(prox_state)
-                    prox_state.update(cfg_prox)
+                    for k, v in cfg_prox.items():
+                        if k not in prox_state or prox_state.get(k) in (None, '', False):
+                            prox_state[k] = v
                     hitl_meta['proxmox'] = prox_state
                 cfg_core = effective_cfg.get('core') if isinstance(effective_cfg.get('core'), dict) else None
                 if isinstance(cfg_core, dict) and cfg_core:
                     core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
                     core_state = dict(core_state)
-                    core_state.update(cfg_core)
+                    for k, v in cfg_core.items():
+                        if k not in core_state or core_state.get(k) in (None, '', False):
+                            core_state[k] = v
                     hitl_meta['core'] = core_state
 
             scen['hitl'] = hitl_meta
