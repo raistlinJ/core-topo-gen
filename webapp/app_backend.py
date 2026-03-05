@@ -12255,12 +12255,6 @@ def api_flow_save_flow_state_to_xml():
     except Exception:
         return jsonify({'ok': False, 'error': 'invalid xml_path'}), 400
 
-    prior_flow_state = None
-    try:
-        prior_flow_state = _flow_state_from_xml_path(xml_path, scenario_label)
-    except Exception:
-        prior_flow_state = None
-
     snap_before = _xml_trace_snapshot(xml_path, scenario_label)
 
     if clear_state:
@@ -12277,18 +12271,6 @@ def api_flow_save_flow_state_to_xml():
                 flow_state['length'] = 0
                 flow_state['flag_assignments'] = []
                 flow_state['flags_enabled'] = False
-        except Exception:
-            pass
-        try:
-            prev_enabled = None
-            next_enabled = None
-            if isinstance(prior_flow_state, dict) and ('flow_enabled' in prior_flow_state):
-                prev_enabled = _coerce_bool(prior_flow_state.get('flow_enabled'))
-            if isinstance(flow_state, dict) and ('flow_enabled' in flow_state):
-                next_enabled = _coerce_bool(flow_state.get('flow_enabled'))
-            if (next_enabled is not None) and (prev_enabled is None or prev_enabled != next_enabled):
-                flow_state['topology_dirty'] = True
-                flow_state['topology_dirty_reason'] = 'flow_enabled_toggled'
         except Exception:
             pass
         flow_state = _enrich_flow_state_with_artifacts(flow_state)
@@ -20764,6 +20746,72 @@ def api_flow_prepare_preview_for_execute():
                 _gen_by_id[_gid] = _g
     except Exception:
         _gen_by_id = {}
+
+    def _clear_prior_outputs_from_assignments(assignments: list[dict[str, Any]]) -> list[Any]:
+        cleaned_assignments: list[Any] = []
+        for entry in (assignments or []):
+            if not isinstance(entry, dict):
+                try:
+                    cleaned_assignments.append(entry)
+                except Exception:
+                    pass
+                continue
+            a2 = dict(entry)
+            for key in (
+                'resolved_outputs',
+                'resolved_outputs_detail',
+                'resolved_paths',
+                'inject_files_detail',
+                'outputs_manifest',
+                'artifacts_dir',
+                'run_dir',
+                'inject_source_dir',
+                'flag_value',
+                'generated',
+            ):
+                a2.pop(key, None)
+
+            inj_override = a2.get('inject_files_override')
+            has_override = isinstance(inj_override, list) and any(str(x or '').strip() for x in inj_override)
+            if not has_override:
+                gid = str(a2.get('id') or a2.get('generator_id') or '').strip()
+                gen_def = _gen_by_id.get(gid) if gid else None
+                inj_list = gen_def.get('inject_files') if isinstance(gen_def, dict) else None
+                if isinstance(inj_list, list):
+                    cleaned = [str(x or '').strip() for x in inj_list if str(x or '').strip()]
+                    if cleaned:
+                        a2['inject_files'] = cleaned
+                    else:
+                        a2.pop('inject_files', None)
+                else:
+                    raw_inj = a2.get('inject_files')
+                    if isinstance(raw_inj, list):
+                        cleaned = []
+                        for raw in raw_inj:
+                            s = str(raw or '').strip()
+                            if not s:
+                                continue
+                            src = s
+                            for sep in ('->', '=>'):
+                                if sep in src:
+                                    src = src.split(sep, 1)[0].strip()
+                                    break
+                            if src.startswith(('/', '~')) or src.startswith('upload:'):
+                                continue
+                            cleaned.append(s)
+                        if cleaned:
+                            a2['inject_files'] = cleaned
+                        else:
+                            a2.pop('inject_files', None)
+
+            cleaned_assignments.append(a2)
+        return cleaned_assignments
+
+    if run_generators:
+        try:
+            flag_assignments = _clear_prior_outputs_from_assignments(flag_assignments)
+        except Exception:
+            pass
 
     def _flow_is_file_input_type(type_value: Any) -> bool:
         try:

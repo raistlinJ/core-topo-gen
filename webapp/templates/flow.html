@@ -441,9 +441,20 @@
   let topologyDirty = false;
   let topologyDirtyReason = '';
 
+  function normalizeTopologyDirtyState(isDirty, reason) {
+    const dirty = !!isDirty;
+    const reasonText = String(reason || '').trim();
+    if (!dirty) return { dirty: false, reason: '' };
+    if (reasonText === 'flow_enabled_toggled') {
+      return { dirty: false, reason: '' };
+    }
+    return { dirty: true, reason: reasonText };
+  }
+
   function setTopologyDirtyState(isDirty, reason) {
-    topologyDirty = !!isDirty;
-    topologyDirtyReason = topologyDirty ? String(reason || '').trim() : '';
+    const normalized = normalizeTopologyDirtyState(isDirty, reason);
+    topologyDirty = !!normalized.dirty;
+    topologyDirtyReason = topologyDirty ? normalized.reason : '';
     updateTopologyDirtyUi();
   }
 
@@ -8857,6 +8868,19 @@
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
+    const hasRuntimeFlowValues = (assignments) => {
+      if (!Array.isArray(assignments) || !assignments.length) return false;
+      return assignments.every((fa) => {
+        if (!fa || typeof fa !== 'object') return false;
+        const flagVal = String(fa.flag_value || '').trim();
+        const outs = (fa.resolved_outputs && typeof fa.resolved_outputs === 'object' && !Array.isArray(fa.resolved_outputs))
+          ? fa.resolved_outputs
+          : null;
+        const outFlag = outs ? String(outs['Flag(flag_id)'] || outs['flag'] || '').trim() : '';
+        const artDir = String(fa.artifacts_dir || fa.run_dir || '').trim();
+        return !!(flagVal || outFlag || artDir);
+      });
+    };
     if (!scenario) {
       setStatus('No scenario selected.', true);
       return;
@@ -8881,56 +8905,16 @@
         if (!Array.isArray(currentChain) || currentChain.length === 0) {
           throw new Error('Generate a chain first.');
         }
-        const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-        const prepData = await postJson(
-          '/api/flag-sequencing/prepare_preview_for_execute',
-          {
-            scenario,
-            length,
-            preset,
-            chain_ids: chain_ids,
-            preview_plan: previewPlanForRequest(),
-            allow_node_duplicates: !!allowNodeDuplicates,
-            mode: 'resolve',
-            best_effort: false,
-          },
-          { timeoutMs: 480000 }
-        );
-        setFlowValidityFromPayload(prepData);
-        // Prefer server-returned (possibly enriched) assignments so the UI can show
-        // generator run status/mismatch info before scenario execution.
-        if (prepData && Array.isArray(prepData.flag_assignments)) {
-          currentFlagAssignments = prepData.flag_assignments.slice();
-          renderChainEditor();
+        if (!hasRuntimeFlowValues(currentFlagAssignments)) {
+          throw new Error('Execute requires generated values for every step. Click Generate to resolve, then retry Execute.');
         }
-        xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
-        previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
-        if (!xmlPath || !previewPlan) {
-          throw new Error('Prepare step did not return xml_path/preview_plan_path');
-        }
-
-        // Guardrail: do not call /run_cli_async unless resolve produced runtime values.
         try {
-          const hasRuntimeFlowValues = (assignments) => {
-            if (!Array.isArray(assignments) || !assignments.length) return false;
-            return assignments.some((fa) => {
-              if (!fa || typeof fa !== 'object') return false;
-              const flagVal = String(fa.flag_value || '').trim();
-              const outs = (fa.resolved_outputs && typeof fa.resolved_outputs === 'object' && !Array.isArray(fa.resolved_outputs))
-                ? fa.resolved_outputs
-                : null;
-              const outFlag = outs ? String(outs['Flag(flag_id)'] || outs['flag'] || '').trim() : '';
-              const artDir = String(fa.artifacts_dir || fa.run_dir || '').trim();
-              return !!(flagVal || outFlag || artDir);
-            });
-          };
-          if (!hasRuntimeFlowValues(prepData && prepData.flag_assignments)) {
-            const flowErrs = Array.isArray(prepData && prepData.flow_errors) ? prepData.flow_errors.filter(Boolean) : [];
-            const detail = flowErrs.length ? (' Details: ' + flowErrs.join('; ')) : '';
-            throw new Error('Resolve did not produce runtime Flow values. Click Generate to resolve, then retry Execute.' + detail);
+          if (typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+            xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
           }
-        } catch (resolveCheckErr) {
-          throw resolveCheckErr;
+        } catch (e) { }
+        if (!xmlPath) {
+          throw new Error('No saved XML found for this scenario. Save XML from Topology first.');
         }
       } else {
         xmlPath = await resolveXmlPathForSaveWithFallback(scenario, { attemptSave: true });
