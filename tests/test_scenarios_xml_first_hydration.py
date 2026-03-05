@@ -113,3 +113,17 @@ def test_scenarios_tabs_xml_refresh_updates_live_window_state() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing live window.state XML rehydrate snippets: " + "; ".join(missing)
+
+
+def test_scenarios_tabs_xml_refresh_prefers_latest_scenario_xml_path() -> None:
+    text = TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    latest_snippet = "explicitXmlPath = (getLatestXmlPathForScenario(scenario) || '').toString().trim();"
+    hidden_snippet = "explicitXmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').toString().trim();"
+
+    latest_idx = text.find(latest_snippet)
+    hidden_idx = text.find(hidden_snippet)
+
+    assert latest_idx != -1, "Missing latest per-scenario XML path lookup snippet"
+    assert hidden_idx != -1, "Missing hidden XML path lookup snippet"
+    assert latest_idx < hidden_idx, "Latest per-scenario XML path must be preferred over hidden XML path"

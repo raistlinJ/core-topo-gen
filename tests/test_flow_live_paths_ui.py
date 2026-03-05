@@ -144,6 +144,20 @@ def test_flow_state_with_topology_dirty_field_is_usable_on_restore() -> None:
     assert expected_snippet in text, "Flow restore should treat topology_dirty-bearing flow_state as usable"
 
 
+def test_flow_restore_requires_resolved_values_for_saved_chain() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const hasResolvedValues = (flowState) => {",
+        "const assignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : [];",
+        "return hasResolvedValues(normalized);",
+        "setStatus('Chain does not exist. Click Generate to start.', false);",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Flow restore should hide partial chain states without resolved values: " + "; ".join(missing)
+
+
 def test_flow_refresh_does_not_mark_dirty_from_preview_plan_fetch_errors() -> None:
     text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 

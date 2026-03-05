@@ -1291,16 +1291,55 @@
   }
 
   function getSavedFlowStateForScenario(scenarioName) {
+    const normalizeFlowStateShape = (state) => {
+      if (!state || typeof state !== 'object') return null;
+      const out = { ...state };
+      let chainIds = Array.isArray(out.chain_ids)
+        ? out.chain_ids.map((x) => String(x || '').trim()).filter(Boolean)
+        : [];
+      if (!chainIds.length && Array.isArray(out.chain)) {
+        chainIds = out.chain.map((entry) => {
+          if (entry && typeof entry === 'object') return String(entry.id || entry.node_id || '').trim();
+          return String(entry || '').trim();
+        }).filter(Boolean);
+      }
+      if (chainIds.length) {
+        out.chain_ids = chainIds;
+        out.length = chainIds.length;
+      }
+      return out;
+    };
+
     const isUsableState = (state) => {
+      const hasResolvedValues = (flowState) => {
+        if (!flowState || typeof flowState !== 'object') return false;
+        const assignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : [];
+        if (!assignments.length) return false;
+        return assignments.some((entry) => {
+          if (!entry || typeof entry !== 'object') return false;
+          const ri = (entry.resolved_inputs && typeof entry.resolved_inputs === 'object' && !Array.isArray(entry.resolved_inputs))
+            ? Object.keys(entry.resolved_inputs).length
+            : 0;
+          const ro = (entry.resolved_outputs && typeof entry.resolved_outputs === 'object' && !Array.isArray(entry.resolved_outputs))
+            ? Object.keys(entry.resolved_outputs).length
+            : 0;
+          return (ri + ro) > 0;
+        });
+      };
+
       if (!state || typeof state !== 'object') return false;
-      if (Array.isArray(state.chain_ids) && state.chain_ids.length) return true;
-      if (state.flow_enabled === false) return true;
       if (Object.prototype.hasOwnProperty.call(state, 'topology_dirty')) return true;
+      const normalized = normalizeFlowStateShape(state);
+      if (!normalized) return false;
+      if (normalized.flow_enabled === false) return true;
+      if (Array.isArray(normalized.chain_ids) && normalized.chain_ids.length) {
+        return hasResolvedValues(normalized);
+      }
       return false;
     };
 
     try {
-      const fromServer = getFlowStateForScenario(scenarioName);
+      const fromServer = normalizeFlowStateShape(getFlowStateForScenario(scenarioName));
       const serverUsable = isUsableState(fromServer);
       const xmlAuthoritative = hasAuthoritativeXmlPathForScenario(scenarioName);
 
@@ -1314,7 +1353,7 @@
         const fromShared = (typeof window.coretgGetSavedFlowStateForScenario === 'function')
           ? window.coretgGetSavedFlowStateForScenario(scenarioName)
           : null;
-        if (isUsableState(fromShared)) return fromShared;
+        if (isUsableState(fromShared)) return normalizeFlowStateShape(fromShared);
       } catch (e) { }
     } catch (e) { }
     return null;
@@ -2164,7 +2203,7 @@
       } else if (!flowEnabled) {
         setStatus('Flag sequencing is disabled.', false);
       } else {
-        setStatus('No saved flow chain. Click Generate to start.', false);
+        setStatus('Chain does not exist. Click Generate to start.', false);
       }
     }
   }
@@ -9623,7 +9662,7 @@
   await refreshLatestPreviewPlanPathForScenario(activeScenario);
   const restored = await restoreSavedFlowForScenario(activeScenario);
   if (!restored) {
-    setStatus('No saved flow chain. Click Generate to start.', false);
+    setStatus('Chain does not exist. Click Generate to start.', false);
   }
   // Scenarios header Preview tab: route to /scenarios/preview.
   document.addEventListener('DOMContentLoaded', () => {

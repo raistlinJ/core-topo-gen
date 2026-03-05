@@ -95,3 +95,44 @@ def test_builder_seed_merges_hitl_validation_hints(tmp_repo_root, monkeypatch):
     assert isinstance(hitl, dict)
     assert hitl.get("proxmox", {}).get("secret_id") == "p1"
     assert hitl.get("core", {}).get("core_secret_id") == "c1"
+
+
+def test_persist_scenario_catalog_preserves_hitl_hint_maps(tmp_repo_root):
+    import webapp.app_backend as backend
+
+    outputs_dir = Path(backend._outputs_dir())
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    catalog_path = Path(backend._scenario_catalog_file())
+    catalog = {
+        "names": ["Scenario 1"],
+        "sources": ["/tmp/old.xml"],
+        "updated_at": "2020-01-01T00:00:00Z",
+        "participant_urls": {"scenario 1": "https://participant.old:8006"},
+        "hitl_validation": {
+            "scenario 1": {
+                "proxmox": {"secret_id": "prox-1", "validated": True},
+                "core": {"core_secret_id": "core-1", "validated": True, "vm_key": "pve::101"},
+            }
+        },
+        "hitl_config": {
+            "scenario 1": {
+                "enabled": True,
+                "core": {"vm_key": "pve::101"},
+                "proxmox": {"secret_id": "prox-1"},
+            }
+        },
+    }
+    catalog_path.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+
+    backend._persist_scenario_catalog(
+        ["Scenario 1"],
+        source_path="/tmp/new.xml",
+        participant_urls={"scenario 1": "https://participant.new:8006"},
+    )
+
+    after = json.loads(catalog_path.read_text(encoding="utf-8"))
+    assert (after.get("hitl_validation") or {}).get("scenario 1", {}).get("proxmox", {}).get("secret_id") == "prox-1"
+    assert (after.get("hitl_validation") or {}).get("scenario 1", {}).get("core", {}).get("core_secret_id") == "core-1"
+    assert (after.get("hitl_config") or {}).get("scenario 1", {}).get("enabled") is True
+    assert (after.get("participant_urls") or {}).get("scenario 1") == "https://participant.new:8006"

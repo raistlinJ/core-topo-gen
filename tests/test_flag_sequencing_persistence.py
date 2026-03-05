@@ -590,3 +590,23 @@ def test_attackflow_preview_backfills_vuln_assignment_with_default_flag_inject(t
         )
     finally:
         shutil.rmtree(plan_dir, ignore_errors=True)
+
+
+def test_canonicalize_flow_state_derives_chain_ids_from_chain() -> None:
+    flow_state = {
+        'scenario': 'Anatest',
+        'chain': [
+            {'id': 'h2', 'name': 'docker-5'},
+            {'id': 'h7', 'name': 'docker-9'},
+        ],
+        'flag_assignments': [
+            {'node_id': 'h2', 'id': 'textfile_username_password'},
+            {'node_id': 'h7', 'id': 'nfs_sensitive_file'},
+        ],
+    }
+
+    normalized = app_backend._canonicalize_flow_state_paths(flow_state)
+
+    assert isinstance(normalized, dict)
+    assert normalized.get('chain_ids') == ['h2', 'h7']
+    assert normalized.get('length') == 2

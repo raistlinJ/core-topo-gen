@@ -5157,6 +5157,9 @@
     let serverSnapshotPendingPayload = null;
     let serverSnapshotTimerId = null;
     let serverSnapshotDisabled = false;
+    // Explicit-save mode: avoid background snapshot writes that can race and overwrite
+    // recent HITL validation state on delayed refresh.
+    const ENABLE_SERVER_SNAPSHOT_AUTOSAVE = false;
 
     function scrubHitlForServerSnapshot(snapshotPayload) {
         return;
@@ -5200,6 +5203,9 @@
     }
 
     function scheduleServerSnapshotPersist(snapshot) {
+        if (!ENABLE_SERVER_SNAPSHOT_AUTOSAVE) {
+            return;
+        }
         if (!snapshot || typeof snapshot !== 'object') {
             return;
         }
@@ -5232,6 +5238,9 @@
     }
 
     async function flushServerSnapshotPersistNow() {
+        if (!ENABLE_SERVER_SNAPSHOT_AUTOSAVE) {
+            return { ok: true, skipped: true, disabled: true };
+        }
         if (serverSnapshotDisabled) return { ok: false, error: 'Authentication required' };
         const payload = serverSnapshotPendingPayload;
         if (!payload) return { ok: true, skipped: true };
@@ -7567,7 +7576,16 @@
                         if (activeScenarioName) {
                             state.result_path_scenario = activeScenarioName;
                             window.__lastSavedXml = { scenario: activeScenarioName, path: resultPath };
+                            try {
+                                if (typeof window.coretgSetLatestXmlPathForScenario === 'function') {
+                                    window.coretgSetLatestXmlPathForScenario(activeScenarioName, resultPath);
+                                }
+                            } catch (e) { }
                         }
+                    } catch (e) { }
+                    try {
+                        const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+                        if (xmlPathInput) xmlPathInput.value = resultPath;
                     } catch (e) { }
                     try {
                         if (resultPath && typeof resultPath === 'string' && resultPath.endsWith('.xml') && !isAutosaveXmlPath(resultPath)) {
@@ -8141,8 +8159,7 @@
             snapshot.project_key_hint = stableProjectHint;
             scrubSnapshotTransientErrors(snapshot);
 
-            // Always persist a sanitized snapshot on the server so refresh/back doesn't lose
-            // newly-created state for users who don't use local persistence (e.g. builder view).
+            // Explicit-save mode: do not auto-persist editor snapshots in the background.
             try { scheduleServerSnapshotPersist(snapshot); } catch (_) { }
             try { storeCorePasswordInSession(); } catch (_) { }
             // Auto-save disabled: only explicit Save actions should write XML.
@@ -21982,10 +21999,28 @@
     const RUN_PROGRESS_LOG_MAX_LINES = 800;
     let runProgressLogLineCount = 0;
 
+    function shouldSuppressRunProgressLine(rawLine) {
+        try {
+            const line = String(rawLine || '');
+            if (!line) return false;
+            const lower = line.toLowerCase();
+            const hasSsToken = /(^|[^a-z0-9_])ss([^a-z0-9_]|$)/.test(lower);
+            if (!hasSsToken) return false;
+            const looksLikeBenignSsWarning =
+                (lower.includes('not found') || lower.includes('command not found') || lower.includes('warning'));
+            if (!looksLikeBenignSsWarning) return false;
+            const fatalOrError = /(\bfatal\b|\berror\b|\btraceback\b|\bexception\b)/.test(lower);
+            return !fatalOrError;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function runProgressLogLine(s) {
         const pre = document.getElementById('runProgressLog');
         if (!pre) return;
         const line = (s || '');
+        if (shouldSuppressRunProgressLine(line)) return;
         // Level detection first so we only log once with correct level
         let lvl = 'INFO';
         try {

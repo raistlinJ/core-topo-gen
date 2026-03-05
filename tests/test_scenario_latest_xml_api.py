@@ -192,7 +192,7 @@ def test_latest_xml_path_for_scenario_ignores_run_history_xml_without_scenario_n
     assert resolved is None
 
 
-def test_api_latest_state_strict_xml_does_not_merge_hints(tmp_path, monkeypatch):
+def test_api_latest_state_strict_xml_merges_hitl_hints(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
 
@@ -229,10 +229,11 @@ def test_api_latest_state_strict_xml_does_not_merge_hints(tmp_path, monkeypatch)
     prox = hitl.get('proxmox') or {}
     core = hitl.get('core') or {}
 
-    assert prox.get('secret_id') in (None, '')
-    assert prox.get('validated') in (None, False)
-    assert core.get('core_secret_id') in (None, '')
-    assert core.get('validated') in (None, False)
+    assert prox.get('secret_id') == 'prox-secret-1'
+    assert prox.get('validated') is True
+    assert core.get('core_secret_id') == 'core-secret-1'
+    assert core.get('validated') is True
+    assert core.get('vm_key') == 'pve::101'
 
 
 def test_api_latest_state_prefers_explicit_xml_path_over_latest_lookup(tmp_path, monkeypatch):
@@ -268,3 +269,90 @@ def test_api_latest_state_prefers_explicit_xml_path_over_latest_lookup(tmp_path,
     scenario_state = data.get('scenario_state') or {}
     hitl = scenario_state.get('hitl') or {}
     assert hitl.get('enabled') is True
+
+
+def test_save_then_latest_state_roundtrip_preserves_hitl_and_sections(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp import app_backend as backend
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    save_payload = {
+        'scenarios': [
+            {
+                'name': 'Anatest',
+                'base': {'filepath': ''},
+                'hitl': {
+                    'enabled': True,
+                    'bridge_validated': True,
+                    'core': {
+                        'vm_key': 'pve::101',
+                        'core_secret_id': 'core-secret-1',
+                        'validated': True,
+                        'last_validated_at': '2026-03-05T10:00:00',
+                    },
+                    'proxmox': {
+                        'secret_id': 'prox-secret-1',
+                        'validated': True,
+                        'url': 'https://proxmox.local',
+                        'last_validated_at': '2026-03-05T10:00:00',
+                    },
+                    'interfaces': [
+                        {'name': 'en0', 'attachment': 'existing_router'},
+                    ],
+                },
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 3},
+                        ],
+                    },
+                    'Routing': {
+                        'density': 0.5,
+                        'items': [
+                            {'selected': 'RIP', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 2},
+                        ],
+                    },
+                    'Services': {'density': 0.5, 'items': []},
+                    'Traffic': {'density': 0.5, 'items': []},
+                    'Events': {'density': 0.5, 'items': []},
+                    'Vulnerabilities': {'density': 0.5, 'items': []},
+                    'Segmentation': {'density': 0.5, 'items': []},
+                },
+            }
+        ]
+    }
+
+    saved = client.post('/save_xml_api', data=json.dumps(save_payload), content_type='application/json')
+    assert saved.status_code == 200
+    saved_data = saved.get_json() or {}
+    assert saved_data.get('ok') is True
+    assert saved_data.get('result_path')
+
+    latest = client.get('/api/scenario/latest_state', query_string={'scenario': 'Anatest'})
+    assert latest.status_code == 200
+    latest_data = latest.get_json() or {}
+    assert latest_data.get('ok') is True
+
+    scen = latest_data.get('scenario_state') or {}
+    hitl = scen.get('hitl') or {}
+    core = hitl.get('core') or {}
+    prox = hitl.get('proxmox') or {}
+
+    assert core.get('validated') is True
+    assert core.get('core_secret_id') == 'core-secret-1'
+    assert core.get('vm_key') == 'pve::101'
+    assert prox.get('validated') is True
+    assert prox.get('secret_id') == 'prox-secret-1'
+    assert hitl.get('bridge_validated') is True
+
+    sections = scen.get('sections') or {}
+    ni_items = (sections.get('Node Information') or {}).get('items') or []
+    routing_items = (sections.get('Routing') or {}).get('items') or []
+    assert ni_items and ni_items[0].get('selected') == 'Docker'
+    assert routing_items and routing_items[0].get('selected') == 'RIP'

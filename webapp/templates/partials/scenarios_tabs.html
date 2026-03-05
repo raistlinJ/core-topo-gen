@@ -491,17 +491,17 @@
       } catch (e) { explicitXmlPath = ''; }
       if (!explicitXmlPath) {
         try {
-          explicitXmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').toString().trim();
+          explicitXmlPath = (getLatestXmlPathForScenario(scenario) || '').toString().trim();
         } catch (e) { explicitXmlPath = ''; }
       }
       if (!explicitXmlPath) {
         try {
-          explicitXmlPath = (getLatestXmlPathForScenario(scenario) || '').toString().trim();
+          explicitXmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').toString().trim();
         } catch (e) { explicitXmlPath = ''; }
       }
 
       let latestStateUrl = '/api/scenario/latest_state?scenario=' + encodeURIComponent(scenario);
-      if (explicitXmlPath) {
+      if (explicitXmlPath && options.forceXmlPath === true) {
         latestStateUrl += '&xml_path=' + encodeURIComponent(explicitXmlPath);
       }
 
@@ -981,10 +981,15 @@
         } catch (e) { entry = entry; }
       }
       if (!entry || typeof entry !== 'object') return null;
+      let chain_ids = Array.isArray(entry.chain_ids) ? entry.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
+      if (!chain_ids.length && Array.isArray(entry.chain)) {
+        chain_ids = entry.chain
+          .map((x) => (x && typeof x === 'object') ? String(x.id || x.node_id || '').trim() : String(x || '').trim())
+          .filter(Boolean);
+      }
       const scenario = (entry.scenario || scenarioName || '').toString();
       const preset = (entry.preset || '').toString();
       const length = Number.isFinite(+entry.length) ? (+entry.length) : null;
-      const chain_ids = Array.isArray(entry.chain_ids) ? entry.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
       const flow_enabled = (entry.flow_enabled === true) ? true : (entry.flow_enabled === false ? false : undefined);
       if (!chain_ids.length && flow_enabled !== false) return null;
       const flag_assignments = Array.isArray(entry.flag_assignments) ? entry.flag_assignments : null;

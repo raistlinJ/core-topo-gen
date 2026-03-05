@@ -640,6 +640,9 @@ def test_save_xml_api_marks_topology_dirty_when_topology_changes(tmp_path, monke
     flow_state = scen0.get('flow_state') or {}
     assert flow_state.get('topology_dirty') is True
     assert flow_state.get('topology_dirty_reason') == 'topology_or_ip_changed'
+    assert (flow_state.get('chain_ids') or []) == []
+    assert (flow_state.get('flag_assignments') or []) == []
+    assert flow_state.get('length') == 0
 
 
 def test_save_xml_api_preserves_hitl_validation_state_roundtrip(tmp_path, monkeypatch):
@@ -743,3 +746,193 @@ def test_save_xml_api_preserves_hitl_validation_state_roundtrip(tmp_path, monkey
     assert ext_vm.get('vm_key') == 'pve::101'
     assert ext_vm.get('interface_bridge') == 'vmbr1'
     assert interfaces[0].get('core_bridge') == 'vmbr1'
+
+
+def test_save_xml_api_partial_hitl_payload_keeps_verified_readiness(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    # Initial save with full verified HITL state.
+    initial_payload = {
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "base": {"filepath": ""},
+                "hitl": {
+                    "enabled": True,
+                    "bridge_validated": True,
+                    "core": {
+                        "vm_key": "pve::101",
+                        "core_secret_id": "core-secret-1",
+                        "validated": True,
+                    },
+                    "proxmox": {
+                        "secret_id": "prox-secret-1",
+                        "validated": True,
+                        "url": "https://proxmox.local",
+                    },
+                    "interfaces": [{"name": "en0", "attachment": "existing_router"}],
+                },
+                "sections": {
+                    "Node Information": {"density": 0, "items": []},
+                    "Routing": {"density": 0.5, "items": []},
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ]
+    }
+    first = client.post('/save_xml_api', data=json.dumps(initial_payload), content_type='application/json')
+    assert first.status_code == 200
+    first_data = first.get_json() or {}
+    assert first_data.get('ok') is True
+    first_path = first_data.get('result_path')
+    assert first_path and os.path.exists(first_path)
+
+    # Follow-up save with a partial HITL payload (simulates delayed autosave/editor snapshot)
+    # that omits readiness-critical fields.
+    partial_payload = {
+        "project_key_hint": first_path,
+        "scenario_query": "Anatest",
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "base": {"filepath": ""},
+                "hitl": {
+                    "enabled": True,
+                    "core": {"vm_name": "CORE VM"},
+                    "proxmox": {"url": "https://proxmox.local"},
+                    "interfaces": [{"name": "en0", "attachment": "existing_router"}],
+                },
+                "sections": {
+                    "Node Information": {"density": 0, "items": []},
+                    "Routing": {"density": 0.5, "items": []},
+                    "Services": {"density": 0.5, "items": []},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ]
+    }
+
+    second = client.post('/save_xml_api', data=json.dumps(partial_payload), content_type='application/json')
+    assert second.status_code == 200
+    second_data = second.get_json() or {}
+    assert second_data.get('ok') is True
+    second_path = second_data.get('result_path')
+    assert second_path and os.path.exists(second_path)
+
+    parsed = backend._parse_scenarios_xml(second_path)
+    scen0 = (parsed.get('scenarios') or [])[0]
+    hitl = scen0.get('hitl') or {}
+    core = hitl.get('core') or {}
+    prox = hitl.get('proxmox') or {}
+
+    # Readiness-critical fields must survive partial save payloads.
+    assert core.get('core_secret_id') == 'core-secret-1'
+    assert core.get('validated') is True
+    assert core.get('vm_key') == 'pve::101'
+    assert prox.get('secret_id') == 'prox-secret-1'
+    assert prox.get('validated') is True
+    assert hitl.get('bridge_validated') is True
+
+
+def test_save_xml_api_partial_payload_preserves_unrelated_sections(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    initial_payload = {
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "density_count": 12,
+                "base": {"filepath": ""},
+                "sections": {
+                    "Node Information": {
+                        "density": 0,
+                        "items": [{"selected": "Docker", "factor": 1.0, "v_metric": "Count", "v_count": 3}],
+                    },
+                    "Routing": {
+                        "density": 0.5,
+                        "items": [{"selected": "RIP", "factor": 1.0, "v_metric": "Count", "v_count": 2}],
+                    },
+                    "Services": {"density": 0.5, "items": [{"selected": "SSH", "factor": 1.0, "v_metric": "Count", "v_count": 1}]},
+                    "Traffic": {"density": 0.5, "items": []},
+                    "Events": {"density": 0.5, "items": []},
+                    "Vulnerabilities": {"density": 0.5, "items": []},
+                    "Segmentation": {"density": 0.5, "items": []},
+                },
+            }
+        ]
+    }
+
+    first = client.post('/save_xml_api', data=json.dumps(initial_payload), content_type='application/json')
+    assert first.status_code == 200
+    first_data = first.get_json() or {}
+    assert first_data.get('ok') is True
+    first_path = first_data.get('result_path')
+    assert first_path and os.path.exists(first_path)
+
+    # Update only Node Information; omit Routing/Services in payload.
+    partial_payload = {
+        "project_key_hint": first_path,
+        "scenario_query": "Anatest",
+        "scenarios": [
+            {
+                "name": "Anatest",
+                "density_count": 12,
+                "base": {"filepath": ""},
+                "sections": {
+                    "Node Information": {
+                        "density": 0,
+                        "items": [{"selected": "Docker", "factor": 1.0, "v_metric": "Count", "v_count": 5}],
+                    }
+                },
+            }
+        ],
+    }
+
+    second = client.post('/save_xml_api', data=json.dumps(partial_payload), content_type='application/json')
+    assert second.status_code == 200
+    second_data = second.get_json() or {}
+    assert second_data.get('ok') is True
+    second_path = second_data.get('result_path')
+    assert second_path and os.path.exists(second_path)
+
+    parsed = backend._parse_scenarios_xml(second_path)
+    scen0 = (parsed.get('scenarios') or [])[0]
+    sections = scen0.get('sections') or {}
+
+    # Provided field updates.
+    ni = sections.get('Node Information') or {}
+    ni_items = ni.get('items') or []
+    assert ni_items and ni_items[0].get('v_count') == 5
+
+    # Omitted sections remain unchanged from prior XML.
+    routing = sections.get('Routing') or {}
+    routing_items = routing.get('items') or []
+    assert routing_items and routing_items[0].get('selected') == 'RIP'
+    assert routing_items[0].get('v_count') == 2
+
+    services = sections.get('Services') or {}
+    services_items = services.get('items') or []
+    assert services_items and services_items[0].get('selected') == 'SSH'

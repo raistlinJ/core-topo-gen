@@ -9338,6 +9338,31 @@ def _canonicalize_flow_state_paths(flow_state: dict[str, Any], *, xml_path: str 
             _canonicalize_flow_assignment_paths(a) if isinstance(a, dict) else a
             for a in assigns
         ]
+
+    # Keep FlowState chain fields consistent for readers that rely on chain_ids.
+    try:
+        chain_ids = out.get('chain_ids') if isinstance(out.get('chain_ids'), list) else []
+        chain_ids_norm = [str(x or '').strip() for x in (chain_ids or []) if str(x or '').strip()]
+
+        if not chain_ids_norm:
+            chain_entries = out.get('chain') if isinstance(out.get('chain'), list) else []
+            derived = []
+            for entry in chain_entries:
+                if isinstance(entry, dict):
+                    nid = str(entry.get('id') or entry.get('node_id') or '').strip()
+                    if nid:
+                        derived.append(nid)
+                else:
+                    nid = str(entry or '').strip()
+                    if nid:
+                        derived.append(nid)
+            chain_ids_norm = derived
+
+        if chain_ids_norm:
+            out['chain_ids'] = chain_ids_norm
+            out['length'] = len(chain_ids_norm)
+    except Exception:
+        pass
     return out
 
 
@@ -26147,6 +26172,40 @@ def _persist_scenario_catalog(
     seen_norms: set[str] = set()
     participant_map_input = participant_urls or {}
     participant_by_norm: dict[str, str] = {}
+    existing_payload: dict[str, Any] = {}
+    existing_participant_by_norm: dict[str, str] = {}
+    existing_hitl_validation: dict[str, Any] = {}
+    existing_hitl_config: dict[str, Any] = {}
+
+    try:
+        if os.path.exists(catalog_path):
+            with open(catalog_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing_payload = loaded
+                raw_participants = loaded.get('participant_urls')
+                if isinstance(raw_participants, dict):
+                    for key, value in raw_participants.items():
+                        norm = _normalize_scenario_label(key)
+                        if not norm:
+                            continue
+                        normalized_url = _normalize_participant_proxmox_url(value)
+                        if normalized_url:
+                            existing_participant_by_norm[norm] = normalized_url
+                        else:
+                            existing_participant_by_norm.setdefault(norm, '')
+                raw_hitl_validation = loaded.get('hitl_validation')
+                if isinstance(raw_hitl_validation, dict):
+                    existing_hitl_validation = dict(raw_hitl_validation)
+                raw_hitl_config = loaded.get('hitl_config')
+                if isinstance(raw_hitl_config, dict):
+                    existing_hitl_config = dict(raw_hitl_config)
+    except Exception:
+        existing_payload = {}
+        existing_participant_by_norm = {}
+        existing_hitl_validation = {}
+        existing_hitl_config = {}
+
     for raw in names or []:
         if raw in (None, ''):
             continue
@@ -26163,6 +26222,9 @@ def _persist_scenario_catalog(
             normalized_url = _normalize_participant_proxmox_url(participant_map_input[norm])
             if normalized_url:
                 participant_by_norm[norm] = normalized_url
+            else:
+                # Preserve explicit clear signals to override stale XML/catalog values.
+                participant_by_norm[norm] = ''
     try:
         sources_out: Any = None
         if source_path:
@@ -26210,13 +26272,44 @@ def _persist_scenario_catalog(
                     sources_out = [abs_source for _ in ordered]
         if sources_out is None:
             sources_out = ['' for _ in ordered]
+
+        # Preserve existing per-scenario hint maps for retained scenario names.
+        allowed_norms = {_normalize_scenario_label(name) for name in ordered if _normalize_scenario_label(name)}
+        preserved_participants = {
+            key: val
+            for key, val in existing_participant_by_norm.items()
+            if _normalize_scenario_label(key) in allowed_norms
+        }
+        preserved_participants.update(participant_by_norm)
+        preserved_hitl_validation = {
+            key: val
+            for key, val in existing_hitl_validation.items()
+            if _normalize_scenario_label(key) in allowed_norms
+        }
+        preserved_hitl_config = {
+            key: val
+            for key, val in existing_hitl_config.items()
+            if _normalize_scenario_label(key) in allowed_norms
+        }
+
         payload = {
             'names': ordered,
             'sources': sources_out,
             'updated_at': _local_timestamp_display(),
         }
-        if participant_by_norm:
-            payload['participant_urls'] = participant_by_norm
+        if preserved_participants:
+            payload['participant_urls'] = preserved_participants
+        if preserved_hitl_validation:
+            payload['hitl_validation'] = preserved_hitl_validation
+        if preserved_hitl_config:
+            payload['hitl_config'] = preserved_hitl_config
+        if ordered:
+            payload.pop('force_empty', None)
+            payload.pop('force_empty_at', None)
+        elif existing_payload.get('force_empty') is True:
+            payload['force_empty'] = True
+            if isinstance(existing_payload.get('force_empty_at'), str) and existing_payload.get('force_empty_at'):
+                payload['force_empty_at'] = existing_payload.get('force_empty_at')
         os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, indent=2)
@@ -34252,6 +34345,13 @@ def api_latest_state_for_scenario():
         if selected is None:
             return jsonify({'ok': False, 'error': 'Scenario not found in XML'}), 404
 
+        # Refresh/hard-reload should preserve verified HITL readiness hints even when
+        # the latest XML omits secret identifiers or validated flags.
+        try:
+            selected = _merge_hitl_hints_into_scenario_state(selected, scen_norm)
+        except Exception:
+            pass
+
         core_payload = parsed.get('core') if isinstance(parsed.get('core'), dict) else None
         try:
             xml_mtime = float(os.path.getmtime(xml_path))
@@ -36471,6 +36571,83 @@ def save_xml_api():
                 return False
             return _has_meaningful_value(hitl)
 
+        def _merge_verified_hitl_fields(existing_hitl: Any, incoming_hitl: Any) -> Any:
+            """Merge existing verified HITL fields into incoming payload without clobbering user edits.
+
+            This protects readiness-critical fields (validated + secret identifiers + vm_key)
+            during autosave/partial saves where the client may send a reduced HITL object.
+            """
+            if not isinstance(existing_hitl, dict):
+                return incoming_hitl
+            if not isinstance(incoming_hitl, dict):
+                return copy.deepcopy(existing_hitl)
+
+            merged_hitl = copy.deepcopy(incoming_hitl)
+            existing = copy.deepcopy(existing_hitl)
+
+            # Preserve overall bridge validation marker when incoming omitted it.
+            try:
+                if bool(existing.get('bridge_validated')) and not bool(merged_hitl.get('bridge_validated')):
+                    merged_hitl['bridge_validated'] = True
+                    if (not merged_hitl.get('bridge_validated_at')) and existing.get('bridge_validated_at'):
+                        merged_hitl['bridge_validated_at'] = existing.get('bridge_validated_at')
+            except Exception:
+                pass
+
+            # Proxmox readiness guard.
+            existing_prox = existing.get('proxmox') if isinstance(existing.get('proxmox'), dict) else {}
+            incoming_prox = merged_hitl.get('proxmox') if isinstance(merged_hitl.get('proxmox'), dict) else {}
+            incoming_prox = dict(incoming_prox)
+            try:
+                existing_secret = str(existing_prox.get('secret_id') or '').strip()
+                existing_validated = bool(existing_prox.get('validated'))
+                incoming_secret = str(incoming_prox.get('secret_id') or '').strip()
+                incoming_validated = bool(incoming_prox.get('validated'))
+                if existing_validated and existing_secret and (not incoming_validated or not incoming_secret):
+                    incoming_prox['secret_id'] = existing_secret
+                    incoming_prox['validated'] = True
+                    if (not incoming_prox.get('last_validated_at')) and existing_prox.get('last_validated_at'):
+                        incoming_prox['last_validated_at'] = existing_prox.get('last_validated_at')
+                # Fill missing connection metadata from existing state.
+                for key in ('url', 'port', 'verify_ssl', 'stored_at', 'last_message'):
+                    if key not in incoming_prox or incoming_prox.get(key) in (None, ''):
+                        if existing_prox.get(key) not in (None, ''):
+                            incoming_prox[key] = existing_prox.get(key)
+            except Exception:
+                pass
+            if incoming_prox:
+                merged_hitl['proxmox'] = incoming_prox
+
+            # CORE readiness guard.
+            existing_core = existing.get('core') if isinstance(existing.get('core'), dict) else {}
+            incoming_core = merged_hitl.get('core') if isinstance(merged_hitl.get('core'), dict) else {}
+            incoming_core = dict(incoming_core)
+            try:
+                existing_core_secret = str(existing_core.get('core_secret_id') or '').strip()
+                existing_vm_key = str(existing_core.get('vm_key') or '').strip()
+                existing_validated = bool(existing_core.get('validated'))
+                incoming_core_secret = str(incoming_core.get('core_secret_id') or '').strip()
+                incoming_vm_key = str(incoming_core.get('vm_key') or '').strip()
+                incoming_validated = bool(incoming_core.get('validated'))
+                if existing_validated and existing_core_secret and existing_vm_key and (
+                    (not incoming_validated) or (not incoming_core_secret) or (not incoming_vm_key)
+                ):
+                    incoming_core['core_secret_id'] = existing_core_secret
+                    incoming_core['vm_key'] = existing_vm_key
+                    incoming_core['validated'] = True
+                    if (not incoming_core.get('last_validated_at')) and existing_core.get('last_validated_at'):
+                        incoming_core['last_validated_at'] = existing_core.get('last_validated_at')
+                for key in ('vm_name', 'vm_node', 'grpc_host', 'grpc_port', 'ssh_host', 'ssh_port', 'stored_at'):
+                    if key not in incoming_core or incoming_core.get(key) in (None, ''):
+                        if existing_core.get(key) not in (None, ''):
+                            incoming_core[key] = existing_core.get(key)
+            except Exception:
+                pass
+            if incoming_core:
+                merged_hitl['core'] = incoming_core
+
+            return merged_hitl
+
         existing_hitl_by_norm: dict[str, dict[str, Any]] = {}
         try:
             for scen in scenarios if isinstance(scenarios, list) else []:
@@ -36534,13 +36711,21 @@ def save_xml_api():
                     try:
                         norm = _normalize_scenario_label(display_name)
                         existing_hitl = existing_hitl_by_norm.get(norm)
-                        if isinstance(existing_hitl, dict) and not _has_meaningful_hitl(scen):
+                        if isinstance(existing_hitl, dict):
                             scen_to_write = dict(scen)
-                            scen_to_write['hitl'] = copy.deepcopy(existing_hitl)
-                            try:
-                                app.logger.info('[save_xml_api] preserved hitl for scenario=%s from existing XML', display_name)
-                            except Exception:
-                                pass
+                            incoming_hitl = scen.get('hitl') if isinstance(scen, dict) else None
+                            if not _has_meaningful_hitl(scen):
+                                scen_to_write['hitl'] = copy.deepcopy(existing_hitl)
+                                try:
+                                    app.logger.info('[save_xml_api] preserved hitl for scenario=%s from existing XML', display_name)
+                                except Exception:
+                                    pass
+                            else:
+                                scen_to_write['hitl'] = _merge_verified_hitl_fields(existing_hitl, incoming_hitl)
+                                try:
+                                    app.logger.info('[save_xml_api] merged verified hitl fields for scenario=%s', display_name)
+                                except Exception:
+                                    pass
                     except Exception:
                         scen_to_write = scen
 

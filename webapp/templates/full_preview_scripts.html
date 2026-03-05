@@ -3342,7 +3342,16 @@
           (async function poll() {
             try {
               const r = await fetch('/run_status/' + run_id);
-              if (!r.ok) { setTimeout(poll, 1200); return; }
+              if (!r.ok) {
+                if (r.status === 404) {
+                  appendExecuteProgressLog('Run status unavailable (404). The run ID is no longer active, likely due to a server restart.');
+                  cleanupExecuteProgress();
+                  setExecuteProgressUI({ status: 'Run status unavailable', meta: 'Run ID not found', barText: 'Stopped', animate: false });
+                  return;
+                }
+                setTimeout(poll, 1200);
+                return;
+              }
               const data = await r.json();
               if (!data.done) { setTimeout(poll, 1000); return; }
               cleanupExecuteProgress();
@@ -3447,7 +3456,16 @@
                   (async function pollRetry() {
                     try {
                       const r2 = await fetch('/run_status/' + run_id2);
-                      if (!r2.ok) { setTimeout(pollRetry, 1200); return; }
+                      if (!r2.ok) {
+                        if (r2.status === 404) {
+                          appendExecuteProgressLog('Retry run status unavailable (404). The run ID is no longer active, likely due to a server restart.');
+                          cleanupExecuteProgress();
+                          setExecuteProgressUI({ status: 'Retry status unavailable', meta: 'Run ID not found', barText: 'Stopped', animate: false });
+                          return;
+                        }
+                        setTimeout(pollRetry, 1200);
+                        return;
+                      }
                       const data2 = await r2.json();
                       if (!data2.done) { setTimeout(pollRetry, 1000); return; }
                       cleanupExecuteProgress();

@@ -286,42 +286,6 @@ def register(
                 except Exception:
                     return ''
 
-            def _scenario_has_items(scen: Any) -> bool:
-                if not isinstance(scen, dict):
-                    return False
-                sections = scen.get('sections') if isinstance(scen.get('sections'), dict) else {}
-                if not isinstance(sections, dict) or not sections:
-                    return False
-                for sec in sections.values():
-                    if not isinstance(sec, dict):
-                        continue
-                    items = sec.get('items') if isinstance(sec.get('items'), list) else []
-                    if any(isinstance(item, dict) and item for item in (items or [])):
-                        return True
-                return False
-
-            def _is_summary_only_scenario(scen: Any) -> bool:
-                if not isinstance(scen, dict):
-                    return False
-                sections = scen.get('sections') if isinstance(scen.get('sections'), dict) else None
-                if not isinstance(sections, dict):
-                    return False
-                if _scenario_has_items(scen):
-                    return False
-                # Keep this conservative: only treat as summary-only when at least one
-                # topology count/summary signal is present, which indicates this came
-                # from a reduced snapshot rather than an intentional empty authoring state.
-                for key in ('density_count', 'scenario_total_nodes', 'base_nodes', 'combined_nodes', 'additional_nodes'):
-                    try:
-                        raw = scen.get(key)
-                        if raw is None:
-                            continue
-                        if str(raw).strip() != '':
-                            return True
-                    except Exception:
-                        continue
-                return False
-
             def _candidate_source_xml_paths(project_hint_path: str, scenario_name: str) -> list[str]:
                 out: list[str] = []
                 try:
@@ -377,17 +341,96 @@ def register(
                     return any(_has_meaningful_value(v) for v in value.values())
                 return False
 
-            def _preserve_hitl_if_missing(scen: Any, project_hint_path: str) -> Any:
+            def _preserve_hitl_if_missing(scen: Any, project_hint_path: str, source_scen: Any = None) -> Any:
                 if not isinstance(scen, dict):
                     return scen
                 existing_hitl = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
-                if isinstance(existing_hitl, dict) and _has_meaningful_value(existing_hitl):
-                    return scen
+
+                def _merge_verified_hitl_fields(source_hitl: Any, incoming_hitl: Any) -> Any:
+                    if not isinstance(source_hitl, dict):
+                        return incoming_hitl
+                    if not isinstance(incoming_hitl, dict):
+                        return copy.deepcopy(source_hitl)
+
+                    merged_hitl = copy.deepcopy(incoming_hitl)
+                    source = copy.deepcopy(source_hitl)
+
+                    try:
+                        if bool(source.get('bridge_validated')) and not bool(merged_hitl.get('bridge_validated')):
+                            merged_hitl['bridge_validated'] = True
+                            if (not merged_hitl.get('bridge_validated_at')) and source.get('bridge_validated_at'):
+                                merged_hitl['bridge_validated_at'] = source.get('bridge_validated_at')
+                    except Exception:
+                        pass
+
+                    source_prox = source.get('proxmox') if isinstance(source.get('proxmox'), dict) else {}
+                    merged_prox = merged_hitl.get('proxmox') if isinstance(merged_hitl.get('proxmox'), dict) else {}
+                    merged_prox = dict(merged_prox)
+                    try:
+                        source_secret = str(source_prox.get('secret_id') or '').strip()
+                        source_validated = bool(source_prox.get('validated'))
+                        merged_secret = str(merged_prox.get('secret_id') or '').strip()
+                        merged_validated = bool(merged_prox.get('validated'))
+                        if source_validated and source_secret and (not merged_validated or not merged_secret):
+                            merged_prox['secret_id'] = source_secret
+                            merged_prox['validated'] = True
+                            if (not merged_prox.get('last_validated_at')) and source_prox.get('last_validated_at'):
+                                merged_prox['last_validated_at'] = source_prox.get('last_validated_at')
+                        for key in ('url', 'port', 'verify_ssl', 'stored_at', 'last_message'):
+                            if key not in merged_prox or merged_prox.get(key) in (None, ''):
+                                if source_prox.get(key) not in (None, ''):
+                                    merged_prox[key] = source_prox.get(key)
+                    except Exception:
+                        pass
+                    if merged_prox:
+                        merged_hitl['proxmox'] = merged_prox
+
+                    source_core = source.get('core') if isinstance(source.get('core'), dict) else {}
+                    merged_core = merged_hitl.get('core') if isinstance(merged_hitl.get('core'), dict) else {}
+                    merged_core = dict(merged_core)
+                    try:
+                        source_core_secret = str(source_core.get('core_secret_id') or '').strip()
+                        source_vm_key = str(source_core.get('vm_key') or '').strip()
+                        source_validated = bool(source_core.get('validated'))
+                        merged_core_secret = str(merged_core.get('core_secret_id') or '').strip()
+                        merged_vm_key = str(merged_core.get('vm_key') or '').strip()
+                        merged_validated = bool(merged_core.get('validated'))
+                        if source_validated and source_core_secret and source_vm_key and (
+                            (not merged_validated) or (not merged_core_secret) or (not merged_vm_key)
+                        ):
+                            merged_core['core_secret_id'] = source_core_secret
+                            merged_core['vm_key'] = source_vm_key
+                            merged_core['validated'] = True
+                            if (not merged_core.get('last_validated_at')) and source_core.get('last_validated_at'):
+                                merged_core['last_validated_at'] = source_core.get('last_validated_at')
+                        for key in ('vm_name', 'vm_node', 'grpc_host', 'grpc_port', 'ssh_host', 'ssh_port', 'stored_at'):
+                            if key not in merged_core or merged_core.get(key) in (None, ''):
+                                if source_core.get(key) not in (None, ''):
+                                    merged_core[key] = source_core.get(key)
+                    except Exception:
+                        pass
+                    if merged_core:
+                        merged_hitl['core'] = merged_core
+
+                    return merged_hitl
 
                 scenario_name = str(scen.get('name') or '').strip()
                 target = _norm_name(scenario_name)
                 if not target:
                     return scen
+
+                # Fast path: if the parsed source scenario is already available, merge from it.
+                try:
+                    source_hitl = source_scen.get('hitl') if isinstance(source_scen, dict) else None
+                    if isinstance(source_hitl, dict) and _has_meaningful_value(source_hitl):
+                        out = dict(scen)
+                        if isinstance(existing_hitl, dict) and _has_meaningful_value(existing_hitl):
+                            out['hitl'] = _merge_verified_hitl_fields(source_hitl, existing_hitl)
+                        else:
+                            out['hitl'] = copy.deepcopy(source_hitl)
+                        return out
+                except Exception:
+                    pass
 
                 explicit_path = ''
                 try:
@@ -421,12 +464,20 @@ def register(
                                 hitl = row.get('hitl') if isinstance(row.get('hitl'), dict) else None
                                 if isinstance(hitl, dict) and _has_meaningful_value(hitl):
                                     out = dict(scen)
-                                    out['hitl'] = copy.deepcopy(hitl)
-                                    try:
-                                        if log is not None:
-                                            log.info('[save_xml_api] preserved hitl for scenario=%s from source=%s', scenario_name, src)
-                                    except Exception:
-                                        pass
+                                    if isinstance(existing_hitl, dict) and _has_meaningful_value(existing_hitl):
+                                        out['hitl'] = _merge_verified_hitl_fields(hitl, existing_hitl)
+                                        try:
+                                            if log is not None:
+                                                log.info('[save_xml_api] merged verified hitl fields for scenario=%s from source=%s', scenario_name, src)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        out['hitl'] = copy.deepcopy(hitl)
+                                        try:
+                                            if log is not None:
+                                                log.info('[save_xml_api] preserved hitl for scenario=%s from source=%s', scenario_name, src)
+                                        except Exception:
+                                            pass
                                     return out
                     except Exception:
                         pass
@@ -526,11 +577,55 @@ def register(
                                 continue
                             if _norm_name(row.get('name')) != target:
                                 continue
-                            if _scenario_has_items(row):
-                                return row
+                            return row
                     except Exception:
                         continue
                 return None
+
+            def _deep_merge_preserve_missing(source: Any, incoming: Any) -> Any:
+                """Merge incoming over source while preserving fields missing in incoming.
+
+                - Dicts merge recursively.
+                - Lists/scalars replace when provided by incoming.
+                - Missing keys in incoming stay untouched from source.
+                """
+                if isinstance(source, dict) and isinstance(incoming, dict):
+                    merged: dict[str, Any] = copy.deepcopy(source)
+                    for key, value in incoming.items():
+                        if key in merged:
+                            merged[key] = _deep_merge_preserve_missing(merged.get(key), value)
+                        else:
+                            merged[key] = copy.deepcopy(value)
+                    return merged
+                return copy.deepcopy(incoming)
+
+            def _is_reduced_snapshot_payload(scen: Any) -> bool:
+                """Detect reduced UI snapshots that should not clear section items."""
+                if not isinstance(scen, dict):
+                    return False
+                sections = scen.get('sections') if isinstance(scen.get('sections'), dict) else None
+                if not isinstance(sections, dict) or not sections:
+                    return False
+
+                has_summary_signal = False
+                for key in ('scenario_total_nodes', 'base_nodes', 'combined_nodes', 'additional_nodes'):
+                    try:
+                        raw = scen.get(key)
+                        if raw is not None and str(raw).strip() != '':
+                            has_summary_signal = True
+                            break
+                    except Exception:
+                        continue
+                if not has_summary_signal:
+                    return False
+
+                for sec in sections.values():
+                    if not isinstance(sec, dict):
+                        continue
+                    items = sec.get('items') if isinstance(sec.get('items'), list) else None
+                    if isinstance(items, list) and len(items) > 0:
+                        return False
+                return True
 
             def _topology_signature(scen: Any) -> str:
                 if not isinstance(scen, dict):
@@ -578,6 +673,12 @@ def register(
                     changed = False
                 if changed:
                     flow_state = dict(flow_state or {})
+                    # Topology/IP changes invalidate saved chain placement and resolved values.
+                    # Keep the dirty marker but clear chain payload so Flag Sequencing starts clean.
+                    flow_state['chain_ids'] = []
+                    flow_state['length'] = 0
+                    flow_state['flag_assignments'] = []
+                    flow_state['flags_enabled'] = False
                     flow_state['topology_dirty'] = True
                     flow_state['topology_dirty_reason'] = 'topology_or_ip_changed'
                     flow_state['updated_at'] = local_timestamp_safe()
@@ -589,28 +690,41 @@ def register(
             if not isinstance(scenarios, list):
                 return jsonify({'ok': False, 'error': 'Invalid payload (scenarios list required)'}), 400
 
-            # Guard against reduced snapshots (e.g., from non-topology pages) that
-            # carry only section summaries and would otherwise wipe topology items.
+            source_by_norm: dict[str, dict[str, Any]] = {}
             if isinstance(scenarios, list):
-                hydrated: list[Any] = []
                 for scen in scenarios:
                     if not isinstance(scen, dict):
-                        hydrated.append(scen)
                         continue
-                    if not _is_summary_only_scenario(scen):
-                        hydrated.append(scen)
+                    name = str(scen.get('name') or '').strip()
+                    norm = _norm_name(name)
+                    if not norm or norm in source_by_norm:
                         continue
-                    src = _load_scenario_from_sources(str(scen.get('name') or ''), project_key_hint)
-                    if not isinstance(src, dict):
-                        hydrated.append(scen)
+                    src = _load_scenario_from_sources(name, project_key_hint)
+                    if isinstance(src, dict):
+                        source_by_norm[norm] = src
+
+            # Minimal patch semantics: merge incoming fields over source XML scenario.
+            if isinstance(scenarios, list):
+                merged_with_source: list[Any] = []
+                for scen in scenarios:
+                    if not isinstance(scen, dict):
+                        merged_with_source.append(scen)
                         continue
-                    merged = dict(src)
-                    for key, val in scen.items():
-                        if key == 'sections':
-                            continue
-                        merged[key] = val
-                    hydrated.append(merged)
-                scenarios = hydrated
+                    norm = _norm_name(scen.get('name'))
+                    src = source_by_norm.get(norm)
+                    if isinstance(src, dict):
+                        if _is_reduced_snapshot_payload(scen):
+                            merged = dict(src)
+                            for key, val in scen.items():
+                                if key == 'sections':
+                                    continue
+                                merged[key] = val
+                            merged_with_source.append(merged)
+                        else:
+                            merged_with_source.append(_deep_merge_preserve_missing(src, scen))
+                    else:
+                        merged_with_source.append(scen)
+                scenarios = merged_with_source
 
             # If topology/IP-related fields changed compared to source XML, mark
             # FlowState as dirty so Flag Sequencing prompts a re-generate.
@@ -620,7 +734,8 @@ def register(
                     if not isinstance(scen, dict):
                         marked.append(scen)
                         continue
-                    src = _load_scenario_from_sources(str(scen.get('name') or ''), project_key_hint)
+                    norm = _norm_name(scen.get('name'))
+                    src = source_by_norm.get(norm)
                     marked.append(_with_flow_state_dirty_if_topology_changed(scen, src))
                 scenarios = marked
 
@@ -630,7 +745,8 @@ def register(
                     if not isinstance(scen, dict):
                         preserved.append(scen)
                         continue
-                    preserved.append(_preserve_hitl_if_missing(scen, project_key_hint))
+                    norm = _norm_name(scen.get('name'))
+                    preserved.append(_preserve_hitl_if_missing(scen, project_key_hint, source_scen=source_by_norm.get(norm)))
                 scenarios = preserved
 
             if clear_flow_preview and isinstance(scenarios, list):
