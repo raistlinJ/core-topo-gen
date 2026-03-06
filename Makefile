@@ -1,6 +1,6 @@
 # Simple developer conveniences
 
-.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend run-web run-web-local run-web-remote run-web-local-bg run-web-remote-bg
+.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend ensure-webui-deps run-web run-web-local run-web-remote run-web-local-bg run-web-remote-bg
 
 CERT_SANS?=DNS:localhost,IP:127.0.0.1
 CERT_SUBJECT?=/CN=localhost
@@ -133,17 +133,42 @@ WEB_PORT?=9090
 CORE_REMOTE_HOST?=localhost
 CORE_REMOTE_PORT?=50051
 
+ensure-webui-deps:
+	@set -e; \
+	PY_CMD="$(WEBUI_PY)"; \
+	if [ -z "$$PY_CMD" ] && [ -x ".venv312/bin/python" ]; then PY_CMD=".venv312/bin/python"; fi; \
+	if [ -z "$$PY_CMD" ] && [ -x ".venv/bin/python" ]; then PY_CMD=".venv/bin/python"; fi; \
+	if [ -z "$$PY_CMD" ]; then \
+	  for CANDIDATE in core-python python3 python; do \
+	    if command -v "$$CANDIDATE" >/dev/null 2>&1; then \
+	      PY_CMD="$$CANDIDATE"; \
+	      break; \
+	    fi; \
+	  done; \
+	fi; \
+	if [ -z "$$PY_CMD" ]; then \
+	  echo "No Python interpreter found for dependency install." >&2; \
+	  exit 1; \
+	fi; \
+	echo "Ensuring Web UI dependencies with $$PY_CMD"; \
+	"$$PY_CMD" -m pip install --disable-pip-version-check -r requirements.txt -r webapp/requirements.txt
+
 run-web-local:
+	@$(MAKE) ensure-webui-deps
 	@bash scripts/run_webui_local.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)"
 
 run-web:
+	@$(MAKE) ensure-webui-deps
 	@bash scripts/run_webui_mode.sh --mode auto --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)"
 
 run-web-local-bg:
+	@$(MAKE) ensure-webui-deps
 	@bash scripts/run_webui_local.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)" --kill-existing --detach
 
 run-web-remote:
+	@$(MAKE) ensure-webui-deps
 	@bash scripts/run_webui_remote.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)" --core-host "$(CORE_REMOTE_HOST)" --core-port "$(CORE_REMOTE_PORT)"
 
 run-web-remote-bg:
+	@$(MAKE) ensure-webui-deps
 	@bash scripts/run_webui_remote.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)" --core-host "$(CORE_REMOTE_HOST)" --core-port "$(CORE_REMOTE_PORT)" --kill-existing --detach
