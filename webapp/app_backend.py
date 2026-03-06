@@ -10258,6 +10258,8 @@ def _ensure_proxmox_bridge(client: Any, node: str, bridge_name: str, *, comment:
 def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
     client, record = _connect_proxmox_from_secret(identifier)
     inventory: List[Dict[str, Any]] = []
+    node_errors: List[str] = []
+    attempted_nodes = 0
     nodes = []
     try:
         nodes = client.nodes.get()  # type: ignore[assignment]
@@ -10267,10 +10269,12 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
         node_name = node.get('node') if isinstance(node, dict) else None
         if not node_name:
             continue
+        attempted_nodes += 1
         try:
             vms = client.nodes(node_name).qemu.get()
         except Exception as exc:
             logging.getLogger(__name__).warning('Failed to enumerate VMs for node %s: %s', node_name, exc)
+            node_errors.append(f'{node_name}: {exc}')
             continue
         for vm in vms or []:
             if not isinstance(vm, dict):
@@ -10314,6 +10318,15 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
                 'status': vm_status,
                 'interfaces': interfaces,
             })
+
+    if attempted_nodes > 0 and not inventory and node_errors:
+        err_detail = '; '.join(node_errors[:5])
+        raise RuntimeError(
+            'Connected to Proxmox but could not enumerate QEMU VMs. '
+            f'Node errors: {err_detail}. '
+            'Verify account permissions for node/VM audit access and API visibility.'
+        )
+
     return {
         'fetched_at': _local_timestamp_display(),
         'url': record.get('url'),

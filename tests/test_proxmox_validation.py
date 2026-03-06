@@ -112,6 +112,31 @@ class DummyProxmoxAPI:
         self.nodes = DummyNodes(self.inventory)
 
 
+class _FailingNodeQemu:
+    def get(self):
+        raise RuntimeError("403 permission denied")
+
+
+class _FailingNode:
+    def __init__(self):
+        self.qemu = _FailingNodeQemu()
+
+
+class _FailingNodes:
+    def get(self):
+        return [{"node": "pve1"}]
+
+    def __call__(self, _node_name):
+        return _FailingNode()
+
+
+class _FailingProxmoxAPI:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.version = SimpleNamespace(get=lambda: {"version": "8.0"})
+        self.nodes = _FailingNodes()
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(app_backend, "ProxmoxAPI", DummyProxmoxAPI)
@@ -199,4 +224,27 @@ def test_proxmox_inventory_success(client):
     assert iface["id"] == "net0"
     assert iface["bridge"] == "vmbr0"
     assert iface["macaddr"].lower().startswith("aa:bb:cc:dd:ee")
+
+
+def test_proxmox_inventory_surfaces_node_permission_errors(client, monkeypatch):
+    monkeypatch.setattr(app_backend, "ProxmoxAPI", _FailingProxmoxAPI)
+
+    validate_payload = {
+        "url": "https://pve.example.local",
+        "port": 8443,
+        "username": "root@pam",
+        "password": "secret",
+        "scenario_index": 0,
+        "scenario_name": "Scenario 1",
+        "remember_credentials": True,
+    }
+    resp = client.post("/api/proxmox/validate", json=validate_payload)
+    assert resp.status_code == 200
+    secret_id = resp.get_json()["secret_id"]
+
+    inventory_resp = client.post("/api/proxmox/vms", json={"secret_id": secret_id})
+    assert inventory_resp.status_code == 502
+    payload = inventory_resp.get_json()
+    assert payload["success"] is False
+    assert "could not enumerate QEMU VMs" in payload["error"]
 
