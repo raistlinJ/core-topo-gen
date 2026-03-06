@@ -9603,6 +9603,38 @@ def _ensure_private_file(path: str, mode: int = 0o600) -> None:
             pass
 
 
+def _can_write_directory(path: str) -> bool:
+    try:
+        probe = os.path.join(path, '.write_probe')
+        with open(probe, 'w', encoding='utf-8') as fh:
+            fh.write('ok')
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _secrets_base_dir() -> str:
+    override = str(os.environ.get('CORETG_SECRETS_DIR') or '').strip()
+    candidates: List[str] = []
+    if override:
+        candidates.append(override)
+    candidates.append(os.path.join(_outputs_dir(), 'secrets'))
+    candidates.append(os.path.join(os.path.expanduser('~'), '.core-topo-gen', 'secrets'))
+
+    errors: List[str] = []
+    for candidate in candidates:
+        try:
+            base = _ensure_private_dir(candidate)
+            if _can_write_directory(base):
+                return base
+            errors.append(f'{base}: not writable')
+        except Exception as exc:
+            errors.append(f'{candidate}: {exc}')
+
+    raise RuntimeError('No writable secrets directory available: ' + '; '.join(errors))
+
+
 def _sanitize_secret_slug(raw: str, fallback: str = 'entry') -> str:
     cleaned = ''.join(ch.lower() if ch.isalnum() else '-' for ch in (raw or ''))
     cleaned = re.sub(r'-{2,}', '-', cleaned).strip('-')
@@ -9610,7 +9642,7 @@ def _sanitize_secret_slug(raw: str, fallback: str = 'entry') -> str:
 
 
 def _proxmox_secret_dir() -> str:
-    base = _ensure_private_dir(os.path.join(_outputs_dir(), 'secrets'))
+    base = _secrets_base_dir()
     prox_dir = os.path.join(base, 'proxmox')
     return _ensure_private_dir(prox_dir)
 
@@ -9702,9 +9734,17 @@ def _save_proxmox_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     path = _proxmox_secret_path(identifier)
     tmp_path = path + '.tmp'
-    with open(tmp_path, 'w', encoding='utf-8') as fh:
-        json.dump(record, fh, indent=2)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(record, fh, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(f'Failed to persist Proxmox credentials at {path}: {exc}') from exc
     _ensure_private_file(path)
     return {
         'identifier': identifier,
@@ -9753,7 +9793,7 @@ def _delete_proxmox_credentials(identifier: str) -> bool:
 
 
 def _core_secret_dir() -> str:
-    base = _ensure_private_dir(os.path.join(_outputs_dir(), 'secrets'))
+    base = _secrets_base_dir()
     core_dir = os.path.join(base, 'core')
     return _ensure_private_dir(core_dir)
 
