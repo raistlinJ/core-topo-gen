@@ -13,11 +13,14 @@ pytestmark = pytest.mark.skipif(app_backend.Fernet is None, reason="cryptography
 def _clean_secret_cache(tmp_path, monkeypatch):
     outputs_dir = tmp_path / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    secrets_dir = outputs_dir / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
 
     def fake_outputs_dir():
         return str(outputs_dir)
 
     monkeypatch.setattr(app_backend, "_outputs_dir", fake_outputs_dir)
+    monkeypatch.setenv("CORETG_SECRETS_DIR", str(secrets_dir))
 
     key = app_backend.Fernet.generate_key().decode()  # type: ignore[attr-defined]
     monkeypatch.setenv("PROXMOX_SECRET_KEY", key)

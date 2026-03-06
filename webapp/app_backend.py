@@ -9616,23 +9616,11 @@ def _can_write_directory(path: str) -> bool:
 
 def _secrets_base_dir() -> str:
     override = str(os.environ.get('CORETG_SECRETS_DIR') or '').strip()
-    candidates: List[str] = []
-    if override:
-        candidates.append(override)
-    candidates.append(os.path.join(_outputs_dir(), 'secrets'))
-    candidates.append(os.path.join(os.path.expanduser('~'), '.core-topo-gen', 'secrets'))
-
-    errors: List[str] = []
-    for candidate in candidates:
-        try:
-            base = _ensure_private_dir(candidate)
-            if _can_write_directory(base):
-                return base
-            errors.append(f'{base}: not writable')
-        except Exception as exc:
-            errors.append(f'{candidate}: {exc}')
-
-    raise RuntimeError('No writable secrets directory available: ' + '; '.join(errors))
+    candidate = override or os.path.join(os.path.expanduser('~'), '.core-topo-gen', 'secrets')
+    base = _ensure_private_dir(candidate)
+    if not _can_write_directory(base):
+        raise RuntimeError(f'Secrets directory is not writable: {base}')
+    return base
 
 
 def _sanitize_secret_slug(raw: str, fallback: str = 'entry') -> str:

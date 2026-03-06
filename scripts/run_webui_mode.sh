@@ -152,6 +152,7 @@ export PYTHONUNBUFFERED=1
 export WEBAPP_LOG_LEVEL="$LOG_LEVEL_ARG"
 export CORETG_DEBUG="${CORETG_DEBUG:-0}"
 export CORETG_USE_RELOADER="${CORETG_USE_RELOADER:-0}"
+export CORETG_SECRETS_DIR="${CORETG_SECRETS_DIR:-$HOME/.core-topo-gen/secrets}"
 export CORETG_HOST="$WEB_HOST_ARG"
 export CORETG_PORT="$WEB_PORT_ARG"
 export CORE_HOST="$CORE_HOST_EFFECTIVE"
@@ -170,6 +171,7 @@ fi
 echo "[webui:$MODE] python=$PY_CMD"
 echo "[webui:$MODE] bind=${CORETG_HOST}:${CORETG_PORT}"
 echo "[webui:$MODE] core=${CORE_HOST}:${CORE_PORT}"
+echo "[webui:$MODE] secrets_dir=${CORETG_SECRETS_DIR}"
 echo "[webui:$MODE] log_level=${WEBAPP_LOG_LEVEL}"
 
 if [[ "$DETACH" == "1" ]]; then
