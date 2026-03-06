@@ -139,6 +139,17 @@ ensure-webui-deps:
 	if [ -z "$$PY_CMD" ] && [ -x ".venv312/bin/python" ]; then PY_CMD=".venv312/bin/python"; fi; \
 	if [ -z "$$PY_CMD" ] && [ -x ".venv/bin/python" ]; then PY_CMD=".venv/bin/python"; fi; \
 	if [ -z "$$PY_CMD" ]; then \
+	  if command -v python3 >/dev/null 2>&1; then \
+	    echo "Creating local virtualenv at .venv (python3)"; \
+	    python3 -m venv .venv; \
+	    PY_CMD=".venv/bin/python"; \
+	  elif command -v python >/dev/null 2>&1; then \
+	    echo "Creating local virtualenv at .venv (python)"; \
+	    python -m venv .venv; \
+	    PY_CMD=".venv/bin/python"; \
+	  fi; \
+	fi; \
+	if [ -z "$$PY_CMD" ]; then \
 	  for CANDIDATE in core-python python3 python; do \
 	    if command -v "$$CANDIDATE" >/dev/null 2>&1; then \
 	      PY_CMD="$$CANDIDATE"; \
@@ -151,7 +162,15 @@ ensure-webui-deps:
 	  exit 1; \
 	fi; \
 	echo "Ensuring Web UI dependencies with $$PY_CMD"; \
-	"$$PY_CMD" -m pip install --disable-pip-version-check -r requirements.txt -r webapp/requirements.txt
+	if "$$PY_CMD" -m pip install --disable-pip-version-check -r requirements.txt -r webapp/requirements.txt; then \
+	  exit 0; \
+	fi; \
+	if [ "$$PY_CMD" = "core-python" ]; then \
+	  echo "core-python install failed; retrying with --user to avoid system permission issues"; \
+	  "$$PY_CMD" -m pip install --user --disable-pip-version-check -r requirements.txt -r webapp/requirements.txt; \
+	else \
+	  exit 1; \
+	fi
 
 run-web-local:
 	@$(MAKE) ensure-webui-deps
