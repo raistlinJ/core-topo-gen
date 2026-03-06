@@ -39,6 +39,23 @@ uv sync --extra dev
 ```bash
 uv run python webapp/app_backend.py
 ```
+- Run with explicit mode scripts (recommended for CORE VM workflows):
+```bash
+# backward-compatible default behavior (same style as before)
+bash scripts/run_webui_mode.sh
+
+# local CORE daemon on same machine
+bash scripts/run_webui_local.sh --web-port 9090
+
+# remote CORE daemon
+bash scripts/run_webui_remote.sh --core-host 10.0.0.50 --core-port 50051 --web-port 9090
+
+# background variants via Make
+make run-web
+make run-web-local-bg
+make run-web-remote-bg CORE_REMOTE_HOST=10.0.0.50 CORE_REMOTE_PORT=50051
+```
+- Local mode UX guard: CORE endpoint fields (`gRPC host/port`, `SSH host/port`) are pinned to localhost values and rendered read-only in the CORE Connection modal.
 - Run HTTPS Web UI with Docker Compose:
 ```bash
 docker compose up -d --build

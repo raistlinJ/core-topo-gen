@@ -476,7 +476,7 @@ _CORE_FIELD_KEYS = (
     'venv_user_override',
 )
 
-DEFAULT_CORE_VENV_BIN = '/opt/core/venv/bin/python'
+DEFAULT_CORE_VENV_BIN = '/opt/core/venv/bin'
 CORE_DAEMON_START_COMMAND = 'sudo systemctl start core-daemon'
 PYTHON_EXECUTABLE_NAMES = ('core-python', 'python3', 'python')
 REMOTE_BASE_DIR_ENV = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen')
@@ -5055,6 +5055,27 @@ def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[s
         'venv_bin': venv_bin,
         'venv_user_override': bool(venv_user_override),
     }
+
+    if _webui_local_mode():
+        try:
+            local_host = str(os.getenv('CORETG_LOCAL_CORE_HOST') or '127.0.0.1').strip() or '127.0.0.1'
+        except Exception:
+            local_host = '127.0.0.1'
+        try:
+            local_port = int(os.getenv('CORETG_LOCAL_CORE_PORT') or CORE_PORT)
+        except Exception:
+            local_port = CORE_PORT
+        try:
+            local_ssh_port = int(os.getenv('CORETG_LOCAL_SSH_PORT') or 22)
+        except Exception:
+            local_ssh_port = 22
+        cfg['host'] = local_host
+        cfg['grpc_host'] = local_host
+        cfg['port'] = local_port
+        cfg['grpc_port'] = local_port
+        cfg['ssh_host'] = local_host
+        cfg['ssh_port'] = local_ssh_port
+
     if include_password:
         cfg['ssh_password'] = ssh_password_val or ''
     return cfg
@@ -10947,6 +10968,22 @@ def _webui_running_in_docker() -> bool:
     return False
 
 
+def _webui_local_mode() -> bool:
+    """Whether Web UI is operating in explicit single-box local mode."""
+
+    try:
+        mode = str(os.getenv('CORETG_RUN_MODE') or '').strip().lower()
+    except Exception:
+        mode = ''
+    if mode == 'local':
+        return True
+    try:
+        force = str(os.getenv('CORETG_LOCAL_MODE') or '').strip().lower()
+    except Exception:
+        force = ''
+    return force in {'1', 'true', 'yes', 'y', 'on'}
+
+
 @app.before_request
 def _inject_current_user() -> None:
     try:
@@ -11043,7 +11080,28 @@ def _inject_ui_view_state() -> dict:
 
 @app.context_processor
 def _inject_runtime_flags() -> dict:
-    return {'webui_running_in_docker': _webui_running_in_docker()}
+    local_host = '127.0.0.1'
+    local_port = CORE_PORT
+    local_ssh_port = 22
+    try:
+        local_host = str(os.getenv('CORETG_LOCAL_CORE_HOST') or '127.0.0.1').strip() or '127.0.0.1'
+    except Exception:
+        local_host = '127.0.0.1'
+    try:
+        local_port = int(os.getenv('CORETG_LOCAL_CORE_PORT') or CORE_PORT)
+    except Exception:
+        local_port = CORE_PORT
+    try:
+        local_ssh_port = int(os.getenv('CORETG_LOCAL_SSH_PORT') or 22)
+    except Exception:
+        local_ssh_port = 22
+    return {
+        'webui_running_in_docker': _webui_running_in_docker(),
+        'webui_local_mode': _webui_local_mode(),
+        'webui_local_core_host': local_host,
+        'webui_local_core_port': local_port,
+        'webui_local_ssh_port': local_ssh_port,
+    }
 
 
 def set_ui_view_mode():
@@ -36896,10 +36954,11 @@ def run_cli():
     docker_remove_all_containers = _coerce_bool(
         request.form.get('docker_remove_all_containers')
     ) or _coerce_bool(request.form.get('docker_nuke_all'))
-    if _webui_running_in_docker() and docker_remove_all_containers:
+    if _webui_running_in_docker() and (docker_cleanup_before_run or docker_remove_all_containers):
+        docker_cleanup_before_run = False
         docker_remove_all_containers = False
         try:
-            app.logger.warning('[sync] Ignoring docker_remove_all_containers request because web UI is running in Docker')
+            app.logger.warning('[sync] Ignoring docker cleanup/restart toggles because web UI is running in Docker')
         except Exception:
             pass
     scenario_index_hint: Optional[int] = None
@@ -41616,10 +41675,12 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     docker_remove_conflicts = job_spec.get('docker_remove_conflicts')
     docker_cleanup_before_run = job_spec.get('docker_cleanup_before_run')
     docker_remove_all_containers = job_spec.get('docker_remove_all_containers')
-    if _webui_running_in_docker() and docker_remove_all_containers:
+    if _webui_running_in_docker() and (adv_fix_docker_daemon or docker_cleanup_before_run or docker_remove_all_containers):
+        adv_fix_docker_daemon = False
+        docker_cleanup_before_run = False
         docker_remove_all_containers = False
         try:
-            app.logger.warning('[async] Background run %s: forced docker_remove_all_containers=False (web UI in Docker)', run_id)
+            app.logger.warning('[async] Background run %s: forced docker repair/cleanup toggles off (web UI in Docker)', run_id)
         except Exception:
             pass
 
@@ -42938,10 +42999,12 @@ def run_cli_async():
             overwrite_existing_images = _coerce_bool(j.get('overwrite_existing_images'))
         except Exception:
             pass
-    if _webui_running_in_docker() and docker_remove_all_containers:
+    if _webui_running_in_docker() and (adv_fix_docker_daemon or docker_cleanup_before_run or docker_remove_all_containers):
+        adv_fix_docker_daemon = False
+        docker_cleanup_before_run = False
         docker_remove_all_containers = False
         try:
-            app.logger.warning('[async] Ignoring docker_remove_all_containers request because web UI is running in Docker')
+            app.logger.warning('[async] Ignoring docker repair/cleanup toggles because web UI is running in Docker')
         except Exception:
             pass
     if not xml_path:
@@ -46437,24 +46500,37 @@ def test_core():
         if core_secret_id:
             stored_secret = _load_core_credentials(core_secret_id)
             if not stored_secret:
-                return jsonify({'ok': False, 'error': 'Stored CORE credentials are unavailable. Re-enter the SSH password for the selected CORE VM.'}), 400
-            stored_vm_key = str(stored_secret.get('vm_key') or '').strip()
-            if stored_vm_key and stored_vm_key != scenario_vm_key:
-                stored_vm_name = str(stored_secret.get('vm_name') or stored_secret.get('vm_key') or 'previous VM')
-                mismatch_message = (
-                    f'Stored CORE credentials target {stored_vm_name}, ' \
-                    f'but Step 2 is configured for {scenario_vm_name or scenario_vm_key}. '
-                    'Clear the Step 2 credentials and validate with the selected CORE VM.'
-                )
-                return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
-            stored_vm_node = str(stored_secret.get('vm_node') or '').strip()
-            if stored_vm_node and scenario_vm_node and stored_vm_node != scenario_vm_node:
-                mismatch_message = (
-                    f'Stored CORE credentials reference node {stored_vm_node}, '
-                    f'but the selected CORE VM resides on node {scenario_vm_node}. '
-                    'Clear the Step 2 credentials and validate with the selected CORE VM.'
-                )
-                return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
+                supplied_password = str(cfg.get('ssh_password') or '')
+                if supplied_password.strip():
+                    # Recover gracefully when the previously saved secret was deleted/rotated:
+                    # continue with user-provided credentials and issue a fresh stored secret.
+                    app.logger.warning(
+                        '[core] stale core_secret_id=%s unavailable; proceeding with entered SSH password for vm_key=%s',
+                        core_secret_id,
+                        scenario_vm_key,
+                    )
+                    cfg['core_secret_id'] = None
+                    core_secret_id = ''
+                else:
+                    return jsonify({'ok': False, 'error': 'Stored CORE credentials are unavailable. Re-enter the SSH password for the selected CORE VM.'}), 400
+            if stored_secret:
+                stored_vm_key = str(stored_secret.get('vm_key') or '').strip()
+                if stored_vm_key and stored_vm_key != scenario_vm_key:
+                    stored_vm_name = str(stored_secret.get('vm_name') or stored_secret.get('vm_key') or 'previous VM')
+                    mismatch_message = (
+                        f'Stored CORE credentials target {stored_vm_name}, ' \
+                        f'but Step 2 is configured for {scenario_vm_name or scenario_vm_key}. '
+                        'Clear the Step 2 credentials and validate with the selected CORE VM.'
+                    )
+                    return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
+                stored_vm_node = str(stored_secret.get('vm_node') or '').strip()
+                if stored_vm_node and scenario_vm_node and stored_vm_node != scenario_vm_node:
+                    mismatch_message = (
+                        f'Stored CORE credentials reference node {stored_vm_node}, '
+                        f'but the selected CORE VM resides on node {scenario_vm_node}. '
+                        'Clear the Step 2 credentials and validate with the selected CORE VM.'
+                    )
+                    return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
         auto_start_daemon = bool(cfg.get('auto_start_daemon'))
         install_custom_services = bool(cfg.get('install_custom_services'))
         stop_duplicate_daemons = bool(cfg.get('stop_duplicate_daemons'))

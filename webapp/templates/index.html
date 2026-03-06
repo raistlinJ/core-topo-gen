@@ -570,21 +570,15 @@
 
                     <div class="row g-2 mb-3">
                         <div class="col-12 col-md-6">
-                            {% if webui_running_in_docker %}
-                            <div class="form-check form-switch">
-                                <input class="form-check-input" type="checkbox" role="switch"
-                                    id="coreAdvFixDockerDaemon" disabled>
-                                <label class="form-check-label text-muted" for="coreAdvFixDockerDaemon">Fix Docker daemon for CORE
-                                    (disable default bridge + iptables)</label>
-                                <div class="form-text">Disabled while Web UI runs in Docker to avoid interrupting this session.</div>
-                            </div>
-                            {% else %}
+                            {% if not webui_running_in_docker %}
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch"
                                     id="coreAdvFixDockerDaemon">
                                 <label class="form-check-label" for="coreAdvFixDockerDaemon">Fix Docker daemon for CORE
                                     (disable default bridge + iptables)</label>
                             </div>
+                            {% else %}
+                            <div class="small text-muted">Docker daemon repair controls are hidden while Web UI runs in Docker.</div>
                             {% endif %}
                         </div>
                         <div class="col-12 col-md-6">
@@ -881,29 +875,24 @@
                     <summary class="fw-semibold">Advanced</summary>
                     <div class="small text-muted mt-2">Applies to remote execution only.</div>
                     <div class="mt-3 d-grid gap-2">
+                        {% if not webui_running_in_docker %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvFixDockerDaemon">
                             <label class="form-check-label" for="executeAdvFixDockerDaemon">Fix Docker daemon for CORE
                                 (disable default bridge + iptables)</label>
                         </div>
+                        {% endif %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvRunCoreCleanup" checked>
                             <label class="form-check-label" for="executeAdvRunCoreCleanup">Run core-cleanup</label>
                         </div>
+                        {% if not webui_running_in_docker %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvDockerCleanupBeforeRun"
                                 checked>
                             <label class="form-check-label" for="executeAdvDockerCleanupBeforeRun">Remove old Docker
                                 containers/images before run</label>
                         </div>
-                        {% if webui_running_in_docker %}
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="executeAdvDockerNukeAll" disabled>
-                            <label class="form-check-label text-muted" for="executeAdvDockerNukeAll">Delete all docker containers
-                                (disabled while Web UI runs in Docker)</label>
-                            <div class="form-text">Safety guard: this option is disabled to avoid removing the running Web UI container.</div>
-                        </div>
-                        {% else %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvDockerNukeAll">
                             <label class="form-check-label" for="executeAdvDockerNukeAll">Delete all docker containers
@@ -911,6 +900,8 @@
                             <div class="form-text">This will stop and remove all containers (does not remove images).
                             </div>
                         </div>
+                        {% else %}
+                        <div class="small text-muted">Docker repair/cleanup options are hidden while Web UI runs in Docker.</div>
                         {% endif %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvCheckCoreVersion">
@@ -1235,6 +1226,10 @@
     window.CORETG_USER_ROLE = CORETG_USER_ROLE;
     const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
     const WEBUI_RUNNING_IN_DOCKER = {{ 'true' if webui_running_in_docker else 'false' }};
+    const WEBUI_LOCAL_MODE = {{ 'true' if webui_local_mode else 'false' }};
+    const WEBUI_LOCAL_CORE_HOST = {{ (webui_local_core_host or '127.0.0.1')|tojson }};
+    const WEBUI_LOCAL_CORE_PORT = {{ (webui_local_core_port or 50051)|int }};
+    const WEBUI_LOCAL_SSH_PORT = {{ (webui_local_ssh_port or 22)|int }};
     const IS_ADMIN_USER = (CORETG_USER_ROLE || '') === 'admin';
     const SCENARIOS_ACTIVE_TAB = '{{ scenarios_active_tab }}';
     window.CORETG_SCENARIOS_ACTIVE_TAB = SCENARIOS_ACTIVE_TAB;
@@ -11494,6 +11489,15 @@
         const scenario = state.scenarios[sidx];
         const hitlState = ensureHitlStateForScenario(scenario);
         const coreState = hitlState.core || (hitlState.core = {});
+        if (WEBUI_LOCAL_MODE) {
+            // Local mode keeps localhost endpoints static to prevent accidental drift.
+            coreState.grpc_host = WEBUI_LOCAL_CORE_HOST;
+            coreState.host = WEBUI_LOCAL_CORE_HOST;
+            coreState.grpc_port = WEBUI_LOCAL_CORE_PORT;
+            coreState.port = WEBUI_LOCAL_CORE_PORT;
+            coreState.ssh_host = WEBUI_LOCAL_CORE_HOST;
+            coreState.ssh_port = WEBUI_LOCAL_SSH_PORT;
+        }
         const rememberToggle = document.getElementById('coreRememberCreds');
         const rememberCreds = rememberToggle ? !!rememberToggle.checked : shouldRememberCore(hitlState);
         coreState.remember_credentials = rememberCreds;
@@ -11509,12 +11513,12 @@
         const advCheckVersionToggle = document.getElementById('coreAdvCheckCoreVersion');
         const advRestartDaemonToggle = document.getElementById('coreAdvRestartCoreDaemon');
         const advAutoKillToggle = document.getElementById('coreAdvAutoKillSessions');
-        const advFixDocker = advFixDockerToggle ? !!advFixDockerToggle.checked : !!(coreState.adv_fix_docker_daemon);
+            const advFixDocker = (WEBUI_RUNNING_IN_DOCKER ? false : (advFixDockerToggle ? !!advFixDockerToggle.checked : !!(coreState.adv_fix_docker_daemon)));
         const advRunCleanup = advRunCleanupToggle ? !!advRunCleanupToggle.checked : !!(coreState.adv_run_core_cleanup);
         const advCheckVersion = advCheckVersionToggle ? !!advCheckVersionToggle.checked : !!(coreState.adv_check_core_version);
         const advRestartDaemon = advRestartDaemonToggle ? !!advRestartDaemonToggle.checked : !!(coreState.adv_restart_core_daemon);
         const advAutoKill = advAutoKillToggle ? !!advAutoKillToggle.checked : !!(coreState.adv_auto_kill_sessions);
-        coreState.adv_fix_docker_daemon = advFixDocker;
+            coreState.adv_fix_docker_daemon = advFixDocker;
         coreState.adv_run_core_cleanup = advRunCleanup;
         coreState.adv_check_core_version = advCheckVersion;
         coreState.adv_restart_core_daemon = advRestartDaemon;
@@ -14209,6 +14213,9 @@
                 coreAutoStartInput.disabled = builderLocked || inputsDisabled;
             }
             if (coreAdvFixDockerDaemonInput) {
+                if (WEBUI_RUNNING_IN_DOCKER) {
+                    coreState.adv_fix_docker_daemon = false;
+                }
                 coreAdvFixDockerDaemonInput.checked = !!(coreState.adv_fix_docker_daemon);
                 coreAdvFixDockerDaemonInput.disabled = WEBUI_RUNNING_IN_DOCKER || builderLocked || inputsDisabled;
             }
@@ -14232,14 +14239,16 @@
                 coreAdvAutoKillSessionsInput.disabled = builderLocked || inputsDisabled;
             }
             if (coreModalInputs.grpc_host) {
-                coreModalInputs.grpc_host.value = coreState.grpc_host || '';
-                coreModalInputs.grpc_host.disabled = inputsDisabled;
+                coreModalInputs.grpc_host.value = WEBUI_LOCAL_MODE ? WEBUI_LOCAL_CORE_HOST : (coreState.grpc_host || '');
+                coreModalInputs.grpc_host.disabled = WEBUI_LOCAL_MODE || inputsDisabled;
+                coreModalInputs.grpc_host.readOnly = WEBUI_LOCAL_MODE;
                 coreModalInputs.grpc_host.setAttribute('data-scen-idx', String(sidx));
             }
             if (coreModalInputs.grpc_port) {
                 const port = Number.isFinite(Number(coreState.grpc_port)) && Number(coreState.grpc_port) > 0 ? Number(coreState.grpc_port) : 50051;
-                coreModalInputs.grpc_port.value = port;
-                coreModalInputs.grpc_port.disabled = inputsDisabled;
+                coreModalInputs.grpc_port.value = WEBUI_LOCAL_MODE ? WEBUI_LOCAL_CORE_PORT : port;
+                coreModalInputs.grpc_port.disabled = WEBUI_LOCAL_MODE || inputsDisabled;
+                coreModalInputs.grpc_port.readOnly = WEBUI_LOCAL_MODE;
                 coreModalInputs.grpc_port.setAttribute('data-scen-idx', String(sidx));
             }
             if (coreModalInputs.venv_bin) {
@@ -14248,14 +14257,16 @@
                 coreModalInputs.venv_bin.setAttribute('data-scen-idx', String(sidx));
             }
             if (coreModalInputs.ssh_host) {
-                coreModalInputs.ssh_host.value = coreState.ssh_host || '';
-                coreModalInputs.ssh_host.disabled = inputsDisabled;
+                coreModalInputs.ssh_host.value = WEBUI_LOCAL_MODE ? WEBUI_LOCAL_CORE_HOST : (coreState.ssh_host || '');
+                coreModalInputs.ssh_host.disabled = WEBUI_LOCAL_MODE || inputsDisabled;
+                coreModalInputs.ssh_host.readOnly = WEBUI_LOCAL_MODE;
                 coreModalInputs.ssh_host.setAttribute('data-scen-idx', String(sidx));
             }
             if (coreModalInputs.ssh_port) {
                 const sshPort = Number.isFinite(Number(coreState.ssh_port)) && Number(coreState.ssh_port) > 0 ? Number(coreState.ssh_port) : 22;
-                coreModalInputs.ssh_port.value = sshPort;
-                coreModalInputs.ssh_port.disabled = inputsDisabled;
+                coreModalInputs.ssh_port.value = WEBUI_LOCAL_MODE ? WEBUI_LOCAL_SSH_PORT : sshPort;
+                coreModalInputs.ssh_port.disabled = WEBUI_LOCAL_MODE || inputsDisabled;
+                coreModalInputs.ssh_port.readOnly = WEBUI_LOCAL_MODE;
                 coreModalInputs.ssh_port.setAttribute('data-scen-idx', String(sidx));
             }
             if (coreModalInputs.ssh_username) {
@@ -17192,10 +17203,10 @@
                 : getExecuteConfirmUpdateRemotePref()
         );
         const advanced = {
-            fixDockerDaemon: remoteExecution && !!(executeAdvFixDockerDaemon && executeAdvFixDockerDaemon.checked),
+            fixDockerDaemon: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvFixDockerDaemon && executeAdvFixDockerDaemon.checked),
             runCoreCleanup: remoteExecution && !!(executeAdvRunCoreCleanup && executeAdvRunCoreCleanup.checked),
-            dockerCleanupBeforeRun: remoteExecution && !!(executeAdvDockerCleanupBeforeRun && executeAdvDockerCleanupBeforeRun.checked),
-            dockerNukeAll: remoteExecution && !!(executeAdvDockerNukeAll && executeAdvDockerNukeAll.checked),
+            dockerCleanupBeforeRun: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvDockerCleanupBeforeRun && executeAdvDockerCleanupBeforeRun.checked),
+            dockerNukeAll: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvDockerNukeAll && executeAdvDockerNukeAll.checked),
             checkCoreVersion: remoteExecution && !!(executeAdvCheckCoreVersion && executeAdvCheckCoreVersion.checked),
             restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
             startCoreDaemon: remoteExecution && !!(executeAdvStartCoreDaemon && executeAdvStartCoreDaemon.checked),
@@ -17573,6 +17584,22 @@
         }
         if (!executeAdvUploadOnlyInjectedArtifacts) {
             executeAdvUploadOnlyInjectedArtifacts = document.getElementById('executeAdvUploadOnlyInjectedArtifacts');
+        }
+        if (WEBUI_RUNNING_IN_DOCKER) {
+            try {
+                if (executeAdvFixDockerDaemon) {
+                    executeAdvFixDockerDaemon.checked = false;
+                    executeAdvFixDockerDaemon.disabled = true;
+                }
+                if (executeAdvDockerCleanupBeforeRun) {
+                    executeAdvDockerCleanupBeforeRun.checked = false;
+                    executeAdvDockerCleanupBeforeRun.disabled = true;
+                }
+                if (executeAdvDockerNukeAll) {
+                    executeAdvDockerNukeAll.checked = false;
+                    executeAdvDockerNukeAll.disabled = true;
+                }
+            } catch (e) { }
         }
         // Make dialog controls togglable (global function)
         if (typeof window.setExecuteDialogControlsEnabled !== 'function') {

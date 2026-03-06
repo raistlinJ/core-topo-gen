@@ -1,6 +1,6 @@
 # Simple developer conveniences
 
-.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend
+.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend run-web run-web-local run-web-remote run-web-local-bg run-web-remote-bg
 
 CERT_SANS?=DNS:localhost,IP:127.0.0.1
 CERT_SUBJECT?=/CN=localhost
@@ -124,3 +124,26 @@ clean:
 	@echo "Stopping and removing docker containers (and volumes)..."
 	@docker compose down -v || true
 	@echo "(certs preserved in nginx/certs; remove manually if desired)"
+
+# Run-mode launchers (single-machine local CORE vs remote CORE daemon)
+# Optional overrides:
+#   make run-web-remote CORE_REMOTE_HOST=10.0.0.50 CORE_REMOTE_PORT=50051 WEB_PORT=9090
+WEB_HOST?=127.0.0.1
+WEB_PORT?=9090
+CORE_REMOTE_HOST?=localhost
+CORE_REMOTE_PORT?=50051
+
+run-web-local:
+	@bash scripts/run_webui_local.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)"
+
+run-web:
+	@bash scripts/run_webui_mode.sh --mode auto --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)"
+
+run-web-local-bg:
+	@bash scripts/run_webui_local.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)" --kill-existing --detach
+
+run-web-remote:
+	@bash scripts/run_webui_remote.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)" --core-host "$(CORE_REMOTE_HOST)" --core-port "$(CORE_REMOTE_PORT)"
+
+run-web-remote-bg:
+	@bash scripts/run_webui_remote.sh --web-host "$(WEB_HOST)" --web-port "$(WEB_PORT)" --core-host "$(CORE_REMOTE_HOST)" --core-port "$(CORE_REMOTE_PORT)" --kill-existing --detach

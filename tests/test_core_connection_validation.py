@@ -273,6 +273,67 @@ def test_test_core_rejects_mismatched_secret(client, monkeypatch):
     assert 'CORE-OLD' in data['error']
 
 
+def test_test_core_allows_stale_secret_when_password_reentered(client, monkeypatch):
+    monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
+    monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
+    monkeypatch.setattr(backend, '_load_core_credentials', lambda *_args, **_kwargs: None)
+
+    saved_payloads = []
+
+    def _fake_save(payload):
+        saved_payloads.append(payload.copy())
+        return {
+            'identifier': 'secret-replaced',
+            'scenario_name': payload.get('scenario_name'),
+            'scenario_index': payload.get('scenario_index'),
+            'host': payload['grpc_host'],
+            'port': payload['grpc_port'],
+            'grpc_host': payload['grpc_host'],
+            'grpc_port': payload['grpc_port'],
+            'ssh_host': payload['ssh_host'],
+            'ssh_port': payload['ssh_port'],
+            'ssh_username': payload['ssh_username'],
+            'ssh_enabled': payload['ssh_enabled'],
+            'vm_key': payload.get('vm_key'),
+            'vm_name': payload.get('vm_name'),
+            'vm_node': payload.get('vm_node'),
+            'vmid': payload.get('vmid'),
+            'stored_at': '2026-03-05T00:00:00Z',
+        }
+
+    monkeypatch.setattr(backend, '_save_core_credentials', _fake_save)
+
+    payload = {
+        'core': {
+            'host': 'core-host',
+            'port': 50051,
+            'ssh_host': 'core-host',
+            'ssh_port': 22,
+            'ssh_username': 'core',
+            'ssh_password': 'fresh-pass',
+            'core_secret_id': 'stale-secret',
+        },
+        'scenario_name': 'Scenario Stale Secret',
+        'scenario_index': 2,
+        'hitl_core': {
+            'vm_key': 'pve1::303',
+            'vm_node': 'pve1',
+            'vm_name': 'CORE VM 303',
+            'vmid': 303,
+            'core_secret_id': 'stale-secret',
+        },
+    }
+
+    resp = client.post('/test_core', json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['ok'] is True, data
+    assert data.get('core_secret_id') == 'secret-replaced'
+    assert saved_payloads
+    assert saved_payloads[0]['ssh_password'] == 'fresh-pass'
+    assert saved_payloads[0]['vm_key'] == 'pve1::303'
+
+
 def test_test_core_success_includes_vm_metadata(client, monkeypatch):
     monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
     monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
