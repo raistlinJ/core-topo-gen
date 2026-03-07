@@ -30365,6 +30365,15 @@ def _default_scenarios_payload_for_names(names: Iterable[Any] | None) -> Dict[st
     }
 
 
+def _empty_scenarios_payload() -> Dict[str, Any]:
+    return {
+        "scenarios": [],
+        "result_path": None,
+        "core": _default_core_dict(),
+        "host_interfaces": _enumerate_host_interfaces(),
+    }
+
+
 def _filter_scenarios_by_norms(
     scenarios: Iterable[Any],
     allowed_norms: set[str],
@@ -30431,6 +30440,8 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
         payload = {}
     else:
         payload = dict(payload)
+
+    had_explicit_scenarios_list = isinstance(payload.get('scenarios'), list)
 
     try:
         force_empty = _scenario_catalog_force_empty()
@@ -30600,8 +30611,8 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
         normalized_scenarios.append(scen_norm)
 
-    # Only fall back to default scenarios for unrestricted users.
-    if not normalized_scenarios and allowed_norms is None:
+    # Only synthesize a default scenario when the caller omitted scenarios entirely.
+    if not normalized_scenarios and allowed_norms is None and not had_explicit_scenarios_list:
         normalized_scenarios = defaults['scenarios']
 
     # If the UI is in builder mode (even for admin users previewing builder view),
@@ -36214,7 +36225,7 @@ def index():
     # Admin Scenarios editor should list the same scenarios as CORE/Reports.
     # Start from catalog names so the left-hand scenario list includes saved-but-not-executed
     # scenarios like "Scenario 1b".
-    payload = _default_scenarios_payload()
+    payload = _empty_scenarios_payload()
     force_empty = False
     try:
         role = _normalize_role_value(current.get('role')) if current else ''
@@ -36225,7 +36236,7 @@ def index():
                 payload = _default_scenarios_payload_for_names(scenario_names)
                 payload['_catalog_stub'] = True
     except Exception:
-        payload = _default_scenarios_payload()
+        payload = _empty_scenarios_payload()
     # Reconstruct base_upload if base filepath already present
     _attach_base_upload(payload)
     _hydrate_base_upload_from_disk(payload)

@@ -130,6 +130,26 @@ def test_index_preserves_empty_snapshot_on_reload(tmp_path, monkeypatch):
     assert payload.get('editor_snapshot', {}).get('scenarios') == []
 
 
+def test_index_without_catalog_or_snapshot_renders_empty_payload(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    resp = client.get('/')
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    match = re.search(r'<script id="payload-data" type="application/json">(.*?)</script>', html, re.S)
+    assert match is not None
+    payload = json.loads(match.group(1))
+    assert payload.get('scenarios') == []
+
+
 def test_save_xml_api_vulnerabilities_category_roundtrip_preserves_type_vector(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)

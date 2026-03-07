@@ -1882,7 +1882,7 @@
     function defaultScenario(name) {
         return {
             _sid: generateScenarioSid(),
-            name: name || `NewScenario${document.querySelectorAll('.scenario-card').length + 1}`,
+            name: name || `NewScenario${(Array.isArray(state?.scenarios) ? state.scenarios.length : 0) + 1}`,
             base: { filepath: '' },
             hitl: { enabled: false, interfaces: [] },
             density_count: 10,
@@ -9220,8 +9220,6 @@
         updateTopologySeedControls();
         // Ensure H/S bounds visibility reflects initial r2s_mode values
         updateHsBoundsVisibility();
-        // Ensure routing policy preview replaces the default "(pending)" label.
-        setTimeout(validateRoutingEdges, 0);
         // Enable/disable Download XML button based on saved xml path
         updateDownloadButtonState();
         // Sync Base Scenario UI with persisted metadata (independent of active scenario)
@@ -12396,6 +12394,14 @@
             appendScenarioBtn.onclick = (e) => {
                 e.preventDefault();
                 logInfo('New scenario created');
+                try {
+                    if (!Array.isArray(state.scenarios) || state.scenarios.length === 0) {
+                        deletedScenarioIds = new Set();
+                        deletedScenarioNameKeys = new Set();
+                        writeStringSetToLocalStorage(DELETED_SCENARIO_IDS_STORAGE_KEY, deletedScenarioIds);
+                        writeStringSetToLocalStorage(DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY, deletedScenarioNameKeys);
+                    }
+                } catch (e) { }
                 const newScenario = defaultScenario();
                 try {
                     newScenario.name = ensureUniqueScenarioName(newScenario.name, state.scenarios);
@@ -14864,12 +14870,6 @@
                     </table>
                 </div>
                                         <div class="text-danger small mt-1 section-warning" data-scen-idx="${activeIdx}" data-sec="${name}" style="display:none">Weights must sum to 1.000</div>
-                                        ${name === 'Routing' ? `
-                                        <div id="routingEdgesWarnings" class="alert alert-warning py-2 px-3 small mt-3 d-none"></div>
-                                        <div class="d-flex flex-wrap align-items-center gap-3 mt-3 small" id="routingEdgesSummary" style="display:none;">
-                                                <div><strong>Policy:</strong> <span data-role="edges-policy">(pending)</span></div>
-                                        </div>
-                                        ` : ''}
             </div>`;
             root.appendChild(card);
         });
@@ -15562,9 +15562,6 @@
                                 updateWeightWarning(sidx, sec);
                                 updateWeightInputsDisplay(sidx, sec);
                             }
-                            if (field === 'edges' || field === 'r2s_edges') {
-                                setTimeout(validateRoutingEdges, 20);
-                            }
                         } else if (['pattern', 'content_type', 'selected', 'script_path', 'v_name', 'v_path', 'v_count', 'v_metric', 'r2r_mode', 'r2s_mode'].includes(field)) {
                             const prev = item[field];
                             if (field === 'v_count') {
@@ -15584,17 +15581,12 @@
                                 if (el.value !== 'Exact') { delete item.edges; }
                                 renderMain();
                                 updateHsBoundsVisibility();
-                                setTimeout(validateRoutingEdges, 50);
                             }
                             if (field === 'r2s_mode') {
                                 item.r2s_mode = el.value;
                                 if (el.value !== 'Exact') { delete item.r2s_edges; }
                                 renderMain();
                                 updateHsBoundsVisibility();
-                                setTimeout(validateRoutingEdges, 50);
-                            }
-                            if (field === 'edges') {
-                                setTimeout(validateRoutingEdges, 20);
                             } else if (field === 'content_type') {
                                 // Re-render to reflect show/hide of traffic-config inputs when Random is selected
                                 renderMain();
@@ -16985,105 +16977,6 @@
             ['Node Information', 'Routing', 'Services', 'Traffic', 'Events', 'Vulnerabilities', 'Segmentation'].forEach(sec => updateWeightWarning(activeIdx, sec));
         }
     }
-    // Routing edges validation utilities
-    function validateRoutingEdges() {
-        const scen = state.scenarios[activeIdx]; if (!scen) return;
-        const routing = (scen.sections && scen.sections['Routing'] && scen.sections['Routing'].items) || [];
-        const warn = [];
-        routing.forEach((r, i) => { const m = r.r2r_mode; if (m === 'Exact' && !(r.edges >= 1)) warn.push(`Row ${i + 1}: Exact mode requires a degree ≥ 1`); });
-        routing.forEach((r, i) => { if (r.r2s_mode === 'Exact' && !(r.r2s_edges >= 1)) warn.push(`Row ${i + 1}: R-to-S Exact requires a value ≥ 1`); });
-        // Highlight inputs
-        document.querySelectorAll('.edges-degree-input').forEach(inp => {
-            const v = parseInt(inp.value, 10); const tr = inp.closest('tr');
-            const sel = tr ? tr.querySelector('[data-field="r2r_mode"]') : null;
-            const mode = sel ? sel.value : '';
-            if (mode === 'Exact' && !(v >= 1)) inp.classList.add('is-invalid'); else inp.classList.remove('is-invalid');
-        });
-        document.querySelectorAll('.r2s-degree-input').forEach(inp => {
-            const v = parseInt(inp.value, 10); const tr = inp.closest('tr');
-            const sel = tr ? tr.querySelector('[data-field="r2s_mode"]') : null;
-            const mode = sel ? sel.value : '';
-            if (mode === 'Exact' && !(v >= 1)) inp.classList.add('is-invalid'); else inp.classList.remove('is-invalid');
-        });
-        // If a separate warning container existed we could populate it here later.
-        computeRoutingEdgePolicyPreview();
-    }
-    setTimeout(validateRoutingEdges, 500);
-
-    // Derive a lightweight preview (pre-generation) of intended policy and an estimated degree band
-    function computeRoutingEdgePolicyPreview() {
-        const scen = state.scenarios[activeIdx]; if (!scen) return;
-        const routing = (scen.sections && scen.sections['Routing'] && scen.sections['Routing'].items) || [];
-        const summaryEl = document.getElementById('routingEdgesSummary');
-        if (!summaryEl) return;
-        if (!routing.length) { summaryEl.style.display = 'none'; return; }
-        // Make sure the preview is visible once we have routing rows.
-        summaryEl.style.display = 'flex';
-        // Determine target policy: Exact avg > Max > Min > Random (mirrors backend)
-        const exactVals = routing.filter(r => r.r2r_mode === 'Exact' && r.edges >= 1).map(r => r.edges);
-        let mode = 'Random'; let target = 0;
-        if (exactVals.length) {
-            target = Math.round(exactVals.reduce((a, b) => a + b, 0) / exactVals.length);
-            if (target < 1) target = 1; mode = 'Exact';
-        } else {
-            const modes = routing.map(r => r.r2r_mode).filter(Boolean);
-            if (modes.includes('Uniform')) mode = 'Uniform';
-            else if (modes.includes('Min')) mode = 'Min';
-            else if (modes.includes('NonUniform')) mode = 'NonUniform';
-            else mode = 'Random';
-        }
-        // Determine predominant R-to-S mode (simple precedence similar to R-to-R)
-        let r2sMode = 'Random';
-        const r2sExactVals = routing.filter(r => r.r2s_mode === 'Exact' && r.r2s_edges >= 1).map(r => r.r2s_edges);
-        if (r2sExactVals.length) {
-            r2sMode = 'Exact';
-        } else {
-            const r2sModes = routing.map(r => r.r2s_mode).filter(Boolean);
-            if (r2sModes.includes('Uniform')) r2sMode = 'Uniform';
-            else if (r2sModes.includes('Min')) r2sMode = 'Min';
-            else if (r2sModes.includes('NonUniform')) r2sMode = 'NonUniform';
-            else r2sMode = 'Random';
-        }
-        const policySpan = summaryEl.querySelector('[data-role="edges-policy"]');
-        if (policySpan) { policySpan.textContent = `R-R: ${mode}${mode === 'Exact' ? `(≈${target})` : ''} | R-S: ${r2sMode}`; }
-        // Estimate degree distribution preview (pure heuristic):
-        let minD = 0, avgD = 0, maxD = 0;
-        if (mode === 'Exact') { minD = target; avgD = target + 1; maxD = target + 2; }
-        else if (mode === 'Uniform') { minD = 4; avgD = 4; maxD = 5; }
-        else if (mode === 'NonUniform') { minD = 1; avgD = 3; maxD = 8; }
-        else if (mode === 'Min') { minD = 2; avgD = 3; maxD = 4; }
-        else { minD = 1; avgD = 2; maxD = 4; }
-        // Removed Min/Avg/Max and sparkline visualization per request
-        // Resource warning for Uniform (previously Max) mode – still warn if near-dense
-        const warnEl = document.getElementById('routingEdgesWarnings');
-        if (warnEl) {
-            warnEl.classList.add('d-none');
-            warnEl.innerHTML = '';
-            if (mode === 'Uniform') {
-                // Approximate router count: we don't know exact until build; use routing item count as lower bound
-                let approxRouters = routing.length || 0;
-                // If scenario embeds an explicit router count in future, prefer it; attempt common field names
-                if (typeof scen.router_count === 'number' && scen.router_count > approxRouters) approxRouters = scen.router_count;
-                if (typeof scen.routers_total === 'number' && scen.routers_total > approxRouters) approxRouters = scen.routers_total;
-                // Compute full mesh edges estimate
-                const estEdges = approxRouters > 1 ? (approxRouters * (approxRouters - 1) / 2) : 0;
-                // Thresholds: warn if routers >= 25 OR estimated edges >= 300
-                if (approxRouters >= 25 || estEdges >= 300) {
-                    const edgesFmt = estEdges.toLocaleString();
-                    warnEl.innerHTML = `<strong>Uniform Mode:</strong> balanced high degree connectivity can grow ~O(n²). With ~${approxRouters} routers this implies about ${edgesFmt} potential links. This may increase session startup time and resource usage.`;
-                    warnEl.classList.remove('d-none');
-                } else {
-                    // Light advisory (still show something so users understand cost) for smaller counts
-                    if (approxRouters >= 10) {
-                        warnEl.innerHTML = `<strong>Heads up:</strong> Uniform mode aims for evenly high degrees (approaches dense graph). Routers: ~${approxRouters}.`;
-                        warnEl.classList.remove('d-none');
-                    }
-                }
-            }
-        }
-        summaryEl.style.display = 'flex';
-    }
-
     function prepareRunCli() {
         // prefer the last saved XML path or result_path if it's XML
         const rp = state.result_path || '';
