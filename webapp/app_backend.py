@@ -44885,6 +44885,24 @@ def core_page():
         if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
             scenario_norm = _normalize_scenario_label(scenario_names[0])
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+    no_scenario_context = (not bool(scenario_names)) and (not bool(scenario_query))
+    if no_scenario_context:
+        return render_template(
+            'core.html',
+            sessions=[],
+            xmls=[],
+            host='',
+            port='',
+            scenarios=[],
+            active_scenario='',
+            core_errors=[],
+            core_grpc_command='',
+            core_vm_configured=False,
+            core_vm_summary={},
+            core_log_entries=_current_core_ui_logs(),
+            participant_url_flags=participant_url_flags,
+            no_scenario_context=True,
+        )
     core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
     core_cfg = _ensure_core_vm_metadata(core_cfg)
     host = core_cfg.get('host', CORE_HOST)
@@ -45015,6 +45033,7 @@ def core_page():
         core_vm_summary=core_vm_summary,
         core_log_entries=_current_core_ui_logs(),
         participant_url_flags=participant_url_flags,
+        no_scenario_context=False,
     )
 
 
@@ -45034,6 +45053,8 @@ def core_data():
             return False
         return default
 
+    include_xmls = _query_bool_param('include_xmls', True)
+
     history = _load_run_history()
     current_user = _current_user()
     scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
@@ -45050,6 +45071,29 @@ def core_data():
         if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
             scenario_norm = _normalize_scenario_label(scenario_names[0])
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+    no_scenario_context = (not bool(scenario_names)) and (not bool(scenario_query))
+    if no_scenario_context:
+        payload: dict[str, Any] = {
+            'sessions': [],
+            'scenarios': [],
+            'active_scenario': '',
+            'participant_url_flags': participant_url_flags,
+            'active_session_counts': {},
+            'scenario_item_counts': {},
+            'host': '',
+            'port': None,
+            'core_vm_configured': False,
+            'core_vm_summary': {},
+            'core_modal_href': url_for('index', core_modal=1),
+            'errors': [],
+            'grpc_command': '',
+            'logs': _current_core_ui_logs(),
+            'daemon_status': 'idle',
+            'no_scenario_context': True,
+        }
+        if include_xmls:
+            payload['xmls'] = []
+        return jsonify(payload)
     core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
     core_cfg = _ensure_core_vm_metadata(core_cfg)
     host = core_cfg.get('host', CORE_HOST)
@@ -45066,8 +45110,6 @@ def core_data():
         core_cfg.get('ssh_port'),
     )
     session_meta: Dict[str, Any] = {}
-    include_xmls = _query_bool_param('include_xmls', True)
-
     sessions = _list_active_core_sessions(host, port, core_cfg, errors=core_errors, meta=session_meta)
     grpc_command = session_meta.get('grpc_command')
     app.logger.info('[core.data] session_count=%d', len(sessions))
@@ -45330,6 +45372,7 @@ def core_data():
         'grpc_command': grpc_command,
         'logs': _current_core_ui_logs(),
         'daemon_status': daemon_status,
+        'no_scenario_context': False,
     }
     if include_xmls:
         payload['xmls'] = xmls or []

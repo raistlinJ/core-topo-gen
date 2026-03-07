@@ -6,7 +6,7 @@
 {% block header_right_extra %}
 {% set current_role = (current_user.role|default('')|lower) if (current_user is defined and
 current_user.is_authenticated) else '' %}
-{% set hide_daemon_badge = is_builder_view or current_role == 'builder' %}
+{% set hide_daemon_badge = is_builder_view or current_role == 'builder' or no_scenario_context %}
 <div class="d-flex align-items-center gap-3 small flex-wrap justify-content-end">
   <div class="d-flex align-items-center gap-2">
     <label for="refreshInterval" class="form-label mb-0 text-white">Every</label>
@@ -266,7 +266,7 @@ current_user.is_authenticated) else '' %}
   </div>
 </div>
 <div id="coreErrorContainer" class="mb-3">
-  {% if core_errors and not is_builder_view %}
+  {% if (not no_scenario_context) and core_errors and not is_builder_view %}
   <div class="alert alert-danger" role="alert">
     <div class="fw-bold">CORE connection issues</div>
     <ul class="mb-0">
@@ -279,7 +279,8 @@ current_user.is_authenticated) else '' %}
 </div>
 {% set has_core_errors = core_errors|default([])|length > 0 %}
 <div id="coreVmBannerContainer">
-  {% if core_vm_configured and core_vm_summary and not has_core_errors %}
+  {% if no_scenario_context %}
+  {% elif core_vm_configured and core_vm_summary and not has_core_errors %}
   <div class="alert alert-success" role="status">
     <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
       <div class="flex-grow-1">
@@ -592,6 +593,10 @@ current_user.is_authenticated) else '' %}
     const container = document.getElementById('coreVmBannerContainer');
     if (!container) return;
     if (isBuilderView) return;
+    if (payload && payload.no_scenario_context) {
+      container.innerHTML = '';
+      return;
+    }
 
     const errs = Array.isArray(payload?.errors) ? payload.errors : [];
     const hasErrs = errs.length > 0;
@@ -1147,13 +1152,19 @@ current_user.is_authenticated) else '' %}
       }
       try {
         renderCoreVmBanner(data);
+        const daemonBadge = document.getElementById('coreDaemonBadge');
+        if (daemonBadge) {
+          daemonBadge.classList.toggle('d-none', !!data.no_scenario_context);
+        }
         const daemon = document.getElementById('coreDaemonHostPort');
         if (daemon && data.host && data.port) {
           daemon.textContent = `${data.host}:${data.port}`;
+        } else if (daemon && data.no_scenario_context) {
+          daemon.textContent = '';
         }
 
         // Check for daemon down status
-        if (data.daemon_status === 'down') {
+        if (!data.no_scenario_context && data.daemon_status === 'down') {
           const tEl = document.getElementById('cdmTarget');
           if (tEl) tEl.textContent = (data.host && data.port) ? `${data.host}:${data.port}` : 'unknown';
 

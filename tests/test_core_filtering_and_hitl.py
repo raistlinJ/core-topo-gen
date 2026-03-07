@@ -102,6 +102,35 @@ def test_core_data_can_omit_xmls_payload(tmp_path, monkeypatch):
     assert 'xmls' not in payload
 
 
+def test_core_data_with_no_scenarios_skips_core_lookup(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp import app_backend as backend
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    run_history_path = outdir / 'run_history.json'
+    monkeypatch.setattr(backend, 'RUN_HISTORY_PATH', str(run_history_path))
+    run_history_path.write_text('[]', encoding='utf-8')
+
+    def fail_list_active_core_sessions(*args, **kwargs):
+        raise AssertionError('CORE session lookup should not run with no scenarios')
+
+    monkeypatch.setattr(backend, '_list_active_core_sessions', fail_list_active_core_sessions)
+
+    resp = client.get('/core/data')
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload.get('no_scenario_context') is True
+    assert payload.get('sessions') == []
+    assert payload.get('errors') == []
+    assert payload.get('host') == ''
+    assert payload.get('port') is None
+
+
 def test_core_stop_redirect_preserves_scenario(monkeypatch):
     client = app.test_client()
     _login(client)
