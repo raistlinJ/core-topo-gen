@@ -25895,7 +25895,7 @@ def _build_editor_snapshot_payload(raw_state: Any) -> Optional[Dict[str, Any]]:
         sanitized = _sanitize_snapshot_scenario(scen)
         if sanitized:
             sanitized_scenarios.append(sanitized)
-    if not sanitized_scenarios:
+    if scenarios_raw and not sanitized_scenarios:
         return None
     snapshot: Dict[str, Any] = {'scenarios': sanitized_scenarios}
     core_meta = _normalize_core_config(raw_state.get('core'), include_password=True)
@@ -30474,7 +30474,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
     # --- Scenarios ---
     scenarios_raw = payload.get('scenarios')
-    if not isinstance(scenarios_raw, list) or not scenarios_raw:
+    if not isinstance(scenarios_raw, list):
         # For actual restricted roles (builder/participant), an empty assignment list
         # should result in an empty scenario list ("all or none" visibility).
         scenarios_raw = defaults['scenarios'] if allowed_norms is None else []
@@ -36243,6 +36243,8 @@ def index():
         snapshot = _load_editor_state_snapshot(current)
         if snapshot:
             payload['editor_snapshot'] = snapshot
+            if not payload.get('result_path') and isinstance(snapshot.get('scenarios'), list) and not snapshot.get('scenarios'):
+                payload['scenarios'] = []
             if snapshot.get('result_path') and not payload.get('result_path'):
                 payload['result_path'] = snapshot.get('result_path')
             if snapshot.get('project_key_hint') and not payload.get('project_key_hint'):
@@ -36535,20 +36537,23 @@ def save_xml():
                 # Default to first scenario when active_index is missing/invalid.
                 active_out_path = next(iter(scenario_paths_map.values()))
         else:
-            flash('No scenarios to save.')
-            return redirect(url_for('index'))
+            out_path = None
         out_path = active_out_path
         try:
-            app.logger.info('[save_xml] wrote %s scenario xml files under %s', len(scenario_paths_map) or 1, out_dir)
+            if scenario_paths_map:
+                app.logger.info('[save_xml] wrote %s scenario xml files under %s', len(scenario_paths_map), out_dir)
+            else:
+                app.logger.info('[save_xml] persisted empty scenario state with no xml output')
         except Exception:
             pass
         # Read back XML content for preview
         xml_text = ""
-        try:
-            with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
-                xml_text = f.read()
-        except Exception:
-            xml_text = ""
+        if out_path:
+            try:
+                with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    xml_text = f.read()
+            except Exception:
+                xml_text = ""
         try:
             names_for_catalog = [name for name in scenario_names_desc if isinstance(name, str) and name.strip()]
             if names_for_catalog:
@@ -36558,7 +36563,7 @@ def save_xml():
         if out_path:
             flash(f'Scenarios saved (per-scenario). Active XML: {os.path.basename(out_path)}')
         else:
-            flash('Scenarios saved (per-scenario).')
+            flash('Empty scenario state saved.')
         payload = {
             'scenarios': data.get('scenarios', []),
             'result_path': out_path,
@@ -36857,10 +36862,13 @@ def save_xml_api():
             if active_out_path is None and scenario_paths_map:
                 active_out_path = next(iter(scenario_paths_map.values()))
         else:
-            return jsonify({ 'ok': False, 'error': 'No scenarios to save' }), 400
+            active_out_path = None
         out_path = active_out_path
         try:
-            app.logger.info('[save_xml_api] wrote %s scenario xml files under %s', len(scenario_paths_map) or 1, out_dir)
+            if scenario_paths_map:
+                app.logger.info('[save_xml_api] wrote %s scenario xml files under %s', len(scenario_paths_map), out_dir)
+            else:
+                app.logger.info('[save_xml_api] persisted empty scenario state with no xml output')
         except Exception:
             pass
         resp_core = _normalize_core_config(normalized_core or core_meta or {}, include_password=False) if (normalized_core or core_meta) else _default_core_dict()
@@ -36872,8 +36880,7 @@ def save_xml_api():
             'project_key_hint': project_key_hint or out_path,
         }
         try:
-            if scenario_paths_by_index:
-                snapshot_source['saved_xml_paths_by_index'] = scenario_paths_by_index
+            snapshot_source['saved_xml_paths_by_index'] = scenario_paths_by_index
         except Exception:
             pass
         if scenario_query_hint:
@@ -36899,8 +36906,7 @@ def save_xml_api():
         response_payload = { 'ok': True, 'result_path': out_path, 'core': resp_core }
         if scenario_paths_map:
             response_payload['scenario_paths'] = scenario_paths_map
-        if scenario_paths_by_index:
-            response_payload['scenario_paths_by_index'] = scenario_paths_by_index
+        response_payload['scenario_paths_by_index'] = scenario_paths_by_index
         if active_index is not None and 0 <= active_index < len(scenarios):
             try:
                 active_name = str((scenarios[active_index] or {}).get('name') or '').strip()

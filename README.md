@@ -16,6 +16,7 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 
 ## Highlights
 - **Single-source planning** – edit scenarios in the browser or any XML editor and reproduce results with the CLI.
+- **Flexible editor state** – the Web UI can intentionally hold zero scenarios while you clear or stage a project; XML is produced only after at least one scenario exists.
 - **Deterministic previews** – optional RNG seed locks in host expansion, router placement, connectivity, services, segmentation, and vulnerability assignment.
 - **Live log dock** – stream run output, filter by level or text/regex, and toggle auto-follow for long runs.
 - **Rich topology policies** – per-routing-item R2R meshes, R2S aggregation, host grouping bounds, and switch re-homing.
@@ -56,6 +57,7 @@ make run-web-local-bg
 make run-web-remote-bg CORE_REMOTE_HOST=10.0.0.50 CORE_REMOTE_PORT=50051
 ```
 - Local mode UX guard: CORE endpoint fields (`gRPC host/port`, `SSH host/port`) are pinned to localhost values and rendered read-only in the CORE Connection modal.
+- Scenario editor note: removing the final scenario now leaves the editor in an empty state instead of auto-creating a replacement scenario.
 - Run HTTPS Web UI with Docker Compose:
 ```bash
 docker compose up -d --build

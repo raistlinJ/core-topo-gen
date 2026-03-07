@@ -1,6 +1,6 @@
 # Simple developer conveniences
 
-.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend ensure-webui-deps run-web run-web-local run-web-remote run-web-local-bg run-web-remote-bg
+.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend ensure-webui-deps clear-runtime-data run-web run-web-local run-web-remote run-web-local-bg run-web-remote-bg
 
 CERT_SANS?=DNS:localhost,IP:127.0.0.1
 CERT_SUBJECT?=/CN=localhost
@@ -171,6 +171,9 @@ ensure-webui-deps:
 	else \
 	  exit 1; \
 	fi
+
+clear-runtime-data:
+	@bash scripts/clear_runtime_data.sh
 
 run-web-local:
 	@$(MAKE) ensure-webui-deps

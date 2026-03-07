@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from webapp.app_backend import app
 
 
@@ -48,6 +49,85 @@ def test_save_xml_api_writes_file(tmp_path, monkeypatch):
     path = data.get('result_path')
     assert path and os.path.isabs(path)
     assert os.path.exists(path)
+
+
+def test_save_xml_api_accepts_empty_scenarios_and_persists_snapshot(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {"scenarios": [], "active_index": 0}
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data.get('ok') is True
+    assert data.get('result_path') is None
+    assert data.get('scenario_paths_by_index') == []
+
+    snapshot = backend._load_editor_state_snapshot({'username': 'coreadmin', 'role': 'admin'})
+    assert snapshot is not None
+    assert snapshot.get('scenarios') == []
+    assert snapshot.get('result_path') is None
+
+
+def test_editor_snapshot_api_accepts_empty_scenario_list(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    resp = client.post(
+        '/api/editor_snapshot',
+        data=json.dumps({"scenarios": [], "active_index": 0}),
+        content_type='application/json',
+    )
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data == {'success': True}
+
+    snapshot = backend._load_editor_state_snapshot({'username': 'coreadmin', 'role': 'admin'})
+    assert snapshot is not None
+    assert snapshot.get('scenarios') == []
+
+
+def test_index_preserves_empty_snapshot_on_reload(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    saved = client.post(
+        '/api/editor_snapshot',
+        data=json.dumps({"scenarios": [], "active_index": 0}),
+        content_type='application/json',
+    )
+    assert saved.status_code == 200
+
+    resp = client.get('/')
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    match = re.search(r'<script id="payload-data" type="application/json">(.*?)</script>', html, re.S)
+    assert match is not None
+    payload = json.loads(match.group(1))
+    assert payload.get('scenarios') == []
+    assert payload.get('editor_snapshot', {}).get('scenarios') == []
 
 
 def test_save_xml_api_vulnerabilities_category_roundtrip_preserves_type_vector(tmp_path, monkeypatch):

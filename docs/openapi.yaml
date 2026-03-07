@@ -564,6 +564,75 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SaveXmlApiResponse'
+  /api/scenario/latest_xml:
+    get:
+      tags:
+        - Scenario Editor
+      summary: Get the latest saved XML path for a scenario
+      parameters:
+        - name: scenario
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Latest XML path for the scenario.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LatestScenarioXmlResponse'
+        '400':
+          description: Missing scenario name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No XML found for the scenario.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/scenario/latest_state:
+    get:
+      tags:
+        - Scenario Editor
+      summary: Parse the latest saved scenario state from XML
+      description: >-
+        Returns the editor-shaped scenario JSON plus the top-level core configuration for the
+        requested scenario. This is useful for round-tripping saved XML back into structured state.
+      parameters:
+        - name: scenario
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: xml_path
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional explicit XML path to parse instead of the latest saved XML.
+      responses:
+        '200':
+          description: Parsed scenario state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LatestScenarioStateResponse'
+        '400':
+          description: Missing scenario name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: XML not found or scenario missing from XML.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/host_interfaces:
     get:
       tags:
@@ -692,6 +761,10 @@ paths:
       tags:
         - Planning
       summary: Generate a deterministic full preview plan
+      description: >-
+        Computes a dry-run topology and services preview without starting a CORE session.
+        Clients may either provide `xml_path` for an existing saved scenario XML or send inline
+        `scenarios` plus optional `core` to have the server render a temporary XML for preview.
       requestBody:
         required: true
         content:
@@ -717,6 +790,105 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PlanPreviewResponse'
+  /api/plan/persist_flow_plan:
+    post:
+      tags:
+        - Planning
+      summary: Persist preview metadata into XML
+      description: >-
+        Computes the full preview for a saved XML and persists preview metadata back into the XML
+        so Flow preview endpoints can reuse it later.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersistFlowPlanRequest'
+      responses:
+        '200':
+          description: Preview metadata persisted into XML.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistFlowPlanResponse'
+        '400':
+          description: Missing XML path.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Unexpected planning failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/planner/ensure_plan:
+    post:
+      tags:
+        - Planning
+      summary: Ensure preview metadata exists for XML
+      description: >-
+        Planner helper that computes preview metadata for a saved XML and returns the resolved
+        XML path, scenario, seed, and preview-plan path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersistFlowPlanRequest'
+      responses:
+        '200':
+          description: Preview metadata ensured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistFlowPlanResponse'
+        '400':
+          description: Missing XML path.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Unexpected planning failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/planner/latest_plan:
+    get:
+      tags:
+        - Planning
+      summary: Resolve the latest XML for a scenario
+      description: >-
+        Returns the latest XML path associated with the scenario. Preview metadata is embedded in
+        XML, so `preview_plan_path` currently points at the XML file itself.
+      parameters:
+        - name: scenario
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Latest XML resolved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersistFlowPlanResponse'
+        '400':
+          description: Missing scenario name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No XML found for the scenario.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/flag-sequencing/attackflow_preview:
     get:
@@ -822,6 +994,49 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/flag-sequencing/latest_preview_plan:
+    get:
+      tags:
+        - Flag Sequencing
+      summary: Locate the latest Flow-eligible preview metadata for a scenario
+      parameters:
+        - name: scenario
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: xml_path
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional XML path hint to prefer over the latest saved XML.
+      responses:
+        '200':
+          description: Preview metadata status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LatestPreviewPlanResponse'
+        '400':
+          description: Missing scenario name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No saved XML with preview metadata found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: CORE VM has not been validated for Flow preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/flag-sequencing/prepare_preview_for_execute:
     post:
       tags:
@@ -898,6 +1113,74 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '422':
           description: Invalid chain or generator assignment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/save_flow_state_to_xml:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Persist FlowState into scenario XML
+      description: >-
+        Writes the current Flow state into the selected scenario inside the XML file. This is the
+        persistence step that makes saved Flow chains round-trip with Scenario Editor XML.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveFlowStateToXmlRequest'
+      responses:
+        '200':
+          description: Flow state saved into XML.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SaveFlowStateToXmlResponse'
+        '400':
+          description: Missing XML path or flow state payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: XML update failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/revalidate_flow:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Revalidate saved Flow outputs in XML
+      description: >-
+        Validates Flow artifacts already saved in XML. Useful after persisting FlowState to confirm
+        that resolved outputs and assignments are still structurally valid.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevalidateFlowRequest'
+      responses:
+        '200':
+          description: Flow validation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevalidateFlowResponse'
+        '400':
+          description: Missing scenario or saved Flow outputs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: XML not found for the scenario.
           content:
             application/json:
               schema:
@@ -2443,6 +2726,43 @@ components:
         error:
           type: string
           description: Error message when `ok` is false.
+    LatestScenarioXmlResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+        xml_path:
+          type: string
+        error:
+          type: string
+    LatestScenarioStateResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+        scenario_norm:
+          type: string
+        xml_path:
+          type: string
+        xml_mtime:
+          type: number
+        scenario_state:
+          type: object
+          additionalProperties: true
+        core:
+          type: object
+          nullable: true
+          additionalProperties: true
+        error:
+          type: string
     ProxmoxInterfaceMapping:
       type: object
       properties:
@@ -2577,12 +2897,21 @@ components:
       additionalProperties: true
     PlanPreviewRequest:
       type: object
-      required:
-        - xml_path
       properties:
         xml_path:
           type: string
-          description: Absolute path to the Scenario Editor XML file.
+          description: Absolute path to the Scenario Editor XML file. Optional when inline `scenarios` are provided.
+        scenarios:
+          type: array
+          description: Inline Scenario Editor payload used to render a temporary XML for preview.
+          items:
+            type: object
+            additionalProperties: true
+        core:
+          type: object
+          nullable: true
+          description: Optional top-level core connection/settings payload used when rendering inline scenarios.
+          additionalProperties: true
         scenario:
           type: string
           description: Specific scenario name to plan (defaults to the first scenario).
@@ -2616,10 +2945,49 @@ components:
           type: object
           additionalProperties: true
           description: Section breakdowns (routers, services, vulnerabilities, segmentation, traffic).
+        flow_meta:
+          type: object
+          additionalProperties: true
+          description: Flow state metadata attached to the preview when available.
         error:
           type: string
       required:
         - ok
+    PersistFlowPlanRequest:
+      type: object
+      required:
+        - xml_path
+      properties:
+        xml_path:
+          type: string
+          description: Absolute path to the Scenario Editor XML file.
+        scenario:
+          type: string
+          nullable: true
+        seed:
+          type: integer
+          nullable: true
+    PersistFlowPlanResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        xml_path:
+          type: string
+          nullable: true
+        scenario:
+          type: string
+          nullable: true
+        seed:
+          type: integer
+          nullable: true
+        preview_plan_path:
+          type: string
+          nullable: true
+        error:
+          type: string
     RunCliAsyncRequest:
       type: object
       required:
@@ -3309,6 +3677,41 @@ components:
           nullable: true
           additionalProperties: true
       additionalProperties: true
+    LatestPreviewPlanResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+          nullable: true
+        preview_plan_path:
+          type: string
+          nullable: true
+        preview_source:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+          additionalProperties: true
+        docker_count:
+          type: integer
+          nullable: true
+        vuln_count:
+          type: integer
+          nullable: true
+        flow_eligible:
+          type: boolean
+          nullable: true
+        core_validated:
+          type: boolean
+          nullable: true
+        error:
+          type: string
+      additionalProperties: true
 
     PreparePreviewForExecuteRequest:
       type: object
@@ -3354,6 +3757,61 @@ components:
       properties:
         ok:
           type: boolean
+      additionalProperties: true
+    SaveFlowStateToXmlRequest:
+      type: object
+      required:
+        - xml_path
+      properties:
+        xml_path:
+          type: string
+        scenario:
+          type: string
+          nullable: true
+        flow_state:
+          type: object
+          nullable: true
+          additionalProperties: true
+        clear:
+          type: boolean
+          nullable: true
+    SaveFlowStateToXmlResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        xml_path:
+          type: string
+          nullable: true
+        error:
+          type: string
+    RevalidateFlowRequest:
+      type: object
+      required:
+        - scenario
+      properties:
+        scenario:
+          type: string
+        xml_path:
+          type: string
+          nullable: true
+        flag_assignments:
+          type: array
+          nullable: true
+          items:
+            type: object
+            additionalProperties: true
+    RevalidateFlowResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
       additionalProperties: true
 
     AfbFromChainRequest:

@@ -29,6 +29,8 @@ Run the backend directly for local development:
 uv run python webapp/app_backend.py
 ```
 - Visit `http://localhost:9090`.
+- The Scenarios editor can be empty. If you delete the last scenario, the UI keeps an empty project until you create or import another scenario.
+- Saving an empty editor snapshot preserves that state, but no scenario XML is generated until at least one scenario exists.
 - For HTTPS + reverse proxy mode, use [HTTPS via Docker Compose](#https-via-docker-compose).
 - HITL editor note: the “Attach to” dropdown offers `Existing Router`, `Existing Switch`, or `New Router`. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
 
@@ -50,6 +52,7 @@ Validate a running scenario via Web UI APIs:
 latest_xml=$(ls -1t outputs/scenarios-*/Anatest.xml 2>/dev/null | head -n 1)
 ./.venv312/bin/python scripts/validate_scenario_runtime.py "$latest_xml" --username coreadmin --password coreadmin --verbose
 ```
+- This requires a saved scenario XML. An empty editor project does not create an XML file.
 - Default is **strict mode**: also requires latest execute `validation_summary` counters to be zero (`missing_nodes`, `docker_not_running`, `injects_missing`, `generator_outputs_missing`, `generator_injects_missing`).
 - Use `--no-strict` for baseline-only checks:
 ```bash

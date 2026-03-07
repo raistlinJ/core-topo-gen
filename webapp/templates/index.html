@@ -1436,7 +1436,6 @@
                 }
             });
             if (!state.scenarios.length) {
-                state.scenarios.push(defaultScenario());
                 activeIdx = 0;
             } else if (activeIdx >= state.scenarios.length) {
                 activeIdx = Math.max(0, state.scenarios.length - 1);
@@ -4732,7 +4731,7 @@
     }
 
     // Base state is from server payload or default
-    let state = initialPayload ?? { scenarios: [defaultScenario('NewScenario')], result_path: null };
+    let state = initialPayload ?? { scenarios: [], result_path: null };
     // Expose live in-memory state to shared cross-tab helpers (Topology/Flow/Preview).
     // Note: `let state = ...` does not create `window.state`, so helpers in other templates
     // cannot see it unless we explicitly attach it.
@@ -5065,8 +5064,8 @@
                 state.scenarios = fallbackScenarios;
                 try { logWarn(`[topology] Recovered scenarios from fallback snapshot (count=${fallbackScenarios.length}).`); } catch (e) { }
             } else {
-                state.scenarios = [defaultScenario('NewScenario')];
-                try { logWarn('[topology] No scenarios found; inserted default scenario.'); } catch (e) { }
+                state.scenarios = [];
+                try { logInfo('[topology] No scenarios found; preserving empty editor state.'); } catch (e) { }
             }
         }
     } catch (e) {
@@ -7632,6 +7631,27 @@
                 const persistFlowPlanAfterSave = async () => {
                     try {
                         const rp = String(state?.result_path || '').trim();
+                const clearSavedXmlState = () => {
+                    try { logInfo('[xml-save] Clearing saved XML state for empty scenario set'); } catch (e) { }
+                    try {
+                        state.result_path = null;
+                        state.result_path_scenario = '';
+                        state.saved_xml_paths_by_index = [];
+                        if (Array.isArray(state.scenarios)) {
+                            state.scenarios.forEach((scen) => {
+                                if (!scen || typeof scen !== 'object') return;
+                                delete scen.saved_xml_path;
+                            });
+                        }
+                    } catch (e) { }
+                    try {
+                        const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+                        if (xmlPathInput) xmlPathInput.value = '';
+                    } catch (e) { }
+                    try { updateDownloadButtonState(); } catch (e) { }
+                    try { refreshXmlDockPreview({ force: true }); } catch (e) { }
+                    persistEditorState();
+                };
                         if (!rp || !rp.endsWith('.xml')) return;
                         const activeScenario = state?.scenarios?.[activeIdx];
                         const scenarioName = (activeScenario && activeScenario.name) ? String(activeScenario.name).trim() : '';
@@ -7700,6 +7720,8 @@
                         if (data.result_path) {
                             applyResultPath(data.result_path, data.active_scenario || '');
                             try { logInfo(`[xml-save] Saved XML path: ${data.result_path}`); } catch (e) { }
+                        } else if (!Array.isArray(state.scenarios) || !state.scenarios.length) {
+                            clearSavedXmlState();
                         }
                         if (data.scenario_paths_by_index) {
                             try { applyScenarioSavedPaths(data.scenario_paths_by_index); } catch (e) { }
@@ -7982,7 +8004,9 @@
         return '';
     };
 
-    let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.length || 1) - 1);
+    let activeIdx = state.scenarios.length
+        ? Math.min(Math.max(0, persistedActiveIdx), state.scenarios.length - 1)
+        : 0;
     try {
         const preferredScenarioName = resolvePreferredScenarioNameOnLoad();
         const preferredIdx = findScenarioIndexByName(preferredScenarioName);
@@ -11963,8 +11987,6 @@
         });
         selectedScenarioIds.clear();
         if (!state.scenarios.length) {
-            // Always keep at least one blank scenario to avoid empty editor state hassles
-            state.scenarios.push(defaultScenario());
             activeIdx = 0;
         } else {
             if (activeIdx >= state.scenarios.length) activeIdx = state.scenarios.length - 1;
@@ -12357,6 +12379,12 @@
             };
             list.appendChild(a);
         });
+        if (!state.scenarios.length) {
+            const empty = document.createElement('div');
+            empty.className = 'list-group-item text-muted small';
+            empty.textContent = 'No scenarios yet. Create one or import XML.';
+            list.appendChild(empty);
+        }
         const appendScenarioBtn = document.getElementById('appendScenarioBtn');
         const importBtn = document.getElementById('importBtn');
         const exportBtn = document.getElementById('exportBtn');
@@ -18410,6 +18438,12 @@
         // Only require verification when the button is actually "Execute".
         const label = (btn.textContent || '').toString().trim().toLowerCase();
         const isExecute = label === 'execute';
+        const hasActiveScenario = Number.isInteger(getActiveScenarioContext().idx);
+        if (!hasActiveScenario) {
+            btn.disabled = true;
+            btn.setAttribute('title', 'Create or import a scenario first.');
+            return;
+        }
         if (!isExecute) {
             btn.disabled = false;
             btn.removeAttribute('title');

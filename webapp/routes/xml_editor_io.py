@@ -190,22 +190,25 @@ def register(
                 if active_out_path is None and scenario_paths_map:
                     active_out_path = next(iter(scenario_paths_map.values()))
             else:
-                flash('No scenarios to save.')
-                return redirect(url_for('index'))
+                out_path = None
 
             out_path = active_out_path
             try:
                 if log is not None:
-                    log.info('[save_xml] wrote %s scenario xml files under %s', len(scenario_paths_map) or 1, out_dir)
+                    if scenario_paths_map:
+                        log.info('[save_xml] wrote %s scenario xml files under %s', len(scenario_paths_map), out_dir)
+                    else:
+                        log.info('[save_xml] persisted empty scenario state with no xml output')
             except Exception:
                 pass
 
             xml_text = ''
-            try:
-                with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    xml_text = f.read()
-            except Exception:
-                xml_text = ''
+            if out_path:
+                try:
+                    with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        xml_text = f.read()
+                except Exception:
+                    xml_text = ''
             try:
                 names_for_catalog = [name for name in scenario_names_desc if isinstance(name, str) and name.strip()]
                 if names_for_catalog:
@@ -215,7 +218,7 @@ def register(
             if out_path:
                 flash(f'Scenarios saved (per-scenario). Active XML: {os.path.basename(out_path)}')
             else:
-                flash('Scenarios saved (per-scenario).')
+                flash('Empty scenario state saved.')
             payload = {
                 'scenarios': data.get('scenarios', []),
                 'result_path': out_path,
@@ -848,11 +851,14 @@ def register(
                 if active_out_path is None and scenario_paths_map:
                     active_out_path = next(iter(scenario_paths_map.values()))
             else:
-                return jsonify({'ok': False, 'error': 'No scenarios to save'}), 400
+                active_out_path = None
             out_path = active_out_path
             try:
                 if log is not None:
-                    log.info('[save_xml_api] wrote %s scenario xml files under %s', len(scenario_paths_map) or 1, out_dir)
+                    if scenario_paths_map:
+                        log.info('[save_xml_api] wrote %s scenario xml files under %s', len(scenario_paths_map), out_dir)
+                    else:
+                        log.info('[save_xml_api] persisted empty scenario state with no xml output')
             except Exception:
                 pass
             resp_core = normalize_core_config(normalized_core or core_meta or {}, include_password=False) if (normalized_core or core_meta) else default_core_dict()
@@ -864,8 +870,7 @@ def register(
                 'project_key_hint': project_key_hint or out_path,
             }
             try:
-                if scenario_paths_by_index:
-                    snapshot_source['saved_xml_paths_by_index'] = scenario_paths_by_index
+                snapshot_source['saved_xml_paths_by_index'] = scenario_paths_by_index
             except Exception:
                 pass
             if scenario_query_hint:
@@ -892,8 +897,7 @@ def register(
             response_payload = {'ok': True, 'result_path': out_path, 'core': resp_core}
             if scenario_paths_map:
                 response_payload['scenario_paths'] = scenario_paths_map
-            if scenario_paths_by_index:
-                response_payload['scenario_paths_by_index'] = scenario_paths_by_index
+            response_payload['scenario_paths_by_index'] = scenario_paths_by_index
             if active_index is not None and 0 <= active_index < len(scenarios):
                 try:
                     active_name = str((scenarios[active_index] or {}).get('name') or '').strip()

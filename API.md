@@ -64,10 +64,24 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 : Multipart upload (`scenarios_xml` `.xml` file). Loads the file into the editor state and renders the main page.
 
 `POST /save_xml`
-: Form field `scenarios_json` (stringified JSON). Persists the editor payload to `outputs/scenarios-<timestamp>/scenarios.xml` and re-renders the editor. The saved XML includes additive planning attributes (`base_nodes`, `combined_nodes`, `explicit_count`, etc.) for lossless round-tripping.
+: Form field `scenarios_json` (stringified JSON). Persists the editor payload and re-renders the editor.
+
+- When `scenarios` contains one or more entries, the server writes per-scenario XML files under `outputs/scenarios-<timestamp>/`.
+- When `scenarios` is empty, the server preserves the empty editor snapshot and returns the editor view without generating XML.
+- Saved XML includes additive planning attributes (`base_nodes`, `combined_nodes`, `explicit_count`, etc.) for lossless round-tripping.
 
 `POST /save_xml_api`
-: JSON body `{ "scenarios": [...], "active_index"?: int }`. Returns `{ "ok": true, "result_path": ".../scenarios.xml" }` on success or `{ "ok": false, "error": "..." }` with HTTP 400/500 on failure.
+: JSON body `{ "scenarios": [...], "active_index"?: int }`.
+
+- With one or more scenarios, returns `{ "ok": true, "result_path": "/abs/path.xml", "scenario_paths_by_index": [...] }`.
+- With zero scenarios, returns `{ "ok": true, "result_path": null, "scenario_paths_by_index": [] }` and persists the empty editor snapshot without generating XML.
+- Invalid payloads still return `{ "ok": false, "error": "..." }` with HTTP 400/500.
+
+`GET /api/scenario/latest_xml`
+: Query `scenario=<name>`. Returns the latest saved XML path for the scenario: `{ "ok": true, "scenario": "...", "xml_path": "/abs/path.xml" }`.
+
+`GET /api/scenario/latest_state`
+: Query `scenario=<name>` and optional `xml_path=<abs_path>`. Returns the parsed scenario JSON state that the editor uses, plus top-level `core` settings. This is the easiest way for an LLM client to round-trip a saved XML back into structured JSON.
 
 Flow-state persistence notes for `save_xml` / `save_xml_api`:
 - When topology/IP planning changes are detected for a scenario, the server marks `flow_state.topology_dirty=true` and clears chain payload fields (`chain_ids=[]`, `length=0`, `flag_assignments=[]`, `flags_enabled=false`) so stale chains are not reused.
@@ -103,6 +117,19 @@ Generates a deterministic planning preview without starting a CORE session.
 	"seed": 12345                        // optional; random when omitted (returned in response)
 }
 ```
+
+JSON-first preview is also supported without saving XML first:
+
+```json
+{
+	"scenarios": [{ "name": "Scenario 1", "node_info": {}, "routing": {}, "flow_state": {} }],
+	"core": { "host": "127.0.0.1", "port": 50051 },
+	"scenario": "Scenario 1",
+	"seed": 12345
+}
+```
+
+When `xml_path` is omitted and `scenarios` is provided, the server renders a temporary XML internally, computes the preview, and returns the same response shape. This is the most useful backend entry point for an LLM that wants to validate scenario structure before persisting XML.
 
 **Response JSON**
 
@@ -146,6 +173,15 @@ Generates a deterministic planning preview without starting a CORE session.
 - Exact aggregation (`r2s_mode=Exact` and `r2s_edges=1`) collapses hosts behind a single switch and ignores bounds.
 - Preview responses are cached; purge `outputs/plan_cache.json` to invalidate.
 
+`POST /api/plan/persist_flow_plan`
+: Request JSON `{ "xml_path": "/abs/path.xml", "scenario"?: "Name", "seed"?: 12345 }`. Computes the full preview and persists `PlanPreview` metadata into the XML. Returns `{ "ok": true, "xml_path": "...", "scenario": "...", "seed": 12345, "preview_plan_path": "/abs/path.xml" }`.
+
+`POST /api/planner/ensure_plan`
+: Lightweight helper that ensures a preview plan exists for a saved XML without writing extra plan files. Returns the same shape as `persist_flow_plan`.
+
+`GET /api/planner/latest_plan`
+: Query `scenario=<name>`. Returns the latest XML path associated with the scenario. Despite the name, `preview_plan_path` currently points at the scenario XML file because preview metadata is embedded in XML.
+
 ### Flag Sequencing (Flow)
 
 These endpoints power the **Flow** page (Flag Sequencing) in the Web UI.
@@ -159,6 +195,9 @@ Important notes:
 
 `GET /api/flag-sequencing/attackflow_preview`
 : Returns a chain preview derived from the latest preview plan for the scenario. Response includes `chain`, `flag_assignments`, and validity metadata (`flow_valid`, `flow_errors`, `flags_enabled`).
+
+`GET /api/flag-sequencing/latest_preview_plan`
+: Query `scenario=<name>` and optional `xml_path=<abs_path>`. Returns whether the latest XML for that scenario already contains Flow-eligible preview metadata. This is a useful readiness check before asking for an attack-flow preview.
 
 Common query params:
 - `scenario=<name>` (optional; best to provide explicitly)
@@ -238,9 +277,39 @@ Request JSON (typical):
 `POST /api/flag-sequencing/upload_flow_inject_file`
 : Uploads a file for `inject_files_override`. Returns an `inject_value` token (`upload:<abs_path>`) that can be used in the override list.
 
+`POST /api/flag-sequencing/save_flow_state_to_xml`
+: Request JSON `{ "xml_path": "/abs/path.xml", "scenario": "Name", "flow_state": {...} }` or `{ "xml_path": "/abs/path.xml", "scenario": "Name", "clear": true }`. Persists the current Flow state directly into the XML under the scenario’s `FlagSequencing/FlowState` section. This is the endpoint that makes Flow assignments round-trip with saved XML.
+
+`POST /api/flag-sequencing/revalidate_flow`
+: Revalidates saved Flow outputs already embedded in XML. Use this after `save_flow_state_to_xml` if you want the backend to confirm the saved artifacts are still structurally valid.
+
 Deprecated endpoints (removed):
 - `POST /api/flag-sequencing/bundle_from_chain` → returns `410 Gone`
 - `GET /api/flag-sequencing/attackflow` → returns `410 Gone`
+
+## LLM Scenario Authoring Workflow
+
+For an LLM integration whose goal is “produce valid scenario XML that loads into the editor and supports topology/Flow preview,” the current backend already supports a workable flow:
+
+1. Build Scenario Editor JSON in the same shape returned by `GET /api/scenario/latest_state`.
+2. Validate the scenario structurally with `POST /api/plan/preview_full` using inline `scenarios` + optional `core`.
+3. Persist the scenario to XML with `POST /save_xml_api`.
+4. Persist preview metadata into the XML with `POST /api/plan/persist_flow_plan`.
+5. Ask for Flow chain suggestions with `GET /api/flag-sequencing/attackflow_preview`.
+6. Save any chosen Flow overrides with `POST /api/flag-sequencing/save_flow_substitutions`.
+7. Write the Flow state back into the XML with `POST /api/flag-sequencing/save_flow_state_to_xml`.
+
+What this gives you today:
+- A backend-supported way to author Scenario Editor JSON and emit a valid XML file.
+- Deterministic topology planning before execution.
+- Flow preview and persisted Flow state embedded into XML.
+- Round-trip inspection via `latest_state`.
+
+What is still missing for a clean LLM integration:
+- A formally documented JSON schema for the full `scenarios[]` editor payload. Today the backend accepts it, but the contract is only implicit in UI state and parser code.
+- A dedicated “draft scenario” endpoint that validates editor JSON without first depending on UI-shaped objects.
+- Endpoint-level examples for common scenario patterns (basic topology, vulnerabilities, Flow-enabled scenario).
+- A smaller, stable API surface for non-browser clients so an LLM does not need to mimic the full editor state shape.
 
 ### Generator Builder
 

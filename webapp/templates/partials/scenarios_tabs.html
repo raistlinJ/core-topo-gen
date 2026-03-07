@@ -716,6 +716,10 @@
 
   function resolveScenarioNameHint(){
     try {
+      const liveScenarios = (window.state && Array.isArray(window.state.scenarios)) ? window.state.scenarios : [];
+      if (!liveScenarios.length) return '';
+    } catch (e) {}
+    try {
       const params = new URLSearchParams(window.location.search || '');
       const qp = (params.get('scenario') || '').trim();
       if (qp) return qp;
@@ -873,6 +877,10 @@
 
   function resolveScenarioNameFromUrlOrHidden(){
     try {
+      const liveScenarios = (window.state && Array.isArray(window.state.scenarios)) ? window.state.scenarios : [];
+      if (!liveScenarios.length) return '';
+    } catch (e) {}
+    try {
       const params = new URLSearchParams(window.location.search || '');
       const qp = (params.get('scenario') || '').trim();
       if (qp) return qp;
@@ -943,7 +951,14 @@
 
   async function ensureScenarioPersistedAndTabsSynced(){
     try {
-      const scen = resolveScenarioNameFromUrlOrHidden() || getLastSelectedScenario();
+      const hasScenarios = !!(window.state && Array.isArray(window.state.scenarios) && window.state.scenarios.length);
+      const scen = hasScenarios ? (resolveScenarioNameFromUrlOrHidden() || getLastSelectedScenario()) : '';
+      if (!hasScenarios) {
+        try {
+          const hidden = document.getElementById('scenariosPreviewScenario');
+          if (hidden) hidden.value = '';
+        } catch (e) {}
+      }
       if (scen) setLastSelectedScenario(scen);
       if (scen) {
         try { await refreshScenarioStateFromXml(scen, { updateHidden: true }); } catch (e) {}
