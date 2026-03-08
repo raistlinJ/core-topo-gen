@@ -882,12 +882,34 @@
     } catch (e) { }
   }
 
-  function shouldAllowGeneratorReuse(warningText) {
+  async function shouldAllowGeneratorReuse(warningText) {
     try {
       const msg = String(warningText || '');
       if (!msg) return true;
       if (!msg.toLowerCase().includes('generator reuse')) return true;
+      if (typeof window.confirmWithModal === 'function') {
+        return await window.confirmWithModal(
+          'Allow Generator Reuse?',
+          'Not enough unique generators are available for this chain length. Allow generator reuse?',
+          'Allow Reuse'
+        );
+      }
       return confirm('Not enough unique generators for this chain length. Allow generator reuse?');
+    } catch (e) {
+      return true;
+    }
+  }
+
+  async function confirmFlowAction(title, message, confirmLabel) {
+    try {
+      if (typeof window.confirmWithModal === 'function') {
+        return await window.confirmWithModal(
+          String(title || 'Confirm'),
+          String(message || ''),
+          String(confirmLabel || 'Continue')
+        );
+      }
+      return confirm(String(message || title || 'Confirm'));
     } catch (e) {
       return true;
     }
@@ -1945,6 +1967,100 @@
     } catch (e) { }
   }
 
+  function closeComposeModal(force) {
+    try {
+      if (!composeDialogEl) return;
+      const forceClose = !!force;
+      const cleanup = () => {
+        try {
+          if (composeModalInstance) {
+            composeModalInstance.dispose();
+          }
+        } catch (e) { }
+        composeModalInstance = null;
+        try {
+          if (typeof window.CORETG_CLEANUP_MODAL_STATE === 'function') {
+            window.CORETG_CLEANUP_MODAL_STATE(forceClose);
+          }
+        } catch (e) { }
+      };
+      const hiddenHandler = () => {
+        composeDialogEl.removeEventListener('hidden.bs.modal', hiddenHandler);
+        cleanup();
+      };
+      composeDialogEl.addEventListener('hidden.bs.modal', hiddenHandler);
+      if (composeModalInstance) {
+        try { composeModalInstance.hide(); } catch (e) { }
+      }
+      window.setTimeout(() => {
+        try {
+          if (composeDialogEl.classList.contains('show') || document.querySelectorAll('.modal-backdrop').length > 0) {
+            if (typeof window.CORETG_FORCE_HIDE_MODAL === 'function') {
+              window.CORETG_FORCE_HIDE_MODAL(composeDialogEl);
+            } else {
+              composeDialogEl.classList.remove('show');
+              composeDialogEl.style.display = 'none';
+              composeDialogEl.setAttribute('aria-hidden', 'true');
+              composeDialogEl.removeAttribute('aria-modal');
+              composeDialogEl.removeAttribute('role');
+            }
+            cleanup();
+          }
+        } catch (e) { }
+      }, 300);
+    } catch (e) { }
+  }
+
+  function cancelComposeLoading(statusText) {
+    try {
+      composeFinalized = true;
+      composeModalEnabled = false;
+      if (composeStatusEl) composeStatusEl.textContent = String(statusText || 'Cancelled.');
+      if (composeProgressBarEl) {
+        composeProgressBarEl.textContent = 'Cancelled';
+        composeProgressBarEl.style.width = '100%';
+        composeProgressBarEl.classList.remove('progress-bar-animated', 'progress-bar-striped', 'text-bg-success', 'text-bg-danger');
+      }
+      if (composeSpinnerEl) composeSpinnerEl.classList.add('d-none');
+      if (composeCloseBtnEl) composeCloseBtnEl.disabled = false;
+      try {
+        if (composeModalInstance) {
+          composeModalInstance.hide();
+          composeModalInstance.dispose();
+        }
+      } catch (e) { }
+      composeModalInstance = null;
+      try {
+        if (composeDialogEl && typeof window.CORETG_FORCE_HIDE_MODAL === 'function') {
+          window.CORETG_FORCE_HIDE_MODAL(composeDialogEl);
+        } else if (composeDialogEl) {
+          composeDialogEl.classList.remove('show');
+          composeDialogEl.style.display = 'none';
+          composeDialogEl.setAttribute('aria-hidden', 'true');
+          composeDialogEl.removeAttribute('aria-modal');
+          composeDialogEl.removeAttribute('role');
+        }
+      } catch (e) { }
+      closeComposeModal(true);
+      try {
+        document.body.classList.remove('modal-open');
+        document.body.style.removeProperty('overflow');
+        document.body.style.removeProperty('padding-right');
+      } catch (e) { }
+    } catch (e) { }
+    hideLoading();
+  }
+
+  try {
+    if (composeDialogEl) {
+      composeDialogEl.addEventListener('hidden.bs.modal', () => {
+        try {
+          composeModalEnabled = false;
+        } catch (e) { }
+      });
+    }
+  } catch (e) { }
+
   function setFlowValidityFromPayload(payload) {
     const p = payload && typeof payload === 'object' ? payload : null;
     const flowValid = p && ('flow_valid' in p) ? !!p.flow_valid : true;
@@ -2358,6 +2474,17 @@
       const err = new Error((data && (data.error || data.message)) || ('HTTP ' + res.status));
       err.payload = data;
       if (res.status === 401) err.loginRequired = true;
+      throw err;
+    }
+    return data;
+  }
+
+  async function postSequencePreviewPlan(payload, opts) {
+    const data = await postJson('/api/flag-sequencing/sequence_preview_plan', payload, opts);
+    if (data && data.ok === false) {
+      const err = new Error((data.error || data.message || 'Sequence preview failed').toString());
+      err.payload = data;
+      err.validationError = !!data.validation_error;
       throw err;
     }
     return data;
@@ -8197,6 +8324,7 @@
     const progressSteps = ['Saving XML', 'Testing connection', 'Generating preview plan', 'Sequencing chain', 'Resolving values', 'Saving resolved data'];
     let resolvedOk = false;
     let usedBestEffort = false;
+    let generateCancelled = false;
     const saveAfterResolve = (options && options.saveAfterResolve !== undefined)
       ? !!options.saveAfterResolve
       : !!runSavePreviewResolve;
@@ -8366,7 +8494,7 @@
             showLoading('Sequencing chain…');
             setLoadingSteps(progressSteps, 3);
             appendLoadingLog(`Sequencing attempt ${retryIndex + 1}`);
-            data = await postJson('/api/flag-sequencing/sequence_preview_plan', {
+            data = await postSequencePreviewPlan({
               scenario,
               length,
               preset,
@@ -8402,10 +8530,11 @@
           }
           try {
             if (data && data.warning) {
-              const okReuse = shouldAllowGeneratorReuse(data.warning);
+              const okReuse = await shouldAllowGeneratorReuse(data.warning);
               if (!okReuse) {
+                generateCancelled = true;
                 clearFlowState('Generation cancelled (generator reuse declined).');
-                hideLoading();
+                cancelComposeLoading('Generation cancelled.');
                 return;
               }
             }
@@ -8417,7 +8546,11 @@
           const offer = usePreview ? shouldOfferBestEffort(err) : null;
           if (offer) {
             appendLoadingLog(`Eligible nodes: ${offer.available}; requested ${offer.requested || length}`);
-            const want = confirm(`Only ${offer.available} eligible nodes are available for this scenario.\n\nRun Generate in best-effort mode (use ${offer.available})?`);
+            const want = await confirmFlowAction(
+              'Run Best-Effort Generate?',
+              `Only ${offer.available} eligible nodes are available for this scenario.\n\nRun Generate in best-effort mode and use ${offer.available}?`,
+              'Run Best-Effort'
+            );
             if (!want) {
               hideLoading();
               setStatus('Generate cancelled.', false);
@@ -8425,7 +8558,7 @@
             }
             if (runSavePreviewResolve) {
               appendLoadingLog(`Retrying best-effort length ${offer.available}`);
-              data = await postJson('/api/flag-sequencing/sequence_preview_plan', {
+              data = await postSequencePreviewPlan({
                 scenario,
                 length,
                 preset,
@@ -8460,7 +8593,11 @@
             continue;
           }
 
-          const reduce = confirm('Generate failed after retries. Reduce chain length and retry?');
+          const reduce = await confirmFlowAction(
+            'Retry With Shorter Chain?',
+            'Generate failed after retries. Reduce chain length and retry?',
+            'Retry'
+          );
           if (reduce) {
             const nextLenRaw = prompt('New chain length:', String(Math.max(1, (parseInt(length, 10) || 1) - 1)));
             const nextLen = parseInt(nextLenRaw || '', 10);
@@ -8587,11 +8724,12 @@
               currentFlagAssignments = prepData.flag_assignments.slice();
               try {
                 if (prepData && prepData.warning) {
-                  const okReuse = shouldAllowGeneratorReuse(prepData.warning);
+                  const okReuse = await shouldAllowGeneratorReuse(prepData.warning);
                   if (!okReuse) {
+                    generateCancelled = true;
                     clearFlowState('Resolve cancelled (generator reuse declined).');
-                    hideLoading();
-                    break;
+                    cancelComposeLoading('Resolve cancelled.');
+                    return;
                   }
                 }
               } catch (e) { }
@@ -8712,7 +8850,7 @@
               setStatus(`Resolve hit duplicate flags; retrying (${attemptedRetries})…`, true);
               showLoading('Retrying resolve…');
               appendLoadingLog('Duplicate flags during resolve; resequencing.');
-              const data2 = await postJson('/api/flag-sequencing/sequence_preview_plan', {
+              const data2 = await postSequencePreviewPlan({
                 scenario,
                 length,
                 preset,
@@ -8751,6 +8889,10 @@
             break;
           }
         }
+      }
+
+      if (generateCancelled) {
+        return;
       }
 
       // Persist the generated chain so hard refresh restores it (best-effort).
@@ -9431,7 +9573,11 @@
           composeProgressBarEl.classList.add('text-bg-danger');
         }
         setStatus('Re-validate failed: missing files.', true);
-        const regen = window.confirm('Missing files on CORE VM. Generate again?');
+        const regen = await confirmFlowAction(
+          'Missing CORE Files',
+          'Missing files on CORE VM. Generate again?',
+          'Generate Again'
+        );
         if (regen) {
           if (btnEl) btnEl.click();
         }

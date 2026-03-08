@@ -397,6 +397,8 @@
             <div class="modal-body">
                 <p class="small text-muted">Complete Steps 1 and 2 to choose a Proxmox resource and CORE VM with
                     credentials.</p>
+                <div id="coreVmSelectBusyNotice" class="alert alert-info small d-none" role="status" aria-live="polite">
+                </div>
                 <div id="coreVmSelectContainer" class="d-flex flex-column gap-3"></div>
             </div>
             <div class="modal-footer">
@@ -2847,7 +2849,8 @@
             const proxClearBtn = document.querySelector(`[data-proxmox-clear][data-scen-idx="${sidx}"]`);
             if (proxClearBtn) {
                 const hasAny = !!(prox.secret_id || proxHasCreds);
-                proxClearBtn.disabled = !hasAny;
+                const loading = proxInventoryFetchInFlight.has(sidx);
+                proxClearBtn.disabled = loading || !hasAny;
             }
             const inventoryStatusEl = document.querySelector(`[data-proxmox-inventory-status="${sidx}"]`);
             if (inventoryStatusEl) {
@@ -2958,7 +2961,8 @@
             }
             const coreClearBtn = document.querySelector(`[data-hitl-core-clear][data-scen-idx="${sidx}"]`);
             if (coreClearBtn) {
-                coreClearBtn.disabled = IS_BUILDER_VIEW || !(coreVmKey || coreHost || coreUser || corePasswordRaw || coreSshHostRaw || coreHasSecret);
+                const loading = proxInventoryFetchInFlight.has(sidx);
+                coreClearBtn.disabled = loading || IS_BUILDER_VIEW || !(coreVmKey || coreHost || coreUser || corePasswordRaw || coreSshHostRaw || coreHasSecret);
                 if (IS_BUILDER_VIEW) {
                     coreClearBtn.title = 'Builder view is read-only. Ask an admin to clear CORE credentials.';
                 }
@@ -3112,6 +3116,7 @@
             if (proxInventoryFetchInFlight.size === 0) {
                 toggleEditorBusy(false);
             }
+            toggleCoreVmSelectModalBusy(proxInventoryFetchInFlight.has(activeIdx));
             toggleExternalIfxModalBusy(proxInventoryFetchInFlight.size > 0);
             return prox.inventory;
         }
@@ -3120,6 +3125,7 @@
         }
         proxInventoryFetchInFlight.add(sidx);
         toggleEditorBusy(true);
+        toggleCoreVmSelectModalBusy(true);
         toggleExternalIfxModalBusy(true);
         updateProxmoxSummary(sidx);
         let shouldRerender = false;
@@ -3171,6 +3177,7 @@
             if (proxInventoryFetchInFlight.size === 0) {
                 toggleEditorBusy(false);
             }
+            toggleCoreVmSelectModalBusy(proxInventoryFetchInFlight.has(activeIdx));
             toggleExternalIfxModalBusy(proxInventoryFetchInFlight.size > 0);
             updateProxmoxSummary(sidx);
             if (shouldRerender) {
@@ -9323,6 +9330,38 @@
         });
     }
 
+    function toggleCoreVmSelectModalBusy(isBusy) {
+        const modal = document.getElementById('coreVmSelectModal');
+        if (!modal) return;
+        const busy = !!isBusy;
+        const notice = document.getElementById('coreVmSelectBusyNotice');
+        if (busy) {
+            modal.setAttribute('aria-busy', 'true');
+            if (notice) {
+                notice.textContent = 'Refreshing VM list…';
+                notice.classList.remove('d-none');
+            }
+        } else {
+            modal.removeAttribute('aria-busy');
+            if (notice) {
+                notice.classList.add('d-none');
+                notice.textContent = '';
+            }
+        }
+        modal.querySelectorAll('button, input, select, textarea').forEach(el => {
+            if (busy) {
+                if (!el.hasAttribute('data-core-vm-busy-disabled')) {
+                    el.setAttribute('data-core-vm-busy-disabled', el.disabled ? '1' : '0');
+                }
+                el.disabled = true;
+            } else if (el.hasAttribute('data-core-vm-busy-disabled')) {
+                const wasDisabled = el.getAttribute('data-core-vm-busy-disabled') === '1';
+                el.disabled = wasDisabled;
+                el.removeAttribute('data-core-vm-busy-disabled');
+            }
+        });
+    }
+
     let externalIfxStatusTimer = null;
 
     function clearExternalIfxStatus() {
@@ -14210,6 +14249,7 @@
 
         try { updateProxmoxSummary(activeIdx); } catch (err) { console.warn('Failed to refresh Proxmox summary', err); }
 
+        toggleCoreVmSelectModalBusy(proxInventoryFetchInFlight.has(activeIdx));
         toggleExternalIfxModalBusy(proxInventoryFetchInFlight.size > 0);
 
         updateHitlStatusForScenario(activeIdx);
@@ -16412,6 +16452,7 @@
             });
             document.querySelectorAll('[data-hitl-core-clear]').forEach(btn => {
                 btn.addEventListener('click', () => {
+                    if (btn.disabled) return;
                     const sidx = parseInt(btn.getAttribute('data-scen-idx'));
                     if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
                     const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
@@ -16708,6 +16749,7 @@
         });
         document.querySelectorAll('[data-proxmox-clear]').forEach(btn => {
             btn.addEventListener('click', async () => {
+                if (btn.disabled) return;
                 const sidx = parseInt(btn.getAttribute('data-scen-idx'));
                 if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
                 const scenario = state.scenarios[sidx];

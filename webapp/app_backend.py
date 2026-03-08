@@ -19607,6 +19607,11 @@ def api_flow_sequence_preview_plan():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
+    def _validation_failure(message: str, **extra: Any):
+        payload = {'ok': False, 'error': message, 'validation_error': True}
+        payload.update(extra)
+        return jsonify(payload)
+
     preview_plan_path = str(j.get('preview_plan') or '').strip() or None
     xml_hint = str(j.get('xml_path') or '').strip()
     if preview_plan_path:
@@ -19667,7 +19672,12 @@ def api_flow_sequence_preview_plan():
             chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
 
     if not chain_nodes:
-        return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan.', 'available': 0, 'requested_length': requested_length, 'stats': stats}), 422
+        return _validation_failure(
+            'No eligible nodes found in preview plan.',
+            available=0,
+            requested_length=requested_length,
+            stats=stats,
+        )
 
     warning: str | None = None
 
@@ -19676,13 +19686,12 @@ def api_flow_sequence_preview_plan():
             warning = f"Only {len(chain_nodes)} eligible nodes found; using chain length {len(chain_nodes)} instead of requested {length}."
             length = len(chain_nodes)
         else:
-            return jsonify({
-                'ok': False,
-                'error': 'Not enough eligible nodes in preview plan to build the requested chain.',
-                'available': len(chain_nodes),
-                'requested_length': requested_length,
-                'stats': stats,
-            }), 422
+            return _validation_failure(
+                'Not enough eligible nodes in preview plan to build the requested chain.',
+                available=len(chain_nodes),
+                requested_length=requested_length,
+                stats=stats,
+            )
 
     # Inject preview host IP/interface details onto chain nodes for UI display.
     host_by_id: dict[str, dict[str, Any]] = {}
@@ -19736,7 +19745,7 @@ def api_flow_sequence_preview_plan():
     if preset_steps:
         flag_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
         if preset_err:
-            return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
+            return _validation_failure(f'Error: {preset_err}', stats=stats)
     else:
         # Use flow_seed as base, with retry_index variation
         base_seed = _get_flow_seed(preview, flow_seed_param)
@@ -19751,13 +19760,12 @@ def api_flow_sequence_preview_plan():
             disallow_generator_reuse=(not allow_node_duplicates),
         )
         if (not flag_assignments) and (not allow_node_duplicates):
-            return jsonify({
-                'ok': False,
-                'error': 'Not enough unique generators for this chain length while duplicates are disabled. Reduce chain length or enable duplicates.',
-                'scenario': scenario_label or scenario_norm,
-                'length': len(chain_nodes or []),
-                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
-            }), 422
+            return _validation_failure(
+                'Not enough unique generators for this chain length while duplicates are disabled. Reduce chain length or enable duplicates.',
+                scenario=scenario_label or scenario_norm,
+                length=len(chain_nodes or []),
+                chain=[{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
+            )
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Presets force an intended generator order and should not be reordered.
@@ -19793,14 +19801,13 @@ def api_flow_sequence_preview_plan():
             gen_ids = [str(a.get('id') or a.get('generator_id') or '').strip() for a in (flag_assignments or []) if isinstance(a, dict)]
             gen_ids = [g for g in gen_ids if g]
             if len(set(gen_ids)) != len(gen_ids):
-                return jsonify({
-                    'ok': False,
-                    'error': 'Duplicate generators detected while duplicates are disabled. Reduce chain length or enable duplicates.',
-                    'scenario': scenario_label or scenario_norm,
-                    'length': len(chain_nodes or []),
-                    'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
-                    'flag_assignments': flag_assignments,
-                }), 422
+                return _validation_failure(
+                    'Duplicate generators detected while duplicates are disabled. Reduce chain length or enable duplicates.',
+                    scenario=scenario_label or scenario_norm,
+                    length=len(chain_nodes or []),
+                    chain=[{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
+                    flag_assignments=flag_assignments,
+                )
         except Exception:
             pass
 

@@ -74,9 +74,10 @@ def test_sequence_preview_plan_hard_fails_when_duplicate_generators_disallowed(m
                 "allow_node_duplicates": False,
             },
         )
-        assert resp.status_code == 422, resp.get_json()
+        assert resp.status_code == 200, resp.get_json()
         data = resp.get_json() or {}
         assert data.get("ok") is False
+        assert data.get("validation_error") is True
         assert "duplicate generators detected" in str(data.get("error") or "").lower()
         assert assignment_modes
         assert all(mode is True for mode in assignment_modes)
