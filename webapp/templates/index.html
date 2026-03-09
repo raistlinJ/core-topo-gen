@@ -256,6 +256,31 @@
         color: #4c5a67;
     }
 
+    .ai-generator-stream-panel-header-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    .ai-generator-stream-panel-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.74rem;
+        font-weight: 600;
+        letter-spacing: normal;
+        text-transform: none;
+        color: #4c5a67;
+    }
+
+    .ai-generator-stream-panel-subheader {
+        min-height: 18px;
+        padding: 6px 14px 0;
+        font-size: 0.74rem;
+        color: #71808f;
+    }
+
     #aiGeneratorStreamOutput {
         margin: 0;
         min-height: 360px;
@@ -317,13 +342,19 @@
         word-break: break-word;
     }
 
-    .ai-generator-stream-event-preview {
+    .ai-generator-stream-event-live-tail {
         white-space: pre-wrap;
         word-break: break-word;
+        max-height: 280px;
+        overflow: auto;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(11, 95, 255, 0.04);
+        border: 1px solid rgba(11, 95, 255, 0.08);
     }
 
     .ai-generator-stream-event-toggle {
-        margin-top: 8px;
+        margin-top: 6px;
     }
 
     .ai-generator-stream-event-toggle summary {
@@ -666,10 +697,13 @@
                 <div class="ai-generator-stream-shell">
                     <div class="ai-generator-stream-panel">
                         <div class="ai-generator-stream-panel-header">Model Output</div>
+                        <div class="ai-generator-stream-panel-subheader" id="aiGeneratorStreamOutputHint"></div>
                         <pre id="aiGeneratorStreamOutput"></pre>
                     </div>
                     <div class="ai-generator-stream-panel">
-                        <div class="ai-generator-stream-panel-header">Activity</div>
+                        <div class="ai-generator-stream-panel-header ai-generator-stream-panel-header-row">
+                            <span>Activity</span>
+                        </div>
                         <div id="aiGeneratorStreamEvents"></div>
                     </div>
                 </div>
@@ -677,6 +711,7 @@
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" id="aiGeneratorStreamCopyBtn">Copy Transcript</button>
                 <button type="button" class="btn btn-outline-secondary" id="aiGeneratorStreamDownloadBtn">Download Transcript</button>
+                <button type="button" class="btn btn-outline-primary" id="aiGeneratorStreamRetryBtn" disabled>Retry</button>
                 <button type="button" class="btn btn-outline-danger" id="aiGeneratorStreamCancelBtn">Cancel</button>
                 <button type="button" class="btn btn-outline-secondary" id="aiGeneratorStreamCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
             </div>
@@ -4735,7 +4770,7 @@
             model: '',
             mcp_server_path: 'MCP/server.py',
             mcp_server_url: defaultServerUrl,
-            servers_json_path: 'MCP/ollmcp-servers.json',
+            servers_json_path: 'MCP/mcp-bridge-servers.json',
             auto_discovery: false,
             available_tools: [],
             enabled_tools: [],
@@ -4895,6 +4930,7 @@
         buildAiGeneratorBridgePayload,
         getCoreConfig,
         persistEditorState: () => persistEditorState(),
+        persistEditorSnapshotToServerNow: () => persistEditorSnapshotToServerNow(),
         updatePlanButtons: () => updatePlanButtons(),
         render: () => render(),
         renderAiGeneratorPanel: () => renderAiGeneratorPanel(),
@@ -6327,6 +6363,9 @@
         });
         document.getElementById('aiGeneratorStreamDownloadBtn')?.addEventListener('click', () => {
             downloadAiGeneratorTranscript();
+        });
+        document.getElementById('aiGeneratorStreamRetryBtn')?.addEventListener('click', () => {
+            void window.CORETG_AI_GENERATOR_STREAM?.retryStream?.();
         });
         document.getElementById('aiGeneratorStreamCancelBtn')?.addEventListener('click', () => {
             void cancelAiGeneratorStream();
@@ -8673,50 +8712,67 @@
         }, 1200);
     }
 
+    function buildEditorSnapshot() {
+        try {
+            state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+            window.state = state;
+        } catch (e) { }
+        const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
+            path: state.scenarios?.[0]?.base?.filepath || '',
+            display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
+        } : null);
+        const coreForPersist = sanitizeCoreForPersist(state.core);
+        const scenariosForSnapshot = cloneScenariosForSnapshot(state.scenarios || []);
+        const snapshot = {
+            scenarios: scenariosForSnapshot,
+            result_path: state.result_path || null,
+            core: coreForPersist || null,
+            core_ok: !!state.core_ok,
+            core_tested_host: state.core_tested_host || null,
+            core_tested_port: state.core_tested_port || null,
+            base_upload: baseUploadMeta,
+            host_interfaces: Array.isArray(state.host_interfaces) ? state.host_interfaces : [],
+            host_interfaces_source: state.host_interfaces_source || null,
+            host_interfaces_metadata: state.host_interfaces_metadata || null,
+            host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
+        };
+        snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+        const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
+        const trimmedScenarioToken = (scenarioQueryToken || '').trim();
+        const nextScenarioQuery = trimmedScenarioToken || scenarioSignature || '';
+        snapshot.scenario_query = nextScenarioQuery || null;
+        if (!trimmedScenarioToken && nextScenarioQuery) {
+            scenarioQueryToken = nextScenarioQuery;
+        }
+        const stableProjectHint = (() => {
+            if (currentProjectKey && currentProjectKey !== DEFAULT_PROJECT_KEY) return currentProjectKey;
+            if (snapshot.project_key_hint) return snapshot.project_key_hint;
+            if (nextScenarioQuery) return nextScenarioQuery;
+            if (snapshot.result_path) return snapshot.result_path;
+            if (snapshot.base_upload && snapshot.base_upload.path) return snapshot.base_upload.path;
+            return null;
+        })();
+        snapshot.project_key_hint = stableProjectHint;
+        scrubSnapshotTransientErrors(snapshot);
+        return snapshot;
+    }
+
+    async function persistEditorSnapshotToServerNow() {
+        if (serverSnapshotDisabled) return { ok: false, error: 'Authentication required' };
+        const snapshot = buildEditorSnapshot();
+        if (!snapshot || typeof snapshot !== 'object') return { ok: false, error: 'Snapshot unavailable' };
+        try {
+            return await transmitEditorSnapshotToServer(snapshot);
+        } catch (err) {
+            const message = (err && err.message) ? err.message : 'Snapshot persist failed';
+            return { ok: false, error: message };
+        }
+    }
+
     function persistEditorState(options = {}) {
         try {
             const skipXml = !!(options && options.skipXml);
-            try {
-                state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
-                window.state = state;
-            } catch (e) { }
-            const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
-                path: state.scenarios?.[0]?.base?.filepath || '',
-                display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
-            } : null);
-            const coreForPersist = sanitizeCoreForPersist(state.core);
-            const scenariosForSnapshot = cloneScenariosForSnapshot(state.scenarios || []);
-            const snapshot = {
-                scenarios: scenariosForSnapshot,
-                result_path: state.result_path || null,
-                core: coreForPersist || null,
-                core_ok: !!state.core_ok,
-                core_tested_host: state.core_tested_host || null,
-                core_tested_port: state.core_tested_port || null,
-                base_upload: baseUploadMeta,
-                host_interfaces: Array.isArray(state.host_interfaces) ? state.host_interfaces : [],
-                host_interfaces_source: state.host_interfaces_source || null,
-                host_interfaces_metadata: state.host_interfaces_metadata || null,
-                host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
-            };
-            snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
-            const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
-            const trimmedScenarioToken = (scenarioQueryToken || '').trim();
-            const nextScenarioQuery = trimmedScenarioToken || scenarioSignature || '';
-            snapshot.scenario_query = nextScenarioQuery || null;
-            if (!trimmedScenarioToken && nextScenarioQuery) {
-                scenarioQueryToken = nextScenarioQuery;
-            }
-            const stableProjectHint = (() => {
-                if (currentProjectKey && currentProjectKey !== DEFAULT_PROJECT_KEY) return currentProjectKey;
-                if (snapshot.project_key_hint) return snapshot.project_key_hint;
-                if (nextScenarioQuery) return nextScenarioQuery;
-                if (snapshot.result_path) return snapshot.result_path;
-                if (snapshot.base_upload && snapshot.base_upload.path) return snapshot.base_upload.path;
-                return null;
-            })();
-            snapshot.project_key_hint = stableProjectHint;
-            scrubSnapshotTransientErrors(snapshot);
+            const snapshot = buildEditorSnapshot();
 
             // Explicit-save mode: do not auto-persist editor snapshots in the background.
             try { scheduleServerSnapshotPersist(snapshot); } catch (_) { }

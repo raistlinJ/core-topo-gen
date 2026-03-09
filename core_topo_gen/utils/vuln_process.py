@@ -172,6 +172,91 @@ def _read_csv(path: str) -> List[Dict[str, str]]:
 	return rows
 
 
+def _extract_vulnerability_slug(path: str) -> str:
+	text = str(path or '').strip()
+	if not text:
+		return ''
+	text = text.replace('\\', '/')
+	text = text.split('?', 1)[0].split('#', 1)[0]
+	for marker in ('/tree/master/', '/blob/master/', '/content/vulhub/', '/repo/', '/vulhub/'):
+		if marker not in text:
+			continue
+		suffix = text.split(marker, 1)[1].strip('/')
+		parts = [part for part in suffix.split('/') if part]
+		if parts and parts[-1] in ('docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml', 'README.md', 'README.zh-cn.md'):
+			parts = parts[:-1]
+		if len(parts) >= 2:
+			return '/'.join(parts[-2:])
+		if parts:
+			return parts[0]
+	return ''
+
+
+def canonical_vulnerability_name(name: str, path: str = '', cve: str = '') -> str:
+	raw_name = str(name or '').strip()
+	raw_cve = str(cve or '').strip()
+	slug = _extract_vulnerability_slug(path)
+	if slug and '/' in slug:
+		return slug
+	if raw_name and raw_cve and '/' not in raw_name and raw_cve.lower() not in raw_name.lower():
+		return f'{raw_name}/{raw_cve}'
+	return raw_name or slug
+
+
+def vulnerability_catalog_identity(name: str = '', path: str = '', cve: str = '') -> str:
+	canonical_name = canonical_vulnerability_name(name, path, cve)
+	if canonical_name:
+		return canonical_name.strip().lower()
+	slug = _extract_vulnerability_slug(path)
+	if slug:
+		return slug.strip().lower()
+	raw_name = str(name or '').strip().lower()
+	if raw_name:
+		return raw_name
+	raw_cve = str(cve or '').strip().lower()
+	if raw_cve:
+		return raw_cve
+	return ''
+
+
+def resolve_vulnerability_catalog_entry(catalog: Iterable[Dict[str, str]], *, v_name: str | None = None, v_path: str | None = None) -> Optional[Dict[str, str]]:
+	def _normalize(value: str | None) -> str:
+		return str(value or '').strip().lower()
+
+	normalized_name = _normalize(v_name)
+	normalized_path = _normalize(v_path)
+	requested_identity = vulnerability_catalog_identity(str(v_name or ''), str(v_path or ''), '')
+
+	for entry in catalog:
+		entry_path = str(entry.get('Path') or '').strip()
+		if normalized_path and _normalize(entry_path) == normalized_path:
+			return {
+				'name': canonical_vulnerability_name(str(entry.get('Name') or ''), entry_path, str(entry.get('CVE') or '')),
+				'path': entry_path,
+			}
+
+	for entry in catalog:
+		entry_name = str(entry.get('Name') or '').strip()
+		if normalized_name and _normalize(entry_name) == normalized_name:
+			return {
+				'name': canonical_vulnerability_name(entry_name, str(entry.get('Path') or ''), str(entry.get('CVE') or '')),
+				'path': str(entry.get('Path') or '').strip(),
+			}
+
+	if requested_identity:
+		for entry in catalog:
+			entry_name = str(entry.get('Name') or '').strip()
+			entry_path = str(entry.get('Path') or '').strip()
+			entry_identity = vulnerability_catalog_identity(entry_name, entry_path, str(entry.get('CVE') or ''))
+			if entry_identity and entry_identity == requested_identity:
+				return {
+					'name': canonical_vulnerability_name(entry_name, entry_path, str(entry.get('CVE') or '')),
+					'path': entry_path,
+				}
+
+	return None
+
+
 def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 	"""Load a vulnerability catalog for CLI selection.
 
@@ -271,17 +356,20 @@ def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 		if os.path.exists(p):
 			active_any_exists = True
 			items.extend(_read_csv(p))
+	if active_csvs and active_any_exists and items:
+		pass
 	if active_csvs and active_any_exists and not items:
 		return []
 
 	# 2) Repo-shipped defaults (only when no active installed catalog is present,
 	# or when active paths are missing entirely).
-	for p in [
-		os.path.join(repo_root, 'raw_datasources', 'vuln_list_w_url.csv'),
-		os.path.join(repo_root, 'raw_datasources', 'vuln_list.csv'),
-	]:
-		if os.path.exists(p):
-			items.extend(_read_csv(p))
+	if not (active_csvs and active_any_exists and items):
+		for p in [
+			os.path.join(repo_root, 'raw_datasources', 'vuln_list_w_url.csv'),
+			os.path.join(repo_root, 'raw_datasources', 'vuln_list.csv'),
+		]:
+			if os.path.exists(p):
+				items.extend(_read_csv(p))
 	# Normalize Path entries for portability between local GUI and remote CORE host.
 	try:
 		for it in items:
@@ -289,15 +377,26 @@ def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 				path_val = it.get('Path') if isinstance(it, dict) else None
 				if path_val:
 					it['Path'] = _normalize_catalog_path(repo_root, str(path_val))
+				it['Name'] = canonical_vulnerability_name(
+					str(it.get('Name') or ''),
+					str(it.get('Path') or ''),
+					str(it.get('CVE') or ''),
+				)
 			except Exception:
 				continue
 	except Exception:
 		pass
-	# Deduplicate by (Name, Path)
+	# Deduplicate by vulnerability identity so installed-catalog rows win over
+	# repo defaults that describe the same vulnerability differently.
 	seen = set()
 	out: List[Dict[str, str]] = []
 	for it in items:
-		key = (it.get('Name'), it.get('Path'))
+		identity = vulnerability_catalog_identity(
+			str(it.get('Name') or ''),
+			str(it.get('Path') or ''),
+			str(it.get('CVE') or ''),
+		)
+		key = ('identity', identity) if identity else ('name-path', it.get('Name'), it.get('Path'))
 		if key in seen:
 			continue
 		seen.add(key)

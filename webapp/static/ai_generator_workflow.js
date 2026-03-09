@@ -2,6 +2,69 @@
     function createCoretgAiGeneratorWorkflow(deps) {
         const streamApi = (deps && deps.streamApi) || {};
 
+        function extractCountIntent(promptValue) {
+            const text = String(promptValue || '').toLowerCase();
+            const totalNodesMatch = text.match(/\b(?:topology|scenario)\s+with\s+(\d+)\s+nodes?\b|\b(\d+)\s+total\s+nodes?\b|\b(\d+)\s+nodes?\b/);
+            const routerMatch = text.match(/\b(\d+)\s+routers?\b/);
+            const totalNodes = totalNodesMatch ? parseInt(totalNodesMatch[1] || totalNodesMatch[2] || totalNodesMatch[3] || '0', 10) : null;
+            const routerCount = routerMatch ? parseInt(routerMatch[1] || '0', 10) : null;
+            return {
+                totalNodes: Number.isFinite(totalNodes) ? totalNodes : null,
+                routerCount: Number.isFinite(routerCount) ? routerCount : null,
+            };
+        }
+
+        function buildFinalOutputFallback(data, message = '', success = true, promptValue = '') {
+            const providerResponse = (data && data.provider_response ? String(data.provider_response) : '').trim();
+            if (providerResponse) return providerResponse;
+
+            const preview = (data && data.preview && typeof data.preview === 'object') ? data.preview : {};
+            const routers = Array.isArray(preview.routers) ? preview.routers.length : 0;
+            const hosts = Array.isArray(preview.hosts) ? preview.hosts.length : 0;
+            const switches = Array.isArray(preview.switches) ? preview.switches.length : 0;
+            const countIntent = extractCountIntent(promptValue);
+            const retryUsed = !!(data && data.count_intent_retry_used);
+            const mismatch = (data && data.count_intent_mismatch && typeof data.count_intent_mismatch === 'object')
+                ? data.count_intent_mismatch
+                : null;
+            const parts = [];
+            if (success) {
+                parts.push('No textual model summary was returned. The request completed through tool calls.');
+                parts.push(`Preview summary: routers=${routers}, hosts=${hosts}, switches=${switches}.`);
+                if (retryUsed) {
+                    parts.push('An automatic retry was attempted because the first preview did not match the requested counts.');
+                }
+                if (countIntent.totalNodes !== null || countIntent.routerCount !== null) {
+                    const requestedBits = [];
+                    if (countIntent.totalNodes !== null) requestedBits.push(`requested total nodes=${countIntent.totalNodes}`);
+                    if (countIntent.routerCount !== null) requestedBits.push(`requested routers=${countIntent.routerCount}`);
+                    parts.push(`Requested counts: ${requestedBits.join(', ')}.`);
+                }
+                if (mismatch && Array.isArray(mismatch.reasons) && mismatch.reasons.length) {
+                    parts.push(`Count mismatch remains: ${mismatch.reasons.join('; ')}.`);
+                }
+            } else {
+                parts.push('No textual model output was returned before the request ended.');
+            }
+            if (message) {
+                parts.push('');
+                parts.push(message);
+            }
+            return parts.join('\n');
+        }
+
+        function ensureModalOutput(data, message = '', success = true, promptValue = '') {
+            if (!streamApi || typeof streamApi.appendOutput !== 'function') return;
+            const existingOutput = (typeof streamApi.getOutputText === 'function')
+                ? streamApi.getOutputText()
+                : String((streamApi.state && streamApi.state.outputText) || '');
+            if (existingOutput.trim()) return;
+            const fallbackText = buildFinalOutputFallback(data, message, success, promptValue);
+            if (fallbackText.trim()) {
+                streamApi.appendOutput(fallbackText);
+            }
+        }
+
         function renderPanel() {
             if (deps && typeof deps.renderAiGeneratorPanel === 'function') {
                 deps.renderAiGeneratorPanel();
@@ -16,7 +79,7 @@
             return deps && typeof deps.getPreviewState === 'function' ? deps.getPreviewState() : null;
         }
 
-        function applyPreviewSuccess({ idx, scenario, aiState, promptValue, data }) {
+        async function applyPreviewSuccess({ idx, scenario, aiState, promptValue, data }) {
             const state = getState();
             const previewState = getPreviewState();
             if (!state || !previewState) return;
@@ -62,6 +125,11 @@
             });
 
             try { deps.persistEditorState(); } catch (e) { }
+            try {
+                if (deps && typeof deps.persistEditorSnapshotToServerNow === 'function') {
+                    await deps.persistEditorSnapshotToServerNow();
+                }
+            } catch (e) { }
             try { deps.updatePlanButtons(); } catch (e) { }
             deps.render();
         }
@@ -312,7 +380,7 @@
             }
         }
 
-        async function generatePreview() {
+        async function generatePreview(options = {}) {
             const { idx, scenario } = deps.getActiveScenarioContext();
             if (idx === null || !scenario) return;
             const state = getState();
@@ -321,14 +389,16 @@
             const originalLabel = generateBtn ? generateBtn.textContent : '';
             const promptInput = document.getElementById('aiGeneratorPromptInput');
             const promptValue = (promptInput ? promptInput.value : (aiState.draft_prompt || '')).toString().trim();
+            const skipConfirmation = !!(options && options.skipConfirmation);
             if (!promptValue) {
                 deps.persistAiGeneratorStateForScenario(scenario, idx, { last_generation_error: 'Prompt / command intent is required.' });
                 renderPanel();
                 return;
             }
-            try {
-                const confirmTitle = 'Reconstruct Scenario Elements';
-                const confirmMessage = `
+            if (!skipConfirmation) {
+                try {
+                    const confirmTitle = 'Reconstruct Scenario Elements';
+                    const confirmMessage = `
                 <p class="mb-3">This will remove the current topology/editor scenario data and recreate it from the prompt.</p>
                 <div class="row g-3 text-start">
                     <div class="col-md-6">
@@ -360,23 +430,29 @@
                 </div>
                 <p class="mt-3 mb-0">Proceed?</p>
             `;
-                let confirmed = false;
-                if (typeof window.confirmWithModal === 'function') {
-                    confirmed = await window.confirmWithModal(confirmTitle, confirmMessage, 'Reconstruct Elements', 'primary', { allowHtml: true });
-                } else {
-                    confirmed = window.confirm('This will rebuild topology/editor scenario data from the prompt while preserving Base CORE Scenario, Topology Seed, VM / Access settings, and AI Generator connection settings. Proceed?');
-                }
-                if (!confirmed) {
+                    let confirmed = false;
+                    if (typeof window.confirmWithModal === 'function') {
+                        confirmed = await window.confirmWithModal(confirmTitle, confirmMessage, 'Reconstruct Elements', 'primary', { allowHtml: true });
+                    } else {
+                        confirmed = window.confirm('This will rebuild topology/editor scenario data from the prompt while preserving Base CORE Scenario, Topology Seed, VM / Access settings, and AI Generator connection settings. Proceed?');
+                    }
+                    if (!confirmed) {
+                        return;
+                    }
+                } catch (e) {
                     return;
                 }
-            } catch (e) {
-                return;
             }
             if (generateBtn) {
                 generateBtn.disabled = true;
                 generateBtn.textContent = 'Generating...';
             }
             try {
+                if (typeof streamApi.setRetryAction === 'function') {
+                    streamApi.setRetryAction(() => generatePreview({ skipConfirmation: true }));
+                } else if (streamApi.state) {
+                    streamApi.state.retryAction = () => generatePreview({ skipConfirmation: true });
+                }
                 let scenarioSeed = null;
                 try {
                     const seedCandidate = (typeof window.coretgEnsureSeedForScenario === 'function')
@@ -442,6 +518,9 @@
                         streamApi.appendEvent('Thinking', (event.text || '').toString(), 'default', {
                             mergeKey: 'llm-thinking',
                             appendBody: true,
+                            tailMode: 'thinking',
+                            maxChars: 24000,
+                            maxLines: 400,
                         });
                         return;
                     }
@@ -464,10 +543,12 @@
                     }
                     if (type === 'result') {
                         finalData = (event.data && typeof event.data === 'object') ? event.data : null;
+                        ensureModalOutput(finalData, '', true, promptValue);
                     }
                 });
 
                 if (streamError) {
+                    ensureModalOutput(finalData, streamError, false, promptValue);
                     streamApi.finishModal(false, streamError);
                     handlePreviewFailure({ idx, scenario, promptValue, message: streamError });
                     return;
@@ -476,17 +557,20 @@
                     const message = finalData && (finalData.error || finalData.message)
                         ? (finalData.error || finalData.message)
                         : 'Generation stream ended before a final result was returned.';
+                    ensureModalOutput(finalData, message, false, promptValue);
                     streamApi.finishModal(false, message);
                     handlePreviewFailure({ idx, scenario, promptValue, message });
                     return;
                 }
 
-                applyPreviewSuccess({ idx, scenario, aiState, promptValue, data: finalData });
+                await applyPreviewSuccess({ idx, scenario, aiState, promptValue, data: finalData });
+                ensureModalOutput(finalData, 'Scenario draft and preview are ready.', true, promptValue);
                 streamApi.finishModal(true, 'Scenario draft and preview are ready.');
             } catch (err) {
                 const message = (err && (err.name === 'AbortError' || err.code === 20))
                     ? 'Generation cancelled by user.'
                     : ((err && err.message) ? err.message : 'Unexpected generation failure.');
+                ensureModalOutput(null, message, false, promptValue);
                 streamApi.finishModal(false, message);
                 handlePreviewFailure({ idx, scenario, promptValue, message });
             } finally {

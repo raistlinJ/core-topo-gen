@@ -30395,6 +30395,20 @@ _TRAFFIC_NUMERIC_DEFAULTS: Dict[str, float] = {
 }
 
 
+def _ensure_vulnerability_docker_capacity(scenario_payload: Any) -> tuple[Dict[str, Any], dict]:
+    from core_topo_gen.planning.docker_capacity import ensure_scenario_payload_docker_capacity
+
+    try:
+        return ensure_scenario_payload_docker_capacity(scenario_payload)
+    except Exception:
+        scenario = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+        return scenario, {
+            'required_docker_hosts': 0,
+            'current_docker_hosts': 0,
+            'added_docker_hosts': 0,
+        }
+
+
 def _normalize_node_information_role(value: Any) -> str:
     text = str(value or '').strip()
     if not text:
@@ -30428,13 +30442,13 @@ def _normalize_routing_item_selection(value: Any) -> str:
         return ''
     normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
     aliases = {
-        'routing': 'Routing',
-        'router': 'Routing',
-        'routers': 'Routing',
-        'gateway': 'Routing',
-        'gateways': 'Routing',
-        'l3': 'Routing',
-        'layer3': 'Routing',
+        'routing': 'OSPFv2',
+        'router': 'OSPFv2',
+        'routers': 'OSPFv2',
+        'gateway': 'OSPFv2',
+        'gateways': 'OSPFv2',
+        'l3': 'OSPFv2',
+        'layer3': 'OSPFv2',
         'rip': 'RIP',
         'ripng': 'RIPNG',
         'bgp': 'BGP',
@@ -30669,6 +30683,15 @@ def _normalize_scenario_section_semantics(scenario_payload: Any) -> Dict[str, An
         node_section = {'items': []}
 
     scenario['sections'] = sections
+    scenario = _canonicalize_specific_vulnerability_items(scenario, strict=False)
+    if isinstance(scenario.get('plan_preview'), dict):
+        scenario['plan_preview'] = _canonicalize_plan_preview_vulnerability_names(
+            scenario.get('plan_preview'),
+            scenario_payload=scenario,
+        )
+    scenario, docker_capacity_repair = _ensure_vulnerability_docker_capacity(scenario)
+    if docker_capacity_repair.get('added_docker_hosts'):
+        scenario['docker_capacity_repair'] = docker_capacity_repair
     return scenario
 
 
@@ -30711,6 +30734,139 @@ def _load_backend_vuln_catalog_items() -> List[Dict[str, Any]]:
         return [item for item in items if isinstance(item, dict)]
     except Exception:
         return []
+
+
+def _canonicalize_specific_vulnerability_items(
+    scenario_payload: Any,
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    scenario = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else None
+    if not isinstance(sections, dict):
+        return scenario
+
+    vuln_section = sections.get('Vulnerabilities') if isinstance(sections.get('Vulnerabilities'), dict) else None
+    items = vuln_section.get('items') if isinstance(vuln_section, dict) and isinstance(vuln_section.get('items'), list) else None
+    if not isinstance(items, list):
+        return scenario
+
+    catalog_items = _load_backend_vuln_catalog_items()
+    from core_topo_gen.utils.vuln_process import resolve_vulnerability_catalog_entry
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        selected = str(item.get('selected') or '').strip().lower()
+        if selected != 'specific':
+            continue
+        resolved = resolve_vulnerability_catalog_entry(
+            catalog_items,
+            v_name=str(item.get('v_name') or ''),
+            v_path=str(item.get('v_path') or item.get('path') or ''),
+        )
+        if resolved:
+            item['v_name'] = resolved['name']
+            current_path = str(item.get('v_path') or item.get('path') or '').strip()
+            item['v_path'] = current_path or resolved['path']
+            continue
+        if strict:
+            raise ValueError('Specific vulnerability must match an enabled catalog entry by v_path or v_name')
+
+    return scenario
+
+
+def _specific_vulnerability_name_map(scenario_payload: Any) -> Dict[str, str]:
+    original = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+    canonical = _canonicalize_specific_vulnerability_items(original, strict=False)
+    original_sections = original.get('sections') if isinstance(original.get('sections'), dict) else {}
+    canonical_sections = canonical.get('sections') if isinstance(canonical.get('sections'), dict) else {}
+    original_items = ((original_sections.get('Vulnerabilities') or {}).get('items') or []) if isinstance(original_sections, dict) else []
+    canonical_items = ((canonical_sections.get('Vulnerabilities') or {}).get('items') or []) if isinstance(canonical_sections, dict) else []
+    mapping: Dict[str, str] = {}
+    for original_item, canonical_item in zip(original_items, canonical_items):
+        if not isinstance(original_item, dict) or not isinstance(canonical_item, dict):
+            continue
+        if str(original_item.get('selected') or '').strip().lower() != 'specific':
+            continue
+        source_name = str(original_item.get('v_name') or '').strip()
+        target_name = str(canonical_item.get('v_name') or '').strip()
+        if source_name and target_name:
+            mapping[source_name] = target_name
+        target_path = str(canonical_item.get('v_path') or '').strip()
+        if target_name:
+            mapping[target_name] = target_name
+            short_name = target_name.split('/', 1)[0].strip()
+            if short_name:
+                mapping[short_name] = target_name
+        if target_path:
+            try:
+                path_parts = [part for part in target_path.replace('\\', '/').split('/') if part]
+                if len(path_parts) >= 2:
+                    path_alias = path_parts[-2].strip()
+                    if path_alias:
+                        mapping[path_alias] = target_name or mapping.get(path_alias, path_alias)
+            except Exception:
+                pass
+    return mapping
+
+
+def _canonicalize_plan_preview_vulnerability_names(plan_preview: Any, *, scenario_payload: Any) -> Any:
+    if not isinstance(plan_preview, dict):
+        return plan_preview
+
+    name_map = _specific_vulnerability_name_map(scenario_payload)
+    if not name_map:
+        return plan_preview
+
+    payload = copy.deepcopy(plan_preview)
+    full_preview = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+    if not isinstance(full_preview, dict):
+        return payload
+
+    def _rename_list(values: Any) -> Any:
+        if not isinstance(values, list):
+            return values
+        return [name_map.get(str(value or '').strip(), str(value or '').strip()) for value in values if str(value or '').strip()]
+
+    for group_name in ('hosts', 'routers', 'switches'):
+        nodes = full_preview.get(group_name)
+        if not isinstance(nodes, list):
+            continue
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if isinstance(node.get('vulnerabilities'), list):
+                node['vulnerabilities'] = _rename_list(node.get('vulnerabilities'))
+
+    for field_name in ('vulnerabilities_preview', 'vulnerabilities_by_node'):
+        raw_map = full_preview.get(field_name)
+        if not isinstance(raw_map, dict):
+            continue
+        next_map: Dict[Any, Any] = {}
+        for key, value in raw_map.items():
+            next_map[key] = _rename_list(value)
+        full_preview[field_name] = next_map
+
+    raw_plan = full_preview.get('vulnerabilities_plan')
+    if isinstance(raw_plan, dict):
+        next_plan: Dict[str, int] = {}
+        for key, value in raw_plan.items():
+            next_key = name_map.get(str(key or '').strip(), str(key or '').strip())
+            if not next_key:
+                continue
+            try:
+                next_value = int(value) if value is not None else 0
+            except Exception:
+                try:
+                    next_value = int(float(value))
+                except Exception:
+                    next_value = 0
+            next_plan[next_key] = next_plan.get(next_key, 0) + next_value
+        full_preview['vulnerabilities_plan'] = next_plan
+
+    payload['full_preview'] = full_preview
+    return payload
 
 
 def _concretize_preview_placeholders(scenario_payload: Any, *, seed: Any = None) -> Dict[str, Any]:
@@ -34673,6 +34829,12 @@ def _parse_scenarios_xml(path):
         if root.tag == "ScenarioEditor":
             scen = _parse_scenario_editor(root)
             scen["name"] = os.path.splitext(os.path.basename(path))[0]
+            scen = _canonicalize_specific_vulnerability_items(scen, strict=False)
+            if isinstance(scen.get('plan_preview'), dict):
+                scen['plan_preview'] = _canonicalize_plan_preview_vulnerability_names(
+                    scen.get('plan_preview'),
+                    scenario_payload=scen,
+                )
             data["scenarios"].append(scen)
             return data
         raise ValueError("Root element must be <Scenarios> or <ScenarioEditor>")
@@ -34733,6 +34895,12 @@ def _parse_scenarios_xml(path):
         if se is None:
             continue
         scen.update(_parse_scenario_editor(se))
+        scen = _canonicalize_specific_vulnerability_items(scen, strict=False)
+        if isinstance(scen.get('plan_preview'), dict):
+            scen['plan_preview'] = _canonicalize_plan_preview_vulnerability_names(
+                scen.get('plan_preview'),
+                scenario_payload=scen,
+            )
         # If scenario-level density_count was absent but Node Information section provided one, keep existing.
         data["scenarios"].append(scen)
     return data
@@ -35376,7 +35544,27 @@ def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> di
             return None
         payload = json.loads(raw)
         if isinstance(payload, dict):
-            return _canonicalize_plan_payload_paths(payload, xml_path=xml_path)
+            payload = _canonicalize_plan_payload_paths(payload, xml_path=xml_path)
+            try:
+                parsed = _parse_scenarios_xml(xml_path)
+                scenarios = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                selected = None
+                if isinstance(scenarios, list):
+                    target_norm = _normalize_scenario_label(scenario_label or '') if scenario_label else ''
+                    for scenario_payload in scenarios:
+                        if not isinstance(scenario_payload, dict):
+                            continue
+                        if target_norm:
+                            name = str(scenario_payload.get('name') or '').strip()
+                            if _normalize_scenario_label(name) != target_norm:
+                                continue
+                        selected = scenario_payload
+                        break
+                if isinstance(selected, dict):
+                    payload = _canonicalize_plan_preview_vulnerability_names(payload, scenario_payload=selected)
+            except Exception:
+                pass
+            return payload
         return None
     except Exception:
         return None

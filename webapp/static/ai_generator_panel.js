@@ -187,7 +187,7 @@
                                         </div>
                                         <div class="mb-3">
                                             <label class="form-label">servers.json Path</label>
-                                            <input type="text" class="form-control" id="aiGeneratorServersJsonInput" value="${escapeHtml(aiState.servers_json_path || 'MCP/ollmcp-servers.json')}" placeholder="/path/to/servers.json">
+                                            <input type="text" class="form-control" id="aiGeneratorServersJsonInput" value="${escapeHtml(aiState.servers_json_path || 'MCP/mcp-bridge-servers.json')}" placeholder="/path/to/servers.json">
                                             <div class="form-text">Auto-filled with a repo-local MCP server config file you can use if you prefer config-file based server wiring.</div>
                                         </div>
                                         <div class="form-check form-switch mb-3">

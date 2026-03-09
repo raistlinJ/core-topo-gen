@@ -10,6 +10,7 @@ Use this page to navigate the main project documentation.
 ## Core workflows
 - [Full Preview Workflow](FULL_PREVIEW_WORKFLOW.md)
 - [Feature Deep Dive](FEATURE_DEEP_DIVE.md)
+- AI Generator state flow and persistence are documented in [Feature Deep Dive](FEATURE_DEEP_DIVE.md#ai-generator-workflow).
 
 ## Reference
 - [Architecture Overview](ARCHITECTURE_OVERVIEW.md)

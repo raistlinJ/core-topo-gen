@@ -24,7 +24,7 @@ def main() -> int:
         'model': ai_state.get('model') or '',
         'mcp_server_path': ai_state.get('mcp_server_path') or 'MCP/server.py',
         'mcp_server_url': ai_state.get('mcp_server_url') or '',
-        'servers_json_path': ai_state.get('servers_json_path') or 'MCP/ollmcp-servers.json',
+        'servers_json_path': ai_state.get('servers_json_path') or 'MCP/mcp-bridge-servers.json',
         'auto_discovery': bool(ai_state.get('auto_discovery')),
         'hil_enabled': bool(ai_state.get('hil_enabled')),
         'enabled_tools': ai_state.get('enabled_tools') or [],

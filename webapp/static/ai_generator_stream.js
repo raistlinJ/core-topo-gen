@@ -4,6 +4,8 @@
         outputStarted: false,
         controller: null,
         running: false,
+        canRetry: false,
+        retryAction: null,
         requestId: '',
         meta: '',
         status: '',
@@ -12,7 +14,10 @@
         events: [],
     };
     const EVENT_COLLAPSE_THRESHOLD = 900;
-
+    const STREAMING_TAIL_MAX_CHARS = 24000;
+    const STREAMING_TAIL_MAX_LINES = 400;
+    const OUTPUT_TAIL_MAX_CHARS = 180000;
+    const OUTPUT_TAIL_MAX_LINES = 3000;
     function createRequestId() {
         try {
             if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -26,38 +31,120 @@
         const cancelBtn = document.getElementById('aiGeneratorStreamCancelBtn');
         const copyBtn = document.getElementById('aiGeneratorStreamCopyBtn');
         const downloadBtn = document.getElementById('aiGeneratorStreamDownloadBtn');
+        const retryBtn = document.getElementById('aiGeneratorStreamRetryBtn');
         const closeBtn = document.getElementById('aiGeneratorStreamCloseBtn');
         const headerCloseBtn = document.getElementById('aiGeneratorStreamHeaderCloseBtn');
         if (cancelBtn) cancelBtn.disabled = !streamState.running;
         if (copyBtn) copyBtn.disabled = !streamState.outputText && !streamState.events.length;
         if (downloadBtn) downloadBtn.disabled = !streamState.outputText && !streamState.events.length;
+        if (retryBtn) retryBtn.disabled = !!streamState.running || !streamState.canRetry || typeof streamState.retryAction !== 'function';
         if (closeBtn) closeBtn.disabled = !!streamState.running;
         if (headerCloseBtn) headerCloseBtn.disabled = !!streamState.running;
     }
 
-    function renderEventBody(bodyEl, fullBody) {
+    function setRetryAction(retryAction) {
+        streamState.retryAction = typeof retryAction === 'function' ? retryAction : null;
+        updateButtons();
+    }
+
+    async function retryStream() {
+        if (streamState.running || !streamState.canRetry || typeof streamState.retryAction !== 'function') return;
+        try {
+            await streamState.retryAction();
+        } catch (err) {
+            appendEvent('Retry failed', (err && err.message) ? err.message : 'Retry request failed.', 'danger');
+        }
+    }
+
+    function shouldUseRollingTail(options = {}) {
+        const modeKey = (options && options.tailMode) ? String(options.tailMode) : '';
+        if (modeKey === 'thinking') {
+            return true;
+        }
+        return !!(options && options.rollingTail);
+    }
+
+    function buildRollingTailText(text, maxChars = STREAMING_TAIL_MAX_CHARS, maxLines = STREAMING_TAIL_MAX_LINES) {
+        let visible = (text || '').toString();
+        let trimmedByChars = false;
+        let trimmedByLines = false;
+        if (visible.length > maxChars) {
+            visible = visible.slice(visible.length - maxChars);
+            trimmedByChars = true;
+        }
+        const lines = visible.split('\n');
+        if (lines.length > maxLines) {
+            visible = lines.slice(lines.length - maxLines).join('\n');
+            trimmedByLines = true;
+        }
+        return {
+            text: visible,
+            trimmed: trimmedByChars || trimmedByLines,
+        };
+    }
+
+    function renderScrollingTextBlock(parentEl, text, className) {
+        const block = document.createElement('div');
+        block.className = className;
+        block.textContent = text;
+        parentEl.appendChild(block);
+        block.scrollTop = block.scrollHeight;
+        return block;
+    }
+
+    function bindPayloadToggle(detailsEl, summaryEl) {
+        if (!detailsEl || !summaryEl) return;
+        const syncLabel = () => {
+            summaryEl.textContent = detailsEl.open ? 'Collapse payload' : 'Expand payload';
+        };
+        detailsEl.addEventListener('toggle', syncLabel);
+        syncLabel();
+    }
+
+    function renderOutput() {
+        const outputEl = document.getElementById('aiGeneratorStreamOutput');
+        const outputHintEl = document.getElementById('aiGeneratorStreamOutputHint');
+        if (!outputEl) return;
+        const fullText = (streamState.outputText || '').toString();
+        const tail = buildRollingTailText(fullText, OUTPUT_TAIL_MAX_CHARS, OUTPUT_TAIL_MAX_LINES);
+        outputEl.textContent = tail.text;
+        outputEl.scrollTop = outputEl.scrollHeight;
+        if (outputHintEl) {
+            outputHintEl.textContent = tail.trimmed
+                ? 'Showing newest model output lines. Older output remains available via Copy Transcript or Download Transcript.'
+                : '';
+        }
+    }
+
+    function renderEventBody(bodyEl, fullBody, options = {}) {
         if (!bodyEl) return;
         const text = (fullBody || '').toString();
         bodyEl.textContent = '';
         if (!text) return;
-        if (text.length <= EVENT_COLLAPSE_THRESHOLD) {
-            bodyEl.textContent = text;
+        const renderedText = shouldUseRollingTail(options)
+            ? buildRollingTailText(
+                text,
+                options.maxChars || STREAMING_TAIL_MAX_CHARS,
+                options.maxLines || STREAMING_TAIL_MAX_LINES,
+            ).text
+            : text;
+        const shouldCollapse = renderedText.length > EVENT_COLLAPSE_THRESHOLD || renderedText.includes('\n');
+        if (!shouldCollapse) {
+            bodyEl.textContent = renderedText;
             return;
         }
-        const preview = document.createElement('div');
-        preview.className = 'ai-generator-stream-event-preview';
-        preview.textContent = `${text.slice(0, EVENT_COLLAPSE_THRESHOLD)}\n\n[truncated in-place; expand below for full payload]`;
-        bodyEl.appendChild(preview);
-
         const details = document.createElement('details');
         details.className = 'ai-generator-stream-event-toggle';
+        details.open = !!options.initialOpen;
         const summary = document.createElement('summary');
-        summary.textContent = 'Show full payload';
         const full = document.createElement('div');
-        full.className = 'ai-generator-stream-event-toggle-body';
-        full.textContent = text;
+        full.className = shouldUseRollingTail(options)
+            ? 'ai-generator-stream-event-live-tail ai-generator-stream-event-toggle-body'
+            : 'ai-generator-stream-event-toggle-body';
+        full.textContent = renderedText;
         details.appendChild(summary);
         details.appendChild(full);
+        bindPayloadToggle(details, summary);
         bodyEl.appendChild(details);
     }
 
@@ -95,17 +182,33 @@
     }
 
     function appendOutput(text, prefix = '') {
-        const outputEl = document.getElementById('aiGeneratorStreamOutput');
-        if (!outputEl || !text) return;
+        if (!text) return;
         if (!streamState.outputStarted && prefix) {
-            outputEl.textContent += `${prefix}`;
             streamState.outputText += `${prefix}`;
             streamState.outputStarted = true;
         }
-        outputEl.textContent += text;
         streamState.outputText += text;
-        outputEl.scrollTop = outputEl.scrollHeight;
+        renderOutput();
         updateButtons();
+    }
+
+    function getOutputText() {
+        return (streamState.outputText || '').toString();
+    }
+
+    function rerenderEventByMergeKey(mergeKey) {
+        const eventsEl = document.getElementById('aiGeneratorStreamEvents');
+        if (!eventsEl || !mergeKey) return;
+        const existingEl = eventsEl.querySelector(`[data-merge-key="${String(mergeKey).replace(/"/g, '&quot;')}"]`);
+        const existingEvent = streamState.events.find((event) => event && event.mergeKey === mergeKey);
+        if (!existingEl || !existingEvent) return;
+        const bodyEl = existingEl.querySelector('.ai-generator-stream-event-body');
+        const detailsEl = bodyEl ? bodyEl.querySelector('.ai-generator-stream-event-toggle') : null;
+        renderEventBody(bodyEl, existingEvent.body || '', {
+            ...(existingEvent.renderOptions || {}),
+            initialOpen: !!(detailsEl && detailsEl.open),
+        });
+        eventsEl.scrollTop = eventsEl.scrollHeight;
     }
 
     function appendEvent(title, body = '', tone = 'default', options = {}) {
@@ -118,16 +221,21 @@
             const existingIndex = streamState.events.findIndex((event) => event && event.mergeKey === mergeKey);
             if (existingEl && existingIndex >= 0) {
                 const bodyEl = existingEl.querySelector('.ai-generator-stream-event-body');
+                const detailsEl = bodyEl ? bodyEl.querySelector('.ai-generator-stream-event-toggle') : null;
                 const currentBody = (streamState.events[existingIndex].body || '').toString();
                 const nextChunk = (body || '').toString();
                 const nextBody = appendBody ? `${currentBody}${nextChunk}` : nextChunk;
-                renderEventBody(bodyEl, nextBody);
+                renderEventBody(bodyEl, nextBody, {
+                    ...(options || {}),
+                    initialOpen: !!(detailsEl && detailsEl.open),
+                });
                 streamState.events[existingIndex] = {
                     ...streamState.events[existingIndex],
                     title: title || 'Update',
                     body: nextBody,
                     tone: tone || 'default',
                     mergeKey,
+                    renderOptions: options || {},
                 };
                 eventsEl.scrollTop = eventsEl.scrollHeight;
                 updateButtons();
@@ -144,11 +252,11 @@
         titleEl.textContent = title || 'Update';
         const bodyEl = document.createElement('div');
         bodyEl.className = 'ai-generator-stream-event-body';
-        renderEventBody(bodyEl, body || '');
+        renderEventBody(bodyEl, body || '', options);
         item.appendChild(titleEl);
         item.appendChild(bodyEl);
         eventsEl.appendChild(item);
-        streamState.events.push({ title: title || 'Update', body: body || '', tone: tone || 'default', mergeKey });
+        streamState.events.push({ title: title || 'Update', body: body || '', tone: tone || 'default', mergeKey, renderOptions: options || {} });
         eventsEl.scrollTop = eventsEl.scrollHeight;
         updateButtons();
     }
@@ -200,24 +308,49 @@
         }
     }
 
+    function ensureDownloadFrame() {
+        let frame = document.getElementById('aiGeneratorTranscriptDownloadFrame');
+        if (frame) return frame;
+        frame = document.createElement('iframe');
+        frame.id = 'aiGeneratorTranscriptDownloadFrame';
+        frame.name = 'aiGeneratorTranscriptDownloadFrame';
+        frame.style.display = 'none';
+        document.body.appendChild(frame);
+        return frame;
+    }
+
     function downloadTranscript() {
         const text = buildTranscript();
         if (!text.trim()) return;
         try {
-            const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const link = document.createElement('a');
             const safeName = (streamState.meta || 'ai-generator-transcript')
                 .toString()
                 .toLowerCase()
                 .replace(/[^a-z0-9]+/g, '-')
                 .replace(/^-+|-+$/g, '') || 'ai-generator-transcript';
-            link.href = url;
-            link.download = `${safeName}.txt`;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-            URL.revokeObjectURL(url);
+            const frame = ensureDownloadFrame();
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/api/ai/download_transcript';
+            form.target = frame.name;
+            form.style.display = 'none';
+
+            const transcriptField = document.createElement('textarea');
+            transcriptField.name = 'transcript';
+            transcriptField.value = text;
+            form.appendChild(transcriptField);
+
+            const filenameField = document.createElement('input');
+            filenameField.type = 'hidden';
+            filenameField.name = 'filename';
+            filenameField.value = safeName;
+            form.appendChild(filenameField);
+
+            document.body.appendChild(form);
+            form.submit();
+            window.setTimeout(() => {
+                try { document.body.removeChild(form); } catch (e) { }
+            }, 1000);
             appendEvent('Transcript downloaded', 'Downloaded the full output and activity transcript.', 'success');
         } catch (err) {
             appendEvent('Download failed', (err && err.message) ? err.message : 'Transcript download failed.', 'danger');
@@ -250,6 +383,7 @@
         streamState.outputStarted = false;
         streamState.controller = null;
         streamState.running = false;
+        streamState.canRetry = false;
         streamState.requestId = '';
         streamState.outputText = '';
         streamState.events = [];
@@ -263,6 +397,7 @@
         }
         if (outputEl) outputEl.textContent = '';
         if (eventsEl) eventsEl.innerHTML = '';
+        renderOutput();
         setStatus('Preparing request...', 'Connecting to the backend stream.', 'primary');
         appendEvent('Starting', 'Opening generation stream.');
         updateButtons();
@@ -273,6 +408,7 @@
         streamState.running = false;
         streamState.controller = null;
         streamState.requestId = '';
+        streamState.canRetry = true;
         setStatus(
             success ? 'Generation finished' : 'Generation failed',
             detailText || (success ? 'Scenario draft and preview are ready.' : 'The request stopped before a valid result was returned.'),
@@ -323,11 +459,14 @@
         getModalInstance,
         setStatus,
         appendOutput,
+        getOutputText,
         appendEvent,
         buildTranscript,
         copyTranscript,
         downloadTranscript,
         cancelStream,
+        retryStream,
+        setRetryAction,
         showModal,
         finishModal,
         consumeNdjsonStream,

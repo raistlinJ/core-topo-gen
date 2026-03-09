@@ -28,6 +28,7 @@ from ..constants import DEFAULT_IPV4_PREFIXLEN
 from .layout_positions import compute_clustered_layout
 from ..utils.allocators import UniqueAllocator, make_subnet_allocator  # runtime-like allocators
 from .router_host_plan import plan_router_counts, plan_r2s_grouping  # reuse builder's router count & grouping logic
+from .docker_capacity import ensure_role_counts_docker_capacity
 from .node_plan import _normalize_role_name  # internal normalization helper
 from .preview_validation import validate_full_preview
 
@@ -488,7 +489,9 @@ def build_full_preview(
     for r, c in role_counts.items():
         nr = _normalize_role_name(r)
         normalized_counts[nr] = normalized_counts.get(nr, 0) + int(c)
-    role_counts = normalized_counts
+    required_docker_hosts = sum(max(0, int(count or 0)) for count in (vulnerabilities_plan or {}).values())
+    role_counts, docker_capacity_repair = ensure_role_counts_docker_capacity(normalized_counts, required_docker_hosts)
+    total_hosts = sum(int(c) for c in role_counts.values())
     role_expanded = _expand_roles(role_counts)
     host_nodes: List[PreviewNode] = []
     host_router_map: Dict[int, int] = {}
@@ -1065,9 +1068,12 @@ def build_full_preview(
     service_assignments = _preview_services(services_plan, [h.node_id for h in host_nodes], rnd_seed)
     vuln_assignments: Dict[int, List[str]] = {}
     if vulnerabilities_plan:
-        # Match CLI behavior: assign to the full host slot pool in deterministic order.
-        # Use node_id ordering to mirror slot-1..N allocation, then shuffle with the same seed.
-        target_hosts = sorted(host_nodes, key=lambda h: getattr(h, 'node_id', 0))
+        # Vulnerability-bearing slots are realized as Docker-role hosts.
+        # Use deterministic node_id ordering to mirror slot-1..N allocation, then shuffle.
+        target_hosts = sorted(
+            [h for h in host_nodes if str(getattr(h, 'role', '') or '').strip().lower() == 'docker'],
+            key=lambda h: getattr(h, 'node_id', 0),
+        )
         ordered = _stable_shuffle([h.node_id for h in target_hosts], rnd_seed + 101)
         flat: List[str] = []
         for name, count in vulnerabilities_plan.items():
@@ -1412,8 +1418,9 @@ def build_full_preview(
         'routing_plan': routing_plan,
         'services_plan': services_plan,
         'vulnerabilities_plan': vulnerabilities_plan,
-    'base_scenario_reference': base_scenario,
-    'base_bridge_preview': base_bridge_info,
+        'docker_capacity_repair': docker_capacity_repair,
+        'base_scenario_reference': base_scenario,
+        'base_bridge_preview': base_bridge_info,
         'role_counts': dict(role_counts),
         'seed': seed,
         'seed_generated': seed_generated,

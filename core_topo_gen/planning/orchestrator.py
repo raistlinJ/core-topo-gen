@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List, Tuple
 import logging
 
 from .node_plan import compute_node_plan
+from .docker_capacity import ensure_role_counts_docker_capacity
 from .router_plan import compute_router_plan
 from .service_plan import compute_service_plan, ServiceSpec
 from .vulnerability_plan import compute_vulnerability_plan, VulnerabilityItem
@@ -77,6 +78,16 @@ def compute_full_plan(
         kind = selected
         vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c, kind=kind, factor=factor_val, metric=vm))
     vulnerability_plan, vuln_breakdown = compute_vulnerability_plan(density_base, vuln_density, vuln_items)
+    required_docker_hosts = sum(max(0, int(count or 0)) for count in (vulnerability_plan or {}).values())
+    role_counts, docker_capacity_repair = ensure_role_counts_docker_capacity(role_counts, required_docker_hosts)
+    if docker_capacity_repair.get('added_docker_hosts'):
+        try:
+            node_breakdown['additive_nodes'] = int(node_breakdown.get('additive_nodes') or 0) + int(docker_capacity_repair['added_docker_hosts'])
+            node_breakdown['combined_nodes'] = int(node_breakdown.get('combined_nodes') or 0) + int(docker_capacity_repair['added_docker_hosts'])
+        except Exception:
+            pass
+    node_breakdown['docker_capacity_repair'] = docker_capacity_repair
+    vuln_breakdown['docker_capacity_repair'] = docker_capacity_repair
 
     # --- Routing ---
     routing_density, routing_items = parse_routing_info(xml_path, scenario)
@@ -145,6 +156,7 @@ def compute_full_plan(
         'routing_items': routing_items,  # raw objects for downstream preview builder
         'service_plan': service_plan,
         'vulnerability_plan': vulnerability_plan,
+        'docker_capacity_repair': docker_capacity_repair,
         'vulnerability_flag_type': vuln_flag_type,
         'segmentation_plan': segmentation_plan,
         'traffic_plan': traffic_plan_out,

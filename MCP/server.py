@@ -12,7 +12,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from core_topo_gen.utils.vuln_process import load_vuln_catalog
+from core_topo_gen.utils.vuln_process import load_vuln_catalog, resolve_vulnerability_catalog_entry
 from core_topo_gen.utils.segmentation import SEGMENTATION_GUI_TYPES
 from core_topo_gen.utils.services import DEFAULT_SERVICE_POOL
 from webapp import app_backend
@@ -212,7 +212,7 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.add_node_role_item': MCPTool(
                 name='scenario.add_node_role_item',
-                description='Append a concrete Node Information row for explicit host counts, including Docker hosts.',
+                description='Append a concrete Node Information row for explicit host counts, including Docker hosts. This tool is only for host nodes, not routers. If the user asks for total topology nodes plus a separate router count, host rows should cover only the non-router remainder.',
                 input_schema={
                     'type': 'object',
                     'properties': {
@@ -252,7 +252,7 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.add_routing_item': MCPTool(
                 name='scenario.add_routing_item',
-                description='Append a concrete Routing row with explicit router count and optional router-edge planning fields.',
+                description='Append a concrete Routing row with explicit router count and optional router-edge planning fields. Use this tool for router quantity. If the user asks for total topology nodes plus a separate router count, this tool should carry the router portion while Node Information covers the non-router host remainder.',
                 input_schema={
                     'type': 'object',
                     'properties': {
@@ -341,22 +341,16 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.add_vulnerability_item': MCPTool(
                 name='scenario.add_vulnerability_item',
-                description='Append a concrete vulnerability item to the draft Vulnerabilities section from a catalog query, exact catalog match, or explicit type/vector.',
+                description='Append exactly one concrete vulnerability item to the draft Vulnerabilities section. Prefer search_vulnerability_catalog first, then pass explicit v_name and v_path from the chosen result, or pass explicit v_type and v_vector for a Type/Vector row. For requests like "3 different vulnerabilities", call this tool three separate times with one vulnerability per call. Do not pass factor.',
                 input_schema={
                     'type': 'object',
                     'properties': {
                         'draft_id': {'type': 'string'},
-                        'query': {'type': 'string'},
-                        'match_index': {'type': 'integer'},
                         'v_name': {'type': 'string'},
                         'v_path': {'type': 'string'},
                         'v_type': {'type': 'string'},
                         'v_vector': {'type': 'string'},
-                        'selected': {'type': 'string'},
-                        'v_metric': {'type': 'string'},
                         'v_count': {'type': 'integer'},
-                        'factor': {'type': 'number'},
-                        'flag_type': {'type': 'string'},
                     },
                     'required': ['draft_id'],
                     'additionalProperties': False,
@@ -762,7 +756,6 @@ class ScenarioAuthoringMCPServer:
                     },
                     'item_fields': {
                         'selected': field_schema(value_type='string', required=True, enum=['Specific', 'Type/Vector'], notes=['Category is accepted as an alias for Type/Vector.']),
-                        'factor': field_schema(value_type='number', default=1.0, minimum=0),
                         'v_metric': field_schema(value_type='string', default='Count', enum=['Count']),
                         'v_count': field_schema(value_type='integer', default=1, minimum=0),
                         'v_name': field_schema(value_type='string', notes=['Required when selected is Specific.']),
@@ -784,6 +777,7 @@ class ScenarioAuthoringMCPServer:
                     'notes': [
                         'Current UI selection is Random or Specific; Type/Vector remains legacy parser/MCP support rather than a current dropdown value.',
                         'Use search_vulnerability_catalog before add_vulnerability_item when selecting a specific vulnerability.',
+                        'For multiple different vulnerabilities, add separate rows instead of using factor weighting.',
                     ],
                 },
                 'Segmentation': {
@@ -1052,6 +1046,13 @@ class ScenarioAuthoringMCPServer:
                 if not selected:
                     raise ValueError('Vulnerabilities selected must be one of: Random, Specific, or legacy Type/Vector')
                 item['selected'] = selected
+                if selected == 'Specific':
+                    resolved = self._resolve_specific_vulnerability_catalog_entry(
+                        v_name=item.get('v_name'),
+                        v_path=item.get('v_path') or item.get('path'),
+                    )
+                    item['v_name'] = resolved['name']
+                    item['v_path'] = resolved['path']
             elif section_name == 'Segmentation':
                 selected = self._normalize_segmentation_kind(item.get('selected'))
                 if not selected:
@@ -1189,6 +1190,18 @@ class ScenarioAuthoringMCPServer:
         }
         self._last_vulnerability_search = deepcopy(response)
         return response
+
+    def _resolve_specific_vulnerability_catalog_entry(self, *, v_name: Any = None, v_path: Any = None) -> dict[str, str]:
+        catalog = self._load_vulnerability_catalog()
+        resolved = resolve_vulnerability_catalog_entry(
+            catalog,
+            v_name=str(v_name or ''),
+            v_path=str(v_path or ''),
+        )
+        if resolved:
+            return resolved
+
+        raise ValueError('Specific vulnerability must match an enabled catalog entry by v_path or v_name')
 
     def _touch_draft_after_mutation(self, draft: ScenarioDraft) -> None:
         draft.updated_at = app_backend._local_timestamp_safe()
@@ -1634,9 +1647,10 @@ class ScenarioAuthoringMCPServer:
                 v_path = str(chosen.get('path') or '').strip()
             if not v_name or not v_path:
                 raise ValueError('Specific vulnerability items require v_name and v_path')
+            resolved = self._resolve_specific_vulnerability_catalog_entry(v_name=v_name, v_path=v_path)
             new_item['selected'] = 'Specific'
-            new_item['v_name'] = v_name
-            new_item['v_path'] = v_path
+            new_item['v_name'] = resolved['name']
+            new_item['v_path'] = resolved['path']
 
         if 'flag_type' in arguments and str(arguments.get('flag_type') or '').strip():
             vuln_section['flag_type'] = str(arguments.get('flag_type') or '').strip()

@@ -55,6 +55,12 @@ def test_mcp_initialize_and_list_tools():
     assert 'scenario.preview_draft' in tool_names
     assert 'scenario.save_xml' in tool_names
 
+    vuln_tool = next(tool for tool in tools if tool.get('name') == 'scenario.add_vulnerability_item')
+    vuln_properties = (((vuln_tool.get('inputSchema') or {}).get('properties')) or {})
+    assert 'factor' not in vuln_properties
+    assert 'query' not in vuln_properties
+    assert set(vuln_properties) >= {'draft_id', 'v_name', 'v_path', 'v_type', 'v_vector', 'v_count'}
+
 
 def test_mcp_draft_preview_and_save_flow(tmp_path, monkeypatch):
     from webapp import app_backend
@@ -559,6 +565,7 @@ def test_mcp_get_authoring_schema_exposes_backend_option_sets():
     vulnerabilities = sections.get('Vulnerabilities') or {}
     assert set(vulnerabilities.get('ui_selected_values') or []) >= {'Random', 'Specific'}
     assert set(vulnerabilities.get('legacy_selected_values') or []) >= {'Type/Vector'}
+    assert 'factor' not in (vulnerabilities.get('item_fields') or {})
     selection_modes = vulnerabilities.get('selection_modes') or {}
     assert set(selection_modes) >= {'Specific', 'Type/Vector'}
     assert selection_modes.get('Type/Vector', {}).get('selected_aliases') == ['Category']
@@ -614,6 +621,7 @@ def test_mcp_get_authoring_schema_exposes_vulnerability_mode_requirements():
     assert schema.get('section_name') == 'Vulnerabilities'
     section = schema.get('section') or {}
     selection_modes = section.get('selection_modes') or {}
+    assert 'factor' not in (section.get('item_fields') or {})
     assert selection_modes.get('Specific', {}).get('required_item_fields') == ['selected', 'v_name']
     assert selection_modes.get('Type/Vector', {}).get('required_item_fields') == ['selected', 'v_type', 'v_vector']
 
@@ -703,6 +711,75 @@ def test_mcp_add_vulnerability_item_from_catalog_query(monkeypatch):
     vuln_items = (((draft.get('scenario') or {}).get('sections') or {}).get('Vulnerabilities') or {}).get('items') or []
     assert len(vuln_items) == 1
     assert vuln_items[0].get('v_name') == 'mysql/CVE-2012-2122'
+
+
+def test_mcp_add_vulnerability_item_canonicalizes_name_from_matching_path(monkeypatch):
+    import MCP.server as mcp_server
+
+    monkeypatch.setattr(mcp_server, 'load_vuln_catalog', lambda repo_root: [
+        {
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'Type': 'docker-compose',
+            'Vector': 'remote',
+            'CVE': 'CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        },
+    ])
+
+    server = ScenarioAuthoringMCPServer()
+    created = _tool_call(server, 'scenario.create_draft', {'name': 'CanonicalizeVulnScenario'})
+    draft_id = (created.get('draft') or {}).get('draft_id')
+
+    updated = _tool_call(server, 'scenario.add_vulnerability_item', {
+        'draft_id': draft_id,
+        'v_name': 'jboss',
+        'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+        'v_count': 1,
+    })
+
+    added_item = updated.get('added_item') or {}
+    assert added_item.get('v_name') == 'jboss/CVE-2017-12149'
+    assert added_item.get('v_path') == 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149'
+
+
+def test_mcp_add_vulnerability_item_rejects_specific_vuln_outside_enabled_catalog(monkeypatch):
+    import MCP.server as mcp_server
+
+    monkeypatch.setattr(mcp_server, 'load_vuln_catalog', lambda repo_root: [
+        {
+            'Name': 'mysql/CVE-2012-2122',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/mysql/CVE-2012-2122',
+            'Type': 'docker-compose',
+            'Vector': 'remote',
+            'CVE': 'CVE-2012-2122',
+            'Description': 'MySQL Authentication Bypass',
+        },
+    ])
+
+    server = ScenarioAuthoringMCPServer()
+    created = _tool_call(server, 'scenario.create_draft', {'name': 'RejectUnknownVulnScenario'})
+    draft_id = (created.get('draft') or {}).get('draft_id')
+
+    response = server.handle_message({
+        'jsonrpc': '2.0',
+        'id': 9,
+        'method': 'tools/call',
+        'params': {
+            'name': 'scenario.add_vulnerability_item',
+            'arguments': {
+                'draft_id': draft_id,
+                'v_name': 'jboss',
+                'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                'v_count': 1,
+            },
+        },
+    })
+
+    assert response is not None
+    error = response.get('error') or {}
+    assert error.get('code') == -32602
+    assert 'enabled catalog entry' in str(error.get('message') or '')
 
 
 def test_mcp_add_vulnerability_item_accepts_type_vector_aliases_without_selected(monkeypatch):
@@ -812,6 +889,48 @@ def test_mcp_add_vulnerability_item_preserves_prior_search_when_followup_query_m
     added_item = updated.get('added_item') or {}
     assert added_item.get('selected') == 'Specific'
     assert added_item.get('v_name') == 'mysql/CVE-2012-2122'
+
+
+def test_mcp_replace_section_canonicalizes_specific_vulnerability_from_matching_path(monkeypatch):
+    import MCP.server as mcp_server
+
+    monkeypatch.setattr(mcp_server, 'load_vuln_catalog', lambda repo_root: [
+        {
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'Type': 'docker-compose',
+            'Vector': 'remote',
+            'CVE': 'CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        },
+    ])
+
+    server = ScenarioAuthoringMCPServer()
+    created = _tool_call(server, 'scenario.create_draft', {'name': 'ReplaceCanonicalizeScenario'})
+    draft_id = (created.get('draft') or {}).get('draft_id')
+
+    updated = _tool_call(server, 'scenario.replace_section', {
+        'draft_id': draft_id,
+        'section_name': 'Vulnerabilities',
+        'section_payload': {
+            'density': 0,
+            'flag_type': 'text',
+            'items': [
+                {
+                    'selected': 'Specific',
+                    'v_metric': 'Count',
+                    'v_count': 1,
+                    'v_name': 'jboss',
+                    'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                },
+            ],
+        },
+    })
+
+    vuln_items = (((updated.get('draft') or {}).get('scenario') or {}).get('sections') or {}).get('Vulnerabilities', {}).get('items') or []
+    assert len(vuln_items) == 1
+    assert vuln_items[0].get('v_name') == 'jboss/CVE-2017-12149'
+    assert vuln_items[0].get('v_path') == 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149'
 
 
 def test_mcp_returns_error_for_missing_draft():

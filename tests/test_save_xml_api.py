@@ -99,7 +99,7 @@ def test_save_xml_api_repairs_router_rows_misplaced_in_node_information(tmp_path
 
     assert all(str(item.get('selected') or '').strip() != 'Router' for item in node_items if isinstance(item, dict))
     assert routing_items
-    assert routing_items[0].get('selected') == 'Routing'
+    assert routing_items[0].get('selected') == 'OSPFv2'
     assert routing_items[0].get('v_metric') == 'Count'
     assert routing_items[0].get('v_count') == 3
 
@@ -270,6 +270,232 @@ def test_save_xml_api_vulnerabilities_category_roundtrip_preserves_type_vector(t
     assert items[0].get('selected') == 'Category'
     assert items[0].get('v_type') == 'docker-compose'
     assert items[0].get('v_vector') == 'network'
+
+
+def test_save_xml_api_adds_docker_capacity_for_vuln_targets(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'VulnDockerCapacity',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {
+                        'density': 0.0,
+                        'items': [
+                            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 3, 'v_name': 'Demo Vuln', 'v_path': 'demo/path'},
+                        ],
+                        'flag_type': 'text',
+                    },
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenario = (parsed.get('scenarios') or [])[0]
+    node_items = ((scenario.get('sections') or {}).get('Node Information') or {}).get('items') or []
+    docker_total = sum(
+        int(item.get('v_count') or 0)
+        for item in node_items
+        if isinstance(item, dict) and str(item.get('selected') or '').strip() == 'Docker' and str(item.get('v_metric') or '').strip() == 'Count'
+    )
+    assert docker_total == 3
+
+
+def test_save_xml_api_canonicalizes_specific_vulnerability_name_in_sections_and_planpreview(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        backend,
+        '_load_backend_vuln_catalog_items',
+        lambda: [{
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        }],
+    )
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'CanonicalizeSavedJboss',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {
+                        'density': 0.0,
+                        'items': [
+                            {
+                                'selected': 'Specific',
+                                'v_metric': 'Count',
+                                'v_count': 1,
+                                'v_name': 'jboss',
+                                'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                            },
+                        ],
+                        'flag_type': 'text',
+                    },
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'plan_preview': {
+                    'full_preview': {
+                        'hosts': [
+                            {'node_id': 1, 'name': 'docker-1', 'role': 'Docker', 'vulnerabilities': ['jboss']},
+                        ],
+                        'routers': [],
+                        'switches': [],
+                        'vulnerabilities_preview': {'1': ['jboss']},
+                        'vulnerabilities_by_node': {'1': ['jboss']},
+                        'vulnerabilities_plan': {'jboss': 1},
+                    },
+                    'metadata': {},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenario = (parsed.get('scenarios') or [])[0]
+    vuln_items = ((scenario.get('sections') or {}).get('Vulnerabilities') or {}).get('items') or []
+    assert vuln_items[0].get('v_name') == 'jboss/CVE-2017-12149'
+
+    plan_preview = backend._load_plan_preview_from_xml(data.get('result_path'), 'CanonicalizeSavedJboss') or {}
+    full_preview = plan_preview.get('full_preview') or {}
+    assert full_preview.get('vulnerabilities_plan') == {'jboss/CVE-2017-12149': 1}
+    assert full_preview.get('vulnerabilities_by_node') == {'1': ['jboss/CVE-2017-12149']}
+
+
+def test_save_xml_api_canonicalizes_specific_vulnerability_name_from_url_to_installed_catalog_path(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        backend,
+        '_load_backend_vuln_catalog_items',
+        lambda: [{
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': str(tmp_path / 'installed' / 'content' / 'vulhub' / 'jboss' / 'CVE-2017-12149' / 'docker-compose.yml'),
+            'CVE': 'CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        }],
+    )
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'CanonicalizeInstalledPathJboss',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {
+                        'density': 0.0,
+                        'items': [
+                            {
+                                'selected': 'Specific',
+                                'v_metric': 'Count',
+                                'v_count': 1,
+                                'v_name': 'jboss',
+                                'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                            },
+                        ],
+                        'flag_type': 'text',
+                    },
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'plan_preview': {
+                    'full_preview': {
+                        'hosts': [
+                            {'node_id': 1, 'name': 'docker-1', 'role': 'Docker', 'vulnerabilities': ['jboss']},
+                        ],
+                        'routers': [],
+                        'switches': [],
+                        'vulnerabilities_preview': {'1': ['jboss']},
+                        'vulnerabilities_by_node': {'1': ['jboss']},
+                        'vulnerabilities_plan': {'jboss': 1},
+                    },
+                    'metadata': {},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenario = (parsed.get('scenarios') or [])[0]
+    vuln_items = ((scenario.get('sections') or {}).get('Vulnerabilities') or {}).get('items') or []
+    assert vuln_items[0].get('v_name') == 'jboss/CVE-2017-12149'
+
+    plan_preview = backend._load_plan_preview_from_xml(data.get('result_path'), 'CanonicalizeInstalledPathJboss') or {}
+    full_preview = plan_preview.get('full_preview') or {}
+    assert full_preview.get('vulnerabilities_plan') == {'jboss/CVE-2017-12149': 1}
+    assert full_preview.get('vulnerabilities_by_node') == {'1': ['jboss/CVE-2017-12149']}
 
 
 def test_save_xml_api_topology_bounds_roundtrip_persists(tmp_path, monkeypatch):
