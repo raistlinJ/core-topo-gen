@@ -12,6 +12,14 @@ Using **uv**:
 uv sync --extra dev
 ```
 
+Using **pip**:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
 ## HTTPS via Docker Compose
 Run the web app behind nginx with TLS termination:
 ```bash
@@ -28,6 +36,10 @@ Run the backend directly for local development:
 ```bash
 uv run python webapp/app_backend.py
 ```
+With **pip**:
+```bash
+python webapp/app_backend.py
+```
 - Visit `http://localhost:9090`.
 - The Scenarios editor can be empty. If you delete the last scenario, the UI keeps an empty project until you create or import another scenario.
 - Saving an empty editor snapshot preserves that state, but no scenario XML is generated until at least one scenario exists.
@@ -38,6 +50,10 @@ uv run python webapp/app_backend.py
 With **uv**:
 ```bash
 uv run python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
+```
+With **pip**:
+```bash
+python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
 ```
 Popular options:
 - `--scenario NAME` pick a specific scenario entry

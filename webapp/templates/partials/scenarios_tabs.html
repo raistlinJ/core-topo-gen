@@ -15,6 +15,9 @@
       <a class="nav-link {% if scenarios_active_tab == 'connection-setup' %}active{% endif %}" {% if scenarios_active_tab == 'connection-setup' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab, tab='connection-setup') if scenario_tab else url_for('index', tab='connection-setup') }}">VM / Access</a>
     </li>
     <li class="nav-item">
+      <a class="nav-link {% if scenarios_active_tab == 'ai-generator' %}active{% endif %}" {% if scenarios_active_tab == 'ai-generator' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab, tab='ai-generator') if scenario_tab else url_for('index', tab='ai-generator') }}">AI Generator</a>
+    </li>
+    <li class="nav-item">
       <a class="nav-link {% if scenarios_active_tab == 'topology' %}active{% endif %}" {% if scenarios_active_tab == 'topology' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab) if scenario_tab else url_for('index') }}">Topology</a>
     </li>
     <li class="nav-item">
@@ -41,7 +44,7 @@
 <div class="position-fixed start-0 end-0 bg-body border-top" style="bottom: var(--coretg-dock-height, 0px); z-index: 1045;">
   <div class="container-fluid py-2">
     <div class="d-flex justify-content-end gap-2">
-      {% if (not is_builder_view) and scenarios_active_tab in ['connection-setup', 'topology', 'flag-sequencing'] %}
+      {% if (not is_builder_view) and scenarios_active_tab in ['connection-setup', 'ai-generator', 'topology', 'flag-sequencing'] %}
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="button">Save XML</button>
         <button id="downloadXmlBtn" class="btn btn-outline-info px-4 py-2 shadow-sm" type="button" {% if not preview_xml_path %}disabled title="Save XML first"{% endif %}>Download XML</button>
       {% endif %}
@@ -49,8 +52,8 @@
         id="scenariosExecuteBtn"
         class="btn btn-success px-4 py-2 shadow-sm"
         type="button"
-        {% if scenarios_active_tab == 'topology' %}data-coretg-action="continue" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Flag Sequencing"{% elif scenarios_active_tab == 'connection-setup' %}data-coretg-action="continue-topology" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Topology"{% endif %}
-      >{% if scenarios_active_tab == 'preview' %}Execute{% elif scenarios_active_tab in ['topology', 'connection-setup'] %}Continue{% else %}Preview{% endif %}</button>
+        {% if scenarios_active_tab == 'topology' %}data-coretg-action="continue" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Flag Sequencing"{% elif scenarios_active_tab in ['connection-setup', 'ai-generator'] %}data-coretg-action="continue-topology" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Topology"{% endif %}
+      >{% if scenarios_active_tab == 'preview' %}Execute{% elif scenarios_active_tab == 'topology' %}Continue{% elif scenarios_active_tab in ['connection-setup', 'ai-generator'] %}Next{% else %}Preview{% endif %}</button>
     </div>
   </div>
 </div>
@@ -163,6 +166,14 @@
         btn.setAttribute('title', 'Continue to Topology');
         return;
       }
+      if (m === 'ai-generator') {
+        btn.textContent = 'Next';
+        btn.dataset.coretgAction = 'continue-topology';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.disabled = false;
+        btn.setAttribute('title', 'Continue to Topology');
+        return;
+      }
       // default: return to normal label
       btn.dataset.coretgAction = '';
       btn.dataset.coretgScenario = '';
@@ -178,6 +189,11 @@
         btn.setAttribute('title', 'Continue to Flag Sequencing');
       } else if (activeTab === 'connection-setup') {
         btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue-topology';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.setAttribute('title', 'Continue to Topology');
+      } else if (activeTab === 'ai-generator') {
+        btn.textContent = 'Next';
         btn.dataset.coretgAction = 'continue-topology';
         btn.dataset.coretgScenario = (scenarioName || '').toString();
         btn.setAttribute('title', 'Continue to Topology');

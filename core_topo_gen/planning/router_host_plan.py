@@ -589,7 +589,9 @@ def plan_router_counts(
     # Weight-based routers
     import math as _math
     weight_based = int(_math.floor(effective_base * rd_clamped + 1e-9)) if (rd_clamped > 0 and effective_base > 0) else 0
-    router_count = min(total_hosts, count_router_count + weight_based)
+    # Explicit count-based routers are additive and may exceed current host count.
+    # Weight-based routers are still naturally bounded by the density/base-host calculation.
+    router_count = count_router_count + weight_based
     return {
         'router_count': router_count,
         'count_router_count': count_router_count,

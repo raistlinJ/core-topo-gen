@@ -10,7 +10,7 @@ def compute_router_plan(total_hosts: int, base_host_pool: int, routing_density: 
     """Compute router count with simplified rule (no absolute legacy mode):
 
     final = count_based + floor(clamp01(routing_density) * base_host_pool)
-    then clamped to total_hosts.
+    where explicit count-based routers remain additive even when there are few or no hosts.
     """
     # 1) Classify routing items (count-based vs weight-based vs ignored) and accumulate absolute counts.
     item_classifications = []
@@ -113,14 +113,9 @@ def compute_router_plan(total_hosts: int, base_host_pool: int, routing_density: 
             d, effective_base, density_component
         )
     # 4) Combine with count-based component.
-    router_count = min(total_hosts, count_based + density_component)
+    router_count = count_based + density_component
     if logger.isEnabledFor(logging.INFO):
         raw_total = count_based + density_component
-        if raw_total != router_count:
-            logger.info(
-                "[router.plan] final cap: min(total_hosts=%d, raw_total=%d) => %d", 
-                total_hosts, raw_total, router_count
-            )
         logger.info(
             "[router.plan] components: count_based=%d + density_component=%d => raw_total=%d", 
             count_based, density_component, raw_total

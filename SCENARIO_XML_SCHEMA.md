@@ -27,7 +27,7 @@ Child elements:
 ### `<section>` Attributes
 
 All sections share a common element name `<section>` and are distinguished by `name`:
-`Node Information | Routing | Services | Traffic | Events | Vulnerabilities | Segmentation | Notes`
+`Node Information | Routing | Services | Traffic | Vulnerabilities | Segmentation | Notes`
 
 Common attributes:
 | Attribute | Applies | Meaning |
@@ -93,11 +93,6 @@ Vulnerabilities section attributes:
 |-----------|---------|
 | `flag_type` | Flag/artifact type for CTF-style injection (`text | image | file | custom`). Currently only `text` is implemented. |
 
-Events attributes:
-| Attribute | Meaning |
-|-----------|---------|
-| `script_path` | Path to event script (informational – currently not executed automatically). |
-
 Segmentation items currently use only `selected`, `factor`, and optional Count semantics via `v_metric`/`v_count` (future extension for explicit slot counts).
 
 ### Example (Minimal Single Scenario)
@@ -117,7 +112,6 @@ Segmentation items currently use only `selected`, `factor`, and optional Count s
       </section>
       <section name="Services" density="0.500" />
       <section name="Traffic" density="0.500" />
-      <section name="Events" density="0.500" />
       <section name="Vulnerabilities" density="0.500" flag_type="text" />
       <section name="Segmentation" density="0.500" />
       <section name="Notes">

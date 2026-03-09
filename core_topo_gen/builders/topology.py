@@ -4039,8 +4039,9 @@ def build_segmented_topology(core,
         )
     except Exception:
         pass
-    # If no routers requested (no density, no counts) OR no hosts, fall back to simple star topology (no routers)
-    if router_count <= 0 or total_hosts == 0:
+    # If no routers are requested, fall back to a simple star topology.
+    # Explicit router counts should still realize router-only topologies even when there are no hosts.
+    if router_count <= 0:
         logger.info("No routers created: routing density=%s, count_router_count=%s, total_hosts=%s", routing_density, count_router_count, total_hosts)
         session, _switch_unused, nodes, svc, docker_by_name = build_star_from_roles(
             core,

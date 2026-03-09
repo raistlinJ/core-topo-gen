@@ -125,6 +125,13 @@ def test_router_count_additive_density_and_counts(monkeypatch):
     assert len(routers) == 3, f"Expected 3 routers (density ignored without weight-based items), got {len(routers)}"
 
 
+def test_router_only_count_items_realize_routers_without_hosts(monkeypatch):
+    routing_items = [RoutingInfo(protocol="OSPFv2", factor=0.0, abs_count=3)]
+    session, routers, proto_map = _build({}, routing_density=0.0, routing_items=routing_items, mesh_style="tree", monkeypatch=monkeypatch)
+
+    assert len(routers) == 3
+
+
 def test_report_vulnerability_summary(monkeypatch, tmp_path):
     # Directly call write_report to ensure summary line present
     from core_topo_gen.utils.report import write_report

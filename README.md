@@ -36,9 +36,20 @@ View the WebUI images gallery [`docs/screenshots.md`](docs/screenshots.md).
 ```bash
 uv sync --extra dev
 ```
+- Or with pip:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 - Run local Web UI:
 ```bash
 uv run python webapp/app_backend.py
+```
+- With pip/venv:
+```bash
+python webapp/app_backend.py
 ```
 - Run with explicit mode scripts (recommended for CORE VM workflows):
 ```bash
@@ -75,6 +86,10 @@ docker compose down
 - Run CLI:
 ```bash
 uv run python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
+```
+- With pip/venv:
+```bash
+python -m core_topo_gen.cli --xml path/to/scenario.xml --seed 42 --verbose
 ```
 - More setup detail: [docs/QUICK_START.md](docs/QUICK_START.md).
 

@@ -331,7 +331,7 @@
         });
 
         // Global helper for Bootstrap confirmation modal
-        window.confirmWithModal = function (title, message, confirmLabel = 'Confirm', tone = 'primary') {
+        window.confirmWithModal = function (title, message, confirmLabel = 'Confirm', tone = 'primary', options = {}) {
             return new Promise((resolve) => {
                 const modalEl = document.getElementById('confirmationModal');
                 if (!modalEl) {
@@ -346,8 +346,15 @@
                 let result = false;
 
                 if (titleEl) titleEl.textContent = title;
-                if (bodyEl) bodyEl.textContent = message;
-                if (bodyEl) bodyEl.style.whiteSpace = 'pre-wrap';
+                if (bodyEl) {
+                    if (options && options.allowHtml === true) {
+                        bodyEl.innerHTML = String(message || '');
+                        bodyEl.style.whiteSpace = 'normal';
+                    } else {
+                        bodyEl.textContent = message;
+                        bodyEl.style.whiteSpace = 'pre-wrap';
+                    }
+                }
 
                 if (confirmBtn) {
                     confirmBtn.textContent = confirmLabel;

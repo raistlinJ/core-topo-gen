@@ -1,0 +1,1 @@
+"""Repo-native MCP server package for scenario authoring."""
