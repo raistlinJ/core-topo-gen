@@ -8397,9 +8397,29 @@
         setLoadingSteps(progressSteps, 1);
         clearLoadingLog();
         appendLoadingLog('Checking CORE VM connectivity');
-        const testResp = await postJson('/api/flag-sequencing/test_core_connection', { scenario, xml_path: xmlPath });
+        let testResp = null;
+        try {
+          testResp = await postJson('/api/flag-sequencing/test_core_connection', { scenario, xml_path: xmlPath });
+        } catch (err) {
+          const msg = String((err && err.message) || err || 'CORE VM connection failed');
+          hideLoading();
+          setStatus('Generate failed: ' + msg, true);
+          if (typeof window.alertWithModal === 'function') {
+            await window.alertWithModal('CORE Connection Failed', msg, 'OK', 'danger');
+          } else {
+            throw err;
+          }
+          return;
+        }
         if (!testResp || !testResp.ok) {
-          throw new Error((testResp && testResp.error) ? testResp.error : 'CORE VM connection failed');
+          const msg = (testResp && testResp.error) ? String(testResp.error) : 'CORE VM connection failed';
+          hideLoading();
+          setStatus('Generate failed: ' + msg, true);
+          if (typeof window.alertWithModal === 'function') {
+            await window.alertWithModal('CORE Connection Failed', msg, 'OK', 'danger');
+            return;
+          }
+          throw new Error(msg);
         }
         appendLoadingLog('CORE VM connection OK');
 

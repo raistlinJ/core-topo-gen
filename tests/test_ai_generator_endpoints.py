@@ -1037,6 +1037,132 @@ def test_normalize_mcp_bridge_tool_name_repairs_server_prefix_separator():
     assert normalized == 'server.scenario.replace_section'
 
 
+def test_build_llm_chat_tool_schema_hides_draft_id_and_duplicate_aliases():
+    from webapp.routes import ai_provider
+
+    schema = ai_provider._build_llm_chat_tool_schema(
+        'server.scenario.add_routing_item',
+        {
+            'type': 'object',
+            'properties': {
+                'draft_id': {'type': 'string'},
+                'selected': {'type': 'string'},
+                'protocol': {'type': 'string'},
+                'kind': {'type': 'string'},
+                'type': {'type': 'string'},
+                'count': {'type': 'integer'},
+                'v_count': {'type': 'integer'},
+                'r2r_edges': {'type': 'integer'},
+            },
+            'required': ['draft_id'],
+        },
+    )
+
+    properties = schema.get('properties') or {}
+    assert 'draft_id' not in properties
+    assert 'kind' not in properties
+    assert 'type' not in properties
+    assert 'v_count' not in properties
+    assert set(properties) >= {'selected', 'protocol', 'count', 'r2r_edges'}
+    assert schema.get('required') == []
+
+
+def test_sanitize_mcp_bridge_tool_arguments_injects_draft_id_and_strips_unsupported_fields():
+    from webapp.routes import ai_provider
+
+    sanitized = ai_provider._sanitize_mcp_bridge_tool_arguments(
+        'server.scenario.add_vulnerability_item',
+        {
+            'v_name': 'jboss',
+            'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'factor': '?',
+            'selected': 'Specific',
+        },
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'draft_id': {'type': 'string'},
+                'v_name': {'type': 'string'},
+                'v_path': {'type': 'string'},
+                'v_type': {'type': 'string'},
+                'v_vector': {'type': 'string'},
+                'v_count': {'type': 'integer'},
+            },
+        },
+        current_draft_id='draft-123',
+    )
+
+    assert sanitized == {
+        'draft_id': 'draft-123',
+        'v_name': 'jboss',
+        'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+    }
+
+
+def test_sanitize_mcp_bridge_tool_arguments_replaces_blank_draft_id_with_active_draft():
+    from webapp.routes import ai_provider
+
+    sanitized = ai_provider._sanitize_mcp_bridge_tool_arguments(
+        'server.scenario.add_routing_item',
+        {
+            'draft_id': '   ',
+            'selected': 'OSPFv2',
+            'count': 3,
+        },
+        input_schema={
+            'type': 'object',
+            'properties': {
+                'draft_id': {'type': 'string'},
+                'selected': {'type': 'string'},
+                'count': {'type': 'integer'},
+            },
+        },
+        current_draft_id='draft-456',
+    )
+
+    assert sanitized == {
+        'draft_id': 'draft-456',
+        'selected': 'OSPFv2',
+        'count': 3,
+    }
+
+
+def test_mcp_bridge_process_query_server_side_passes_initial_draft_id_when_supported():
+    from webapp.routes import ai_provider
+
+    class _DraftAwareClient:
+        def __init__(self):
+            self.calls = []
+
+        async def process_query(self, prompt, *, initial_draft_id=''):
+            self.calls.append({'prompt': prompt, 'initial_draft_id': initial_draft_id})
+            return 'ok'
+
+    client = _DraftAwareClient()
+    result = asyncio.run(ai_provider._mcp_bridge_process_query_server_side(
+        client,
+        prompt='hello',
+        model='test-model',
+        initial_draft_id='draft-seeded',
+    ))
+
+    assert result == 'ok'
+    assert client.calls == [{'prompt': 'hello', 'initial_draft_id': 'draft-seeded'}]
+
+
+def test_mcp_bridge_goal_prompt_mentions_draft_id_is_injected():
+    from webapp.routes import ai_provider
+
+    prompt = ai_provider._build_mcp_bridge_goal_prompt(
+        draft_id='draft-1',
+        enabled_tools=['server.scenario.add_routing_item'],
+        scenario_name='InjectedDraftScenario',
+        user_prompt='create a topology with 3 routers',
+    )
+
+    assert 'injects the current draft_id automatically' in prompt
+
+
 def test_build_prompt_repair_decision_recognizes_ollama_tool_parse_error():
     from webapp.routes import ai_provider
 
@@ -1405,7 +1531,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_count_mis
     observed_prompts = []
     preview_attempt = {'index': 0}
 
-    async def fake_process_query_server_side(client, *, prompt, model, emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'

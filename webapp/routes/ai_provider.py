@@ -314,6 +314,7 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
             client,
             prompt=current_prompt,
             model=model,
+            initial_draft_id=draft_id,
             emit=emit,
             cancel_check=cancel_check,
             on_response_open=on_response_open,
@@ -1510,6 +1511,100 @@ def _normalize_mcp_bridge_tool_name(tool_name: Any, *, known_server_names: list[
     return text
 
 
+_LLM_TOOL_PROPERTY_ALLOWLISTS: dict[str, set[str]] = {
+    'scenario.add_node_role_item': {'selected', 'count', 'factor'},
+    'scenario.add_service_item': {'selected', 'count', 'factor', 'density'},
+    'scenario.add_routing_item': {
+        'selected', 'protocol', 'count', 'factor', 'density',
+        'r2r_mode', 'r2r_edges', 'r2s_mode', 'r2s_edges', 'r2s_hosts_min', 'r2s_hosts_max',
+    },
+    'scenario.add_traffic_item': {
+        'selected', 'protocol', 'count', 'factor', 'density',
+        'pattern', 'rate_kbps', 'period_s', 'jitter_pct', 'content_type',
+    },
+    'scenario.add_segmentation_item': {'selected', 'count', 'factor', 'density'},
+    'scenario.add_vulnerability_item': {'v_name', 'v_path', 'v_type', 'v_vector', 'v_count'},
+}
+
+
+def _is_draft_scoped_mcp_bridge_tool(qualified_tool_name: Any) -> bool:
+    name = str(qualified_tool_name or '').strip()
+    if not name or '.scenario.' not in name:
+        return False
+    return not name.endswith('scenario.create_draft') and not name.endswith('scenario.search_vulnerability_catalog')
+
+
+def _build_llm_chat_tool_schema(qualified_tool_name: str, input_schema: dict[str, Any]) -> dict[str, Any]:
+    schema = deepcopy(input_schema) if isinstance(input_schema, dict) else {'type': 'object'}
+    properties = schema.get('properties') if isinstance(schema.get('properties'), dict) else {}
+    required = [str(item or '').strip() for item in (schema.get('required') or []) if str(item or '').strip()]
+    tool_suffix = qualified_tool_name.split('.', 1)[1] if '.' in qualified_tool_name else qualified_tool_name
+    allowlist = _LLM_TOOL_PROPERTY_ALLOWLISTS.get(tool_suffix)
+
+    next_properties: dict[str, Any] = {}
+    for key, value in properties.items():
+        normalized_key = str(key or '').strip()
+        if not normalized_key:
+            continue
+        if normalized_key == 'draft_id' and _is_draft_scoped_mcp_bridge_tool(qualified_tool_name):
+            continue
+        if allowlist is not None and normalized_key not in allowlist:
+            continue
+        next_properties[normalized_key] = value
+
+    next_required = [key for key in required if key != 'draft_id' and key in next_properties]
+    schema['properties'] = next_properties
+    schema['required'] = next_required
+    return schema
+
+
+def _sanitize_mcp_bridge_tool_arguments(
+    qualified_tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    input_schema: dict[str, Any] | None = None,
+    current_draft_id: str = '',
+) -> dict[str, Any]:
+    args = dict(tool_args or {}) if isinstance(tool_args, dict) else {}
+    allowed_properties = set()
+    if isinstance(input_schema, dict):
+        allowed_properties = {
+            str(key or '').strip()
+            for key in ((input_schema.get('properties') or {}).keys() if isinstance(input_schema.get('properties'), dict) else [])
+            if str(key or '').strip()
+        }
+
+    def _is_placeholder_value(value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        if not text:
+            return False
+        if text in {'?', '??', '???', '...', '\u2026'}:
+            return True
+        return bool(re.fullmatch(r'[?.\s]+', text))
+
+    sanitized: dict[str, Any] = {}
+    for key, value in args.items():
+        normalized_key = str(key or '').strip()
+        if not normalized_key:
+            continue
+        if allowed_properties and normalized_key not in allowed_properties:
+            continue
+        if normalized_key == 'draft_id' and not str(value or '').strip():
+            continue
+        if _is_placeholder_value(value):
+            continue
+        sanitized[normalized_key] = value
+
+    if qualified_tool_name.endswith('scenario.create_draft'):
+        sanitized.pop('draft_id', None)
+    elif _is_draft_scoped_mcp_bridge_tool(qualified_tool_name) and current_draft_id:
+        sanitized['draft_id'] = current_draft_id
+
+    return sanitized
+
+
 def _normalize_ollama_chat_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_tool_calls, list):
         return []
@@ -1647,7 +1742,7 @@ class _RepoMcpBridgeClient:
                 'function': {
                     'name': tool.name,
                     'description': tool.description,
-                    'parameters': tool.inputSchema if isinstance(tool.inputSchema, dict) else {},
+                    'parameters': _build_llm_chat_tool_schema(tool.name, tool.inputSchema if isinstance(tool.inputSchema, dict) else {}),
                 },
             })
         return payload
@@ -1745,12 +1840,14 @@ class _RepoMcpBridgeClient:
         self,
         prompt: str,
         *,
+        initial_draft_id: str = '',
         emit: Callable[..., None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         on_response_open: Callable[[Any], None] | None = None,
     ) -> str:
         messages: list[dict[str, Any]] = [{'role': 'user', 'content': prompt}]
         final_text = ''
+        current_draft_id = str(initial_draft_id or '').strip()
 
         for _ in range(max(1, int(self.loop_limit or 8))):
             if self._is_cancelled(cancel_check):
@@ -1782,13 +1879,24 @@ class _RepoMcpBridgeClient:
                 if self._is_cancelled(cancel_check):
                     return final_text
                 function = tool_call.get('function') if isinstance(tool_call.get('function'), dict) else {}
-                qualified_tool_name = str(function.get('name') or '').strip()
+                qualified_tool_name = _normalize_mcp_bridge_tool_name(function.get('name'), known_server_names=list(self.sessions.keys()))
                 tool_args = function.get('arguments') if isinstance(function.get('arguments'), dict) else {}
+                tool_definition = next((tool for tool in self.tool_manager.get_available_tools() if tool.name == qualified_tool_name), None)
+                tool_args = _sanitize_mcp_bridge_tool_arguments(
+                    qualified_tool_name,
+                    tool_args,
+                    input_schema=getattr(tool_definition, 'inputSchema', None),
+                    current_draft_id=current_draft_id,
+                )
                 if emit is not None:
                     emit('tool', stage='start', tool_name=qualified_tool_name, message=f'Running {qualified_tool_name}')
                 try:
                     tool_result = await _mcp_bridge_call_tool(self, qualified_tool_name, tool_args)
                     tool_response = _structured_text_payload(tool_result)
+                    if qualified_tool_name.endswith('scenario.create_draft'):
+                        current_draft_id = str(((tool_result.get('draft') or {}).get('draft_id') or '')).strip() or current_draft_id
+                    elif _is_draft_scoped_mcp_bridge_tool(qualified_tool_name):
+                        current_draft_id = str(tool_args.get('draft_id') or current_draft_id).strip()
                 except ProviderAdapterError as exc:
                     enabled_tool_names: list[str] = []
                     tool_manager = getattr(self, 'tool_manager', None)
@@ -1830,18 +1938,25 @@ class _RepoMcpBridgeClient:
 
         return final_text
 
-    async def process_query(self, prompt: str) -> str:
-        return await self._run_query(prompt)
+    async def process_query(self, prompt: str, *, initial_draft_id: str = '') -> str:
+        return await self._run_query(prompt, initial_draft_id=initial_draft_id)
 
     async def process_query_with_events(
         self,
         prompt: str,
         *,
+        initial_draft_id: str = '',
         emit: Callable[..., None],
         cancel_check: Callable[[], bool] | None = None,
         on_response_open: Callable[[Any], None] | None = None,
     ) -> str:
-        return await self._run_query(prompt, emit=emit, cancel_check=cancel_check, on_response_open=on_response_open)
+        return await self._run_query(
+            prompt,
+            initial_draft_id=initial_draft_id,
+            emit=emit,
+            cancel_check=cancel_check,
+            on_response_open=on_response_open,
+        )
 
     async def cleanup(self) -> None:
         self.abort_current_query = True
@@ -1861,22 +1976,35 @@ async def _mcp_bridge_process_query_server_side(
     *,
     prompt: str,
     model: str,
+    initial_draft_id: str = '',
     emit: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     on_response_open: Callable[[Any], None] | None = None,
 ) -> str:
     process_query = None
+    sanitized_initial_draft_id = str(initial_draft_id or '').strip()
+
+    async def _invoke_process_query(callable_obj: Callable[..., Any], current_prompt: str, **kwargs: Any) -> str:
+        if sanitized_initial_draft_id:
+            try:
+                return await callable_obj(current_prompt, initial_draft_id=sanitized_initial_draft_id, **kwargs)
+            except TypeError as exc:
+                if 'initial_draft_id' not in str(exc):
+                    raise
+        return await callable_obj(current_prompt, **kwargs)
+
     if emit is not None:
         process_with_events = getattr(client, 'process_query_with_events', None)
         if callable(process_with_events):
-            process_query = lambda current_prompt: process_with_events(
+            process_query = lambda current_prompt: _invoke_process_query(
+                process_with_events,
                 current_prompt,
                 emit=emit,
                 cancel_check=cancel_check,
                 on_response_open=on_response_open,
             )
     if process_query is None:
-        process_query = client.process_query
+        process_query = lambda current_prompt: _invoke_process_query(client.process_query, current_prompt)
 
     try:
         return await process_query(prompt)
@@ -2023,6 +2151,7 @@ def _build_mcp_bridge_goal_prompt(*, draft_id: str, enabled_tools: list[str], sc
     return '\n'.join([
         'Use MCP tools to rebuild the current scenario draft from scratch. Do not create a second draft.',
         f'Target draft_id: {draft_id}',
+        'The bridge injects the current draft_id automatically for draft-scoped tools. Do not include draft_id in tool arguments unless a tool explicitly requires it.',
         f'Scenario name: {scenario_name}',
         f'Enabled tools: {", ".join(enabled_tools) if enabled_tools else "(none)"}',
         'You must work only through enabled tools.',

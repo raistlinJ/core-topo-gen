@@ -342,8 +342,11 @@
                 const titleEl = document.getElementById('confirmationModalTitle');
                 const bodyEl = document.getElementById('confirmationModalBody');
                 const confirmBtn = document.getElementById('confirmationModalConfirmBtn');
+                const cancelBtn = modalEl.querySelector('.modal-footer [data-bs-dismiss="modal"]');
+                const closeBtn = modalEl.querySelector('.modal-header .btn-close');
                 const previousActive = document.activeElement instanceof HTMLElement ? document.activeElement : null;
                 let result = false;
+                const hideCancel = !!(options && options.hideCancel);
 
                 if (titleEl) titleEl.textContent = title;
                 if (bodyEl) {
@@ -355,6 +358,14 @@
                         bodyEl.style.whiteSpace = 'pre-wrap';
                     }
                 }
+                try {
+                    if (cancelBtn instanceof HTMLElement) {
+                        cancelBtn.style.display = hideCancel ? 'none' : '';
+                    }
+                    if (closeBtn instanceof HTMLElement) {
+                        closeBtn.style.display = hideCancel ? 'none' : '';
+                    }
+                } catch (e) { }
 
                 if (confirmBtn) {
                     confirmBtn.textContent = confirmLabel;
@@ -389,6 +400,14 @@
                     modalEl.removeEventListener('hide.bs.modal', hideHandler);
                     modalEl.removeEventListener('hidden.bs.modal', hiddenHandler);
                     try {
+                        if (cancelBtn instanceof HTMLElement) {
+                            cancelBtn.style.display = '';
+                        }
+                        if (closeBtn instanceof HTMLElement) {
+                            closeBtn.style.display = '';
+                        }
+                    } catch (e) { }
+                    try {
                         window.CORETG_CLEANUP_MODAL_STATE(false);
                     } catch (e) { }
                     try {
@@ -404,6 +423,10 @@
                 modalEl.addEventListener('hidden.bs.modal', hiddenHandler);
                 modal.show();
             });
+        };
+
+        window.alertWithModal = function (title, message, confirmLabel = 'OK', tone = 'primary', options = {}) {
+            return window.confirmWithModal(title, message, confirmLabel, tone, { ...(options || {}), hideCancel: true });
         };
     </script>
 
