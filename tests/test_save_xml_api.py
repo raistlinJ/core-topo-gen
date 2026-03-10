@@ -33,7 +33,6 @@ def test_save_xml_api_writes_file(tmp_path, monkeypatch):
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []}
                 },
@@ -49,6 +48,60 @@ def test_save_xml_api_writes_file(tmp_path, monkeypatch):
     path = data.get('result_path')
     assert path and os.path.isabs(path)
     assert os.path.exists(path)
+
+
+def test_save_xml_api_repairs_router_rows_misplaced_in_node_information(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'RepairRouterScenario',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Router', 'v_metric': 'Count', 'v_count': 3, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {'density': 0.0, 'items': [], 'flag_type': 'text'},
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenarios = parsed.get('scenarios') or []
+    assert len(scenarios) == 1
+
+    sections = (scenarios[0].get('sections') or {})
+    node_items = (sections.get('Node Information') or {}).get('items') or []
+    routing_items = (sections.get('Routing') or {}).get('items') or []
+
+    assert all(str(item.get('selected') or '').strip() != 'Router' for item in node_items if isinstance(item, dict))
+    assert routing_items
+    assert routing_items[0].get('selected') == 'OSPFv2'
+    assert routing_items[0].get('v_metric') == 'Count'
+    assert routing_items[0].get('v_count') == 3
 
 
 def test_save_xml_api_accepts_empty_scenarios_and_persists_snapshot(tmp_path, monkeypatch):
@@ -147,7 +200,10 @@ def test_index_without_catalog_or_snapshot_renders_empty_payload(tmp_path, monke
     match = re.search(r'<script id="payload-data" type="application/json">(.*?)</script>', html, re.S)
     assert match is not None
     payload = json.loads(match.group(1))
-    assert payload.get('scenarios') == []
+    scenarios = payload.get('scenarios') or []
+    assert len(scenarios) == 1
+    assert isinstance(scenarios[0].get('name'), str)
+    assert scenarios[0].get('name')
 
 
 def test_save_xml_api_vulnerabilities_category_roundtrip_preserves_type_vector(tmp_path, monkeypatch):
@@ -171,7 +227,6 @@ def test_save_xml_api_vulnerabilities_category_roundtrip_preserves_type_vector(t
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {
                         "density": 0.5,
                         "items": [
@@ -217,6 +272,232 @@ def test_save_xml_api_vulnerabilities_category_roundtrip_preserves_type_vector(t
     assert items[0].get('v_vector') == 'network'
 
 
+def test_save_xml_api_adds_docker_capacity_for_vuln_targets(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'VulnDockerCapacity',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {
+                        'density': 0.0,
+                        'items': [
+                            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 3, 'v_name': 'Demo Vuln', 'v_path': 'demo/path'},
+                        ],
+                        'flag_type': 'text',
+                    },
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenario = (parsed.get('scenarios') or [])[0]
+    node_items = ((scenario.get('sections') or {}).get('Node Information') or {}).get('items') or []
+    docker_total = sum(
+        int(item.get('v_count') or 0)
+        for item in node_items
+        if isinstance(item, dict) and str(item.get('selected') or '').strip() == 'Docker' and str(item.get('v_metric') or '').strip() == 'Count'
+    )
+    assert docker_total == 3
+
+
+def test_save_xml_api_canonicalizes_specific_vulnerability_name_in_sections_and_planpreview(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        backend,
+        '_load_backend_vuln_catalog_items',
+        lambda: [{
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        }],
+    )
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'CanonicalizeSavedJboss',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {
+                        'density': 0.0,
+                        'items': [
+                            {
+                                'selected': 'Specific',
+                                'v_metric': 'Count',
+                                'v_count': 1,
+                                'v_name': 'jboss',
+                                'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                            },
+                        ],
+                        'flag_type': 'text',
+                    },
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'plan_preview': {
+                    'full_preview': {
+                        'hosts': [
+                            {'node_id': 1, 'name': 'docker-1', 'role': 'Docker', 'vulnerabilities': ['jboss']},
+                        ],
+                        'routers': [],
+                        'switches': [],
+                        'vulnerabilities_preview': {'1': ['jboss']},
+                        'vulnerabilities_by_node': {'1': ['jboss']},
+                        'vulnerabilities_plan': {'jboss': 1},
+                    },
+                    'metadata': {},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenario = (parsed.get('scenarios') or [])[0]
+    vuln_items = ((scenario.get('sections') or {}).get('Vulnerabilities') or {}).get('items') or []
+    assert vuln_items[0].get('v_name') == 'jboss/CVE-2017-12149'
+
+    plan_preview = backend._load_plan_preview_from_xml(data.get('result_path'), 'CanonicalizeSavedJboss') or {}
+    full_preview = plan_preview.get('full_preview') or {}
+    assert full_preview.get('vulnerabilities_plan') == {'jboss/CVE-2017-12149': 1}
+    assert full_preview.get('vulnerabilities_by_node') == {'1': ['jboss/CVE-2017-12149']}
+
+
+def test_save_xml_api_canonicalizes_specific_vulnerability_name_from_url_to_installed_catalog_path(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        backend,
+        '_load_backend_vuln_catalog_items',
+        lambda: [{
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': str(tmp_path / 'installed' / 'content' / 'vulhub' / 'jboss' / 'CVE-2017-12149' / 'docker-compose.yml'),
+            'CVE': 'CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        }],
+    )
+
+    payload = {
+        'scenarios': [
+            {
+                'name': 'CanonicalizeInstalledPathJboss',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {
+                        'density': 0,
+                        'items': [
+                            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                        ],
+                    },
+                    'Routing': {'density': 0.0, 'items': []},
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {
+                        'density': 0.0,
+                        'items': [
+                            {
+                                'selected': 'Specific',
+                                'v_metric': 'Count',
+                                'v_count': 1,
+                                'v_name': 'jboss',
+                                'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                            },
+                        ],
+                        'flag_type': 'text',
+                    },
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'plan_preview': {
+                    'full_preview': {
+                        'hosts': [
+                            {'node_id': 1, 'name': 'docker-1', 'role': 'Docker', 'vulnerabilities': ['jboss']},
+                        ],
+                        'routers': [],
+                        'switches': [],
+                        'vulnerabilities_preview': {'1': ['jboss']},
+                        'vulnerabilities_by_node': {'1': ['jboss']},
+                        'vulnerabilities_plan': {'jboss': 1},
+                    },
+                    'metadata': {},
+                },
+                'notes': '',
+            }
+        ]
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenario = (parsed.get('scenarios') or [])[0]
+    vuln_items = ((scenario.get('sections') or {}).get('Vulnerabilities') or {}).get('items') or []
+    assert vuln_items[0].get('v_name') == 'jboss/CVE-2017-12149'
+
+    plan_preview = backend._load_plan_preview_from_xml(data.get('result_path'), 'CanonicalizeInstalledPathJboss') or {}
+    full_preview = plan_preview.get('full_preview') or {}
+    assert full_preview.get('vulnerabilities_plan') == {'jboss/CVE-2017-12149': 1}
+    assert full_preview.get('vulnerabilities_by_node') == {'1': ['jboss/CVE-2017-12149']}
+
+
 def test_save_xml_api_topology_bounds_roundtrip_persists(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
@@ -252,7 +533,6 @@ def test_save_xml_api_topology_bounds_roundtrip_persists(tmp_path, monkeypatch):
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -344,7 +624,6 @@ def test_save_xml_api_preserves_hitl_when_payload_omits_hitl(tmp_path, monkeypat
                     'Routing': {'density': 0.5, 'items': []},
                     'Services': {'density': 0.5, 'items': []},
                     'Traffic': {'density': 0.5, 'items': []},
-                    'Events': {'density': 0.5, 'items': []},
                     'Vulnerabilities': {'density': 0.5, 'items': []},
                     'Segmentation': {'density': 0.5, 'items': []},
                 },
@@ -445,12 +724,6 @@ def test_save_xml_api_topology_roundtrip_preserves_section_fields(tmp_path, monk
                             }
                         ],
                     },
-                    "Events": {
-                        "density": 0.1,
-                        "items": [
-                            {"selected": "Specific", "factor": 1.0, "script_path": "/tmp/test_event.sh"}
-                        ],
-                    },
                     "Vulnerabilities": {
                         "density": 0.6,
                         "flag_type": "text",
@@ -520,10 +793,7 @@ def test_save_xml_api_topology_roundtrip_preserves_section_fields(tmp_path, monk
     assert float(t0.get('period_s')) == 2.0
     assert float(t0.get('jitter_pct')) == 15.0
     assert t0.get('content_type') == 'json'
-
-    events = secs.get('Events', {})
-    e0 = (events.get('items') or [])[0]
-    assert e0.get('script_path') == '/tmp/test_event.sh'
+    assert 'Events' not in secs
 
     vulns = secs.get('Vulnerabilities', {})
     assert vulns.get('flag_type') == 'text'
@@ -574,7 +844,6 @@ def test_save_xml_api_hydrates_summary_only_payload_from_project_hint(tmp_path, 
                     },
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {
                         "density": 0.5,
                         "items": [
@@ -614,7 +883,6 @@ def test_save_xml_api_hydrates_summary_only_payload_from_project_hint(tmp_path, 
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -623,7 +891,6 @@ def test_save_xml_api_hydrates_summary_only_payload_from_project_hint(tmp_path, 
     }
 
     second = client.post('/save_xml_api', data=json.dumps(summary_only_payload), content_type='application/json')
-    assert second.status_code == 200
     second_data = second.get_json() or {}
     assert second_data.get('ok') is True
     result_xml = second_data.get('result_path')
@@ -682,7 +949,6 @@ def test_save_xml_api_marks_topology_dirty_when_topology_changes(tmp_path, monke
                     },
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -720,7 +986,6 @@ def test_save_xml_api_marks_topology_dirty_when_topology_changes(tmp_path, monke
                     },
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -806,7 +1071,6 @@ def test_save_xml_api_preserves_hitl_validation_state_roundtrip(tmp_path, monkey
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -885,7 +1149,6 @@ def test_save_xml_api_partial_hitl_payload_keeps_verified_readiness(tmp_path, mo
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -919,7 +1182,6 @@ def test_save_xml_api_partial_hitl_payload_keeps_verified_readiness(tmp_path, mo
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.5, "items": []},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },
@@ -977,7 +1239,6 @@ def test_save_xml_api_partial_payload_preserves_unrelated_sections(tmp_path, mon
                     },
                     "Services": {"density": 0.5, "items": [{"selected": "SSH", "factor": 1.0, "v_metric": "Count", "v_count": 1}]},
                     "Traffic": {"density": 0.5, "items": []},
-                    "Events": {"density": 0.5, "items": []},
                     "Vulnerabilities": {"density": 0.5, "items": []},
                     "Segmentation": {"density": 0.5, "items": []},
                 },

@@ -30312,6 +30312,30 @@ def _coerce_str(val: object, default: str = '') -> str:
         return default
 
 
+def _sanitize_ai_generator_state(value: Any) -> Optional[Dict[str, Any]]:
+    """Return a JSON-safe AI Generator state payload for scenario XML round-trips."""
+    if not isinstance(value, dict):
+        return None
+
+    def _clean(item: Any) -> Any:
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        if isinstance(item, dict):
+            cleaned_dict: Dict[str, Any] = {}
+            for key, val in item.items():
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                cleaned_dict[key_text] = _clean(val)
+            return cleaned_dict
+        if isinstance(item, (list, tuple)):
+            return [_clean(entry) for entry in item]
+        return str(item)
+
+    cleaned = _clean(copy.deepcopy(value))
+    return cleaned if isinstance(cleaned, dict) else None
+
+
 def _coerce_stripped(val: object, default: str = '') -> str:
     return _coerce_str(val, default=default).strip()
 def _flag_base_dir() -> str:
@@ -30330,7 +30354,7 @@ def _default_scenario_payload(name: str) -> Dict[str, Any]:
     # Single default scenario with empty sections mirroring PyQt structure
     sections = [
         "Node Information", "Routing", "Services", "Traffic",
-        "Events", "Vulnerabilities", "Segmentation", "HITL"
+        "Vulnerabilities", "Segmentation", "HITL"
     ]
     display_name = str(name or '').strip() or "Scenario"
     sections_dict: Dict[str, Any] = {}
@@ -30350,6 +30374,720 @@ def _default_scenario_payload(name: str) -> Dict[str, Any]:
         "sections": sections_dict,
         "notes": ""
     }
+
+
+_ROUTING_RANDOM_PROTOCOL_DEFAULTS = ['RIP', 'RIPNG', 'BGP', 'OSPFv2', 'OSPFv3']
+_RANDOM_OPTIONS_BY_SECTION: Dict[str, List[str]] = {
+    'Node Information': ['Server', 'Workstation', 'PC', 'Docker'],
+    'Routing': ['RIP', 'RIPNG', 'BGP', 'OSPFv2', 'OSPFv3'],
+    'Services': ['SSH', 'HTTP', 'DHCPClient'],
+    'Traffic': ['TCP', 'UDP'],
+    'Vulnerabilities': ['Specific'],
+    'Segmentation': ['Firewall', 'NAT'],
+}
+_TRAFFIC_CONTENT_TYPE_OPTIONS: List[str] = ['text', 'photo', 'audio', 'video', 'gibberish']
+_TRAFFIC_PATTERN_OPTIONS: List[str] = ['continuous', 'periodic', 'burst', 'poisson', 'ramp']
+_ROUTING_EDGE_MODE_OPTIONS: List[str] = ['Min', 'Uniform', 'Exact', 'NonUniform']
+_TRAFFIC_NUMERIC_DEFAULTS: Dict[str, float] = {
+    'rate_kbps': 64.0,
+    'period_s': 1.0,
+    'jitter_pct': 10.0,
+}
+
+
+def _ensure_vulnerability_docker_capacity(scenario_payload: Any) -> tuple[Dict[str, Any], dict]:
+    from core_topo_gen.planning.docker_capacity import ensure_scenario_payload_docker_capacity
+
+    try:
+        return ensure_scenario_payload_docker_capacity(scenario_payload)
+    except Exception:
+        scenario = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+        return scenario, {
+            'required_docker_hosts': 0,
+            'current_docker_hosts': 0,
+            'added_docker_hosts': 0,
+        }
+
+
+def _normalize_node_information_role(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'docker': 'Docker',
+        'container': 'Docker',
+        'containers': 'Docker',
+        'containerized': 'Docker',
+        'compose': 'Docker',
+        'server': 'Server',
+        'servers': 'Server',
+        'workstation': 'Workstation',
+        'workstations': 'Workstation',
+        'desktop': 'Workstation',
+        'pc': 'PC',
+        'pcs': 'PC',
+        'host': 'PC',
+        'hosts': 'PC',
+        'client': 'PC',
+        'clients': 'PC',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_routing_item_selection(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'routing': 'OSPFv2',
+        'router': 'OSPFv2',
+        'routers': 'OSPFv2',
+        'gateway': 'OSPFv2',
+        'gateways': 'OSPFv2',
+        'l3': 'OSPFv2',
+        'layer3': 'OSPFv2',
+        'rip': 'RIP',
+        'ripng': 'RIPNG',
+        'bgp': 'BGP',
+        'ospf': 'OSPFv2',
+        'ospfv2': 'OSPFv2',
+        'ospfv3': 'OSPFv3',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_service_item_selection(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'ssh': 'SSH',
+        'http': 'HTTP',
+        'https': 'HTTP',
+        'web': 'HTTP',
+        'dhcpclient': 'DHCPClient',
+        'dhcp': 'DHCPClient',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_traffic_item_selection(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'tcp': 'TCP',
+        'udp': 'UDP',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_traffic_pattern_value(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'continuous': 'continuous',
+        'alwayson': 'continuous',
+        'constantrate': 'continuous',
+        'periodic': 'periodic',
+        'burst': 'burst',
+        'bursty': 'burst',
+        'poisson': 'poisson',
+        'ramp': 'ramp',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_traffic_content_type_value(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'text': 'text',
+        'txt': 'text',
+        'photo': 'photo',
+        'image': 'photo',
+        'images': 'photo',
+        'audio': 'audio',
+        'video': 'video',
+        'gibberish': 'gibberish',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_segmentation_item_selection(value: Any) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    normalized = ''.join(ch for ch in text.lower() if ch.isalnum())
+    aliases = {
+        'firewall': 'Firewall',
+        'fw': 'Firewall',
+        'nat': 'NAT',
+        'snat': 'NAT',
+        'dnat': 'NAT',
+        'custom': 'CUSTOM',
+        'plugin': 'CUSTOM',
+        'random': 'Random',
+    }
+    return aliases.get(normalized, '')
+
+
+def _normalize_scenario_section_semantics(scenario_payload: Any) -> Dict[str, Any]:
+    scenario = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else None
+    if not isinstance(sections, dict):
+        return scenario
+
+    node_section = sections.get('Node Information') if isinstance(sections.get('Node Information'), dict) else None
+    routing_section = sections.get('Routing') if isinstance(sections.get('Routing'), dict) else None
+    node_items = list(node_section.get('items') or []) if isinstance(node_section, dict) and isinstance(node_section.get('items'), list) else []
+    routing_items = list(routing_section.get('items') or []) if isinstance(routing_section, dict) and isinstance(routing_section.get('items'), list) else []
+
+    def _apply_count_defaults(item: Dict[str, Any]) -> None:
+        if item.get('v_count') in (None, '') and item.get('count') not in (None, ''):
+            item['v_count'] = item.get('count')
+        if item.get('v_count') not in (None, '') and not str(item.get('v_metric') or '').strip():
+            item['v_metric'] = 'Count'
+        if str(item.get('v_metric') or '').strip() == 'Count' and item.get('v_count') in (None, '', 0):
+            item['v_count'] = 1
+        if item.get('factor') in (None, ''):
+            item['factor'] = 1.0
+
+    next_node_items: list[Any] = []
+    moved_any = False
+    for raw_item in node_items:
+        if not isinstance(raw_item, dict):
+            next_node_items.append(raw_item)
+            continue
+        item = copy.deepcopy(raw_item)
+        raw_selected = str(
+            item.get('selected')
+            or item.get('role')
+            or item.get('node_type')
+            or item.get('type')
+            or item.get('kind')
+            or ''
+        ).strip()
+        normalized_node = _normalize_node_information_role(raw_selected)
+        if normalized_node:
+            item['selected'] = normalized_node
+            _apply_count_defaults(item)
+            next_node_items.append(item)
+            continue
+
+        normalized_routing = _normalize_routing_item_selection(raw_selected)
+        if normalized_routing:
+            item['selected'] = normalized_routing
+            _apply_count_defaults(item)
+            routing_items.append(item)
+            moved_any = True
+            continue
+
+        next_node_items.append(item)
+
+    if node_items or isinstance(node_section, dict):
+        if not isinstance(node_section, dict):
+            node_section = {'items': []}
+        node_section['items'] = next_node_items
+        sections['Node Information'] = node_section
+
+    if moved_any and not isinstance(routing_section, dict):
+        routing_section = {'density': 0.0, 'items': []}
+    if moved_any and routing_section.get('density') in (None, ''):
+        routing_section['density'] = 0.0
+    if moved_any:
+        routing_section['items'] = routing_items
+        sections['Routing'] = routing_section
+
+    for raw_item in routing_items:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_selected = raw_item.get('selected')
+        if raw_selected in (None, ''):
+            raw_selected = raw_item.get('protocol') or raw_item.get('kind') or raw_item.get('type')
+        normalized_selected = _normalize_routing_item_selection(raw_selected)
+        if normalized_selected:
+            raw_item['selected'] = normalized_selected
+        _apply_count_defaults(raw_item)
+
+    service_section = sections.get('Services') if isinstance(sections.get('Services'), dict) else None
+    service_items = service_section.get('items') if isinstance(service_section, dict) and isinstance(service_section.get('items'), list) else []
+    for raw_item in service_items:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_selected = raw_item.get('selected')
+        if raw_selected in (None, ''):
+            raw_selected = raw_item.get('service') or raw_item.get('name') or raw_item.get('type')
+        normalized_selected = _normalize_service_item_selection(raw_selected)
+        if normalized_selected:
+            raw_item['selected'] = normalized_selected
+        _apply_count_defaults(raw_item)
+
+    traffic_section = sections.get('Traffic') if isinstance(sections.get('Traffic'), dict) else None
+    traffic_items = traffic_section.get('items') if isinstance(traffic_section, dict) and isinstance(traffic_section.get('items'), list) else []
+    for raw_item in traffic_items:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_selected = raw_item.get('selected')
+        if raw_selected in (None, ''):
+            raw_selected = raw_item.get('protocol') or raw_item.get('kind') or raw_item.get('type')
+        normalized_selected = _normalize_traffic_item_selection(raw_selected)
+        if normalized_selected:
+            raw_item['selected'] = normalized_selected
+        raw_pattern = raw_item.get('pattern')
+        normalized_pattern = _normalize_traffic_pattern_value(raw_pattern)
+        if normalized_pattern:
+            raw_item['pattern'] = normalized_pattern
+        raw_content_type = raw_item.get('content_type')
+        if raw_content_type in (None, ''):
+            raw_content_type = raw_item.get('content') or raw_item.get('payload')
+        normalized_content_type = _normalize_traffic_content_type_value(raw_content_type)
+        if normalized_content_type:
+            raw_item['content_type'] = normalized_content_type
+        if raw_item.get('rate_kbps') in (None, '') and raw_item.get('rate') not in (None, ''):
+            raw_item['rate_kbps'] = raw_item.get('rate')
+        if raw_item.get('period_s') in (None, '') and raw_item.get('period') not in (None, ''):
+            raw_item['period_s'] = raw_item.get('period')
+        if raw_item.get('jitter_pct') in (None, '') and raw_item.get('jitter') not in (None, ''):
+            raw_item['jitter_pct'] = raw_item.get('jitter')
+        _apply_count_defaults(raw_item)
+
+    segmentation_section = sections.get('Segmentation') if isinstance(sections.get('Segmentation'), dict) else None
+    segmentation_items = segmentation_section.get('items') if isinstance(segmentation_section, dict) and isinstance(segmentation_section.get('items'), list) else []
+    for raw_item in segmentation_items:
+        if not isinstance(raw_item, dict):
+            continue
+        raw_selected = raw_item.get('selected')
+        if raw_selected in (None, ''):
+            raw_selected = raw_item.get('kind') or raw_item.get('type') or raw_item.get('name')
+        normalized_selected = _normalize_segmentation_item_selection(raw_selected)
+        if normalized_selected and normalized_selected != 'CUSTOM':
+            raw_item['selected'] = normalized_selected
+        _apply_count_defaults(raw_item)
+
+    if not isinstance(node_section, dict):
+        node_section = {'items': []}
+
+    scenario['sections'] = sections
+    scenario = _canonicalize_specific_vulnerability_items(scenario, strict=False)
+    if isinstance(scenario.get('plan_preview'), dict):
+        scenario['plan_preview'] = _canonicalize_plan_preview_vulnerability_names(
+            scenario.get('plan_preview'),
+            scenario_payload=scenario,
+        )
+    scenario, docker_capacity_repair = _ensure_vulnerability_docker_capacity(scenario)
+    if docker_capacity_repair.get('added_docker_hosts'):
+        scenario['docker_capacity_repair'] = docker_capacity_repair
+    return scenario
+
+
+def _deterministic_random_fraction(seed_text: Any) -> float:
+    base = hashlib.sha256(str(seed_text or '').encode('utf-8')).digest()
+    digest = hashlib.sha256(base + (0).to_bytes(8, byteorder='little', signed=False)).digest()
+    value = int.from_bytes(digest[:8], byteorder='big', signed=False)
+    return value / 18446744073709551616
+
+
+def _deterministic_pick(options: List[Any], seed_text: Any) -> Any:
+    if not options:
+        return None
+    if len(options) == 1:
+        return options[0]
+    idx = int(_deterministic_random_fraction(seed_text) * len(options)) % len(options)
+    return options[idx]
+
+
+def _coerce_numeric_placeholder(value: Any, *, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    text = str(value or '').strip()
+    if text.lower() == 'random':
+        numeric = default
+    else:
+        try:
+            numeric = float(text) if text else default
+        except Exception:
+            numeric = default
+    if minimum is not None and numeric < minimum:
+        numeric = minimum
+    if maximum is not None and numeric > maximum:
+        numeric = maximum
+    return numeric
+
+
+def _load_backend_vuln_catalog_items() -> List[Dict[str, Any]]:
+    try:
+        from core_topo_gen.utils.vuln_process import load_vuln_catalog
+        items = load_vuln_catalog(_get_repo_root()) or []
+        return [item for item in items if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def _canonicalize_specific_vulnerability_items(
+    scenario_payload: Any,
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    scenario = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else None
+    if not isinstance(sections, dict):
+        return scenario
+
+    vuln_section = sections.get('Vulnerabilities') if isinstance(sections.get('Vulnerabilities'), dict) else None
+    items = vuln_section.get('items') if isinstance(vuln_section, dict) and isinstance(vuln_section.get('items'), list) else None
+    if not isinstance(items, list):
+        return scenario
+
+    catalog_items = _load_backend_vuln_catalog_items()
+    from core_topo_gen.utils.vuln_process import resolve_vulnerability_catalog_entry
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        selected = str(item.get('selected') or '').strip().lower()
+        if selected != 'specific':
+            continue
+        resolved = resolve_vulnerability_catalog_entry(
+            catalog_items,
+            v_name=str(item.get('v_name') or ''),
+            v_path=str(item.get('v_path') or item.get('path') or ''),
+        )
+        if resolved:
+            item['v_name'] = resolved['name']
+            current_path = str(item.get('v_path') or item.get('path') or '').strip()
+            item['v_path'] = current_path or resolved['path']
+            continue
+        if strict:
+            raise ValueError('Specific vulnerability must match an enabled catalog entry by v_path or v_name')
+
+    return scenario
+
+
+def _specific_vulnerability_name_map(scenario_payload: Any) -> Dict[str, str]:
+    original = copy.deepcopy(scenario_payload) if isinstance(scenario_payload, dict) else {}
+    canonical = _canonicalize_specific_vulnerability_items(original, strict=False)
+    original_sections = original.get('sections') if isinstance(original.get('sections'), dict) else {}
+    canonical_sections = canonical.get('sections') if isinstance(canonical.get('sections'), dict) else {}
+    original_items = ((original_sections.get('Vulnerabilities') or {}).get('items') or []) if isinstance(original_sections, dict) else []
+    canonical_items = ((canonical_sections.get('Vulnerabilities') or {}).get('items') or []) if isinstance(canonical_sections, dict) else []
+    mapping: Dict[str, str] = {}
+    for original_item, canonical_item in zip(original_items, canonical_items):
+        if not isinstance(original_item, dict) or not isinstance(canonical_item, dict):
+            continue
+        if str(original_item.get('selected') or '').strip().lower() != 'specific':
+            continue
+        source_name = str(original_item.get('v_name') or '').strip()
+        target_name = str(canonical_item.get('v_name') or '').strip()
+        if source_name and target_name:
+            mapping[source_name] = target_name
+        target_path = str(canonical_item.get('v_path') or '').strip()
+        if target_name:
+            mapping[target_name] = target_name
+            short_name = target_name.split('/', 1)[0].strip()
+            if short_name:
+                mapping[short_name] = target_name
+        if target_path:
+            try:
+                path_parts = [part for part in target_path.replace('\\', '/').split('/') if part]
+                if len(path_parts) >= 2:
+                    path_alias = path_parts[-2].strip()
+                    if path_alias:
+                        mapping[path_alias] = target_name or mapping.get(path_alias, path_alias)
+            except Exception:
+                pass
+    return mapping
+
+
+def _canonicalize_plan_preview_vulnerability_names(plan_preview: Any, *, scenario_payload: Any) -> Any:
+    if not isinstance(plan_preview, dict):
+        return plan_preview
+
+    name_map = _specific_vulnerability_name_map(scenario_payload)
+    if not name_map:
+        return plan_preview
+
+    payload = copy.deepcopy(plan_preview)
+    full_preview = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+    if not isinstance(full_preview, dict):
+        return payload
+
+    def _rename_list(values: Any) -> Any:
+        if not isinstance(values, list):
+            return values
+        return [name_map.get(str(value or '').strip(), str(value or '').strip()) for value in values if str(value or '').strip()]
+
+    for group_name in ('hosts', 'routers', 'switches'):
+        nodes = full_preview.get(group_name)
+        if not isinstance(nodes, list):
+            continue
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if isinstance(node.get('vulnerabilities'), list):
+                node['vulnerabilities'] = _rename_list(node.get('vulnerabilities'))
+
+    for field_name in ('vulnerabilities_preview', 'vulnerabilities_by_node'):
+        raw_map = full_preview.get(field_name)
+        if not isinstance(raw_map, dict):
+            continue
+        next_map: Dict[Any, Any] = {}
+        for key, value in raw_map.items():
+            next_map[key] = _rename_list(value)
+        full_preview[field_name] = next_map
+
+    raw_plan = full_preview.get('vulnerabilities_plan')
+    if isinstance(raw_plan, dict):
+        next_plan: Dict[str, int] = {}
+        for key, value in raw_plan.items():
+            next_key = name_map.get(str(key or '').strip(), str(key or '').strip())
+            if not next_key:
+                continue
+            try:
+                next_value = int(value) if value is not None else 0
+            except Exception:
+                try:
+                    next_value = int(float(value))
+                except Exception:
+                    next_value = 0
+            next_plan[next_key] = next_plan.get(next_key, 0) + next_value
+        full_preview['vulnerabilities_plan'] = next_plan
+
+    payload['full_preview'] = full_preview
+    return payload
+
+
+def _concretize_preview_placeholders(scenario_payload: Any, *, seed: Any = None) -> Dict[str, Any]:
+    scenario = _normalize_scenario_section_semantics(scenario_payload)
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else None
+    if not isinstance(sections, dict):
+        return scenario
+
+    seed_value = seed
+    try:
+        seed_int = int(seed_value)
+        if seed_int <= 0:
+            seed_int = 1
+    except Exception:
+        seed_int = 1
+    scenario_name = str(scenario.get('name') or '').strip() or 'Scenario'
+
+    vuln_catalog_items = _load_backend_vuln_catalog_items()
+    target_sections = ['Node Information', 'Routing', 'Services', 'Traffic', 'Vulnerabilities', 'Segmentation']
+    for section_name in target_sections:
+        sec = sections.get(section_name) if isinstance(sections.get(section_name), dict) else None
+        if not isinstance(sec, dict):
+            continue
+        items = sec.get('items') if isinstance(sec.get('items'), list) else []
+        next_items: list[dict[str, Any]] = []
+        if section_name == 'Vulnerabilities':
+            for index, raw_item in enumerate(items):
+                if not isinstance(raw_item, dict):
+                    continue
+                item = copy.deepcopy(raw_item)
+                raw_selected = str(item.get('selected') or '').strip()
+                normalized_selected = raw_selected.lower()
+                is_random_selected = (not raw_selected) or normalized_selected in {'random', 'category', 'type/vector'}
+                if is_random_selected and vuln_catalog_items:
+                    chosen = _deterministic_pick(
+                        vuln_catalog_items,
+                        f'{seed_int}|{scenario_name}|{section_name}|{index}|v_name|save-xml',
+                    )
+                    picked_name = str((chosen or {}).get('Name') or (chosen or {}).get('name') or '').strip()
+                    picked_path = str((chosen or {}).get('Path') or (chosen or {}).get('path') or '').strip()
+                    picked_desc = str((chosen or {}).get('Description') or (chosen or {}).get('description') or '').strip()
+                    if picked_name:
+                        item['selected'] = 'Specific'
+                        item['v_name'] = picked_name
+                        if picked_path:
+                            item['v_path'] = picked_path
+                        if picked_desc:
+                            item['v_desc'] = picked_desc
+                        if str(item.get('v_metric') or '').strip() in {'', 'Weight'}:
+                            item['v_metric'] = 'Count'
+                        if item.get('v_count') in (None, '', 0):
+                            item['v_count'] = 1
+                next_items.append(item)
+            sec['items'] = next_items
+            sections[section_name] = sec
+            continue
+
+        options = list(_RANDOM_OPTIONS_BY_SECTION.get(section_name) or [])
+        if section_name in {'Traffic', 'Segmentation'}:
+            options = [option for option in options if option != 'CUSTOM']
+        for index, raw_item in enumerate(items):
+            if not isinstance(raw_item, dict):
+                continue
+            item = copy.deepcopy(raw_item)
+
+            if section_name == 'Routing':
+                raw_selected = item.get('selected')
+                if raw_selected in (None, ''):
+                    raw_selected = item.get('protocol')
+                normalized_selected = _normalize_routing_item_selection(raw_selected)
+                if normalized_selected:
+                    item['selected'] = normalized_selected
+
+                if item.get('v_count') not in (None, '') and not str(item.get('v_metric') or '').strip():
+                    item['v_metric'] = 'Count'
+                if str(item.get('v_metric') or '').strip() == 'Count' and item.get('v_count') in (None, '', 0):
+                    item['v_count'] = 1
+                if item.get('factor') in (None, ''):
+                    item['factor'] = 1.0
+
+                for mode_key in ('r2r_mode', 'r2s_mode'):
+                    raw_mode = str(item.get(mode_key) or '').strip()
+                    if not raw_mode or raw_mode.lower() == 'random':
+                        chosen_mode = _deterministic_pick(
+                            _ROUTING_EDGE_MODE_OPTIONS,
+                            f'{seed_int}|{scenario_name}|Routing|{index}|{mode_key}|save-xml',
+                        )
+                        item[mode_key] = str(chosen_mode or 'Uniform')
+
+                r2r_mode = str(item.get('r2r_mode') or '').strip()
+                if r2r_mode == 'Exact':
+                    try:
+                        r2r_edges = int(item.get('r2r_edges') or 0)
+                    except Exception:
+                        r2r_edges = 0
+                    if r2r_edges <= 0:
+                        item['r2r_edges'] = int(_deterministic_pick([2, 3, 4], f'{seed_int}|{scenario_name}|Routing|{index}|r2r_edges|save-xml') or 2)
+                else:
+                    item.pop('r2r_edges', None)
+
+                r2s_mode = str(item.get('r2s_mode') or '').strip()
+                if r2s_mode == 'Exact':
+                    try:
+                        r2s_edges = int(item.get('r2s_edges') or 0)
+                    except Exception:
+                        r2s_edges = 0
+                    if r2s_edges <= 0:
+                        item['r2s_edges'] = int(_deterministic_pick([1, 2, 3], f'{seed_int}|{scenario_name}|Routing|{index}|r2s_edges|save-xml') or 1)
+                else:
+                    item.pop('r2s_edges', None)
+
+                if r2s_mode == 'NonUniform':
+                    try:
+                        r2s_hosts_min = int(item.get('r2s_hosts_min') or 0)
+                    except Exception:
+                        r2s_hosts_min = 0
+                    try:
+                        r2s_hosts_max = int(item.get('r2s_hosts_max') or 0)
+                    except Exception:
+                        r2s_hosts_max = 0
+                    if r2s_hosts_min <= 0:
+                        r2s_hosts_min = 1
+                    if r2s_hosts_max <= 0:
+                        r2s_hosts_max = 4
+                    if r2s_hosts_min > r2s_hosts_max:
+                        r2s_hosts_min, r2s_hosts_max = r2s_hosts_max, r2s_hosts_min
+                    item['r2s_hosts_min'] = r2s_hosts_min
+                    item['r2s_hosts_max'] = r2s_hosts_max
+
+            raw_selected = str(item.get('selected') or '').strip()
+            if (not raw_selected or raw_selected.lower() == 'random') and options:
+                pick = _deterministic_pick(
+                    options,
+                    f'{seed_int}|{scenario_name}|{section_name}|{index}|selected|save-xml',
+                )
+                if pick is not None:
+                    item['selected'] = str(pick)
+
+            if section_name == 'Traffic':
+                raw_ct = str(item.get('content_type') or '').strip()
+                if not raw_ct or raw_ct.lower() == 'random':
+                    pick_ct = _deterministic_pick(
+                        _TRAFFIC_CONTENT_TYPE_OPTIONS,
+                        f'{seed_int}|{scenario_name}|{section_name}|{index}|content_type|save-xml',
+                    )
+                    if pick_ct is not None:
+                        item['content_type'] = str(pick_ct)
+
+                ct_now = str(item.get('content_type') or '').strip()
+                raw_pattern = str(item.get('pattern') or '').strip()
+                if ct_now and ct_now.lower() != 'random' and (not raw_pattern or raw_pattern.lower() == 'random'):
+                    pick_pattern = _deterministic_pick(
+                        _TRAFFIC_PATTERN_OPTIONS,
+                        f'{seed_int}|{scenario_name}|{section_name}|{index}|pattern|save-xml',
+                    )
+                    if pick_pattern is not None:
+                        item['pattern'] = str(pick_pattern)
+
+                item['rate_kbps'] = _coerce_numeric_placeholder(
+                    item.get('rate_kbps'),
+                    default=_TRAFFIC_NUMERIC_DEFAULTS['rate_kbps'],
+                    minimum=0.0,
+                )
+                item['period_s'] = _coerce_numeric_placeholder(
+                    item.get('period_s'),
+                    default=_TRAFFIC_NUMERIC_DEFAULTS['period_s'],
+                    minimum=0.0,
+                )
+                item['jitter_pct'] = _coerce_numeric_placeholder(
+                    item.get('jitter_pct'),
+                    default=_TRAFFIC_NUMERIC_DEFAULTS['jitter_pct'],
+                    minimum=0.0,
+                    maximum=100.0,
+                )
+
+            next_items.append(item)
+
+        sec['items'] = next_items
+        sections[section_name] = sec
+
+    try:
+        ni = sections.get('Node Information') if isinstance(sections.get('Node Information'), dict) else None
+        ni_items = ni.get('items') if isinstance(ni, dict) and isinstance(ni.get('items'), list) else []
+        density_count = 0
+        try:
+            density_count = int(str(scenario.get('density_count') or '').strip() or '0')
+        except Exception:
+            density_count = 0
+        count_rows = [
+            it for it in ni_items
+            if isinstance(it, dict) and str(it.get('v_metric') or '').strip().lower() == 'count'
+        ]
+        count_sum = 0
+        for item in count_rows:
+            try:
+                count_sum += max(0, int(item.get('v_count') or 0))
+            except Exception:
+                pass
+        weight_rows = [
+            it for it in ni_items
+            if isinstance(it, dict) and str(it.get('v_metric') or 'Weight').strip().lower() != 'count'
+        ]
+        has_usable_weight = any(
+            (float(str(it.get('factor') or 'nan')) > 0) if str(it.get('factor') or '').strip() else True
+            for it in weight_rows if isinstance(it, dict)
+        ) if weight_rows else False
+        planned_from_weight = density_count if (density_count > 0 and has_usable_weight) else 0
+        routing_items = sections.get('Routing', {}).get('items') if isinstance(sections.get('Routing'), dict) else []
+        has_routing_items = any(isinstance(it, dict) for it in routing_items) if isinstance(routing_items, list) else False
+        if count_sum + planned_from_weight <= 0 and not has_routing_items:
+            if not isinstance(ni, dict):
+                ni = {'items': []}
+            if not isinstance(ni.get('items'), list):
+                ni['items'] = []
+            ni['items'].append({'selected': 'PC', 'v_metric': 'Count', 'v_count': 10, 'factor': 1.0})
+            sections['Node Information'] = ni
+    except Exception:
+        pass
+
+    scenario['sections'] = sections
+    return scenario
 
 
 def _default_scenarios_payload_for_names(names: Iterable[Any] | None) -> Dict[str, Any]:
@@ -30508,7 +31246,6 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
         'Routing': {'density': 0.5},
         'Services': {'density': 0.5},
         'Traffic': {'density': 0.5},
-        'Events': {'density': 0.5},
         'Vulnerabilities': {'density': 0.5, 'flag_type': 'text'},
         'Segmentation': {'density': 0.5},
         'HITL': {},
@@ -30555,6 +31292,8 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                 sec_norm.setdefault(key, val)
             sections_out[section_name] = sec_norm
         for extra_name, extra_val in sections_meta.items():
+            if extra_name == 'Events':
+                continue
             if extra_name not in sections_out:
                 sections_out[extra_name] = extra_val
         scen_norm['sections'] = sections_out
@@ -30615,6 +31354,12 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
             hitl_norm['proxmox'] = prox_norm
 
         scen_norm['hitl'] = hitl_norm
+
+        ai_generator_meta = _sanitize_ai_generator_state(scen_norm.get('ai_generator'))
+        if ai_generator_meta:
+            scen_norm['ai_generator'] = ai_generator_meta
+        else:
+            scen_norm.pop('ai_generator', None)
 
         normalized_scenarios.append(scen_norm)
 
@@ -34084,6 +34829,12 @@ def _parse_scenarios_xml(path):
         if root.tag == "ScenarioEditor":
             scen = _parse_scenario_editor(root)
             scen["name"] = os.path.splitext(os.path.basename(path))[0]
+            scen = _canonicalize_specific_vulnerability_items(scen, strict=False)
+            if isinstance(scen.get('plan_preview'), dict):
+                scen['plan_preview'] = _canonicalize_plan_preview_vulnerability_names(
+                    scen.get('plan_preview'),
+                    scenario_payload=scen,
+                )
             data["scenarios"].append(scen)
             return data
         raise ValueError("Root element must be <Scenarios> or <ScenarioEditor>")
@@ -34144,6 +34895,12 @@ def _parse_scenarios_xml(path):
         if se is None:
             continue
         scen.update(_parse_scenario_editor(se))
+        scen = _canonicalize_specific_vulnerability_items(scen, strict=False)
+        if isinstance(scen.get('plan_preview'), dict):
+            scen['plan_preview'] = _canonicalize_plan_preview_vulnerability_names(
+                scen.get('plan_preview'),
+                scenario_payload=scen,
+            )
         # If scenario-level density_count was absent but Node Information section provided one, keep existing.
         data["scenarios"].append(scen)
     return data
@@ -34787,7 +35544,27 @@ def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> di
             return None
         payload = json.loads(raw)
         if isinstance(payload, dict):
-            return _canonicalize_plan_payload_paths(payload, xml_path=xml_path)
+            payload = _canonicalize_plan_payload_paths(payload, xml_path=xml_path)
+            try:
+                parsed = _parse_scenarios_xml(xml_path)
+                scenarios = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                selected = None
+                if isinstance(scenarios, list):
+                    target_norm = _normalize_scenario_label(scenario_label or '') if scenario_label else ''
+                    for scenario_payload in scenarios:
+                        if not isinstance(scenario_payload, dict):
+                            continue
+                        if target_norm:
+                            name = str(scenario_payload.get('name') or '').strip()
+                            if _normalize_scenario_label(name) != target_norm:
+                                continue
+                        selected = scenario_payload
+                        break
+                if isinstance(selected, dict):
+                    payload = _canonicalize_plan_preview_vulnerability_names(payload, scenario_payload=selected)
+            except Exception:
+                pass
+            return payload
         return None
     except Exception:
         return None
@@ -34957,6 +35734,21 @@ def _parse_scenario_editor(se):
                 hitl_info["proxmox"] = prox_cfg
     scen["hitl"] = hitl_info
 
+    # AI Generator state for provider config + draft prompt/generation metadata.
+    try:
+        ai_el = se.find("AIGenerator")
+        if ai_el is not None and ai_el.text:
+            raw_ai = ai_el.text
+            try:
+                parsed_ai = json.loads(raw_ai)
+                sanitized_ai = _sanitize_ai_generator_state(parsed_ai)
+                if isinstance(sanitized_ai, dict):
+                    scen["ai_generator"] = sanitized_ai
+            except Exception:
+                scen["ai_generator"] = {"raw": str(raw_ai)}
+    except Exception:
+        pass
+
     # Flag Sequencing flow state (resolved values, chain selections).
     try:
         fs_el = se.find("FlagSequencing")
@@ -35059,8 +35851,6 @@ def _parse_scenario_editor(se):
                         d['r2s_hosts_max'] = int(hmax_attr)
                 except Exception:
                     pass
-            if name == "Events":
-                d["script_path"] = item.get("script_path", "")
             if name == "Traffic":
                 d.update({
                     "pattern": item.get("pattern", "continuous"),
@@ -35151,6 +35941,7 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
     core_el.set('ssh_port', str(core_cfg.get('ssh_port') or ''))
     core_el.set('ssh_username', str(core_cfg.get('ssh_username') or ''))
     for idx, scen in enumerate(data_dict.get("scenarios", [])):
+        scen = _normalize_scenario_section_semantics(scen)
         scen_el = ET.SubElement(root, "Scenario")
         scen_name = _sanitize_scenario_name_strict((scen or {}).get("name"), f"NewScenario{idx + 1}")
         scen_el.set("name", scen_name)
@@ -35388,6 +36179,14 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                             continue
                         iface_el.set(xml_attr, str(val))
 
+        try:
+            ai_generator = _sanitize_ai_generator_state(scen.get('ai_generator'))
+            if isinstance(ai_generator, dict) and ai_generator:
+                ai_el = ET.SubElement(se, "AIGenerator")
+                ai_el.text = json.dumps(ai_generator, separators=(',', ':'), ensure_ascii=False)
+        except Exception:
+            pass
+
         # Flag Sequencing flow state (resolved values, chain selections).
         try:
             flow_state = scen.get('flow_state')
@@ -35409,7 +36208,7 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
 
         order = [
             "Node Information", "Routing", "Services", "Traffic",
-            "Events", "Vulnerabilities", "Segmentation", "Notes"
+            "Vulnerabilities", "Segmentation", "Notes"
         ]
         combined_host_pool: int | None = None
         scenario_host_additive = 0
@@ -35599,10 +36398,6 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                         it.set('r2s_hosts_min', '1')
                     if 'r2s_hosts_max' not in it.attrib:
                         it.set('r2s_hosts_max', '4')
-                if name == 'Events':
-                    sp = item.get('script_path') or ''
-                    if sp:
-                        it.set('script_path', sp)
                 if name == 'Traffic':
                     it.set('pattern', str(item.get('pattern', 'continuous')))
                     it.set('rate_kbps', f"{float(item.get('rate_kbps', 64.0)):.1f}")
@@ -55181,6 +55976,16 @@ try:
         remove_scenarios_from_catalog=_remove_scenarios_from_catalog,
         delete_saved_scenario_xml_artifacts=_delete_saved_scenario_xml_artifacts,
         remove_scenarios_from_all_editor_snapshots=_remove_scenarios_from_all_editor_snapshots,
+        logger=app.logger,
+    )
+except Exception:
+    pass
+
+try:
+    from webapp.routes import ai_provider as _ai_provider_routes
+
+    _ai_provider_routes.register(
+        app,
         logger=app.logger,
     )
 except Exception:

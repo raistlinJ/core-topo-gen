@@ -1754,6 +1754,12 @@ def main():
     has_routing_counts = any(getattr(ri, 'abs_count', 0) and int(getattr(ri, 'abs_count', 0)) > 0 for ri in (routing_items or []))
     # Always build directly from current scenario plan (phased path removed)
     logging.info("PHASE: Building topology")
+    routers = []
+    switches = []
+    hosts = []
+    service_assignments = {}
+    router_protocols = {}
+    docker_by_name = {}
     if (routing_density and routing_density > 0) or has_routing_counts:
         session, routers, hosts, service_assignments, router_protocols, docker_by_name = build_segmented_topology(
             core,

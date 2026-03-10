@@ -29,7 +29,6 @@ def test_density_count_persists_roundtrip(tmp_path, monkeypatch):
                     "Routing": {"density": 0.5, "items": []},
                     "Services": {"density": 0.0, "items": []},
                     "Traffic": {"density": 0.0, "items": []},
-                    "Events": {"density": 0.0, "items": []},
                     "Vulnerabilities": {"density": 0.0, "items": []},
                     "Segmentation": {"density": 0.0, "items": []}
                 },

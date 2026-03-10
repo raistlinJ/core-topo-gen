@@ -3,7 +3,7 @@
 {% block active_page %}{% set active_page = 'scenarios' %}{% endblock %}
 {% set scenario_tab = request.args.get('scenario', '').strip() if request else '' %}
 {% set requested_tab = request.args.get('tab', '').strip() if request else '' %}
-{% if requested_tab in ['connection-setup', 'topology'] %}
+{% if requested_tab in ['connection-setup', 'ai-generator', 'topology'] %}
 {% set scenarios_active_tab = requested_tab %}
 {% else %}
 {% set scenarios_active_tab = 'topology' %}
@@ -100,6 +100,297 @@
         min-height: 38px;
     }
 
+    .ai-generator-shell {
+        background: linear-gradient(135deg, rgba(11, 95, 255, 0.08), rgba(17, 153, 142, 0.08));
+        border: 1px solid rgba(11, 95, 255, 0.12);
+        border-radius: 18px;
+        padding: 20px;
+    }
+
+    .ai-generator-shell .card {
+        border-radius: 16px;
+    }
+
+    .ai-generator-status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        display: inline-block;
+        background: #adb5bd;
+    }
+
+    .ai-generator-status-dot.is-valid {
+        background: #198754;
+        box-shadow: 0 0 0 4px rgba(25, 135, 84, 0.15);
+    }
+
+    .ai-generator-status-dot.is-invalid {
+        background: #dc3545;
+        box-shadow: 0 0 0 4px rgba(220, 53, 69, 0.15);
+    }
+
+    .ai-generator-packet {
+        white-space: pre-wrap;
+        font-size: 0.8rem;
+        max-height: 320px;
+        overflow: auto;
+    }
+
+    .ai-generator-tools-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 10px;
+    }
+
+    .ai-generator-tools-scroll {
+        max-height: 320px;
+        overflow-y: auto;
+        overflow-x: hidden;
+        padding-right: 4px;
+    }
+
+    .ai-generator-tool-option {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 10px;
+        align-items: start;
+        border: 1px solid rgba(11, 95, 255, 0.12);
+        border-radius: 14px;
+        padding: 10px 12px;
+        background: rgba(255, 255, 255, 0.82);
+        min-height: 88px;
+    }
+
+    .ai-generator-tool-option:hover {
+        border-color: rgba(11, 95, 255, 0.28);
+        background: rgba(255, 255, 255, 0.96);
+    }
+
+    .ai-generator-tool-option .form-check-input {
+        margin-top: 0.25rem;
+    }
+
+    .ai-generator-tool-meta {
+        min-width: 0;
+    }
+
+    .ai-generator-tool-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 3px;
+    }
+
+    .ai-generator-tool-name {
+        font-size: 0.92rem;
+        font-weight: 600;
+        line-height: 1.2;
+        word-break: break-word;
+    }
+
+    .ai-generator-tool-server {
+        flex: 0 0 auto;
+        border-radius: 999px;
+        background: rgba(11, 95, 255, 0.1);
+        color: #0b5fff;
+        font-size: 0.72rem;
+        font-weight: 600;
+        padding: 2px 8px;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+    }
+
+    .ai-generator-tool-description {
+        color: #6c757d;
+        font-size: 0.79rem;
+        line-height: 1.35;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+
+    .ai-generator-tool-identity {
+        color: #8a9199;
+        font-size: 0.72rem;
+        margin-top: 5px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    #aiGeneratorStreamModal .modal-dialog {
+        max-width: min(1100px, 94vw);
+    }
+
+    .ai-generator-stream-status {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+    }
+
+    .ai-generator-stream-shell {
+        display: grid;
+        grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.9fr);
+        gap: 14px;
+    }
+
+    .ai-generator-stream-panel {
+        border: 1px solid rgba(11, 95, 255, 0.12);
+        border-radius: 14px;
+        background: rgba(248, 250, 252, 0.9);
+        overflow: hidden;
+    }
+
+    .ai-generator-stream-panel-header {
+        padding: 10px 14px;
+        border-bottom: 1px solid rgba(11, 95, 255, 0.1);
+        font-size: 0.82rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: #4c5a67;
+    }
+
+    .ai-generator-stream-panel-header-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    .ai-generator-stream-panel-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 0.74rem;
+        font-weight: 600;
+        letter-spacing: normal;
+        text-transform: none;
+        color: #4c5a67;
+    }
+
+    .ai-generator-stream-panel-subheader {
+        min-height: 18px;
+        padding: 6px 14px 0;
+        font-size: 0.74rem;
+        color: #71808f;
+    }
+
+    #aiGeneratorStreamOutput {
+        margin: 0;
+        min-height: 360px;
+        max-height: 58vh;
+        overflow: auto;
+        padding: 14px;
+        background: linear-gradient(180deg, #f8fafc 0%, #eef3f8 100%);
+        color: #22313f;
+        font-size: 0.86rem;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border-top: 1px solid rgba(11, 95, 255, 0.08);
+    }
+
+    #aiGeneratorStreamOutput:empty::before {
+        content: 'Model output will appear here as it streams.';
+        color: #71808f;
+        font-style: italic;
+    }
+
+    #aiGeneratorStreamEvents {
+        max-height: 58vh;
+        overflow: auto;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .ai-generator-stream-event {
+        border-radius: 12px;
+        padding: 9px 10px;
+        border: 1px solid rgba(11, 95, 255, 0.1);
+        background: white;
+    }
+
+    .ai-generator-stream-event.is-error {
+        border-color: rgba(220, 53, 69, 0.2);
+        background: rgba(220, 53, 69, 0.06);
+    }
+
+    .ai-generator-stream-event.is-success {
+        border-color: rgba(25, 135, 84, 0.2);
+        background: rgba(25, 135, 84, 0.06);
+    }
+
+    .ai-generator-stream-event-title {
+        font-size: 0.78rem;
+        font-weight: 700;
+        margin-bottom: 3px;
+        color: #33404d;
+    }
+
+    .ai-generator-stream-event-body {
+        font-size: 0.8rem;
+        color: #5b6773;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
+    .ai-generator-stream-event-live-tail {
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 280px;
+        overflow: auto;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(11, 95, 255, 0.04);
+        border: 1px solid rgba(11, 95, 255, 0.08);
+    }
+
+    .ai-generator-stream-event-toggle {
+        margin-top: 6px;
+    }
+
+    .ai-generator-stream-event-toggle summary {
+        cursor: pointer;
+        color: #0b5fff;
+        font-weight: 600;
+        font-size: 0.76rem;
+        user-select: none;
+    }
+
+    .ai-generator-stream-event-toggle[open] summary {
+        margin-bottom: 8px;
+    }
+
+    .ai-generator-stream-event-toggle-body {
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 280px;
+        overflow: auto;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(11, 95, 255, 0.04);
+        border: 1px solid rgba(11, 95, 255, 0.08);
+    }
+
+    @media (max-width: 992px) {
+        .ai-generator-stream-shell {
+            grid-template-columns: 1fr;
+        }
+
+        #aiGeneratorStreamOutput,
+        #aiGeneratorStreamEvents {
+            max-height: 34vh;
+        }
+    }
+
     .hitl-step-disabled {
         filter: grayscale(0.3);
         opacity: 0.85;
@@ -173,7 +464,9 @@
             <div class="card-body">
                 <div id="connectionSetupRoot"
                     class="{% if scenarios_active_tab == 'connection-setup' %}d-block{% else %}d-none{% endif %}"></div>
-                {% if scenarios_active_tab != 'connection-setup' %}
+                <div id="aiGeneratorRoot"
+                    class="{% if scenarios_active_tab == 'ai-generator' %}d-block{% else %}d-none{% endif %}"></div>
+                {% if scenarios_active_tab not in ['connection-setup', 'ai-generator'] %}
                 <div class="card mb-3" id="topologySeedCard">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <strong>Topology Seed</strong>
@@ -283,7 +576,7 @@
                     </div>
                 </div>
                 {% else %}
-                {# Connection Setup tab: keep required DOM hooks, but do not show the Base/Editor cards. #}
+                {# Connection Setup / AI Generator tabs: keep required DOM hooks, but do not show the Base/Editor cards. #}
                 <div class="d-none" id="connectionSetupHiddenHooks">
                     <div id="hitlEntryButtonsWrap" class="d-flex align-items-center gap-2">
                         {% if not is_builder_view %}
@@ -379,6 +672,48 @@
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" id="runProgressHideBtn"
                     data-bs-dismiss="modal">Hide</button>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="modal fade" id="aiGeneratorStreamModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <h5 class="modal-title">AI Generation Output</h5>
+                    <div class="small text-muted" id="aiGeneratorStreamMeta">Waiting to start…</div>
+                </div>
+                <button type="button" class="btn-close" id="aiGeneratorStreamHeaderCloseBtn" data-bs-dismiss="modal" aria-label="Close" disabled></button>
+            </div>
+            <div class="modal-body">
+                <div class="ai-generator-stream-status">
+                    <div>
+                        <div class="fw-semibold" id="aiGeneratorStreamStatus">Preparing request…</div>
+                        <div class="small text-muted" id="aiGeneratorStreamDetail">Connecting to the backend stream.</div>
+                    </div>
+                    <span class="badge text-bg-primary" id="aiGeneratorStreamStateBadge">Running</span>
+                </div>
+                <div class="ai-generator-stream-shell">
+                    <div class="ai-generator-stream-panel">
+                        <div class="ai-generator-stream-panel-header">Model Output</div>
+                        <div class="ai-generator-stream-panel-subheader" id="aiGeneratorStreamOutputHint"></div>
+                        <pre id="aiGeneratorStreamOutput"></pre>
+                    </div>
+                    <div class="ai-generator-stream-panel">
+                        <div class="ai-generator-stream-panel-header ai-generator-stream-panel-header-row">
+                            <span>Activity</span>
+                        </div>
+                        <div id="aiGeneratorStreamEvents"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" id="aiGeneratorStreamCopyBtn">Copy Transcript</button>
+                <button type="button" class="btn btn-outline-secondary" id="aiGeneratorStreamDownloadBtn">Download Transcript</button>
+                <button type="button" class="btn btn-outline-primary" id="aiGeneratorStreamRetryBtn" disabled>Retry</button>
+                <button type="button" class="btn btn-outline-danger" id="aiGeneratorStreamCancelBtn">Cancel</button>
+                <button type="button" class="btn btn-outline-secondary" id="aiGeneratorStreamCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
             </div>
         </div>
     </div>
@@ -776,6 +1111,9 @@
 <!-- Graph libraries for Full Preview Modal -->
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="{{ url_for('static', filename='core_graph.js') }}"></script>
+<script src="{{ url_for('static', filename='ai_generator_stream.js') }}"></script>
+<script src="{{ url_for('static', filename='ai_generator_workflow.js') }}"></script>
+<script src="{{ url_for('static', filename='ai_generator_panel.js') }}"></script>
 
 <!-- Toast container removed (requested) -->
 <!-- Verify Setup Modal -->
@@ -1337,6 +1675,7 @@
     const DEFAULT_PROJECT_KEY = '__default_project__';
     const DELETED_SCENARIO_IDS_STORAGE_KEY = 'coretg_deleted_scenario_ids_v3';
     const DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY = 'coretg_deleted_scenario_name_keys_v3';
+    const AI_GENERATOR_STATE_STORAGE_KEY = 'coretg_ai_generator_state_v1';
 
     // HITL attachment constants must be defined early because the editor can merge
     // persisted snapshots during initial load, and that merge path calls
@@ -1894,7 +2233,6 @@
                 'Routing': { density: 0.5, items: [] },
                 'Services': { density: 0.5, items: [] },
                 'Traffic': { density: 0.5, items: [] },
-                'Events': { density: 0.5, items: [] },
                 'Vulnerabilities': { density: 0.5, items: [], flag_type: 'text' },
                 'Segmentation': { density: 0.5, items: [] }
             },
@@ -4406,6 +4744,209 @@
         return (getActiveScenarioContext().name || '').trim();
     }
 
+    function getAiGeneratorScenarioKey(scenario, idx = null) {
+        if (scenario && typeof scenario === 'object') {
+            const sid = (scenario._sid || '').toString().trim();
+            if (sid) return sid;
+            const name = (scenario.name || '').toString().trim().toLowerCase();
+            if (name) return `name:${name}`;
+        }
+        if (Number.isInteger(idx)) return `idx:${idx}`;
+        return 'default';
+    }
+
+    function getDefaultAiGeneratorState() {
+        let defaultServerUrl = 'http://127.0.0.1:9090/mcp';
+        try {
+            if (window && window.location && window.location.origin) {
+                defaultServerUrl = `${String(window.location.origin).replace(/\/$/, '')}/mcp`;
+            }
+        } catch (err) { }
+        return {
+            provider: 'ollama',
+            bridge_mode: 'mcp-python-sdk',
+            hil_enabled: false,
+            base_url: 'http://127.0.0.1:11434',
+            model: '',
+            mcp_server_path: 'MCP/server.py',
+            mcp_server_url: defaultServerUrl,
+            servers_json_path: 'MCP/mcp-bridge-servers.json',
+            auto_discovery: false,
+            available_tools: [],
+            enabled_tools: [],
+            draft_id: '',
+            validation: {
+                ok: false,
+                in_progress: false,
+                ollama_ok: false,
+                bridge_ok: false,
+                checked_at: null,
+                message: '',
+                models: [],
+                model_found: false,
+                provider: 'ollama',
+            },
+            draft_prompt: '',
+            prompt_packet: '',
+            last_packet_at: null,
+            last_generation_summary: null,
+            last_generation_error: '',
+        };
+    }
+
+    function loadAiGeneratorStateMap() {
+        return readJsonFromLocalStorage(AI_GENERATOR_STATE_STORAGE_KEY, {});
+    }
+
+    function saveAiGeneratorStateMap(nextMap) {
+        writeJsonToLocalStorage(AI_GENERATOR_STATE_STORAGE_KEY, nextMap || {});
+    }
+
+    function ensureAiGeneratorStateForScenario(scenario, idx = null) {
+        const defaults = getDefaultAiGeneratorState();
+        const localMap = loadAiGeneratorStateMap();
+        const key = getAiGeneratorScenarioKey(scenario, idx);
+        const localState = localMap && typeof localMap[key] === 'object' ? localMap[key] : {};
+        const scenarioState = (scenario && typeof scenario.ai_generator === 'object') ? scenario.ai_generator : {};
+        const localValidation = localState.validation && typeof localState.validation === 'object' ? localState.validation : {};
+        const scenarioValidation = scenarioState.validation && typeof scenarioState.validation === 'object' ? scenarioState.validation : {};
+        const merged = {
+            ...defaults,
+            ...localState,
+            ...scenarioState,
+            validation: {
+                ...defaults.validation,
+                ...localValidation,
+                ...scenarioValidation,
+            },
+        };
+        const messageText = String(merged.validation.message || '').trim();
+        const hasExplicitBridgeFlag = Object.prototype.hasOwnProperty.call(localValidation, 'bridge_ok') || Object.prototype.hasOwnProperty.call(scenarioValidation, 'bridge_ok');
+        const hasExplicitOllamaFlag = Object.prototype.hasOwnProperty.call(localValidation, 'ollama_ok') || Object.prototype.hasOwnProperty.call(scenarioValidation, 'ollama_ok');
+        if (!hasExplicitOllamaFlag) {
+            merged.validation.ollama_ok = !!merged.validation.ok || /^Reached Ollama at\s+/i.test(messageText);
+        }
+        if (!hasExplicitBridgeFlag) {
+            const hasDiscoveredTools = Array.isArray(merged.available_tools) && merged.available_tools.length > 0;
+            if (/^Reached Ollama at\s+/i.test(messageText) && !hasDiscoveredTools) {
+                merged.validation.bridge_ok = false;
+                if (merged.validation.ok) {
+                    merged.validation.ok = false;
+                }
+            } else {
+                merged.validation.bridge_ok = !!merged.validation.ok;
+            }
+        }
+        if (!String(merged.mcp_server_path || '').trim()) merged.mcp_server_path = defaults.mcp_server_path;
+        if (!String(merged.mcp_server_url || '').trim()) merged.mcp_server_url = defaults.mcp_server_url;
+        if (!String(merged.servers_json_path || '').trim()) merged.servers_json_path = defaults.servers_json_path;
+        if (scenario && typeof scenario === 'object') {
+            scenario.ai_generator = merged;
+        }
+        return merged;
+    }
+
+    function buildAiGeneratorBridgePayload(aiState) {
+        const scriptPath = String(aiState && aiState.mcp_server_path || '').trim();
+        const serverUrl = String(aiState && aiState.mcp_server_url || '').trim();
+        const serversJsonPath = String(aiState && aiState.servers_json_path || '').trim();
+        const payload = {
+            bridge_mode: aiState.bridge_mode || 'mcp-python-sdk',
+            auto_discovery: !!aiState.auto_discovery,
+            hil_enabled: !!aiState.hil_enabled,
+            enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],
+            mcp_server_path: '',
+            mcp_server_url: '',
+            servers_json_path: '',
+        };
+        if (scriptPath) {
+            payload.mcp_server_path = scriptPath;
+            return payload;
+        }
+        if (serverUrl) {
+            payload.mcp_server_url = serverUrl;
+            return payload;
+        }
+        if (serversJsonPath) {
+            payload.servers_json_path = serversJsonPath;
+            return payload;
+        }
+        return payload;
+    }
+
+    function persistAiGeneratorStateForScenario(scenario, idx, partialState) {
+        if (!scenario || typeof scenario !== 'object') return getDefaultAiGeneratorState();
+        const current = ensureAiGeneratorStateForScenario(scenario, idx);
+        const next = {
+            ...current,
+            ...(partialState && typeof partialState === 'object' ? partialState : {}),
+            validation: {
+                ...current.validation,
+                ...(partialState && partialState.validation && typeof partialState.validation === 'object' ? partialState.validation : {}),
+            },
+        };
+        scenario.ai_generator = next;
+        const localMap = loadAiGeneratorStateMap();
+        localMap[getAiGeneratorScenarioKey(scenario, idx)] = next;
+        saveAiGeneratorStateMap(localMap);
+        return next;
+    }
+
+    const {
+        state: aiGeneratorStreamState,
+        createRequestId: createAiGeneratorStreamRequestId,
+        updateButtons: updateAiGeneratorStreamButtons,
+        renderEventBody: renderAiGeneratorStreamEventBody,
+        ensureModalGuards: ensureAiGeneratorStreamModalGuards,
+        getModalInstance: getAiGeneratorStreamModalInstance,
+        setStatus: setAiGeneratorStreamStatus,
+        appendOutput: appendAiGeneratorStreamOutput,
+        appendEvent: appendAiGeneratorStreamEvent,
+        buildTranscript: buildAiGeneratorTranscript,
+        copyTranscript: copyAiGeneratorTranscript,
+        downloadTranscript: downloadAiGeneratorTranscript,
+        cancelStream: cancelAiGeneratorStream,
+        showModal: showAiGeneratorStreamModal,
+        finishModal: finishAiGeneratorStreamModal,
+        consumeNdjsonStream: consumeAiGeneratorNdjsonStream,
+    } = window.CORETG_AI_GENERATOR_STREAM;
+
+    let renderAiGeneratorPanel = () => {};
+
+    const {
+        applyAiScenarioPreviewSuccess,
+        handleAiScenarioPreviewFailure,
+        buildAiGeneratorPromptPacket,
+        validateAiGeneratorConfig,
+        fetchAiGeneratorModels,
+        generateAiScenarioPreview,
+    } = window.createCoretgAiGeneratorWorkflow({
+        streamApi: window.CORETG_AI_GENERATOR_STREAM,
+        getState: () => state,
+        getPreviewState: () => previewState,
+        getActiveScenarioContext,
+        ensureAiGeneratorStateForScenario,
+        persistAiGeneratorStateForScenario,
+        buildAiGeneratorBridgePayload,
+        getCoreConfig,
+        persistEditorState: () => persistEditorState(),
+        persistEditorSnapshotToServerNow: () => persistEditorSnapshotToServerNow(),
+        updatePlanButtons: () => updatePlanButtons(),
+        render: () => render(),
+        renderAiGeneratorPanel: () => renderAiGeneratorPanel(),
+    });
+
+    renderAiGeneratorPanel = window.createCoretgAiGeneratorPanel({
+        getScenariosActiveTab: () => SCENARIOS_ACTIVE_TAB,
+        getActiveScenarioContext,
+        ensureAiGeneratorStateForScenario,
+        persistAiGeneratorStateForScenario,
+        buildAiGeneratorPromptPacket,
+        validateAiGeneratorConfig,
+        fetchAiGeneratorModels,
+        generateAiScenarioPreview,
+    });
+
     function buildScenarioAwareUrl(baseUrl, scenarioName = null) {
         if (!baseUrl || typeof baseUrl !== 'string') return baseUrl;
         const sourceName = scenarioName !== null ? scenarioName : getActiveScenarioName();
@@ -5289,6 +5830,13 @@
         }
     }
 
+    function markXmlPreviewSaved(source = null) {
+        try { previewState.xmlSaved = true; } catch (e) { }
+        try { previewState.dirty = false; } catch (e) { }
+        try { noteXmlPreviewSavedSignature(source); } catch (e) { }
+        try { updatePlanButtons(); } catch (e) { }
+    }
+
     try {
         window.noteXmlPreviewSavedSignature = noteXmlPreviewSavedSignature;
         window.buildXmlPreviewSignature = buildXmlPreviewSignature;
@@ -5810,6 +6358,18 @@
     };
 
     document.addEventListener('DOMContentLoaded', () => {
+        document.getElementById('aiGeneratorStreamCopyBtn')?.addEventListener('click', () => {
+            copyAiGeneratorTranscript();
+        });
+        document.getElementById('aiGeneratorStreamDownloadBtn')?.addEventListener('click', () => {
+            downloadAiGeneratorTranscript();
+        });
+        document.getElementById('aiGeneratorStreamRetryBtn')?.addEventListener('click', () => {
+            void window.CORETG_AI_GENERATOR_STREAM?.retryStream?.();
+        });
+        document.getElementById('aiGeneratorStreamCancelBtn')?.addEventListener('click', () => {
+            void cancelAiGeneratorStream();
+        });
         document.getElementById('planPreviewBtn')?.addEventListener('click', computePlanPreview);
         // Scenarios header Preview tab: save XML, then navigate to /scenarios/preview.
         document.getElementById('scenariosPreviewTabLink')?.addEventListener('click', async (ev) => {
@@ -5857,6 +6417,17 @@
                     return;
                 }
                 if (action === 'continue-topology') {
+                    const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
+                    const url = '/' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                    try {
+                        if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+                            window.coretgAllowUnsavedNavOnce();
+                        }
+                    } catch (e) { }
+                    window.location.href = url;
+                    return;
+                }
+                if (action === 'ai-generator') {
                     const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
                     const url = '/' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
                     try {
@@ -7692,9 +8263,7 @@
                 };
 
                 const finalizeSuccess = async () => {
-                    previewState.xmlSaved = true;
-                    try { updatePlanButtons(); } catch (err) { }
-                    try { noteXmlPreviewSavedSignature(); } catch (e) { }
+                    markXmlPreviewSaved();
                     // Keep the dock's XML Preview in sync for all save paths (auto-save + modal saves).
                     try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (e) { }
                     // Persist a concrete flow plan artifact so Flag Sequencing/Preview stay in sync.
@@ -8070,12 +8639,15 @@
     function applyAutosaveResultPath(path) {
         const resolved = (typeof path === 'string') ? path.trim() : '';
         if (!resolved) return;
-        if (state.result_path && state.result_path === resolved) return;
-        state.result_path = resolved;
-        previewState.xmlSaved = true;
-        try { updatePlanButtons(); } catch (e) { }
+        const resultPathChanged = !(state.result_path && state.result_path === resolved);
+        if (resultPathChanged) {
+            state.result_path = resolved;
+        }
+        markXmlPreviewSaved();
         autoSaveXmlSkipNext = true;
-        try { persistEditorState({ skipXml: true }); } catch (e) { }
+        if (resultPathChanged) {
+            try { persistEditorState({ skipXml: true }); } catch (e) { }
+        }
     }
 
     async function flushAutoSaveXmlNow() {
@@ -8140,50 +8712,67 @@
         }, 1200);
     }
 
+    function buildEditorSnapshot() {
+        try {
+            state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+            window.state = state;
+        } catch (e) { }
+        const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
+            path: state.scenarios?.[0]?.base?.filepath || '',
+            display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
+        } : null);
+        const coreForPersist = sanitizeCoreForPersist(state.core);
+        const scenariosForSnapshot = cloneScenariosForSnapshot(state.scenarios || []);
+        const snapshot = {
+            scenarios: scenariosForSnapshot,
+            result_path: state.result_path || null,
+            core: coreForPersist || null,
+            core_ok: !!state.core_ok,
+            core_tested_host: state.core_tested_host || null,
+            core_tested_port: state.core_tested_port || null,
+            base_upload: baseUploadMeta,
+            host_interfaces: Array.isArray(state.host_interfaces) ? state.host_interfaces : [],
+            host_interfaces_source: state.host_interfaces_source || null,
+            host_interfaces_metadata: state.host_interfaces_metadata || null,
+            host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
+        };
+        snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+        const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
+        const trimmedScenarioToken = (scenarioQueryToken || '').trim();
+        const nextScenarioQuery = trimmedScenarioToken || scenarioSignature || '';
+        snapshot.scenario_query = nextScenarioQuery || null;
+        if (!trimmedScenarioToken && nextScenarioQuery) {
+            scenarioQueryToken = nextScenarioQuery;
+        }
+        const stableProjectHint = (() => {
+            if (currentProjectKey && currentProjectKey !== DEFAULT_PROJECT_KEY) return currentProjectKey;
+            if (snapshot.project_key_hint) return snapshot.project_key_hint;
+            if (nextScenarioQuery) return nextScenarioQuery;
+            if (snapshot.result_path) return snapshot.result_path;
+            if (snapshot.base_upload && snapshot.base_upload.path) return snapshot.base_upload.path;
+            return null;
+        })();
+        snapshot.project_key_hint = stableProjectHint;
+        scrubSnapshotTransientErrors(snapshot);
+        return snapshot;
+    }
+
+    async function persistEditorSnapshotToServerNow() {
+        if (serverSnapshotDisabled) return { ok: false, error: 'Authentication required' };
+        const snapshot = buildEditorSnapshot();
+        if (!snapshot || typeof snapshot !== 'object') return { ok: false, error: 'Snapshot unavailable' };
+        try {
+            return await transmitEditorSnapshotToServer(snapshot);
+        } catch (err) {
+            const message = (err && err.message) ? err.message : 'Snapshot persist failed';
+            return { ok: false, error: message };
+        }
+    }
+
     function persistEditorState(options = {}) {
         try {
             const skipXml = !!(options && options.skipXml);
-            try {
-                state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
-                window.state = state;
-            } catch (e) { }
-            const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
-                path: state.scenarios?.[0]?.base?.filepath || '',
-                display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
-            } : null);
-            const coreForPersist = sanitizeCoreForPersist(state.core);
-            const scenariosForSnapshot = cloneScenariosForSnapshot(state.scenarios || []);
-            const snapshot = {
-                scenarios: scenariosForSnapshot,
-                result_path: state.result_path || null,
-                core: coreForPersist || null,
-                core_ok: !!state.core_ok,
-                core_tested_host: state.core_tested_host || null,
-                core_tested_port: state.core_tested_port || null,
-                base_upload: baseUploadMeta,
-                host_interfaces: Array.isArray(state.host_interfaces) ? state.host_interfaces : [],
-                host_interfaces_source: state.host_interfaces_source || null,
-                host_interfaces_metadata: state.host_interfaces_metadata || null,
-                host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
-            };
-            snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
-            const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
-            const trimmedScenarioToken = (scenarioQueryToken || '').trim();
-            const nextScenarioQuery = trimmedScenarioToken || scenarioSignature || '';
-            snapshot.scenario_query = nextScenarioQuery || null;
-            if (!trimmedScenarioToken && nextScenarioQuery) {
-                scenarioQueryToken = nextScenarioQuery;
-            }
-            const stableProjectHint = (() => {
-                if (currentProjectKey && currentProjectKey !== DEFAULT_PROJECT_KEY) return currentProjectKey;
-                if (snapshot.project_key_hint) return snapshot.project_key_hint;
-                if (nextScenarioQuery) return nextScenarioQuery;
-                if (snapshot.result_path) return snapshot.result_path;
-                if (snapshot.base_upload && snapshot.base_upload.path) return snapshot.base_upload.path;
-                return null;
-            })();
-            snapshot.project_key_hint = stableProjectHint;
-            scrubSnapshotTransientErrors(snapshot);
+            const snapshot = buildEditorSnapshot();
 
             // Explicit-save mode: do not auto-persist editor snapshots in the background.
             try { scheduleServerSnapshotPersist(snapshot); } catch (_) { }
@@ -8221,7 +8810,6 @@
         'Routing': ['RIP', 'RIPNG', 'BGP', 'OSPFv2', 'OSPFv3', 'Random'],
         'Services': ['SSH', 'HTTP', 'DHCPClient', 'Random'],
         'Traffic': ['Random', 'TCP', 'UDP'],
-        'Events': ['Script Path'],
         'Vulnerabilities': ['Random', 'Specific'],
         'Segmentation': ['Random', 'Firewall', 'NAT']
     };
@@ -9223,6 +9811,7 @@
         updateActiveScenarioQueryParam();
         renderSidebar();
         renderMain();
+        renderAiGeneratorPanel();
         updateParticipantProxmoxNavLink();
         updateTopologySeedControls();
         // Ensure H/S bounds visibility reflects initial r2s_mode values
@@ -12638,11 +13227,18 @@
                             </div>
                         </div>`;
                     }
+                } else if (SCENARIOS_ACTIVE_TAB === 'ai-generator') {
+                    renderAiGeneratorPanel();
                 }
             } catch (e) { }
             return;
         }
         const scen = state.scenarios[activeIdx] || state.scenarios[0];
+        if (SCENARIOS_ACTIVE_TAB === 'ai-generator') {
+            try { refreshScenariosExecuteButtonState(); } catch (e) { }
+            renderAiGeneratorPanel();
+            return;
+        }
         try { bindHostInterfacesToScenarioCache(activeIdx); } catch (e) { }
         const escapeHtml = (value) => (value ?? '').toString()
             .replace(/&/g, '&amp;')
@@ -12709,6 +13305,10 @@
             } else if (root) {
                 root.appendChild(metaCard);
             }
+        }
+
+        if (SCENARIOS_ACTIVE_TAB === 'ai-generator') {
+            renderAiGeneratorPanel();
         }
 
         // Connection Setup tab: show CORE / Participant Setup in its own card.
@@ -14664,7 +15264,7 @@
         </div>`;
         const headerRow = document.createElement('div');
         const rawSectionNames = Object.keys(scen.sections || {});
-        const filteredSectionNames = rawSectionNames.filter(name => name !== 'Notes' && name !== 'Events' && name !== 'HITL');
+        const filteredSectionNames = rawSectionNames.filter(name => name !== 'Notes' && name !== 'HITL');
         const secNames = [];
         if (filteredSectionNames.includes('Node Information')) {
             secNames.push('Node Information');
@@ -15289,9 +15889,6 @@
                     options = ['Random', 'TCP', 'UDP'];
                     if (cur === 'CUSTOM') legacyOptionHtml = '<option selected value="CUSTOM" disabled>CUSTOM (legacy)</option>';
                     break;
-                case 'Events':
-                    options = ['Script Path'];
-                    break;
                 case 'Segmentation':
                     options = ['Random', 'Firewall', 'NAT'];
                     if (cur === 'CUSTOM') legacyOptionHtml = '<option selected value="CUSTOM" disabled>CUSTOM (legacy)</option>';
@@ -15303,9 +15900,6 @@
         }
 
         const extras = (() => {
-            if (secName === 'Events') {
-                return `<input class="form-control form-control-sm" placeholder="script path" value="${it.script_path || ''}" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" data-field="script_path">`;
-            }
             if (secName === 'Routing') {
                 // Edges mode (Random/Min/Max/Exact). Random now acts like previous Auto (no extra links augmentation).
                 const mode = it.r2r_mode || (it.r2r_edges !== undefined ? 'Exact' : 'Random');
@@ -15602,7 +16196,7 @@
                                 updateWeightWarning(sidx, sec);
                                 updateWeightInputsDisplay(sidx, sec);
                             }
-                        } else if (['pattern', 'content_type', 'selected', 'script_path', 'v_name', 'v_path', 'v_count', 'v_metric', 'r2r_mode', 'r2s_mode'].includes(field)) {
+                        } else if (['pattern', 'content_type', 'selected', 'v_name', 'v_path', 'v_count', 'v_metric', 'r2r_mode', 'r2s_mode'].includes(field)) {
                             const prev = item[field];
                             if (field === 'v_count') {
                                 let n = clampNodeCountValue(el.value);
@@ -15834,7 +16428,6 @@
                     } catch (e) { }
                 }
                 const item = { selected: defaultSelected, factor: 1.0 };
-                if (sec === 'Events') item.script_path = '';
                 if (sec === 'Traffic') { item.pattern = 'Random'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
                 if (sec === 'Vulnerabilities') { item.selected = 'Random'; }
                 // Default new rows: Node Information -> Count; Vulnerabilities -> Count (1); others -> Weight.
@@ -17016,7 +17609,7 @@
         // Initialize warnings per section
         const scen = state.scenarios[activeIdx];
         if (scen) {
-            ['Node Information', 'Routing', 'Services', 'Traffic', 'Events', 'Vulnerabilities', 'Segmentation'].forEach(sec => updateWeightWarning(activeIdx, sec));
+            ['Node Information', 'Routing', 'Services', 'Traffic', 'Vulnerabilities', 'Segmentation'].forEach(sec => updateWeightWarning(activeIdx, sec));
         }
     }
     function prepareRunCli() {

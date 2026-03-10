@@ -1,5 +1,53 @@
 # Feature Deep Dive
 
+## AI Generator workflow
+- The AI Generator tab sends the current in-browser scenario state, the user prompt, the selected Ollama model/base URL, and the enabled MCP tools to the Flask AI generation route.
+- In MCP mode, Ollama does not write XML directly. The backend opens the repo-local MCP server and creates an in-memory draft from the current scenario.
+- Ollama then uses narrow `scenario.*` tools to mutate that draft. Typical tools are:
+	- `scenario.get_authoring_schema`: fetch valid backend-supported section values and defaults.
+	- `scenario.add_node_role_item`: add host rows under Node Information.
+	- `scenario.add_routing_item`: add router rows and routing edge hints.
+	- `scenario.add_service_item`: add Services rows.
+	- `scenario.add_traffic_item`: add Traffic rows.
+	- `scenario.search_vulnerability_catalog` and `scenario.add_vulnerability_item`: select and add vulnerability rows.
+	- `scenario.replace_section`: replace an entire section with a backend-compatible payload.
+	- `scenario.preview_draft`: run the backend preview planner on the current draft.
+	- `scenario.save_xml`: persist the current draft to XML when explicitly needed.
+- Those MCP tools execute repo/backend logic, not free-form model logic. The model chooses the tool calls, but the actual mutations and validation happen inside the backend.
+- The preview shown after generation comes from the backend planner, not from the model. The planner computes routers, hosts, switches, flow metadata, and other derived state from the current in-memory draft.
+- After a successful AI generation, the frontend replaces the current scenario/editor state with the generated scenario and stores the preview metadata in browser/app state. This still does not write XML by itself.
+- XML is only written when a save path is used:
+	- the normal Save XML button serializes the current editor state through `/save_xml_api`
+	- the MCP tool `scenario.save_xml` can also persist the current in-memory draft
+
+### State flow
+```mermaid
+flowchart LR
+		U[User Prompt in AI Tab] --> FE[Frontend Editor State\ncurrent scenario in browser]
+		FE --> API[/Flask AI Generate Route/]
+		API --> MCP[MCP In-Memory Draft\ntemporary scenario draft]
+		MCP --> TOOLS[MCP Authoring Tools\nadd_node_role_item\nadd_routing_item\nadd_traffic_item\nadd_vulnerability_item\nreplace_section]
+		TOOLS --> MCP
+		MCP --> PREVIEW[Backend Preview Planner\nscenario.preview_draft]
+		PREVIEW --> API
+		API --> FE
+		FE --> SAVE[/save_xml_api or Save XML button/]
+		SAVE --> XML[Saved XML on Disk]
+		XML --> LOAD[Later reload / execute / reports]
+
+		MCP -. temporary, session-scoped .-> X1[(Not XML yet)]
+		FE -. editable browser/app state .-> X2[(Not XML yet)]
+```
+
+### Persistence rules
+- MCP draft: temporary, backend-side, session-scoped working copy.
+- Frontend editor state: the currently loaded scenario in the browser after AI generation succeeds.
+- Preview data: derived backend output used to validate what the current draft would build.
+- Saved XML: only created when a save action happens.
+- Practical summary:
+	- AI Generate = edit the scenario in memory and preview it.
+	- Save XML = persist the current scenario state to disk.
+
 ## Planning semantics
 - Host planning honours **Base Hosts** (density) and **Count** rows; metadata is written into XML (`base_nodes`, `additive_nodes`, `combined_nodes`, etc.) for round-trip fidelity.
 - Router and vulnerability planning capture derived vs explicit counts via `explicit_count`, `derived_count`, and `total_planned`.

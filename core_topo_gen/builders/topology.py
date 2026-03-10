@@ -589,31 +589,59 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 poll_seconds = 1.0
 
             attempts = max(1, int(wait_seconds / poll_seconds))
-            for _ in range(attempts):
+            def _wait_for_nonzero_pid() -> tuple[bool, str, str]:
+                pid_ready_local = False
+                last_tail_local = ''
+                last_status_local = ''
+                for _ in range(attempts):
+                    try:
+                        rc2, tail2 = _run(docker_cmd + ['inspect', '--format', '{{.State.Pid}} {{.State.Status}}', inspect_name], timeout=20)
+                        last_tail_local = tail2 or ''
+                        if rc2 == 0:
+                            parts = (tail2 or '').strip().split()
+                            if parts:
+                                try:
+                                    pid = int(parts[0])
+                                except Exception:
+                                    pid = 0
+                                try:
+                                    last_status_local = str(parts[1]).strip().lower() if len(parts) > 1 else ''
+                                except Exception:
+                                    last_status_local = ''
+                                if pid and pid > 0:
+                                    pid_ready_local = True
+                                    break
+                                # If compose left the container in Created state, try an explicit
+                                # start once and continue waiting.
+                                if last_status_local == 'created':
+                                    _run(compose_base + ['start', str(target_service)], timeout=120)
+                    except Exception:
+                        pass
+                    time.sleep(poll_seconds)
+                return pid_ready_local, last_tail_local, last_status_local
+
+            pid_ready, last_inspect_tail, last_status = _wait_for_nonzero_pid()
+
+            # Recovery path: restart loops can come from stale containers left by previous
+            # runs. Remove the existing container and force-recreate it once before giving up.
+            if (not pid_ready) and last_status in ('restarting', 'exited', 'dead', 'created'):
                 try:
-                    rc2, tail2 = _run(docker_cmd + ['inspect', '--format', '{{.State.Pid}} {{.State.Status}}', inspect_name], timeout=20)
-                    last_inspect_tail = tail2 or ''
-                    if rc2 == 0:
-                        parts = (tail2 or '').strip().split()
-                        if parts:
-                            try:
-                                pid = int(parts[0])
-                            except Exception:
-                                pid = 0
-                            try:
-                                last_status = str(parts[1]).strip().lower() if len(parts) > 1 else ''
-                            except Exception:
-                                last_status = ''
-                            if pid and pid > 0:
-                                pid_ready = True
-                                break
-                            # If compose left the container in Created state, try an explicit
-                            # start once and continue waiting.
-                            if last_status == 'created':
-                                _run(compose_base + ['start', str(target_service)], timeout=120)
+                    logger.warning(
+                        '[docker-node] preflight detected unhealthy container state; force-recreating node=%s service=%s status=%s inspect=%s',
+                        node_name,
+                        target_service,
+                        last_status,
+                        inspect_name,
+                    )
                 except Exception:
                     pass
-                time.sleep(poll_seconds)
+                rm_rc, _rm_tail = _run(docker_cmd + ['rm', '-f', inspect_name], timeout=120)
+                if rm_rc != 0:
+                    _run(compose_base + ['rm', '-f', '-s', str(target_service)], timeout=120)
+                rc, tail = _run(compose_base + ['up', '-d', '--force-recreate', '--no-build', str(target_service)], timeout=900)
+                if strict_pull and rc != 0:
+                    raise RuntimeError(f"docker compose up -d --force-recreate failed (node={node_name} svc={target_service} rc={rc})\n{tail}".strip())
+                pid_ready, last_inspect_tail, last_status = _wait_for_nonzero_pid()
 
             # If PID never becomes non-zero, core-daemon may fail with `/proc/0/environ`.
             # Treat this as a hard preflight failure so Execute exits with a clear cause.
@@ -4039,8 +4067,9 @@ def build_segmented_topology(core,
         )
     except Exception:
         pass
-    # If no routers requested (no density, no counts) OR no hosts, fall back to simple star topology (no routers)
-    if router_count <= 0 or total_hosts == 0:
+    # If no routers are requested, fall back to a simple star topology.
+    # Explicit router counts should still realize router-only topologies even when there are no hosts.
+    if router_count <= 0:
         logger.info("No routers created: routing density=%s, count_router_count=%s, total_hosts=%s", routing_density, count_router_count, total_hosts)
         session, _switch_unused, nodes, svc, docker_by_name = build_star_from_roles(
             core,

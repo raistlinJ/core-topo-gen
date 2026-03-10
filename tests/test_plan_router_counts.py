@@ -39,5 +39,5 @@ def test_plan_router_counts_zero_hosts():
     class R: pass
     r = R(); r.abs_count = 3; r.factor = 0.0
     stats = plan_router_counts(rc, routing_density=0.5, routing_items=[r], base_host_pool=0)
-    # Cannot exceed total_hosts=0
-    assert stats['router_count'] == 0
+    # Explicit router counts should survive even when there are no hosts yet.
+    assert stats['router_count'] == 3

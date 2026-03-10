@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "core-topo-gen": {
+      "command": "python",
+      "args": [
+        "MCP/server.py"
+      ],
+      "disabled": false
+    }
+  }
+}
