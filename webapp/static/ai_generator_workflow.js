@@ -27,12 +27,19 @@
             const mismatch = (data && data.count_intent_mismatch && typeof data.count_intent_mismatch === 'object')
                 ? data.count_intent_mismatch
                 : null;
+            const coverageRetryUsed = !!(data && data.prompt_coverage_retry_used);
+            const coverageMismatch = (data && data.prompt_coverage_mismatch && typeof data.prompt_coverage_mismatch === 'object')
+                ? data.prompt_coverage_mismatch
+                : null;
             const parts = [];
             if (success) {
                 parts.push('No textual model summary was returned. The request completed through tool calls.');
                 parts.push(`Preview summary: routers=${routers}, hosts=${hosts}, switches=${switches}.`);
                 if (retryUsed) {
                     parts.push('An automatic retry was attempted because the first preview did not match the requested counts.');
+                }
+                if (coverageRetryUsed) {
+                    parts.push('An automatic retry was attempted because the first draft omitted requested prompt items or values.');
                 }
                 if (countIntent.totalNodes !== null || countIntent.routerCount !== null) {
                     const requestedBits = [];
@@ -42,6 +49,9 @@
                 }
                 if (mismatch && Array.isArray(mismatch.reasons) && mismatch.reasons.length) {
                     parts.push(`Count mismatch remains: ${mismatch.reasons.join('; ')}.`);
+                }
+                if (coverageMismatch && Array.isArray(coverageMismatch.reasons) && coverageMismatch.reasons.length) {
+                    parts.push(`Prompt coverage mismatch remains: ${coverageMismatch.reasons.join('; ')}.`);
                 }
             } else {
                 parts.push('No textual model output was returned before the request ended.');
@@ -122,6 +132,8 @@
                 enabled_tools: Array.isArray(data.enabled_tools) ? data.enabled_tools : aiState.enabled_tools,
                 last_generation_summary: generationSummary,
                 last_generation_error: '',
+                prompt_coverage_mismatch: (data.prompt_coverage_mismatch && typeof data.prompt_coverage_mismatch === 'object') ? data.prompt_coverage_mismatch : null,
+                prompt_coverage_retry_used: !!data.prompt_coverage_retry_used,
             });
 
             try { deps.persistEditorState(); } catch (e) { }
@@ -138,6 +150,8 @@
             deps.persistAiGeneratorStateForScenario(scenario, idx, {
                 draft_prompt: promptValue,
                 last_generation_error: message,
+                prompt_coverage_mismatch: null,
+                prompt_coverage_retry_used: false,
             });
             renderPanel();
         }

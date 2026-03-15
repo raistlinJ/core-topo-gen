@@ -490,7 +490,17 @@ def build_full_preview(
         nr = _normalize_role_name(r)
         normalized_counts[nr] = normalized_counts.get(nr, 0) + int(c)
     required_docker_hosts = sum(max(0, int(count or 0)) for count in (vulnerabilities_plan or {}).values())
-    role_counts, docker_capacity_repair = ensure_role_counts_docker_capacity(normalized_counts, required_docker_hosts)
+    explicit_docker_hosts = max(0, int(normalized_counts.get('Docker') or 0))
+    if explicit_docker_hosts > 0:
+        role_counts, docker_capacity_repair = ensure_role_counts_docker_capacity(normalized_counts, required_docker_hosts)
+    else:
+        role_counts = dict(normalized_counts)
+        docker_capacity_repair = {
+            'required_docker_hosts': required_docker_hosts,
+            'current_docker_hosts': explicit_docker_hosts,
+            'added_docker_hosts': 0,
+            'preview_preserved_roles': True,
+        }
     total_hosts = sum(int(c) for c in role_counts.values())
     role_expanded = _expand_roles(role_counts)
     host_nodes: List[PreviewNode] = []
@@ -1074,6 +1084,8 @@ def build_full_preview(
             [h for h in host_nodes if str(getattr(h, 'role', '') or '').strip().lower() == 'docker'],
             key=lambda h: getattr(h, 'node_id', 0),
         )
+        if not target_hosts:
+            target_hosts = sorted(host_nodes, key=lambda h: getattr(h, 'node_id', 0))
         ordered = _stable_shuffle([h.node_id for h in target_hosts], rnd_seed + 101)
         flat: List[str] = []
         for name, count in vulnerabilities_plan.items():

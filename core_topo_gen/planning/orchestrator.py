@@ -38,6 +38,7 @@ def compute_full_plan(
     # --- Node Information ---
     density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
     role_counts, node_breakdown = compute_node_plan(density_base, weight_items, count_items)
+    role_counts_raw = dict(role_counts)
 
     # --- Vulnerabilities ---
     vuln_density, vuln_items_xml, vuln_flag_type = parse_vulnerabilities_info(xml_path, scenario)
@@ -151,6 +152,7 @@ def compute_full_plan(
         'seed': seed,
         'density_base': density_base,
         'role_counts': role_counts,
+        'role_counts_raw': role_counts_raw,
         'routers_planned': routers_planned,
         'routing_density': routing_density,
         'routing_items': routing_items,  # raw objects for downstream preview builder

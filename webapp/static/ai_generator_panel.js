@@ -37,6 +37,11 @@
             const modelFound = validation.model_found !== false;
             const generationSummary = (aiState.last_generation_summary && typeof aiState.last_generation_summary === 'object') ? aiState.last_generation_summary : null;
             const generationError = (aiState.last_generation_error || '').toString().trim();
+            const promptCoverageMismatch = (aiState.prompt_coverage_mismatch && typeof aiState.prompt_coverage_mismatch === 'object') ? aiState.prompt_coverage_mismatch : null;
+            const promptCoverageReasons = promptCoverageMismatch && Array.isArray(promptCoverageMismatch.reasons)
+                ? promptCoverageMismatch.reasons.filter(Boolean).map((item) => String(item))
+                : [];
+            const promptCoverageRetryUsed = !!aiState.prompt_coverage_retry_used;
             const checkedAt = validation.checked_at ? (() => {
                 try { return new Date(validation.checked_at).toLocaleString(); } catch (err) { return validation.checked_at; }
             })() : '';
@@ -243,6 +248,13 @@
                                     </div>
                                     <div class="mb-3 ${generationSummary ? '' : 'd-none'}" id="aiGeneratorGenerationSummaryWrap">
                                         <div class="alert alert-success mb-0 small" id="aiGeneratorGenerationSummary">${generationSummary ? escapeHtml(`Preview ready: routers=${generationSummary.routers}, hosts=${generationSummary.hosts}, switches=${generationSummary.switches}${generationSummary.seed ? `, seed=${generationSummary.seed}` : ''}`) : ''}</div>
+                                    </div>
+                                    <div class="mb-3 ${(promptCoverageMismatch || promptCoverageRetryUsed) ? '' : 'd-none'}" id="aiGeneratorCoverageWrap">
+                                        <div class="alert ${promptCoverageMismatch ? 'alert-warning' : 'alert-info'} mb-0 small" id="aiGeneratorCoverageMessage">
+                                            ${promptCoverageMismatch
+                                                ? `<div class="fw-semibold mb-1">Some prompt requirements were still ignored.</div><ul class="mb-0">${promptCoverageReasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul>`
+                                                : `${promptCoverageRetryUsed ? 'The backend auto-retried once because the first draft missed requested prompt items or values.' : ''}`}
+                                        </div>
                                     </div>
                                     <details class="mb-0">
                                         <summary class="small text-muted fw-semibold">Prompt packet preview</summary>

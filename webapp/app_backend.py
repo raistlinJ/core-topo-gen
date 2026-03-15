@@ -25785,18 +25785,23 @@ RUNS: Dict[str, Dict[str, Any]] = {}
 RUN_HISTORY_PATH = os.path.join(_outputs_dir(), 'run_history.json')
 RUN_HISTORY_LOCK = threading.RLock()
 
+
+def _run_history_path() -> str:
+    return os.path.join(_outputs_dir(), 'run_history.json')
+
 def _load_run_history():
+    run_history_path = _run_history_path()
     try:
         with RUN_HISTORY_LOCK:
-            if os.path.exists(RUN_HISTORY_PATH):
-                with open(RUN_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            if os.path.exists(run_history_path):
+                with open(run_history_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     if isinstance(data, list):
                         return [_normalize_run_history_entry(item) for item in data if isinstance(item, dict)]
                     return []
     except Exception:
         try:
-            app.logger.exception('[run_history] failed reading %s', RUN_HISTORY_PATH)
+            app.logger.exception('[run_history] failed reading %s', run_history_path)
         except Exception:
             pass
     return []
@@ -25818,8 +25823,9 @@ def _append_run_history(entry: dict) -> bool:
     except Exception:
         run_id = None
 
-    os.makedirs(os.path.dirname(RUN_HISTORY_PATH), exist_ok=True)
-    tmp = RUN_HISTORY_PATH + '.tmp'
+    run_history_path = _run_history_path()
+    os.makedirs(os.path.dirname(run_history_path), exist_ok=True)
+    tmp = run_history_path + '.tmp'
     with RUN_HISTORY_LOCK:
         history = _load_run_history()
         if run_id:
@@ -25838,11 +25844,11 @@ def _append_run_history(entry: dict) -> bool:
                 # Use default=str to avoid silently dropping entries due to an unexpected
                 # non-serializable value. Paths/objects become strings.
                 json.dump(history, f, indent=2, default=str)
-            os.replace(tmp, RUN_HISTORY_PATH)
+            os.replace(tmp, run_history_path)
             return True
         except Exception:
             try:
-                app.logger.exception('[run_history] failed writing %s', RUN_HISTORY_PATH)
+                app.logger.exception('[run_history] failed writing %s', run_history_path)
             except Exception:
                 pass
             try:
@@ -30501,7 +30507,7 @@ def _normalize_traffic_pattern_value(value: Any) -> str:
         'constantrate': 'continuous',
         'periodic': 'periodic',
         'burst': 'burst',
-        'bursty': 'burst',
+        'bursty': 'bursty',
         'poisson': 'poisson',
         'ramp': 'ramp',
         'random': 'Random',
@@ -31017,6 +31023,9 @@ def _concretize_preview_placeholders(scenario_payload: Any, *, seed: Any = None)
 
                 ct_now = str(item.get('content_type') or '').strip()
                 raw_pattern = str(item.get('pattern') or '').strip()
+                if raw_pattern.lower() == 'bursty':
+                    item['pattern'] = 'burst'
+                    raw_pattern = 'burst'
                 if ct_now and ct_now.lower() != 'random' and (not raw_pattern or raw_pattern.lower() == 'random'):
                     pick_pattern = _deterministic_pick(
                         _TRAFFIC_PATTERN_OPTIONS,
@@ -31088,6 +31097,104 @@ def _concretize_preview_placeholders(scenario_payload: Any, *, seed: Any = None)
 
     scenario['sections'] = sections
     return scenario
+
+
+def _concretize_scenarios_for_save(scenarios_payload: Any, *, seed: Any = None) -> list[Any]:
+    if not isinstance(scenarios_payload, list):
+        return []
+
+    try:
+        seed_int = int(seed)
+        if seed_int <= 0:
+            seed_int = 1
+    except Exception:
+        seed_int = 1
+
+    concretized: list[Any] = []
+    for scenario in scenarios_payload:
+        if not isinstance(scenario, dict):
+            concretized.append(scenario)
+            continue
+        try:
+            next_scenario = copy.deepcopy(scenario)
+            scenario_name = str(next_scenario.get('name') or '').strip() or 'Scenario'
+            sections = next_scenario.get('sections') if isinstance(next_scenario.get('sections'), dict) else None
+            if isinstance(sections, dict):
+                routing_section = sections.get('Routing') if isinstance(sections.get('Routing'), dict) else None
+                routing_items = routing_section.get('items') if isinstance(routing_section, dict) and isinstance(routing_section.get('items'), list) else None
+                if isinstance(routing_items, list):
+                    next_items: list[Any] = []
+                    for index, raw_item in enumerate(routing_items):
+                        if not isinstance(raw_item, dict):
+                            next_items.append(raw_item)
+                            continue
+
+                        item = copy.deepcopy(raw_item)
+                        raw_selected = str(item.get('selected') or '').strip()
+                        if not raw_selected or raw_selected.lower() == 'random':
+                            selected = _deterministic_pick(
+                                _ROUTING_RANDOM_PROTOCOL_DEFAULTS,
+                                f'{seed_int}|{scenario_name}|Routing|{index}|selected|save-xml',
+                            )
+                            item['selected'] = str(selected or 'OSPFv2')
+
+                        for mode_key in ('r2r_mode', 'r2s_mode'):
+                            raw_mode = str(item.get(mode_key) or '').strip()
+                            if not raw_mode or raw_mode.lower() == 'random':
+                                chosen_mode = _deterministic_pick(
+                                    _ROUTING_EDGE_MODE_OPTIONS,
+                                    f'{seed_int}|{scenario_name}|Routing|{index}|{mode_key}|save-xml',
+                                )
+                                item[mode_key] = str(chosen_mode or 'Uniform')
+
+                        r2r_mode = str(item.get('r2r_mode') or '').strip()
+                        if r2r_mode == 'Exact':
+                            try:
+                                r2r_edges = int(item.get('r2r_edges') or 0)
+                            except Exception:
+                                r2r_edges = 0
+                            if r2r_edges <= 0:
+                                item['r2r_edges'] = int(_deterministic_pick([2, 3, 4], f'{seed_int}|{scenario_name}|Routing|{index}|r2r_edges|save-xml') or 2)
+                        else:
+                            item.pop('r2r_edges', None)
+
+                        r2s_mode = str(item.get('r2s_mode') or '').strip()
+                        if r2s_mode == 'Exact':
+                            try:
+                                r2s_edges = int(item.get('r2s_edges') or 0)
+                            except Exception:
+                                r2s_edges = 0
+                            if r2s_edges <= 0:
+                                item['r2s_edges'] = int(_deterministic_pick([1, 2, 3], f'{seed_int}|{scenario_name}|Routing|{index}|r2s_edges|save-xml') or 1)
+
+                        if r2s_mode == 'NonUniform':
+                            try:
+                                r2s_hosts_min = int(item.get('r2s_hosts_min') or 0)
+                            except Exception:
+                                r2s_hosts_min = 0
+                            try:
+                                r2s_hosts_max = int(item.get('r2s_hosts_max') or 0)
+                            except Exception:
+                                r2s_hosts_max = 0
+                            if r2s_hosts_min <= 0:
+                                r2s_hosts_min = 1
+                            if r2s_hosts_max <= 0:
+                                r2s_hosts_max = 4
+                            if r2s_hosts_min > r2s_hosts_max:
+                                r2s_hosts_min, r2s_hosts_max = r2s_hosts_max, r2s_hosts_min
+                            item['r2s_hosts_min'] = r2s_hosts_min
+                            item['r2s_hosts_max'] = r2s_hosts_max
+
+                        next_items.append(item)
+
+                    routing_section['items'] = next_items
+                    sections['Routing'] = routing_section
+                    next_scenario['sections'] = sections
+
+            concretized.append(next_scenario)
+        except Exception:
+            concretized.append(copy.deepcopy(scenario))
+    return concretized
 
 
 def _default_scenarios_payload_for_names(names: Iterable[Any] | None) -> Dict[str, Any]:
@@ -37027,7 +37134,7 @@ def index():
     # Admin Scenarios editor should list the same scenarios as CORE/Reports.
     # Start from catalog names so the left-hand scenario list includes saved-but-not-executed
     # scenarios like "Scenario 1b".
-    payload = _empty_scenarios_payload()
+    payload: Dict[str, Any] = {'result_path': None, 'core': _default_core_dict()}
     force_empty = False
     try:
         role = _normalize_role_value(current.get('role')) if current else ''
@@ -37038,7 +37145,7 @@ def index():
                 payload = _default_scenarios_payload_for_names(scenario_names)
                 payload['_catalog_stub'] = True
     except Exception:
-        payload = _empty_scenarios_payload()
+        payload = {'result_path': None, 'core': _default_core_dict()}
     # Reconstruct base_upload if base filepath already present
     _attach_base_upload(payload)
     _hydrate_base_upload_from_disk(payload)
@@ -37280,6 +37387,8 @@ def save_xml():
             scenarios_list = data.get('scenarios') or []
             if isinstance(scenarios_list, list):
                 _normalize_scenario_names_strict(scenarios_list)
+                scenarios_list = _concretize_scenarios_for_save(scenarios_list, seed=data.get('seed'))
+                data['scenarios'] = scenarios_list
         except Exception:
             pass
         scenario_count = len(data.get('scenarios') or []) if isinstance(data.get('scenarios'), list) else 0
@@ -37443,6 +37552,7 @@ def save_xml_api():
         # Enforce strict alphanumeric-only scenario names with deterministic uniquification.
         try:
             _normalize_scenario_names_strict(scenarios)
+            scenarios = _concretize_scenarios_for_save(scenarios, seed=data.get('seed'))
         except Exception:
             pass
         scenario_names: list[str] = []
@@ -39767,6 +39877,14 @@ def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s
         else:
             raise
     role_counts = plan['role_counts']
+    try:
+        role_counts_raw = plan.get('role_counts_raw') if isinstance(plan.get('role_counts_raw'), dict) else None
+        if isinstance(role_counts_raw, dict):
+            explicit_docker_hosts = int(role_counts_raw.get('Docker') or 0)
+            if explicit_docker_hosts <= 0 and plan.get('vulnerability_plan'):
+                role_counts = role_counts_raw
+    except Exception:
+        role_counts = plan['role_counts']
     prelim_router_count = plan['routers_planned']
     routing_items = plan.get('routing_items') or []
     service_plan = plan.get('service_plan') or {}
@@ -44861,6 +44979,7 @@ def remove_base():
     user = _current_user()
     try:
         payload = _default_scenarios_payload()
+        existing_snapshot = _load_editor_state_snapshot(user) or {}
         # If scenarios_json posted, honor that to keep user edits
         data_str = request.form.get('scenarios_json')
         if data_str:
@@ -44879,8 +44998,18 @@ def remove_base():
         flash('Base scenario removed.')
         _clear_base_upload_state()
         payload.pop('base_upload', None)
+        try:
+            snapshot_source = dict(existing_snapshot) if isinstance(existing_snapshot, dict) else {}
+            snapshot_source['scenarios'] = copy.deepcopy(payload.get('scenarios') or [])
+            snapshot_source.pop('base_upload', None)
+            _persist_editor_state_snapshot(snapshot_source, user=user)
+        except Exception:
+            pass
         # Do not attach base upload (cleared)
         payload = _prepare_payload_for_index(payload, user=user)
+        snapshot = _load_editor_state_snapshot(user)
+        if snapshot:
+            payload['editor_snapshot'] = snapshot
         return render_template('index.html', payload=payload, logs='', xml_preview='', ui_build_id=_WEBUI_BUILD_ID)
     except Exception as e:
         flash(f'Failed to remove base: {e}')

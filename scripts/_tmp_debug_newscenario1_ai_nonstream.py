@@ -18,7 +18,7 @@ def main() -> int:
     ai_state = scenario.get('ai_generator') if isinstance(scenario.get('ai_generator'), dict) else {}
     payload = {
         'provider': ai_state.get('provider') or 'ollama',
-        'bridge_mode': ai_state.get('bridge_mode') or 'ollmcp',
+        'bridge_mode': ai_state.get('bridge_mode') or 'mcp-python-sdk',
         'base_url': ai_state.get('base_url') or 'http://127.0.0.1:11434',
         'model': ai_state.get('model') or '',
         'mcp_server_path': ai_state.get('mcp_server_path') or 'MCP/server.py',
@@ -32,7 +32,7 @@ def main() -> int:
     }
     host = ai_provider._normalize_base_url(payload['base_url'])
     result = asyncio.run(
-        ai_provider._ollmcp_generate(
+        ai_provider._mcp_bridge_generate(
             payload,
             current_scenario=scenario,
             user_prompt=payload['prompt'],

@@ -43,6 +43,11 @@ def register(
 
     log = logger or getattr(app, 'logger', None)
 
+    def _concretize_scenarios_for_save(scenarios_payload: Any, *, seed: Any = None) -> list[Any]:
+        from webapp import app_backend as backend
+
+        return backend._concretize_scenarios_for_save(scenarios_payload, seed=seed)
+
     @app.route('/load_xml', methods=['POST'])
     def load_xml():
         user = current_user_getter()
@@ -118,6 +123,8 @@ def register(
                 scenarios_list = data.get('scenarios') or []
                 if isinstance(scenarios_list, list):
                     normalize_scenario_names_strict(scenarios_list)
+                    scenarios_list = _concretize_scenarios_for_save(scenarios_list, seed=data.get('seed'))
+                    data['scenarios'] = scenarios_list
             except Exception:
                 pass
             scenario_count = len(data.get('scenarios') or []) if isinstance(data.get('scenarios'), list) else 0
@@ -768,6 +775,7 @@ def register(
                 scenarios = cleaned
             try:
                 normalize_scenario_names_strict(scenarios)
+                scenarios = _concretize_scenarios_for_save(scenarios, seed=data.get('seed'))
             except Exception:
                 pass
             scenario_names: list[str] = []

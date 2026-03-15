@@ -679,6 +679,38 @@ def test_mcp_search_vulnerability_catalog_returns_mysql_match(monkeypatch):
     assert first.get('cve') == 'CVE-2012-2122'
 
 
+def test_mcp_search_vulnerability_catalog_uses_available_readme_text(tmp_path, monkeypatch):
+    import MCP.server as mcp_server
+
+    pack_dir = tmp_path / 'vulns' / 'demo-web-pack'
+    pack_dir.mkdir(parents=True, exist_ok=True)
+    compose_path = pack_dir / 'docker-compose.yml'
+    compose_path.write_text('services:\n  app:\n    image: demo\n', encoding='utf-8')
+    (pack_dir / 'README.md').write_text(
+        '# Demo Web Pack\n\nThis pack exposes a vulnerable web login panel with SQL injection.\n',
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(mcp_server, 'load_vuln_catalog', lambda repo_root: [
+        {
+            'Name': 'demo/custom-login-pack',
+            'Path': str(compose_path),
+            'Type': 'docker-compose',
+            'Vector': 'remote',
+            'CVE': '',
+            'Description': 'Custom demo vulnerability',
+        },
+    ])
+
+    server = ScenarioAuthoringMCPServer()
+    result = _tool_call(server, 'scenario.search_vulnerability_catalog', {'query': 'web login sql injection'})
+
+    assert result.get('count') == 1
+    first = (result.get('results') or [])[0]
+    assert first.get('name') == 'demo/custom-login-pack'
+    assert first.get('readme_available') is True
+
+
 def test_mcp_add_vulnerability_item_from_catalog_query(monkeypatch):
     import MCP.server as mcp_server
 

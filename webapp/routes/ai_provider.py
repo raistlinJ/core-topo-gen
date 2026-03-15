@@ -6,8 +6,10 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
@@ -43,12 +45,12 @@ _SUPPORTED_SECTION_NAMES = [
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CANONICAL_AI_BRIDGE_MODE = 'mcp-python-sdk'
-_LEGACY_AI_BRIDGE_MODE_ALIASES = {'ollmcp', 'mcp-python-sdk', 'mcp_python_sdk', 'python-sdk', 'mcp-sdk'}
+_SUPPORTED_AI_BRIDGE_MODE_ALIASES = {'mcp-python-sdk', 'mcp_python_sdk', 'python-sdk', 'mcp-sdk'}
 _DEFAULT_MCP_SERVER_PATH = os.path.join(_REPO_ROOT, 'MCP', 'server.py')
 _DEFAULT_MCP_SERVERS_JSON_PATH = os.path.join(_REPO_ROOT, 'MCP', 'mcp-bridge-servers.json')
-_LEGACY_MCP_SERVERS_JSON_PATH = os.path.join(_REPO_ROOT, 'MCP', 'ollmcp-servers.json')
 _ACTIVE_AI_STREAMS: dict[str, dict[str, Any]] = {}
 _ACTIVE_AI_STREAMS_LOCK = threading.Lock()
+_PROMPT_VULNERABILITY_CATALOG_CACHE: list[dict[str, str]] | None = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -87,7 +89,8 @@ def _build_mcp_bridge_tool_parse_retry_prompt(prompt: str) -> str:
         'Retry note: your previous response failed because Ollama could not parse a generated tool call.',
         'Every tool call arguments object must be strict valid JSON with no duplicate keys, no dangling text, and no partial numbers or strings.',
         'For vulnerabilities, do not pass factor.',
-        'For vulnerabilities, use scenario.search_vulnerability_catalog first, then call scenario.add_vulnerability_item with only draft_id plus explicit v_name and v_path, or use v_type and v_vector for a Type/Vector row.',
+        'For vulnerabilities, use scenario.search_vulnerability_catalog first, then call scenario.add_vulnerability_item with only draft_id plus explicit v_name and v_path from the chosen concrete catalog match.',
+        'For broad vulnerability requests, call scenario.search_vulnerability_catalog with only a free-text query from the user wording. Do not pass v_type or v_vector filters unless the user explicitly asked for those exact filters.',
         'If the user asks for multiple different vulnerabilities, make multiple separate add_vulnerability_item calls with v_count=1 instead of trying to encode them in one weighted row.',
     ]
     return prompt + '\n'.join(retry_lines)
@@ -124,25 +127,1084 @@ def _extract_count_intent(user_prompt: str) -> dict[str, int]:
     return count_intent
 
 
+def _extract_vulnerability_target_count(user_prompt: str) -> int:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return 0
+
+    match = re.search(r'\b(\d+)\s+(?:[a-z][a-z0-9-]*\s+){0,3}vulnerabilit(?:y|ies)\b', text)
+    if match:
+        try:
+            return max(0, int(match.group(1)))
+        except Exception:
+            return 0
+
+    if re.search(r'\bvulnerabilit(?:y|ies)\b|\bvulns?\b', text):
+        return 1
+    return 0
+
+
+def _load_vulnerability_catalog_for_prompt() -> list[dict[str, str]]:
+    global _PROMPT_VULNERABILITY_CATALOG_CACHE
+    if _PROMPT_VULNERABILITY_CATALOG_CACHE is not None:
+        return list(_PROMPT_VULNERABILITY_CATALOG_CACHE)
+    try:
+        from core_topo_gen.utils.vuln_process import load_vuln_catalog
+        _PROMPT_VULNERABILITY_CATALOG_CACHE = list(load_vuln_catalog(_REPO_ROOT) or [])
+    except Exception:
+        _PROMPT_VULNERABILITY_CATALOG_CACHE = []
+    return list(_PROMPT_VULNERABILITY_CATALOG_CACHE)
+
+
+def _extract_vulnerability_query_hint(user_prompt: str) -> str:
+    text = str(user_prompt or '').strip().lower()
+    if not text or _extract_vulnerability_target_count(text) <= 0:
+        return ''
+
+    keyword_groups = (
+        ('web', ('web', 'http', 'https', 'apache', 'nginx', 'appweb', 'tomcat', 'jboss')),
+        ('ssh', ('ssh', 'openssh')),
+        ('auth', ('auth', 'authentication', 'login', 'jwt', 'token', 'oauth')),
+        ('database', ('database', 'db', 'mysql', 'postgres', 'mongodb', 'redis')),
+    )
+    for canonical, keywords in keyword_groups:
+        if any(keyword in text for keyword in keywords):
+            return canonical
+
+    phrase_match = re.search(r'\b(?:related to|for|about)\s+([a-z0-9][a-z0-9\s-]{0,40})', text)
+    if phrase_match:
+        phrase = ' '.join(phrase_match.group(1).split())
+        return phrase[:40].strip()
+
+    return 'vulnerability'
+
+
+def _search_vulnerability_catalog_for_prompt(query: str, *, limit: int = 3) -> list[dict[str, str]]:
+    query_text = str(query or '').strip().lower()
+    if not query_text:
+        return []
+
+    catalog = _load_vulnerability_catalog_for_prompt()
+    if not catalog:
+        return []
+
+    tokens = [token for token in re.findall(r'[a-z0-9]+', query_text) if token]
+    if not tokens:
+        return []
+
+    ranked: list[tuple[int, dict[str, str]]] = []
+    for entry in catalog:
+        name = str(entry.get('Name') or '').strip()
+        path = str(entry.get('Path') or '').strip()
+        description = str(entry.get('Description') or '').strip()
+        haystack = ' '.join([
+            name.lower(),
+            path.lower(),
+            description.lower(),
+            str(entry.get('Type') or '').strip().lower(),
+            str(entry.get('Vector') or '').strip().lower(),
+            str(entry.get('CVE') or '').strip().lower(),
+        ])
+        score = 0
+        for token in tokens:
+            if token in haystack:
+                score += 2
+            if token in name.lower():
+                score += 3
+            if token in path.lower():
+                score += 2
+            if token in description.lower():
+                score += 1
+        if score > 0:
+            ranked.append((score, {'name': name, 'path': path}))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]['name'].lower(), item[1]['path'].lower()))
+    return [entry for _score, entry in ranked[:max(1, limit)]]
+
+
+def _build_vulnerability_grounding_guidance(user_prompt: str) -> list[str]:
+    query_hint = _extract_vulnerability_query_hint(user_prompt)
+    if not query_hint:
+        return []
+
+    candidates = _search_vulnerability_catalog_for_prompt(query_hint, limit=3)
+    guidance = [
+        f'For this request, keep the vulnerability catalog query narrow: query="{query_hint}".',
+        'Do one focused vulnerability search, choose concrete matches, and stop. Do not wander through multiple broad catalog searches once you already have viable results.',
+    ]
+    if candidates:
+        candidate_names = ', '.join(
+            f'"{str(candidate.get("name") or "").strip()}"'
+            for candidate in candidates
+            if str(candidate.get('name') or '').strip()
+        )
+        if candidate_names:
+            guidance.append(
+                f'Likely concrete matches for that query include: {candidate_names}. Prefer these before exploring unrelated catalog entries.'
+            )
+    return guidance
+
+
+def _has_low_r2r_intent(user_prompt: str) -> bool:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return False
+    patterns = [
+        r'\blow\s+router(?:-to-router|\s+to\s+router)\s+link\s+ratio\b',
+        r'\blow\s+r2r\b',
+        r'\bminimal\s+router(?:-to-router|\s+to\s+router)\b',
+        r'\bsparse\s+router(?:-to-router|\s+to\s+router)\b',
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _build_mcp_bridge_execution_guidance(user_prompt: str) -> list[str]:
+    intent = _extract_count_intent(user_prompt)
+    router_count = intent.get('router_count')
+    derived_host_count = intent.get('derived_host_count')
+    vulnerability_target_count = _extract_vulnerability_target_count(user_prompt)
+    explicit_host_total = _explicit_host_role_count_total(user_prompt)
+
+    guidance: list[str] = []
+    if router_count is not None and vulnerability_target_count > 0:
+        guidance.append(
+            'Complete this request in order: author Routing first, then Node Information host rows, then Vulnerabilities, and only then any optional remaining sections.'
+        )
+        guidance.append(
+            'Do not postpone the Routing section until after vulnerability search. Add the requested router row before you search the vulnerability catalog so the draft already satisfies the router-count part of the request.'
+        )
+    elif router_count is not None:
+        guidance.append(
+            'Author the Routing section before you finish. Do not stop after editing only Node Information when the prompt explicitly requests routers.'
+        )
+
+    if vulnerability_target_count > 0:
+        guidance.extend(_build_vulnerability_grounding_guidance(user_prompt))
+
+    if derived_host_count is not None and vulnerability_target_count > 0:
+        if explicit_host_total >= derived_host_count:
+            guidance.append(
+                'The explicit host-role counts already fill the available host budget. Do not add extra Docker hosts for vulnerabilities in that case; attach the requested vulnerabilities to those existing hosts instead.'
+            )
+        else:
+            remaining_non_vuln_hosts = max(0, derived_host_count - vulnerability_target_count)
+            guidance.append(
+                f'Because the prompt asks for {vulnerability_target_count} vulnerability target(s), reserve {vulnerability_target_count} Docker host slots inside the {derived_host_count}-host budget before adding vulnerabilities. That leaves {remaining_non_vuln_hosts} non-Docker host slots for the other Node Information rows unless Docker hosts are already explicit.'
+            )
+
+    if router_count is not None and _has_low_r2r_intent(user_prompt):
+        guidance.append(
+            'For low router-to-router link ratio requests, use a sparse Routing setting such as r2r_mode="Min" or another low-edge configuration instead of a dense mesh.'
+        )
+
+    return guidance
+
+
+def _extract_node_role_count_intent(user_prompt: str) -> dict[str, int]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return {}
+
+    role_patterns = (
+        ('Server', r'\b(\d+)\s+servers?\b'),
+        ('Workstation', r'\b(\d+)\s+workstations?\b|\b(\d+)\s+desktops?\b'),
+        ('PC', r'\b(\d+)\s+pcs?\b|\b(\d+)\s+clients?\b|\b(\d+)\s+hosts?\b'),
+        ('Docker', r'\b(\d+)\s+docker\s+(?:hosts?|nodes?|containers?)\b|\b(\d+)\s+containers?\b'),
+    )
+
+    counts: dict[str, int] = {}
+    for role, pattern in role_patterns:
+        total = 0
+        for match in re.finditer(pattern, text):
+            for group in match.groups():
+                if group is None:
+                    continue
+                try:
+                    total += max(0, int(group))
+                except Exception:
+                    continue
+        if total > 0:
+            counts[role] = total
+    return counts
+
+
+def _explicit_host_role_count_total(user_prompt: str) -> int:
+    return sum(_extract_node_role_count_intent(user_prompt).values())
+
+
+def _extract_r2r_density_intent(user_prompt: str) -> str:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return ''
+    low_patterns = [
+        r'\blow\s+router(?:-to-router|\s+to\s+router)\s+link\s+ratio\b',
+        r'\blow\s+r2r\b',
+        r'\bminimal\s+router(?:-to-router|\s+to\s+router)\b',
+        r'\bsparse\s+router(?:-to-router|\s+to\s+router)\b',
+    ]
+    high_patterns = [
+        r'\bhigh\s+router(?:-to-router|\s+to\s+router)\s+link\s+ratio\b',
+        r'\bdense\s+router(?:-to-router|\s+to\s+router)\b',
+        r'\bmesh(?:ed)?\s+routers?\b',
+        r'\bhigh\s+r2r\b',
+    ]
+    if any(re.search(pattern, text) for pattern in low_patterns):
+        return 'low'
+    if any(re.search(pattern, text) for pattern in high_patterns):
+        return 'high'
+    return ''
+
+
+_COUNT_WORDS: dict[str, int] = {
+    'a': 1,
+    'an': 1,
+    'one': 1,
+    'two': 2,
+    'three': 3,
+    'four': 4,
+    'five': 5,
+    'six': 6,
+    'seven': 7,
+    'eight': 8,
+    'nine': 9,
+    'ten': 10,
+    'eleven': 11,
+    'twelve': 12,
+    'pair of': 2,
+    'a pair of': 2,
+    'couple of': 2,
+    'a couple of': 2,
+}
+
+_COUNT_TOKEN_PATTERN = r'\d+|a\s+pair\s+of|pair\s+of|a\s+couple\s+of|couple\s+of|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve'
+
+
+def _parse_count_token(value: Any) -> int | None:
+    text = str(value or '').strip().lower()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            number = int(text)
+        except Exception:
+            return None
+        return number if number > 0 else None
+    return _COUNT_WORDS.get(text)
+
+
+def _sum_count_matches(text: str, pattern: str) -> int:
+    total = 0
+    for match in re.finditer(pattern, text):
+        number = _parse_count_token(match.group(1))
+        if number is not None:
+            total += number
+    return total
+
+
+def _extract_shared_suffix_count_intent(
+    text: str,
+    *,
+    suffix_pattern: str,
+    label_patterns: tuple[tuple[str, str], ...],
+    qualifier_max_words: int = 3,
+) -> dict[str, int]:
+    if not text:
+        return {}
+
+    separator_pattern = r'(?:\s*,\s*and\s+|\s+and\s+|\s*,\s*)'
+    forbidden_qualifier_words = r'and|or|plus|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|pair|couple'
+    qualifier_words = rf'(?:(?!(?:{forbidden_qualifier_words})\b)[a-z][a-z0-9-]*\s+){{0,{qualifier_max_words}}}'
+
+    counts: dict[str, int] = {}
+    for canonical, label_pattern in label_patterns:
+        segment_pattern = re.compile(
+            rf'\b(?P<count>{_COUNT_TOKEN_PATTERN})\s+{qualifier_words}(?P<label>{label_pattern})(?=(?:{separator_pattern}(?:{_COUNT_TOKEN_PATTERN})\s+|\s+{suffix_pattern}\b))'
+        )
+        total = 0
+        for match in segment_pattern.finditer(text):
+            number = _parse_count_token(match.group('count'))
+            if number is None:
+                continue
+            total += number
+        if total > 0:
+            counts[canonical] = counts.get(canonical, 0) + total
+    return counts
+
+
+def _extract_service_count_intent(user_prompt: str) -> dict[str, int]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return {}
+
+    return _extract_shared_suffix_count_intent(
+        text,
+        suffix_pattern=r'services?',
+        label_patterns=(
+            ('SSH', r'ssh'),
+            ('HTTP', r'http|https|web'),
+            ('DHCPClient', r'dhcp'),
+        ),
+        qualifier_max_words=3,
+    )
+
+
+def _extract_traffic_protocol_count_intent(user_prompt: str) -> dict[str, int]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return {}
+
+    flow_suffix = r'(?:traffic\s+flows?|flows?|traffic\s+streams?|streams?)'
+    return _extract_shared_suffix_count_intent(
+        text,
+        suffix_pattern=flow_suffix,
+        label_patterns=(
+            ('TCP', r'tcp'),
+            ('UDP', r'udp'),
+        ),
+        qualifier_max_words=3,
+    )
+
+
+def _extract_traffic_pattern_count_intent(user_prompt: str) -> dict[str, int]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return {}
+
+    flow_suffix = r'(?:traffic\s+flows?|flows?|traffic\s+streams?|streams?)'
+    return _extract_shared_suffix_count_intent(
+        text,
+        suffix_pattern=rf'(?:(?:tcp|udp)\s+)?{flow_suffix}',
+        label_patterns=(
+            ('continuous', r'continuous|always\s+on|constant\s+rate'),
+            ('periodic', r'periodic'),
+            ('burst', r'burst(?:y)?'),
+            ('poisson', r'poisson'),
+            ('ramp', r'ramp'),
+        ),
+        qualifier_max_words=2,
+    )
+
+
+def _extract_requested_traffic_patterns(user_prompt: str) -> list[str]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return []
+
+    matches: list[str] = []
+    for pattern, canonical in (
+        (r'\bcontinuous\b|\balways\s+on\b|\bconstant\s+rate\b', 'continuous'),
+        (r'\bperiodic\b', 'periodic'),
+        (r'\bburst(?:y)?\b', 'burst'),
+        (r'\bpoisson\b', 'poisson'),
+        (r'\bramp\b', 'ramp'),
+    ):
+        if re.search(pattern, text) and canonical not in matches:
+            matches.append(canonical)
+    return matches
+
+
+def _extract_segmentation_control_count_intent(user_prompt: str) -> dict[str, int]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return {}
+
+    count_token = r'(\d+|a\s+pair\s+of|pair\s+of|a\s+couple\s+of|couple\s+of|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)'
+    qualifier_words = r'(?:[a-z][a-z0-9-]*\s+){0,3}'
+    patterns = (
+        ('Firewall', rf'\b({count_token})\s+{qualifier_words}(?:firewalls?|fw)(?:\s+(?:segments?|rules?|controls?))?\b'),
+        ('NAT', rf'\b({count_token})\s+{qualifier_words}(?:nat|snat|dnat)(?:\s+(?:segments?|rules?|controls?))?\b'),
+    )
+
+    counts: dict[str, int] = {}
+    for control, pattern in patterns:
+        total = _sum_count_matches(text, pattern)
+        if total > 0:
+            counts[control] = total
+    return counts
+
+
 def _build_count_intent_guidance(user_prompt: str) -> list[str]:
     intent = _extract_count_intent(user_prompt)
     total_nodes = intent.get('total_nodes')
     router_count = intent.get('router_count')
     derived_host_count = intent.get('derived_host_count')
+    vulnerability_target_count = _extract_vulnerability_target_count(user_prompt)
+    explicit_host_total = _explicit_host_role_count_total(user_prompt)
 
     guidance: list[str] = []
     if total_nodes is not None and router_count is not None and derived_host_count is not None:
-        guidance.append(
-            f'User count intent detected: total topology nodes={total_nodes}, router nodes={router_count}, so Node Information host counts should sum to {derived_host_count} and Routing router count should be {router_count}.'
-        )
+        if vulnerability_target_count > 0:
+            guidance.append(
+                f'User count intent detected: total topology nodes={total_nodes}, router nodes={router_count}, so the final preview host count should be {derived_host_count} and Routing router count should be {router_count}.'
+            )
+            if explicit_host_total >= derived_host_count:
+                guidance.append(
+                    'The explicit host-role counts already consume the full host budget, so satisfy the requested vulnerabilities on those existing hosts instead of adding extra Docker host rows.'
+                )
+            else:
+                remaining_non_vuln_hosts = max(0, derived_host_count - vulnerability_target_count)
+                guidance.append(
+                    f'The prompt also asks for {vulnerability_target_count} vulnerability target(s), and those targets consume Docker host slots inside that {derived_host_count}-host budget. Unless you explicitly include those Docker hosts already, keep the other Node Information host rows to {remaining_non_vuln_hosts} so preview repair does not overshoot the requested total nodes.'
+                )
+        else:
+            guidance.append(
+                f'User count intent detected: total topology nodes={total_nodes}, router nodes={router_count}, so Node Information host counts should sum to {derived_host_count} and Routing router count should be {router_count}.'
+            )
         guidance.append(
             'Do not satisfy a separate router request by reducing router rows to zero or by treating routers as host rows under Node Information.'
         )
     elif total_nodes is not None:
-        guidance.append(
-            f'User count intent detected: node count={total_nodes}. If no separate router count is requested, treat this as the host-node target for Node Information.'
-        )
+        if vulnerability_target_count > 0:
+            guidance.append(
+                f'User count intent detected: node count={total_nodes}. The final preview host count should stay at {total_nodes}.'
+            )
+            if explicit_host_total >= total_nodes:
+                guidance.append(
+                    'The explicit host-role counts already consume the full host budget, so satisfy the requested vulnerabilities on those existing hosts instead of adding extra Docker host rows.'
+                )
+            else:
+                remaining_non_vuln_hosts = max(0, total_nodes - vulnerability_target_count)
+                guidance.append(
+                    f'The prompt also asks for {vulnerability_target_count} vulnerability target(s), and those targets consume Docker host slots inside that {total_nodes}-host budget. Unless you explicitly include those Docker hosts already, keep the other Node Information host rows to {remaining_non_vuln_hosts} so preview repair does not overshoot the requested total nodes.'
+                )
+        else:
+            guidance.append(
+                f'User count intent detected: node count={total_nodes}. If no separate router count is requested, treat this as the host-node target for Node Information.'
+            )
     return guidance
+
+
+def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any]]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return {}
+
+    qualifier_words = r'(?:[a-z][a-z0-9-]*\s+){0,3}'
+
+    def _match_count(pattern: str) -> int | None:
+        match = re.search(pattern, text)
+        if not match:
+            return None
+        try:
+            return max(1, int(match.group(1)))
+        except Exception:
+            return None
+
+    def _has_any(patterns: list[str]) -> bool:
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    def _routing_protocols_requested() -> list[str]:
+        matches: list[str] = []
+        for pattern, canonical in (
+            (r'\bospfv3\b', 'OSPFv3'),
+            (r'\bospf(?:v2)?\b', 'OSPFv2'),
+            (r'\bripng\b', 'RIPNG'),
+            (r'\brip\b', 'RIP'),
+            (r'\bbgp\b', 'BGP'),
+        ):
+            if re.search(pattern, text) and canonical not in matches:
+                matches.append(canonical)
+        return matches
+
+    coverage: dict[str, dict[str, Any]] = {}
+
+    node_role_counts = _extract_node_role_count_intent(user_prompt)
+    for role, count in node_role_counts.items():
+        role_suffix = '' if count == 1 else 's'
+        coverage[f'Node Information:{role}'] = {
+            'exact_items': count,
+            'reason': f'user requested exactly {count} {role} host{role_suffix}',
+        }
+
+    service_counts = _extract_service_count_intent(user_prompt)
+    for service, count in service_counts.items():
+        coverage[f'Services:{service}'] = {
+            'exact_items': count,
+            'reason': f'user requested exactly {count} {service} service row{'s' if count != 1 else ''}',
+        }
+
+    traffic_protocol_counts = _extract_traffic_protocol_count_intent(user_prompt)
+    for protocol, count in traffic_protocol_counts.items():
+        coverage[f'Traffic:{protocol}'] = {
+            'exact_items': count,
+            'reason': f'user requested exactly {count} {protocol} traffic row{'s' if count != 1 else ''}',
+        }
+
+    traffic_pattern_counts = _extract_traffic_pattern_count_intent(user_prompt)
+    for pattern_name, count in traffic_pattern_counts.items():
+        coverage[f'Traffic Pattern:{pattern_name}'] = {
+            'exact_items': count,
+            'reason': f'user requested exactly {count} {pattern_name} traffic row{'s' if count != 1 else ''}',
+        }
+
+    segmentation_control_counts = _extract_segmentation_control_count_intent(user_prompt)
+    for control, count in segmentation_control_counts.items():
+        coverage[f'Segmentation:{control}'] = {
+            'exact_items': count,
+            'reason': f'user requested exactly {count} {control} segmentation row{'s' if count != 1 else ''}',
+        }
+
+    vuln_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'vulnerabilit(?:y|ies)\b')
+    if vuln_count is None and _has_any([r'\bvulnerabilit(?:y|ies)\b', r'\bvulns?\b']):
+        vuln_count = 1
+    if vuln_count is not None:
+        coverage['Vulnerabilities'] = {
+            'min_items': vuln_count,
+            'reason': f'user requested at least {vuln_count} vulnerabilit{'y' if vuln_count == 1 else 'ies'}',
+        }
+
+    traffic_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'(?:traffic\s+flows?|flows?|traffic\s+streams?|streams?)\b')
+    if traffic_count is None and _has_any([r'\btraffic\b', r'\btraffic\s+profile', r'\btraffic\s+profiles\b', r'\btcp\b', r'\budp\b', r'\bflows?\b']):
+        traffic_count = 1
+    if traffic_count is not None:
+        coverage['Traffic'] = {
+            'min_items': traffic_count,
+            'reason': f'user requested at least {traffic_count} traffic row{'s' if traffic_count != 1 else ''}',
+        }
+        traffic_values: list[dict[str, Any]] = []
+        selected_values = [
+            canonical
+            for pattern, canonical in ((r'\btcp\b', 'TCP'), (r'\budp\b', 'UDP'))
+            if re.search(pattern, text)
+        ]
+        if selected_values:
+            traffic_values.append({
+                'field': 'selected_values',
+                'values': selected_values,
+                'reason': 'user explicitly requested these traffic protocols',
+            })
+        pattern_values = _extract_requested_traffic_patterns(user_prompt)
+        if pattern_values:
+            traffic_values.append({
+                'field': 'pattern_values',
+                'values': pattern_values,
+                'reason': 'user explicitly requested these traffic patterns',
+            })
+        if traffic_values:
+            coverage['Traffic']['required_values'] = traffic_values
+
+    service_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'services?\b')
+    if service_count is None and _has_any([r'\bservices?\b']):
+        service_count = 1
+    if service_count is not None:
+        coverage['Services'] = {
+            'min_items': service_count,
+            'reason': f'user requested at least {service_count} service row{'s' if service_count != 1 else ''}',
+        }
+    service_values = [
+        canonical
+        for pattern, canonical in (
+            (r'\bssh\b', 'SSH'),
+            (r'\bhttps?\b|\bweb\b', 'HTTP'),
+            (r'\bdhcp\b', 'DHCPClient'),
+        )
+        if re.search(pattern, text)
+    ]
+    if service_values and ('Services' in coverage or _has_any([r'\bservice\b', r'\bservices\b'])):
+        coverage.setdefault('Services', {
+            'min_items': 1,
+            'reason': 'user requested services',
+        })
+        coverage['Services']['required_values'] = [{
+            'field': 'selected_values',
+            'values': list(dict.fromkeys(service_values)),
+            'reason': 'user explicitly requested these services',
+        }]
+
+    segmentation_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'segments?\b')
+    if segmentation_count is None and _has_any([r'\bsegmentation\b', r'\bsegmented\b', r'\bnetwork\s+segments?\b']):
+        segmentation_count = 1
+    if segmentation_count is not None:
+        coverage['Segmentation'] = {
+            'min_items': segmentation_count,
+            'reason': f'user requested at least {segmentation_count} segmentation row{'s' if segmentation_count != 1 else ''}',
+        }
+    segmentation_values = [
+        canonical
+        for pattern, canonical in ((r'\bfirewall\b|\bfw\b', 'Firewall'), (r'\bnat\b|\bsnat\b|\bdnat\b', 'NAT'))
+        if re.search(pattern, text)
+    ]
+    if segmentation_values and ('Segmentation' in coverage or _has_any([r'\bsegmentation\b', r'\bsegmented\b', r'\bsegment\b'])):
+        coverage.setdefault('Segmentation', {
+            'min_items': 1,
+            'reason': 'user requested segmentation controls',
+        })
+        coverage['Segmentation']['required_values'] = [{
+            'field': 'selected_values',
+            'values': list(dict.fromkeys(segmentation_values)),
+            'reason': 'user explicitly requested these segmentation controls',
+        }]
+
+    routing_values = _routing_protocols_requested()
+    if routing_values:
+        coverage['Routing'] = {
+            'min_items': 1,
+            'reason': 'user explicitly requested routing protocols',
+            'required_values': [{
+                'field': 'selected_values',
+                'values': routing_values,
+                'reason': 'user explicitly requested these routing protocols',
+            }],
+        }
+    r2r_density_intent = _extract_r2r_density_intent(user_prompt)
+    if r2r_density_intent:
+        coverage.setdefault('Routing', {
+            'min_items': 1,
+            'reason': 'user explicitly requested routing configuration',
+        })
+        routing_required_values = coverage['Routing'].get('required_values') if isinstance(coverage['Routing'].get('required_values'), list) else []
+        routing_required_values.append({
+            'field': 'r2r_density_values',
+            'values': [r2r_density_intent],
+            'reason': 'user explicitly requested router-to-router density semantics',
+        })
+        coverage['Routing']['required_values'] = routing_required_values
+
+    if _has_any([r'\bdocker\b']):
+        docker_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'docker\s+(?:hosts?|nodes?|containers?)\b')
+        coverage['Docker'] = {
+            'min_items': docker_count or 1,
+            'reason': f'user requested at least {docker_count or 1} docker host row{'s' if (docker_count or 1) != 1 else ''}',
+        }
+
+    return coverage
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except Exception:
+        return None
+    return number if number > 0 else None
+
+
+def _count_section_coverage_units(scenario_payload: dict[str, Any] | None, section_name: str) -> int:
+    scenario = scenario_payload if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else {}
+    section = sections.get(section_name) if isinstance(sections.get(section_name), dict) else {}
+    items = section.get('items') if isinstance(section.get('items'), list) else []
+    total = 0
+    for item in items:
+        if not isinstance(item, dict) or not item:
+            continue
+        total += _coerce_positive_int(item.get('v_count')) or _coerce_positive_int(item.get('count')) or 1
+    return total
+
+
+def _count_docker_rows(scenario_payload: dict[str, Any] | None) -> int:
+    scenario = scenario_payload if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else {}
+    node_info = sections.get('Node Information') if isinstance(sections.get('Node Information'), dict) else {}
+    items = node_info.get('items') if isinstance(node_info.get('items'), list) else []
+    total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('selected') or '').strip().lower() != 'docker':
+            continue
+        total += _coerce_positive_int(item.get('v_count')) or _coerce_positive_int(item.get('count')) or 1
+    return total
+
+
+def _count_node_role_rows(scenario_payload: dict[str, Any] | None, role: str) -> int:
+    scenario = scenario_payload if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else {}
+    node_info = sections.get('Node Information') if isinstance(sections.get('Node Information'), dict) else {}
+    items = node_info.get('items') if isinstance(node_info.get('items'), list) else []
+    total = 0
+    canonical_role = app_backend._normalize_node_information_role(role)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        selected = app_backend._normalize_node_information_role(item.get('selected'))
+        if selected != canonical_role:
+            continue
+        total += _coerce_positive_int(item.get('v_count')) or _coerce_positive_int(item.get('count')) or 1
+    return total
+
+
+def _count_section_selected_rows(
+    scenario_payload: dict[str, Any] | None,
+    section_name: str,
+    target_value: str,
+    *,
+    normalizer: Callable[[Any], str],
+    field_names: tuple[str, ...] = ('selected',),
+) -> int:
+    scenario = scenario_payload if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else {}
+    section = sections.get(section_name) if isinstance(sections.get(section_name), dict) else {}
+    items = section.get('items') if isinstance(section.get('items'), list) else []
+    total = 0
+    canonical_target = normalizer(target_value)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        selected = ''
+        for field_name in field_names:
+            selected = normalizer(item.get(field_name))
+            if selected:
+                break
+        if selected != canonical_target:
+            continue
+        total += _coerce_positive_int(item.get('v_count')) or _coerce_positive_int(item.get('count')) or 1
+    return total
+
+
+def _count_traffic_pattern_rows(scenario_payload: dict[str, Any] | None, pattern_name: str) -> int:
+    scenario = scenario_payload if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else {}
+    traffic = sections.get('Traffic') if isinstance(sections.get('Traffic'), dict) else {}
+    items = traffic.get('items') if isinstance(traffic.get('items'), list) else []
+    canonical_target = app_backend._normalize_traffic_pattern_value(pattern_name)
+    if canonical_target == 'bursty':
+        canonical_target = 'burst'
+    total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        current = app_backend._normalize_traffic_pattern_value(item.get('pattern'))
+        if current == 'bursty':
+            current = 'burst'
+        if current != canonical_target:
+            continue
+        total += _coerce_positive_int(item.get('v_count')) or _coerce_positive_int(item.get('count')) or 1
+    return total
+
+
+def _classify_r2r_density_from_item(item: dict[str, Any]) -> str:
+    mode = str(item.get('r2r_mode') or '').strip().lower()
+    try:
+        edges = int(item.get('r2r_edges') or 0)
+    except Exception:
+        edges = 0
+
+    if mode == 'min':
+        return 'low'
+    if mode == 'max':
+        return 'high'
+    if mode == 'exact':
+        if edges <= 1:
+            return 'low'
+        if edges >= 4:
+            return 'high'
+    if mode in {'uniform', 'nonuniform'}:
+        if edges > 0 and edges <= 1:
+            return 'low'
+        if edges >= 4:
+            return 'high'
+        if edges > 0:
+            return 'medium'
+    return ''
+
+
+def _extract_actual_prompt_coverage_values(scenario_payload: dict[str, Any] | None) -> dict[str, dict[str, list[str]]]:
+    scenario = scenario_payload if isinstance(scenario_payload, dict) else {}
+    sections = scenario.get('sections') if isinstance(scenario.get('sections'), dict) else {}
+
+    def _section_items(section_name: str) -> list[dict[str, Any]]:
+        section = sections.get(section_name) if isinstance(sections.get(section_name), dict) else {}
+        items = section.get('items') if isinstance(section.get('items'), list) else []
+        return [item for item in items if isinstance(item, dict)]
+
+    def _ordered(values: list[str]) -> list[str]:
+        return list(dict.fromkeys([value for value in values if value]))
+
+    routing_selected = _ordered([
+        app_backend._normalize_routing_item_selection(item.get('selected')) or app_backend._normalize_routing_item_selection(item.get('protocol'))
+        for item in _section_items('Routing')
+    ])
+    routing_r2r_density = _ordered([
+        _classify_r2r_density_from_item(item)
+        for item in _section_items('Routing')
+    ])
+    service_selected = _ordered([
+        app_backend._normalize_service_item_selection(item.get('selected'))
+        for item in _section_items('Services')
+    ])
+    traffic_selected = _ordered([
+        app_backend._normalize_traffic_item_selection(item.get('selected')) or app_backend._normalize_traffic_item_selection(item.get('protocol'))
+        for item in _section_items('Traffic')
+    ])
+    traffic_patterns = _ordered([
+        'burst' if app_backend._normalize_traffic_pattern_value(item.get('pattern')) == 'bursty'
+        else app_backend._normalize_traffic_pattern_value(item.get('pattern'))
+        for item in _section_items('Traffic')
+    ])
+    segmentation_selected = _ordered([
+        app_backend._normalize_segmentation_item_selection(item.get('selected'))
+        for item in _section_items('Segmentation')
+    ])
+
+    vector_values: list[str] = []
+    for item in _section_items('Vulnerabilities'):
+        raw_vector = str(item.get('v_vector') or '').strip().lower()
+        if raw_vector:
+            vector_values.append(raw_vector)
+            continue
+        raw_name = ' '.join([
+            str(item.get('v_name') or '').strip().lower(),
+            str(item.get('v_path') or '').strip().lower(),
+        ])
+        if 'web' in raw_name:
+            vector_values.append('web')
+
+    return {
+        'Routing': {'selected_values': routing_selected, 'r2r_density_values': routing_r2r_density},
+        'Services': {'selected_values': service_selected},
+        'Traffic': {'selected_values': traffic_selected, 'pattern_values': traffic_patterns},
+        'Segmentation': {'selected_values': segmentation_selected},
+        'Vulnerabilities': {'vector_values': _ordered(vector_values)},
+        'Docker': {'selected_values': ['Docker'] if _count_docker_rows(scenario_payload) > 0 else []},
+    }
+
+
+def _get_prompt_coverage_mismatch(user_prompt: str, scenario_payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    intent = _extract_prompt_coverage_intent(user_prompt)
+    if not intent:
+        return None
+
+    actual = {
+        'Routing': _count_section_coverage_units(scenario_payload, 'Routing'),
+        'Services': _count_section_coverage_units(scenario_payload, 'Services'),
+        'Traffic': _count_section_coverage_units(scenario_payload, 'Traffic'),
+        'Vulnerabilities': _count_section_coverage_units(scenario_payload, 'Vulnerabilities'),
+        'Segmentation': _count_section_coverage_units(scenario_payload, 'Segmentation'),
+        'Docker': _count_docker_rows(scenario_payload),
+    }
+    for role in ('Server', 'Workstation', 'PC', 'Docker'):
+        actual[f'Node Information:{role}'] = _count_node_role_rows(scenario_payload, role)
+    for service in ('SSH', 'HTTP', 'DHCPClient'):
+        actual[f'Services:{service}'] = _count_section_selected_rows(
+            scenario_payload,
+            'Services',
+            service,
+            normalizer=app_backend._normalize_service_item_selection,
+            field_names=('selected', 'service', 'name'),
+        )
+    for protocol in ('TCP', 'UDP'):
+        actual[f'Traffic:{protocol}'] = _count_section_selected_rows(
+            scenario_payload,
+            'Traffic',
+            protocol,
+            normalizer=app_backend._normalize_traffic_item_selection,
+            field_names=('selected', 'protocol'),
+        )
+    for pattern_name in ('continuous', 'periodic', 'burst', 'poisson', 'ramp'):
+        actual[f'Traffic Pattern:{pattern_name}'] = _count_traffic_pattern_rows(scenario_payload, pattern_name)
+    for control in ('Firewall', 'NAT'):
+        actual[f'Segmentation:{control}'] = _count_section_selected_rows(
+            scenario_payload,
+            'Segmentation',
+            control,
+            normalizer=app_backend._normalize_segmentation_item_selection,
+            field_names=('selected', 'kind', 'type', 'name'),
+        )
+    actual_values = _extract_actual_prompt_coverage_values(scenario_payload)
+
+    missing: list[dict[str, Any]] = []
+    missing_values: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    for key, requirement in intent.items():
+        actual_items = actual.get(key, 0)
+        exact_items_raw = requirement.get('exact_items')
+        if exact_items_raw not in (None, ''):
+            exact_items = max(0, int(exact_items_raw or 0))
+            if actual_items != exact_items:
+                reason = str(requirement.get('reason') or f'user requested exact {key} counts').strip()
+                missing.append({
+                    'target': key,
+                    'expected_items': exact_items,
+                    'expected_min_items': exact_items,
+                    'actual_items': actual_items,
+                    'reason': reason,
+                })
+                reasons.append(f'{key} expected exactly {exact_items} item(s) but draft has {actual_items}')
+        else:
+            min_items = max(1, int(requirement.get('min_items') or 1))
+            if actual_items >= min_items:
+                pass
+            else:
+                reason = str(requirement.get('reason') or f'user requested {key}').strip()
+                missing.append({
+                    'target': key,
+                    'expected_min_items': min_items,
+                    'actual_items': actual_items,
+                    'reason': reason,
+                })
+                reasons.append(f'{key} expected at least {min_items} item(s) but draft has {actual_items}')
+
+        for value_requirement in requirement.get('required_values') or []:
+            if not isinstance(value_requirement, dict):
+                continue
+            field = str(value_requirement.get('field') or '').strip()
+            expected_values = [
+                str(value or '').strip()
+                for value in (value_requirement.get('values') or [])
+                if str(value or '').strip()
+            ]
+            if not field or not expected_values:
+                continue
+            actual_field_values = [
+                str(value or '').strip()
+                for value in (actual_values.get(key, {}).get(field) or [])
+                if str(value or '').strip()
+            ]
+            missing_field_values = [value for value in expected_values if value not in actual_field_values]
+            if not missing_field_values:
+                continue
+            reason = str(value_requirement.get('reason') or requirement.get('reason') or f'user requested {key} values').strip()
+            missing_values.append({
+                'target': key,
+                'field': field,
+                'expected_values': expected_values,
+                'missing_values': missing_field_values,
+                'actual_values': actual_field_values,
+                'reason': reason,
+            })
+            reasons.append(f'{key} missing requested {field}: {", ".join(missing_field_values)}')
+
+    if not missing and not missing_values:
+        return None
+
+    return {
+        'required': intent,
+        'actual': actual,
+        'actual_values': actual_values,
+        'missing': missing,
+        'missing_values': missing_values,
+        'reasons': reasons,
+    }
+
+
+def _build_prompt_coverage_retry_prompt(prompt: str, mismatch: dict[str, Any]) -> str:
+    missing = mismatch.get('missing') if isinstance(mismatch.get('missing'), list) else []
+    actual = mismatch.get('actual') if isinstance(mismatch.get('actual'), dict) else {}
+    missing_values = mismatch.get('missing_values') if isinstance(mismatch.get('missing_values'), list) else []
+    actual_values = mismatch.get('actual_values') if isinstance(mismatch.get('actual_values'), dict) else {}
+
+    retry_lines = [
+        '',
+        'Retry note: the previous draft omitted one or more requested prompt items.',
+        'Previous draft item counts: '
+        + ', '.join(
+            f'{name}={actual.get(name, 0)}'
+            for name in ('Services', 'Traffic', 'Vulnerabilities', 'Segmentation', 'Docker')
+        )
+        + '.',
+    ]
+
+    def _quote_csv(values: list[str]) -> str:
+        cleaned = [str(value or '').strip() for value in values if str(value or '').strip()]
+        return ', '.join(f'"{value}"' for value in cleaned)
+
+    for item in missing:
+        target = str(item.get('target') or '').strip()
+        expected = int(item.get('expected_min_items') or 1)
+        actual_items = int(item.get('actual_items') or 0)
+        reason = str(item.get('reason') or '').strip()
+        exact_requested = item.get('expected_items') not in (None, '')
+        comparator_text = 'exactly' if exact_requested else 'at least'
+        retry_lines.append(
+            f'Missing requirement: {target} expected {comparator_text} {expected} item(s) but draft has {actual_items}. {reason}.'
+        )
+        if target == 'Vulnerabilities':
+            retry_lines.append(
+                'Add the missing Vulnerabilities rows before finishing. Search the vulnerability catalog using the user\'s wording, then add concrete Specific rows from the chosen matches; for multiple requested vulnerabilities, add separate rows.'
+            )
+        elif target.startswith('Node Information:'):
+            retry_lines.append(
+                'Add or repair Node Information rows so the requested host-role counts are present before finishing. Use selected with the exact host role label and explicit Count rows.'
+            )
+        elif target.startswith('Services:'):
+            service_label = target.split(':', 1)[1].strip()
+            retry_lines.append(
+                'Add or repair Services rows so the requested service labels and exact counts are present before finishing. Use only schema-backed service labels, create distinct rows for distinct requested labels, and do not duplicate one label to satisfy another requested label.'
+            )
+            if service_label:
+                retry_lines.append(
+                    f'Use scenario.add_service_item to add or repair a row with selected="{service_label}" and count={expected}. Do not treat a {service_label} row as satisfying any other requested service label.'
+                )
+        elif target.startswith('Traffic Pattern:'):
+            pattern_label = target.split(':', 1)[1].strip()
+            retry_lines.append(
+                'Add or repair Traffic rows so the requested exact traffic patterns are present at the requested counts before finishing. When multiple patterns are requested, create rows with those exact pattern labels instead of repeating one pattern for all requested counts, and include each missing pattern explicitly rather than duplicating another pattern.'
+            )
+            if pattern_label:
+                retry_lines.append(
+                    f'Use scenario.add_traffic_item to add or repair row(s) with pattern="{pattern_label}", content_type="text", and count={expected}. Preserve distinct pattern labels across rows.'
+                )
+        elif target.startswith('Traffic:'):
+            protocol_label = target.split(':', 1)[1].strip()
+            retry_lines.append(
+                'Add or repair Traffic rows so the requested traffic protocol labels and exact counts are present before finishing. Create distinct rows for distinct requested protocols and do not reuse one protocol label to satisfy another requested protocol.'
+            )
+            if protocol_label:
+                retry_lines.append(
+                    f'Use scenario.add_traffic_item to add or repair row(s) with selected="{protocol_label}", content_type="text", and count={expected}. Do not treat a {protocol_label} row as satisfying another requested protocol label.'
+                )
+        elif target.startswith('Segmentation:'):
+            retry_lines.append(
+                'Add or repair Segmentation rows so the requested segmentation control labels and exact counts are present before finishing.'
+            )
+        elif target == 'Traffic':
+            retry_lines.append(
+                'Add the missing Traffic rows before finishing. Use selected="TCP" or "UDP", one exact pattern, and either v_count or a positive factor.'
+            )
+        elif target == 'Services':
+            retry_lines.append(
+                'Add the missing Services rows before finishing. Use only schema-backed service labels.'
+            )
+        elif target == 'Segmentation':
+            retry_lines.append(
+                'Add the missing Segmentation rows before finishing. Use schema-backed values and dedicated mutation tools when available.'
+            )
+        elif target == 'Docker':
+            retry_lines.append(
+                'Add the missing Docker host rows before finishing. Docker host requests must become Node Information rows with selected="Docker" and an explicit count when available.'
+            )
+    for item in missing_values:
+        target = str(item.get('target') or '').strip()
+        field = str(item.get('field') or '').strip()
+        missing_value_names = ', '.join(str(value or '').strip() for value in (item.get('missing_values') or []) if str(value or '').strip())
+        actual_value_names = ', '.join(str(value or '').strip() for value in (item.get('actual_values') or []) if str(value or '').strip()) or 'none'
+        reason = str(item.get('reason') or '').strip()
+        retry_lines.append(
+            f'Missing value coverage: {target} is missing requested {field}: {missing_value_names}. Current values: {actual_value_names}. {reason}.'
+        )
+        if target == 'Traffic' and field == 'selected_values':
+            retry_lines.append('Add Traffic rows that explicitly use the missing selected protocol values before finishing. If both TCP and UDP were requested, include both labels rather than repeating only one of them.')
+            missing_protocols = [str(value or '').strip() for value in (item.get('missing_values') or []) if str(value or '').strip()]
+            if missing_protocols:
+                retry_lines.append(
+                    f'Use scenario.add_traffic_item for the missing protocol labels: {_quote_csv(missing_protocols)}. Set content_type="text" unless the user asked for another traffic content type.'
+                )
+        elif target == 'Traffic' and field == 'pattern_values':
+            retry_lines.append('Add or repair Traffic rows so the missing exact traffic patterns are present before finishing. If multiple patterns were requested, include each missing pattern explicitly rather than duplicating another pattern.')
+            missing_patterns = [str(value or '').strip() for value in (item.get('missing_values') or []) if str(value or '').strip()]
+            if missing_patterns:
+                retry_lines.append(
+                    f'Use scenario.add_traffic_item for the missing pattern labels: {_quote_csv(missing_patterns)}. Set content_type="text" unless the user asked for another traffic content type.'
+                )
+        elif target == 'Routing' and field == 'r2r_density_values':
+            retry_lines.append('Add or repair Routing rows so the router-to-router density semantics match the request before finishing.')
+        elif target == 'Routing':
+            retry_lines.append('Add or repair Routing rows so the requested routing protocols are present before finishing.')
+        elif target == 'Node Information' and field == 'role_count_values':
+            retry_lines.append('Add or repair Node Information rows so the requested host-role counts are present before finishing.')
+        elif target == 'Services':
+            retry_lines.append('Add or repair Services rows so the requested services are present before finishing. If multiple service labels were requested, include each missing label explicitly rather than duplicating another service row.')
+            missing_services = [str(value or '').strip() for value in (item.get('missing_values') or []) if str(value or '').strip()]
+            if missing_services:
+                retry_lines.append(
+                    f'Use scenario.add_service_item for the missing service labels: {_quote_csv(missing_services)}.'
+                )
+        elif target == 'Segmentation':
+            retry_lines.append('Add or repair Segmentation rows so the requested segmentation controls are present before finishing.')
+        elif target == 'Vulnerabilities':
+            retry_lines.append('Add or repair Vulnerabilities rows so the requested vulnerability coverage is present before finishing.')
+    retry_lines.append('Fix every missing requirement before you finish, then preview again.')
+    return prompt + '\n'.join(retry_lines)
 
 
 def _preview_count_summary(preview: dict[str, Any] | None) -> dict[str, int]:
@@ -185,7 +1247,7 @@ def _get_count_intent_mismatch(user_prompt: str, preview: dict[str, Any] | None)
     }
 
 
-def _build_count_mismatch_retry_prompt(prompt: str, mismatch: dict[str, Any]) -> str:
+def _build_count_mismatch_retry_prompt(prompt: str, mismatch: dict[str, Any], *, user_prompt: str | None = None) -> str:
     requested_total_nodes = mismatch.get('requested_total_nodes')
     requested_router_count = mismatch.get('requested_router_count')
     expected_host_count = mismatch.get('expected_host_count')
@@ -193,6 +1255,7 @@ def _build_count_mismatch_retry_prompt(prompt: str, mismatch: dict[str, Any]) ->
     actual_hosts = mismatch.get('actual_hosts')
     actual_switches = mismatch.get('actual_switches')
     reasons = mismatch.get('reasons') if isinstance(mismatch.get('reasons'), list) else []
+    vulnerability_target_count = _extract_vulnerability_target_count(user_prompt or prompt)
 
     retry_lines = [
         '',
@@ -210,11 +1273,33 @@ def _build_count_mismatch_retry_prompt(prompt: str, mismatch: dict[str, Any]) ->
         retry_lines.append('Requested counts: ' + ', '.join(requested_bits) + '.')
     if reasons:
         retry_lines.append('Mismatch detected: ' + '; '.join(str(reason) for reason in reasons) + '.')
+    if expected_host_count is not None and vulnerability_target_count > 0:
+        explicit_host_total = _explicit_host_role_count_total(user_prompt or prompt)
+        if explicit_host_total >= int(expected_host_count):
+            retry_lines.append(
+                'The explicit host-role counts already consume the full requested host budget. Repair the draft by placing the requested vulnerabilities on those existing hosts instead of adding extra Docker host rows.'
+            )
+        else:
+            remaining_non_vuln_hosts = max(0, int(expected_host_count) - vulnerability_target_count)
+            retry_lines.append(
+                f'The prompt also asks for {vulnerability_target_count} vulnerability target(s). Reserve those as Docker host slots inside the {expected_host_count}-host total; unless you already add those Docker hosts explicitly, keep the other Node Information host rows to {remaining_non_vuln_hosts} so the repaired preview still lands on the requested counts.'
+            )
+        retry_lines.append(
+            'Search broad vulnerability requests with free-text only. Do not pass v_type or v_vector filters unless the user explicitly asked for those exact filters.'
+        )
+    for line in _build_mcp_bridge_execution_guidance(user_prompt or prompt):
+        retry_lines.append(line)
     retry_lines.append('Fix the draft so the next preview matches those explicit counts exactly before you finish.')
     return prompt + '\n'.join(retry_lines)
 
 
-def _build_prompt_repair_decision(*, prompt: str, exc: ProviderAdapterError | None = None, mismatch: dict[str, Any] | None = None) -> _McpBridgeRepairDecision:
+def _build_prompt_repair_decision(
+    *,
+    prompt: str,
+    user_prompt: str | None = None,
+    exc: ProviderAdapterError | None = None,
+    mismatch: dict[str, Any] | None = None,
+) -> _McpBridgeRepairDecision:
     if exc is not None and _is_ollama_tool_parse_error(exc):
         return _McpBridgeRepairDecision(
             category='ollama-tool-parse-error',
@@ -223,11 +1308,18 @@ def _build_prompt_repair_decision(*, prompt: str, exc: ProviderAdapterError | No
             retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt),
         )
     if isinstance(mismatch, dict):
+        if isinstance(mismatch.get('missing'), list):
+            return _McpBridgeRepairDecision(
+                category='prompt-coverage-mismatch',
+                retryable=True,
+                status_message='The draft missed requested prompt items. Retrying once with stricter coverage guidance...',
+                retry_prompt=_build_prompt_coverage_retry_prompt(prompt, mismatch),
+            )
         return _McpBridgeRepairDecision(
             category='count-intent-mismatch',
             retryable=True,
             status_message='Preview counts did not match the requested totals. Retrying once with stricter count guidance...',
-            retry_prompt=_build_count_mismatch_retry_prompt(prompt, mismatch),
+            retry_prompt=_build_count_mismatch_retry_prompt(prompt, mismatch, user_prompt=user_prompt),
         )
     return _McpBridgeRepairDecision(category='none')
 
@@ -304,10 +1396,12 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
     on_response_open: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     current_prompt = prompt
-    retry_used = False
+    count_retry_used = False
+    coverage_retry_count = 0
     final_mismatch: dict[str, Any] | None = None
+    final_coverage_mismatch: dict[str, Any] | None = None
 
-    for attempt in range(2):
+    for _ in range(4):
         if cancel_check and cancel_check():
             raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
         model_response = await _mcp_bridge_process_query_server_side(
@@ -326,16 +1420,26 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
 
         draft_payload = fetched.get('draft') if isinstance(fetched.get('draft'), dict) else {}
         effective_draft_id = str(draft_payload.get('draft_id') or draft_id).strip()
+        scenario_payload = draft_payload.get('scenario') if isinstance(draft_payload.get('scenario'), dict) else {}
         final_mismatch = _get_count_intent_mismatch(
             user_prompt,
             previewed.get('preview') if isinstance(previewed.get('preview'), dict) else {},
         )
-        if final_mismatch and attempt == 0:
-            retry_used = True
-            repair = _build_prompt_repair_decision(prompt=prompt, mismatch=final_mismatch)
+        final_coverage_mismatch = _get_prompt_coverage_mismatch(user_prompt, scenario_payload)
+        if final_mismatch and not count_retry_used:
+            count_retry_used = True
+            repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, mismatch=final_mismatch)
             if emit is not None and repair.status_message:
                 emit('status', message=repair.status_message)
             current_prompt = repair.retry_prompt or prompt
+            draft_id = effective_draft_id
+            continue
+        if final_coverage_mismatch and coverage_retry_count < 2:
+            coverage_retry_count += 1
+            repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, mismatch=final_coverage_mismatch)
+            if emit is not None and repair.status_message:
+                emit('status', message=repair.status_message)
+            current_prompt = repair.retry_prompt or current_prompt
             draft_id = effective_draft_id
             continue
         return {
@@ -344,7 +1448,9 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
             'draft_payload': draft_payload,
             'previewed': previewed,
             'count_intent_mismatch': final_mismatch,
-            'count_intent_retry_used': retry_used,
+            'count_intent_retry_used': count_retry_used,
+            'prompt_coverage_mismatch': final_coverage_mismatch,
+            'prompt_coverage_retry_used': coverage_retry_count > 0,
         }
 
     raise ProviderAdapterError('MCP bridge generation failed to produce a preview result.', status_code=502)
@@ -416,29 +1522,10 @@ def _build_recoverable_mcp_bridge_tool_error(
         }
         return aliases.get(text, 'TCP')
 
-    def infer_vulnerability_vector(value: Any) -> str:
-        text = ' '.join(str(value or '').lower().split())
-        aliases = (
-            ('web', 'web'),
-            ('http', 'web'),
-            ('browser', 'web'),
-            ('sql', 'sql'),
-            ('database', 'sql'),
-            ('db', 'sql'),
-            ('network', 'network'),
-            ('remote', 'remote'),
-            ('local', 'local'),
-        )
-        for needle, normalized in aliases:
-            if needle in text:
-                return normalized
-        return ''
-
     vulnerability_catalog_error = 'specific vulnerability must match an enabled catalog entry by v_path or v_name' in message.lower()
     if tool_name.endswith('scenario.add_vulnerability_item') and vulnerability_catalog_error:
         enabled = [str(name or '').strip() for name in (enabled_tool_names or []) if str(name or '').strip()]
         search_available = any(name.endswith('scenario.search_vulnerability_catalog') for name in enabled)
-        add_vulnerability_available = any(name.endswith('scenario.add_vulnerability_item') for name in enabled)
         raw_query = ' '.join(
             part for part in [
                 str((tool_args or {}).get('query') or '').strip(),
@@ -450,7 +1537,6 @@ def _build_recoverable_mcp_bridge_tool_error(
             ]
             if part
         ).strip()
-        inferred_vector = infer_vulnerability_vector(raw_query)
         try:
             count = max(1, int((tool_args or {}).get('v_count') or 1))
         except Exception:
@@ -458,25 +1544,9 @@ def _build_recoverable_mcp_bridge_tool_error(
 
         guidance = (
             'Do not invent a Specific vulnerability name/path for broad category requests. '
-            'If the request is broad, such as web-related vulnerabilities, either call '
-            'scenario.search_vulnerability_catalog first and use one returned result, or add a '
-            'Type/Vector vulnerability row instead. For web-related vulnerability coverage, use '
-            'selected="Type/Vector", v_type="docker-compose", and v_vector="web".'
+            'Search the vulnerability catalog using the user\'s wording and, when available, README-backed catalog context. '
+            'Then add only concrete Specific vulnerability rows with explicit v_name and v_path from the chosen catalog matches.'
         )
-
-        if inferred_vector == 'web' and (add_vulnerability_available or not enabled):
-            return json.dumps({
-                'error': message,
-                'recoverable': True,
-                'guidance': guidance,
-                'retry_hint': {
-                    'tool': 'scenario.add_vulnerability_item',
-                    'selected': 'Type/Vector',
-                    'v_type': 'docker-compose',
-                    'v_vector': 'web',
-                    'v_count': count,
-                },
-            })
 
         if search_available:
             return json.dumps({
@@ -485,8 +1555,8 @@ def _build_recoverable_mcp_bridge_tool_error(
                 'guidance': guidance,
                 'retry_hint': {
                     'tool': 'scenario.search_vulnerability_catalog',
-                    'query': raw_query or 'web vulnerability',
-                    'limit': max(3, count),
+                    'query': raw_query or 'vulnerability',
+                    'limit': max(5, count * 3),
                 },
             })
 
@@ -497,8 +1567,9 @@ def _build_recoverable_mcp_bridge_tool_error(
         })
 
     traffic_pattern_error = 'pattern must be one of: continuous, periodic, burst, poisson, or ramp' in message.lower()
-    traffic_replace_error = tool_name.endswith('scenario.replace_section') and str((tool_args or {}).get('section_name') or '').strip().lower() == 'traffic' and 'traffic pattern must be one of:' in message.lower()
-    traffic_add_error = tool_name.endswith('scenario.add_traffic_item') and traffic_pattern_error
+    traffic_content_type_error = 'content_type must be one of: text, photo, audio, video, or gibberish' in message.lower()
+    traffic_replace_error = tool_name.endswith('scenario.replace_section') and str((tool_args or {}).get('section_name') or '').strip().lower() == 'traffic' and ('traffic pattern must be one of:' in message.lower() or traffic_content_type_error)
+    traffic_add_error = tool_name.endswith('scenario.add_traffic_item') and (traffic_pattern_error or traffic_content_type_error)
     if traffic_replace_error or traffic_add_error:
         enabled = [str(name or '').strip() for name in (enabled_tool_names or []) if str(name or '').strip()]
         add_traffic_available = any(name.endswith('scenario.add_traffic_item') for name in enabled)
@@ -516,17 +1587,28 @@ def _build_recoverable_mcp_bridge_tool_error(
         pattern_raw = item.get('pattern')
         retry_pattern = normalize_traffic_pattern_for_retry(pattern_raw) or 'continuous'
         retry_protocol = normalize_traffic_protocol_for_retry(item.get('selected') or item.get('protocol') or item.get('kind') or item.get('type'))
+        retry_content_type = app_backend._normalize_traffic_content_type_value(item.get('content_type') or item.get('content')) or 'text'
         count_raw = item.get('v_count') if item.get('v_count') not in (None, '') else item.get('count')
         try:
             count = max(1, int(count_raw)) if count_raw not in (None, '') else 1
         except Exception:
             count = 1
 
-        guidance = (
-            'Traffic rows must use exact pattern values: continuous, periodic, burst, poisson, or ramp. '
-            'For varied traffic profiles, create multiple Traffic rows and give each row one exact pattern value rather than vague free text such as "various" or non-canonical labels. '
-            f'Retry with pattern="{retry_pattern}" for this row.'
-        )
+        guidance_parts = []
+        if traffic_pattern_error:
+            guidance_parts.append(
+                'Traffic rows must use exact pattern values: continuous, periodic, burst, poisson, or ramp. '
+                'For varied traffic profiles, create multiple Traffic rows and give each row one exact pattern value rather than vague free text such as "various" or non-canonical labels.'
+            )
+        if traffic_content_type_error:
+            guidance_parts.append(
+                'Traffic rows must set content_type to one of: text, photo, audio, video, or gibberish. '
+                'If the user did not request a specific content type, use content_type="text".'
+            )
+        guidance = ' '.join(guidance_parts).strip()
+        if not guidance:
+            guidance = 'Traffic rows must satisfy the schema-backed Traffic item contract.'
+        guidance += f' Retry with pattern="{retry_pattern}" and content_type="{retry_content_type}" for this row.'
 
         if add_traffic_available or not enabled:
             return json.dumps({
@@ -538,7 +1620,7 @@ def _build_recoverable_mcp_bridge_tool_error(
                     'protocol': retry_protocol,
                     'count': count,
                     'pattern': retry_pattern,
-                    'content_type': str(item.get('content_type') or item.get('content') or 'text'),
+                    'content_type': retry_content_type,
                 },
             })
         if replace_section_available:
@@ -556,7 +1638,7 @@ def _build_recoverable_mcp_bridge_tool_error(
                             'v_count': count,
                             'factor': 0.0,
                             'pattern': retry_pattern,
-                            'content_type': str(item.get('content_type') or item.get('content') or 'text'),
+                            'content_type': retry_content_type,
                         }],
                     },
                 },
@@ -715,7 +1797,7 @@ def _build_recoverable_mcp_bridge_tool_error(
 
 def _normalize_ai_bridge_mode(raw_value: Any, *, default: str = _CANONICAL_AI_BRIDGE_MODE) -> str:
     bridge_mode = str(raw_value or default).strip().lower()
-    if bridge_mode in _LEGACY_AI_BRIDGE_MODE_ALIASES:
+    if bridge_mode in _SUPPORTED_AI_BRIDGE_MODE_ALIASES:
         return _CANONICAL_AI_BRIDGE_MODE
     raise ProviderAdapterError(f'Unsupported bridge_mode {bridge_mode!r}.', status_code=400)
 
@@ -1147,7 +2229,7 @@ def _build_ollama_prompt(current_scenario: dict[str, Any], user_prompt: str) -> 
             'Routing': 'items contain selected, factor, optional v_metric/v_count for router counts, and optional r2r_mode/r2r_edges/r2s_mode/r2s_edges/r2s_hosts_min/r2s_hosts_max. v_count is the number of routers. r2r_edges is router-to-router link density. r2s_edges and r2s_hosts_* describe router-to-segment attachment density.',
             'Services': 'items contain selected and factor.',
             'Traffic': 'items contain selected, factor, pattern, rate_kbps, period_s, jitter_pct, content_type. Use selected="TCP" or "UDP" plus either v_metric="Count" with v_count or a positive factor so traffic flows materialize.',
-            'Vulnerabilities': 'items contain selected plus vulnerability fields such as v_metric, v_count, v_name, v_type, v_vector.',
+            'Vulnerabilities': 'items contain selected plus vulnerability fields such as v_metric, v_count, v_name, and v_path. Prefer concrete Specific rows chosen from the vulnerability catalog.',
             'Segmentation': 'items contain selected and factor.',
         },
         'user_request': user_prompt,
@@ -1176,6 +2258,7 @@ def _build_ollama_repair_prompt(current_scenario: dict[str, Any], user_prompt: s
             'Use Routing r2r_* and r2s_* fields only for router-to-router or router-to-host connectivity hints and ratios. Those fields describe connectivity density, not router quantity.',
             'There is no r2h field. Map router-to-host wording to Routing r2s_* fields.',
             'Use Traffic items with selected="TCP" or "UDP" and either v_metric="Count" with v_count or a positive factor so flows appear in preview.',
+            'For vulnerabilities, search the catalog first and then write concrete Specific rows with explicit v_name and v_path from the chosen matches.',
             *_build_count_intent_guidance(user_prompt),
         ],
         'user_request': user_prompt,
@@ -1216,12 +2299,82 @@ def _normalize_local_path(raw_value: Any, *, default_path: str | None = None) ->
 
 
 def _normalize_mcp_servers_json_path(raw_value: Any) -> str:
-    normalized = _normalize_local_path(raw_value)
-    if not normalized:
-        return ''
-    if os.path.normpath(normalized) == os.path.normpath(_LEGACY_MCP_SERVERS_JSON_PATH):
-        return _DEFAULT_MCP_SERVERS_JSON_PATH
-    return normalized
+    return _normalize_local_path(raw_value)
+
+
+def _build_bridge_stage_details(*, stage: str, started_at: float, draft_id: str = '') -> dict[str, Any]:
+    details: dict[str, Any] = {
+        'bridge_stage': stage,
+        'bridge_elapsed_seconds': round(max(0.0, time.monotonic() - started_at), 2),
+    }
+    if draft_id:
+        details['draft_id'] = draft_id
+    return details
+
+
+def _build_bridge_query_state_details(client: Any) -> dict[str, Any]:
+    state = getattr(client, 'query_debug_state', None)
+    if not isinstance(state, dict) or not state:
+        return {}
+    details: dict[str, Any] = {}
+    phase = str(state.get('phase') or '').strip()
+    if phase:
+        details['bridge_query_phase'] = phase
+    phase_started_at = state.get('phase_started_at')
+    if isinstance(phase_started_at, (int, float)):
+        details['bridge_query_phase_elapsed_seconds'] = round(max(0.0, time.monotonic() - float(phase_started_at)), 2)
+    iteration = state.get('iteration')
+    if isinstance(iteration, int):
+        details['bridge_query_iteration'] = iteration
+    message_count = state.get('message_count')
+    if isinstance(message_count, int):
+        details['bridge_query_message_count'] = message_count
+    last_tool_name = str(state.get('last_tool_name') or '').strip()
+    if last_tool_name:
+        details['bridge_last_tool_name'] = last_tool_name
+    last_tool_stage = str(state.get('last_tool_stage') or '').strip()
+    if last_tool_stage:
+        details['bridge_last_tool_stage'] = last_tool_stage
+    last_tool_args = state.get('last_tool_args')
+    if isinstance(last_tool_args, dict) and last_tool_args:
+        details['bridge_last_tool_args'] = {
+            str(key): last_tool_args[key]
+            for key in list(last_tool_args.keys())[:8]
+        }
+    llm_mode = str(state.get('llm_mode') or '').strip()
+    if llm_mode:
+        details['bridge_llm_mode'] = llm_mode
+    current_draft_id = str(state.get('current_draft_id') or '').strip()
+    if current_draft_id:
+        details['bridge_current_draft_id'] = current_draft_id
+    return details
+
+
+def _augment_provider_error_for_bridge_stage(
+    exc: BaseException,
+    *,
+    stage: str,
+    started_at: float,
+    fallback: str,
+    draft_id: str = '',
+    client: Any | None = None,
+) -> ProviderAdapterError:
+    details = _build_bridge_stage_details(stage=stage, started_at=started_at, draft_id=draft_id)
+    details.update(_build_bridge_query_state_details(client))
+    if isinstance(exc, ProviderAdapterError):
+        merged_details = dict(getattr(exc, 'details', {}) or {})
+        merged_details.setdefault('bridge_stage', details['bridge_stage'])
+        merged_details.setdefault('bridge_elapsed_seconds', details['bridge_elapsed_seconds'])
+        if draft_id:
+            merged_details.setdefault('draft_id', draft_id)
+        for key, value in details.items():
+            merged_details.setdefault(key, value)
+        return ProviderAdapterError(exc.message, status_code=exc.status_code, details=merged_details)
+    return ProviderAdapterError(
+        _describe_mcp_bridge_base_exception(exc, fallback=fallback),
+        status_code=502,
+        details=details,
+    )
 
 
 def _normalize_mcp_bridge_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1242,7 +2395,7 @@ def _normalize_mcp_bridge_payload(payload: dict[str, Any]) -> dict[str, Any]:
     enabled_tools = _normalize_tool_selection(payload.get('enabled_tools'))
     hil_enabled_raw = payload.get('hil_enabled')
     if hil_enabled_raw is None:
-        hil_enabled = _env_flag('CORETG_MCP_PYTHON_SDK_HIL_ENABLED', _env_flag('CORETG_OLLMCP_HIL_ENABLED', False))
+        hil_enabled = _env_flag('CORETG_MCP_PYTHON_SDK_HIL_ENABLED', False)
     else:
         hil_enabled = bool(hil_enabled_raw)
     return {
@@ -1661,7 +2814,14 @@ class _RepoMcpBridgeClient:
         self.abort_current_query = False
         self.loop_limit = 8
         self.timeout_seconds = 120.0
+        self.query_debug_state: dict[str, Any] = {}
         self._exit_stack: AsyncExitStack | None = None
+
+    def _set_query_debug_state(self, **kwargs: Any) -> None:
+        state = dict(self.query_debug_state)
+        state.update(kwargs)
+        state['phase_started_at'] = time.monotonic()
+        self.query_debug_state = state
 
     async def connect_to_servers(
         self,
@@ -1748,6 +2908,11 @@ class _RepoMcpBridgeClient:
         return payload
 
     def _post_chat(self, *, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        self._set_query_debug_state(
+            phase='awaiting_llm_response',
+            llm_mode='nonstream',
+            message_count=len(messages),
+        )
         try:
             return _post_json(
                 f'{self.host}/api/chat',
@@ -1773,6 +2938,11 @@ class _RepoMcpBridgeClient:
         except URLError as exc:
             reason = getattr(exc, 'reason', exc)
             raise ProviderAdapterError(f'Could not reach Ollama at {self.host}: {reason}', status_code=502) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise ProviderAdapterError(
+                f'Ollama chat request timed out after {self.timeout_seconds:.0f}s.',
+                status_code=502,
+            ) from exc
 
     def _stream_chat(
         self,
@@ -1785,6 +2955,11 @@ class _RepoMcpBridgeClient:
         accumulated_text = ''
         accumulated_thinking = ''
         tool_calls: list[dict[str, Any]] = []
+        self._set_query_debug_state(
+            phase='awaiting_llm_response',
+            llm_mode='stream',
+            message_count=len(messages),
+        )
         try:
             for chunk in _stream_json_lines(
                 f'{self.host}/api/chat',
@@ -1826,6 +3001,11 @@ class _RepoMcpBridgeClient:
         except URLError as exc:
             reason = getattr(exc, 'reason', exc)
             raise ProviderAdapterError(f'Could not reach Ollama at {self.host}: {reason}', status_code=502) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise ProviderAdapterError(
+                f'Ollama chat request timed out after {self.timeout_seconds:.0f}s.',
+                status_code=502,
+            ) from exc
         assistant_message = {
             'role': 'assistant',
             'content': accumulated_text,
@@ -1848,10 +3028,23 @@ class _RepoMcpBridgeClient:
         messages: list[dict[str, Any]] = [{'role': 'user', 'content': prompt}]
         final_text = ''
         current_draft_id = str(initial_draft_id or '').strip()
+        self.query_debug_state = {
+            'phase': 'starting_query',
+            'phase_started_at': time.monotonic(),
+            'iteration': 0,
+            'message_count': len(messages),
+            'current_draft_id': current_draft_id,
+        }
 
-        for _ in range(max(1, int(self.loop_limit or 8))):
+        for iteration in range(max(1, int(self.loop_limit or 8))):
             if self._is_cancelled(cancel_check):
                 return final_text
+            self._set_query_debug_state(
+                phase='starting_iteration',
+                iteration=iteration + 1,
+                message_count=len(messages),
+                current_draft_id=current_draft_id,
+            )
             if emit is not None:
                 assistant_message = self._stream_chat(
                     messages=messages,
@@ -1872,7 +3065,19 @@ class _RepoMcpBridgeClient:
             })
 
             tool_calls = assistant_message.get('tool_calls') if isinstance(assistant_message.get('tool_calls'), list) else []
+            self._set_query_debug_state(
+                phase='assistant_response_received',
+                iteration=iteration + 1,
+                message_count=len(messages),
+                current_draft_id=current_draft_id,
+            )
             if not tool_calls:
+                self._set_query_debug_state(
+                    phase='completed_without_tool_calls',
+                    iteration=iteration + 1,
+                    message_count=len(messages),
+                    current_draft_id=current_draft_id,
+                )
                 break
 
             for tool_call in tool_calls:
@@ -1888,16 +3093,43 @@ class _RepoMcpBridgeClient:
                     input_schema=getattr(tool_definition, 'inputSchema', None),
                     current_draft_id=current_draft_id,
                 )
+                self._set_query_debug_state(
+                    phase='calling_tool',
+                    iteration=iteration + 1,
+                    message_count=len(messages),
+                    current_draft_id=current_draft_id,
+                    last_tool_name=qualified_tool_name,
+                    last_tool_stage='start',
+                    last_tool_args=tool_args,
+                )
                 if emit is not None:
                     emit('tool', stage='start', tool_name=qualified_tool_name, message=f'Running {qualified_tool_name}')
                 try:
                     tool_result = await _mcp_bridge_call_tool(self, qualified_tool_name, tool_args)
-                    tool_response = _structured_text_payload(tool_result)
+                    tool_response = _structured_text_payload(qualified_tool_name, tool_result)
                     if qualified_tool_name.endswith('scenario.create_draft'):
                         current_draft_id = str(((tool_result.get('draft') or {}).get('draft_id') or '')).strip() or current_draft_id
                     elif _is_draft_scoped_mcp_bridge_tool(qualified_tool_name):
                         current_draft_id = str(tool_args.get('draft_id') or current_draft_id).strip()
+                    self._set_query_debug_state(
+                        phase='tool_result_received',
+                        iteration=iteration + 1,
+                        message_count=len(messages),
+                        current_draft_id=current_draft_id,
+                        last_tool_name=qualified_tool_name,
+                        last_tool_stage='result',
+                        last_tool_args=tool_args,
+                    )
                 except ProviderAdapterError as exc:
+                    self._set_query_debug_state(
+                        phase='tool_error',
+                        iteration=iteration + 1,
+                        message_count=len(messages),
+                        current_draft_id=current_draft_id,
+                        last_tool_name=qualified_tool_name,
+                        last_tool_stage='error',
+                        last_tool_args=tool_args,
+                    )
                     enabled_tool_names: list[str] = []
                     tool_manager = getattr(self, 'tool_manager', None)
                     if tool_manager is not None:
@@ -1936,6 +3168,11 @@ class _RepoMcpBridgeClient:
                     'content': tool_response,
                 })
 
+        self._set_query_debug_state(
+            phase='query_complete',
+            message_count=len(messages),
+            current_draft_id=current_draft_id,
+        )
         return final_text
 
     async def process_query(self, prompt: str, *, initial_draft_id: str = '') -> str:
@@ -2017,8 +3254,55 @@ async def _mcp_bridge_process_query_server_side(
         return await process_query(repair.retry_prompt or prompt)
 
 
-def _structured_text_payload(data: dict[str, Any]) -> str:
-    return json.dumps(data, indent=2, sort_keys=True)
+def _compact_draft_payload_for_llm(draft: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'draft_id': str(draft.get('draft_id') or '').strip(),
+        'updated_at': draft.get('updated_at'),
+        'preview_summary': draft.get('preview_summary'),
+        'last_saved_xml_path': draft.get('last_saved_xml_path'),
+    }
+
+
+def _compact_preview_payload_for_llm(preview: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'seed': preview.get('seed'),
+        'routers': len(preview.get('routers') or []),
+        'hosts': len(preview.get('hosts') or []),
+        'switches': len(preview.get('switches') or []),
+        'links': len(preview.get('links') or []),
+    }
+
+
+def _compact_tool_result_for_llm(qualified_tool_name: str, data: dict[str, Any]) -> dict[str, Any]:
+    compact = deepcopy(data)
+    draft = compact.get('draft')
+    if isinstance(draft, dict):
+        compact['draft'] = _compact_draft_payload_for_llm(draft)
+
+    preview = compact.get('preview')
+    if isinstance(preview, dict):
+        compact['preview'] = _compact_preview_payload_for_llm(preview)
+
+    if qualified_tool_name.endswith('search_vulnerability_catalog'):
+        results = compact.get('results')
+        if isinstance(results, list):
+            compact['results'] = [
+                {
+                    'name': result.get('name'),
+                    'path': result.get('path'),
+                    'type': result.get('type'),
+                    'vector': result.get('vector'),
+                    'cve': result.get('cve'),
+                    'score': result.get('score'),
+                }
+                for result in results[:5]
+                if isinstance(result, dict)
+            ]
+    return compact
+
+
+def _structured_text_payload(qualified_tool_name: str, data: dict[str, Any]) -> str:
+    return json.dumps(_compact_tool_result_for_llm(qualified_tool_name, data), indent=2, sort_keys=True)
 
 
 def _configure_mcp_bridge_client_for_web(client: Any, *, hil_enabled: bool) -> None:
@@ -2058,8 +3342,22 @@ async def _mcp_bridge_connect(payload: dict[str, Any], *, model: str, host: str)
 def _apply_mcp_bridge_tool_selection(client: Any, enabled_tools: list[str]) -> dict[str, bool]:
     enabled_map = client.tool_manager.get_enabled_tools().copy()
     selected = {tool_name for tool_name in enabled_tools if _is_user_exposed_mcp_bridge_tool(tool_name)}
+    dedicated_mutation_suffixes = (
+        'scenario.add_node_role_item',
+        'scenario.add_service_item',
+        'scenario.add_routing_item',
+        'scenario.add_traffic_item',
+        'scenario.add_segmentation_item',
+        'scenario.add_vulnerability_item',
+    )
+    has_dedicated_mutation_tools = any(
+        tool_name.endswith(dedicated_mutation_suffixes)
+        for tool_name in (selected or enabled_map.keys())
+    )
     for tool_name in list(enabled_map.keys()):
         if not _is_user_exposed_mcp_bridge_tool(tool_name):
+            new_state = False
+        elif has_dedicated_mutation_tools and tool_name.endswith('scenario.replace_section'):
             new_state = False
         elif not selected:
             new_state = True
@@ -2147,16 +3445,200 @@ def _find_required_mcp_bridge_tool(available_tools: list[str], suffix: str) -> s
     raise ProviderAdapterError(f'Required MCP tool {suffix!r} is not available.', status_code=500)
 
 
-def _build_mcp_bridge_goal_prompt(*, draft_id: str, enabled_tools: list[str], scenario_name: str, user_prompt: str) -> str:
+def _find_optional_mcp_bridge_tool(available_tools: list[str], suffix: str) -> str:
+    for tool_name in available_tools:
+        if tool_name.endswith(suffix):
+            return tool_name
+    return ''
+
+
+def _build_seeded_traffic_rows(user_prompt: str) -> list[dict[str, Any]]:
+    protocol_counts = _extract_traffic_protocol_count_intent(user_prompt)
+    pattern_counts = _extract_traffic_pattern_count_intent(user_prompt)
+    if not protocol_counts:
+        return []
+
+    requested_patterns = _extract_requested_traffic_patterns(user_prompt)
+
+    rows: list[dict[str, Any]] = []
+    protocol_queue = [[protocol, count] for protocol, count in protocol_counts.items() if count > 0]
+    pattern_queue = [[pattern_name, count] for pattern_name, count in pattern_counts.items() if count > 0]
+
+    if pattern_queue and sum(count for _pattern, count in pattern_queue) == sum(count for _protocol, count in protocol_queue):
+        pattern_index = 0
+        for protocol, protocol_count in protocol_queue:
+            remaining = protocol_count
+            while remaining > 0 and pattern_index < len(pattern_queue):
+                pattern_name, pattern_count = pattern_queue[pattern_index]
+                if pattern_count <= 0:
+                    pattern_index += 1
+                    continue
+                assigned = min(remaining, pattern_count)
+                rows.append({
+                    'protocol': protocol,
+                    'count': assigned,
+                    'pattern': pattern_name,
+                    'content_type': 'text',
+                })
+                remaining -= assigned
+                pattern_queue[pattern_index][1] -= assigned
+                if pattern_queue[pattern_index][1] <= 0:
+                    pattern_index += 1
+            if remaining > 0:
+                rows.append({
+                    'protocol': protocol,
+                    'count': remaining,
+                    'pattern': 'continuous',
+                    'content_type': 'text',
+                })
+        return rows
+
+    if len(requested_patterns) > 1:
+        return []
+
+    default_pattern = next(iter(pattern_counts.keys()), '')
+    if not default_pattern and len(requested_patterns) == 1:
+        default_pattern = requested_patterns[0]
+    if not default_pattern:
+        default_pattern = 'continuous'
+
+    for protocol, count in protocol_counts.items():
+        rows.append({
+            'protocol': protocol,
+            'count': count,
+            'pattern': default_pattern,
+            'content_type': 'text',
+        })
+    return rows
+
+
+async def _apply_deterministic_mcp_bridge_seed(
+    client: Any,
+    *,
+    available_tools: list[str],
+    draft_id: str,
+    user_prompt: str,
+) -> list[str]:
+    applied: list[str] = []
+
+    routing_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_routing_item')
+    node_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_node_role_item')
+    service_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_service_item')
+    traffic_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_traffic_item')
+    segmentation_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_segmentation_item')
+    vuln_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_vulnerability_item')
+
+    count_intent = _extract_count_intent(user_prompt)
+    router_count = count_intent.get('router_count')
+    derived_host_count = count_intent.get('derived_host_count')
+    vulnerability_target_count = _extract_vulnerability_target_count(user_prompt)
+
+    if routing_tool and router_count:
+        routing_args: dict[str, Any] = {
+            'draft_id': draft_id,
+            'protocol': 'OSPFv2',
+            'count': router_count,
+        }
+        if _has_low_r2r_intent(user_prompt):
+            routing_args['r2r_mode'] = 'Min'
+        await _mcp_bridge_call_tool(client, routing_tool, routing_args)
+        applied.append(f'Routing routers={router_count}')
+
+    node_role_counts = _extract_node_role_count_intent(user_prompt)
+    explicit_host_total = sum(node_role_counts.values())
+    if derived_host_count is not None:
+        remaining_hosts = max(0, derived_host_count - vulnerability_target_count - explicit_host_total)
+        if remaining_hosts > 0:
+            node_role_counts['PC'] = node_role_counts.get('PC', 0) + remaining_hosts
+    if node_tool:
+        for role in ('Server', 'Workstation', 'PC', 'Docker'):
+            count = int(node_role_counts.get(role) or 0)
+            if count <= 0:
+                continue
+            await _mcp_bridge_call_tool(client, node_tool, {
+                'draft_id': draft_id,
+                'role': role,
+                'count': count,
+            })
+            applied.append(f'Node {role}={count}')
+
+    if service_tool:
+        for service_name, count in _extract_service_count_intent(user_prompt).items():
+            if count <= 0:
+                continue
+            await _mcp_bridge_call_tool(client, service_tool, {
+                'draft_id': draft_id,
+                'service': service_name,
+                'count': count,
+            })
+            applied.append(f'Service {service_name}={count}')
+
+    if traffic_tool:
+        for row in _build_seeded_traffic_rows(user_prompt):
+            await _mcp_bridge_call_tool(client, traffic_tool, {
+                'draft_id': draft_id,
+                'protocol': row['protocol'],
+                'count': row['count'],
+                'pattern': row['pattern'],
+                'content_type': row['content_type'],
+            })
+            applied.append(f'Traffic {row["protocol"]} {row["pattern"]}={row["count"]}')
+
+    if segmentation_tool:
+        for control, count in _extract_segmentation_control_count_intent(user_prompt).items():
+            if count <= 0:
+                continue
+            await _mcp_bridge_call_tool(client, segmentation_tool, {
+                'draft_id': draft_id,
+                'kind': control,
+                'count': count,
+            })
+            applied.append(f'Segmentation {control}={count}')
+
+    if vuln_tool and vulnerability_target_count > 0:
+        query_hint = _extract_vulnerability_query_hint(user_prompt)
+        candidates = _search_vulnerability_catalog_for_prompt(query_hint, limit=vulnerability_target_count)
+        for candidate in candidates[:max(0, vulnerability_target_count)]:
+            candidate_name = str(candidate.get('name') or '').strip()
+            candidate_path = str(candidate.get('path') or '').strip()
+            if not candidate_name or not candidate_path:
+                continue
+            await _mcp_bridge_call_tool(client, vuln_tool, {
+                'draft_id': draft_id,
+                'v_name': candidate_name,
+                'v_path': candidate_path,
+                'v_count': 1,
+            })
+            applied.append(f'Vulnerability {candidate_name}')
+
+    return applied
+
+
+def _build_mcp_bridge_goal_prompt(
+    *,
+    draft_id: str,
+    enabled_tools: list[str],
+    scenario_name: str,
+    user_prompt: str,
+    seeded_actions: list[str] | None = None,
+) -> str:
+    normalized_seeded_actions = [str(action or '').strip() for action in (seeded_actions or []) if str(action or '').strip()]
+    opening_line = 'Use MCP tools to rebuild the current scenario draft from scratch. Do not create a second draft.'
+    seed_lines: list[str] = []
+    if normalized_seeded_actions:
+        opening_line = 'The current draft already contains deterministic seed rows for obvious count-based requirements. Treat those seeded rows as provisionally correct and do not duplicate them. Only adjust or replace a seeded row when the current draft or preview shows a concrete mismatch with the user request.'
+        seed_lines.append('Deterministic seed already added: ' + '; '.join(normalized_seeded_actions) + '.')
+        seed_lines.append('Do not call scenario.get_authoring_schema merely to reinterpret already-seeded Routing, Services, or Traffic rows. Only call it when you need allowed values for an unseeded section or for a concrete field you still cannot author safely.')
     return '\n'.join([
-        'Use MCP tools to rebuild the current scenario draft from scratch. Do not create a second draft.',
+        opening_line,
         f'Target draft_id: {draft_id}',
         'The bridge injects the current draft_id automatically for draft-scoped tools. Do not include draft_id in tool arguments unless a tool explicitly requires it.',
         f'Scenario name: {scenario_name}',
         f'Enabled tools: {", ".join(enabled_tools) if enabled_tools else "(none)"}',
         'You must work only through enabled tools.',
+        *seed_lines,
         'Keep all section payloads backend-compatible.',
-        'Treat the existing draft as a clean replacement target, not as content to preserve.',
+        'Treat the existing draft as the working draft for this request. Do not re-audit or re-author seeded rows by default; focus first on any remaining unseeded requirements, then preview. If seeded rows already satisfy the request, preview immediately.',
         'If scenario.get_authoring_schema is enabled, call it before authoring so you discover concrete section values and defaults instead of guessing labels.',
         'When schema fields expose ui_selected_values, use only those selected labels for section items; do not invent free-text dropdown values.',
         'Do not rename the scenario; its current name is fixed and must be preserved.',
@@ -2168,10 +3650,12 @@ def _build_mcp_bridge_goal_prompt(*, draft_id: str, enabled_tools: list[str], sc
         'Never place Router, Routing, gateway, or protocol rows under Node Information; router counts always belong in Routing.',
         'Interpret Routing fields precisely: v_count is router quantity, r2r_edges is router-to-router links per router, and r2s_edges with r2s_hosts_min or r2s_hosts_max describes router-to-segment or routed-host attachment density.',
         *_build_count_intent_guidance(user_prompt),
+        *_build_mcp_bridge_execution_guidance(user_prompt),
         'If the user asks for routers without naming a protocol, use scenario.add_routing_item with protocol="OSPFv2" and the requested count when that tool is enabled; otherwise replace only the Routing section with a Count row selected="OSPFv2".',
         'When dedicated tools are available, prefer scenario.add_node_role_item for host or Docker counts, scenario.add_routing_item for explicit router/protocol rows and routing edge hints, scenario.add_service_item for Services rows, scenario.add_traffic_item for TCP or UDP traffic, and scenario.add_segmentation_item for Segmentation rows.',
         'For vulnerabilities, prefer scenario.search_vulnerability_catalog first, then call scenario.add_vulnerability_item with explicit v_name and v_path from the chosen result. Do not pass factor. If the user asks for multiple different vulnerabilities, make separate add_vulnerability_item calls with v_count=1 for each chosen vulnerability.',
-        'For broad vulnerability categories such as web-related vulnerabilities, do not invent a Specific vulnerability name. Prefer a Type/Vector row such as selected="Type/Vector", v_type="docker-compose", v_vector="web", or search the vulnerability catalog first and choose concrete results.',
+        'For broad vulnerability categories such as web-related, database, auth, or ssh-related vulnerabilities, do not invent a synthetic category row. Search the vulnerability catalog using the user\'s wording and available README-backed context, and do not pass v_type or v_vector filters unless the user explicitly requested those exact filters. Then choose concrete catalog results.',
+        *_build_vulnerability_grounding_guidance(user_prompt),
         'For services and segmentation, prefer schema-discovered values and the dedicated mutation tools; otherwise use replace_section with backend-compatible items.',
         'For traffic requests, ensure each Traffic row uses selected="TCP" or "UDP", a concrete content_type, and one exact pattern from: continuous, periodic, burst, poisson, or ramp. For varied traffic profiles, create multiple Traffic rows rather than vague free-text profile labels. Each Traffic row must also use either v_metric="Count" with v_count or a positive factor so preview flows materialize.',
         'Only use free-text fields where the schema explicitly expects them, such as notes or vulnerability identifiers like v_name/v_path.',
@@ -2183,7 +3667,16 @@ def _build_mcp_bridge_goal_prompt(*, draft_id: str, enabled_tools: list[str], sc
 
 
 async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dict[str, Any], user_prompt: str, model: str, host: str) -> dict[str, Any]:
-    client, bridge_cfg = await _mcp_bridge_connect(payload, model=model, host=host)
+    connect_started_at = time.monotonic()
+    try:
+        client, bridge_cfg = await _mcp_bridge_connect(payload, model=model, host=host)
+    except BaseException as exc:
+        raise _augment_provider_error_for_bridge_stage(
+            exc,
+            stage='connect_mcp_bridge',
+            started_at=connect_started_at,
+            fallback='MCP bridge generation failed while connecting to MCP servers.',
+        ) from exc
     try:
         seed_scenario = _build_ai_seed_scenario(current_scenario)
         enabled_map = _apply_mcp_bridge_tool_selection(client, bridge_cfg['enabled_tools'])
@@ -2197,23 +3690,53 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
         draft_id = ''
         execution_result: dict[str, Any] | None = None
         for attempt in range(2):
-            created = await _mcp_bridge_call_tool(client, create_tool, {
-                'name': current_scenario.get('name'),
-                'scenario': seed_scenario,
-                'core': payload.get('core') if isinstance(payload.get('core'), dict) else {},
-            })
+            create_started_at = time.monotonic()
+            try:
+                created = await _mcp_bridge_call_tool(client, create_tool, {
+                    'name': current_scenario.get('name'),
+                    'scenario': seed_scenario,
+                    'core': payload.get('core') if isinstance(payload.get('core'), dict) else {},
+                })
+            except BaseException as exc:
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='create_draft',
+                    started_at=create_started_at,
+                    fallback='MCP bridge generation failed while creating the scenario draft.',
+                    client=client,
+                ) from exc
             draft = created.get('draft') if isinstance(created.get('draft'), dict) else {}
             draft_id = str(draft.get('draft_id') or '').strip()
             if not draft_id:
                 raise ProviderAdapterError('MCP draft creation did not return a draft_id.', status_code=500)
+
+            seed_started_at = time.monotonic()
+            try:
+                seeded_actions = await _apply_deterministic_mcp_bridge_seed(
+                    client,
+                    available_tools=enabled_tools,
+                    draft_id=draft_id,
+                    user_prompt=user_prompt,
+                )
+            except BaseException as exc:
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='seed_draft_from_prompt',
+                    started_at=seed_started_at,
+                    draft_id=draft_id,
+                    fallback='MCP bridge generation failed while seeding deterministic draft rows.',
+                    client=client,
+                ) from exc
 
             prompt = _build_mcp_bridge_goal_prompt(
                 draft_id=draft_id,
                 enabled_tools=enabled_tools,
                 scenario_name=str(current_scenario.get('name') or '').strip() or 'Scenario',
                 user_prompt=user_prompt,
+                seeded_actions=seeded_actions,
             )
             try:
+                execute_started_at = time.monotonic()
                 execution_result = await _execute_mcp_bridge_prompt_with_preview_retry(
                     client,
                     draft_id=draft_id,
@@ -2228,21 +3751,40 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
                 repair = _build_generation_repair_decision(exc)
                 if attempt == 0 and repair.recreate_draft:
                     continue
-                raise
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='execute_prompt_and_preview',
+                    started_at=execute_started_at,
+                    draft_id=draft_id,
+                    fallback='MCP bridge generation failed while executing the authoring prompt.',
+                    client=client,
+                ) from exc
             except BaseException as exc:
-                raise ProviderAdapterError(
-                    _describe_mcp_bridge_base_exception(
-                        exc,
-                        fallback='MCP bridge generation failed while executing model-requested tool calls.',
-                    ),
-                    status_code=502,
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='execute_prompt_and_preview',
+                    started_at=execute_started_at,
+                    draft_id=draft_id,
+                    fallback='MCP bridge generation failed while executing model-requested tool calls.',
+                    client=client,
                 ) from exc
         if not isinstance(execution_result, dict):
             raise ProviderAdapterError('MCP bridge generation failed to produce a preview result.', status_code=502)
         draft_payload = execution_result.get('draft_payload') if isinstance(execution_result.get('draft_payload'), dict) else {}
         previewed = execution_result.get('previewed') if isinstance(execution_result.get('previewed'), dict) else {}
         scenario_payload = draft_payload.get('scenario') if isinstance(draft_payload.get('scenario'), dict) else deepcopy(current_scenario)
-        scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
+        canonicalize_started_at = time.monotonic()
+        try:
+            scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
+        except BaseException as exc:
+            raise _augment_provider_error_for_bridge_stage(
+                exc,
+                stage='canonicalize_generated_vulnerabilities',
+                started_at=canonicalize_started_at,
+                draft_id=draft_id,
+                fallback='MCP bridge generation failed while canonicalizing vulnerabilities.',
+                client=client,
+            ) from exc
         return {
             'provider': 'ollama',
             'bridge_mode': bridge_cfg['bridge_mode'],
@@ -2257,6 +3799,8 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
             'breakdowns': None,
             'count_intent_mismatch': execution_result.get('count_intent_mismatch'),
             'count_intent_retry_used': bool(execution_result.get('count_intent_retry_used')),
+            'prompt_coverage_mismatch': execution_result.get('prompt_coverage_mismatch'),
+            'prompt_coverage_retry_used': bool(execution_result.get('prompt_coverage_retry_used')),
             'bridge_tools': [
                 _mcp_bridge_tool_payload(tool, enabled_map)
                 for tool in client.tool_manager.get_available_tools()
@@ -2281,7 +3825,16 @@ async def _mcp_bridge_generate_with_events(
     on_client_ready: Callable[[Any], None] | None = None,
     on_response_open: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
-    client, bridge_cfg = await _mcp_bridge_connect(payload, model=model, host=host)
+    connect_started_at = time.monotonic()
+    try:
+        client, bridge_cfg = await _mcp_bridge_connect(payload, model=model, host=host)
+    except BaseException as exc:
+        raise _augment_provider_error_for_bridge_stage(
+            exc,
+            stage='connect_mcp_bridge',
+            started_at=connect_started_at,
+            fallback='MCP bridge generation failed while connecting to MCP servers.',
+        ) from exc
     seed_scenario = _build_ai_seed_scenario(current_scenario)
     if callable(on_client_ready):
         on_client_ready(client)
@@ -2301,26 +3854,56 @@ async def _mcp_bridge_generate_with_events(
             emit('status', message='Creating scenario draft...')
             if cancel_check and cancel_check():
                 raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
-            created = await _mcp_bridge_call_tool(client, create_tool, {
-                'name': current_scenario.get('name'),
-                'scenario': seed_scenario,
-                'core': payload.get('core') if isinstance(payload.get('core'), dict) else {},
-            })
+            create_started_at = time.monotonic()
+            try:
+                created = await _mcp_bridge_call_tool(client, create_tool, {
+                    'name': current_scenario.get('name'),
+                    'scenario': seed_scenario,
+                    'core': payload.get('core') if isinstance(payload.get('core'), dict) else {},
+                })
+            except BaseException as exc:
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='create_draft',
+                    started_at=create_started_at,
+                    fallback='MCP bridge generation failed while creating the scenario draft.',
+                    client=client,
+                ) from exc
             draft = created.get('draft') if isinstance(created.get('draft'), dict) else {}
             draft_id = str(draft.get('draft_id') or '').strip()
             if not draft_id:
                 raise ProviderAdapterError('MCP draft creation did not return a draft_id.', status_code=500)
+
+            seed_started_at = time.monotonic()
+            try:
+                seeded_actions = await _apply_deterministic_mcp_bridge_seed(
+                    client,
+                    available_tools=enabled_tools,
+                    draft_id=draft_id,
+                    user_prompt=user_prompt,
+                )
+            except BaseException as exc:
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='seed_draft_from_prompt',
+                    started_at=seed_started_at,
+                    draft_id=draft_id,
+                    fallback='MCP bridge generation failed while seeding deterministic draft rows.',
+                    client=client,
+                ) from exc
 
             prompt = _build_mcp_bridge_goal_prompt(
                 draft_id=draft_id,
                 enabled_tools=enabled_tools,
                 scenario_name=str(current_scenario.get('name') or '').strip() or 'Scenario',
                 user_prompt=user_prompt,
+                seeded_actions=seeded_actions,
             )
             emit('status', message='Sending prompt to Ollama...')
             if cancel_check and cancel_check():
                 raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
             try:
+                execute_started_at = time.monotonic()
                 execution_result = await _execute_mcp_bridge_prompt_with_preview_retry(
                     client,
                     draft_id=draft_id,
@@ -2340,14 +3923,22 @@ async def _mcp_bridge_generate_with_events(
                     if repair.status_message:
                         emit('status', message=repair.status_message)
                     continue
-                raise
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='execute_prompt_and_preview',
+                    started_at=execute_started_at,
+                    draft_id=draft_id,
+                    fallback='MCP bridge generation failed while executing the authoring prompt.',
+                    client=client,
+                ) from exc
             except BaseException as exc:
-                raise ProviderAdapterError(
-                    _describe_mcp_bridge_base_exception(
-                        exc,
-                        fallback='MCP bridge generation failed while executing model-requested tool calls.',
-                    ),
-                    status_code=502,
+                raise _augment_provider_error_for_bridge_stage(
+                    exc,
+                    stage='execute_prompt_and_preview',
+                    started_at=execute_started_at,
+                    draft_id=draft_id,
+                    fallback='MCP bridge generation failed while executing model-requested tool calls.',
+                    client=client,
                 ) from exc
         if not isinstance(execution_result, dict):
             raise ProviderAdapterError('MCP bridge generation failed to produce a preview result.', status_code=502)
@@ -2358,7 +3949,18 @@ async def _mcp_bridge_generate_with_events(
         draft_payload = execution_result.get('draft_payload') if isinstance(execution_result.get('draft_payload'), dict) else {}
         previewed = execution_result.get('previewed') if isinstance(execution_result.get('previewed'), dict) else {}
         scenario_payload = draft_payload.get('scenario') if isinstance(draft_payload.get('scenario'), dict) else deepcopy(current_scenario)
-        scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
+        canonicalize_started_at = time.monotonic()
+        try:
+            scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
+        except BaseException as exc:
+            raise _augment_provider_error_for_bridge_stage(
+                exc,
+                stage='canonicalize_generated_vulnerabilities',
+                started_at=canonicalize_started_at,
+                draft_id=draft_id,
+                fallback='MCP bridge generation failed while canonicalizing vulnerabilities.',
+                client=client,
+            ) from exc
         return {
             'provider': 'ollama',
             'bridge_mode': bridge_cfg['bridge_mode'],
@@ -2373,6 +3975,8 @@ async def _mcp_bridge_generate_with_events(
             'breakdowns': None,
             'count_intent_mismatch': execution_result.get('count_intent_mismatch'),
             'count_intent_retry_used': bool(execution_result.get('count_intent_retry_used')),
+            'prompt_coverage_mismatch': execution_result.get('prompt_coverage_mismatch'),
+            'prompt_coverage_retry_used': bool(execution_result.get('prompt_coverage_retry_used')),
             'bridge_tools': [
                 _mcp_bridge_tool_payload(tool, enabled_map)
                 for tool in client.tool_manager.get_available_tools()
@@ -2413,6 +4017,8 @@ def _build_stream_success_payload(
             'provider_response': generation_result.get('provider_response') or '',
             'count_intent_mismatch': generation_result.get('count_intent_mismatch'),
             'count_intent_retry_used': bool(generation_result.get('count_intent_retry_used')),
+            'prompt_coverage_mismatch': generation_result.get('prompt_coverage_mismatch'),
+            'prompt_coverage_retry_used': bool(generation_result.get('prompt_coverage_retry_used')),
             'generated_scenario': generated_scenario,
             'generated_scenarios': next_scenarios,
             'preview': generation_result.get('preview') or {},
@@ -2954,6 +4560,8 @@ def register(app, *, logger=None) -> None:
                 'provider_response': generation_result.get('provider_response') or '',
                 'count_intent_mismatch': generation_result.get('count_intent_mismatch'),
                 'count_intent_retry_used': bool(generation_result.get('count_intent_retry_used')),
+                'prompt_coverage_mismatch': generation_result.get('prompt_coverage_mismatch'),
+                'prompt_coverage_retry_used': bool(generation_result.get('prompt_coverage_retry_used')),
                 'generated_scenario': next_scenarios[scenario_index],
                 'generated_scenarios': next_scenarios,
                 'preview': generation_result.get('preview') or {},

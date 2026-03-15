@@ -1,5 +1,6 @@
 import json
 import asyncio
+from copy import deepcopy
 from io import BytesIO
 from urllib.error import HTTPError
 
@@ -274,6 +275,20 @@ def test_save_xml_api_roundtrip_preserves_ai_generator_state(tmp_path, monkeypat
         'last_packet_at': '2026-03-07T22:05:00Z',
         'last_generation_summary': {'routers': 1, 'hosts': 2, 'switches': 1, 'seed': 1234},
         'last_generation_error': '',
+        'prompt_coverage_mismatch': {
+            'reasons': ['Traffic missing requested selected_values: UDP'],
+            'missing_values': [
+                {
+                    'target': 'Traffic',
+                    'field': 'selected_values',
+                    'expected_values': ['TCP', 'UDP'],
+                    'missing_values': ['UDP'],
+                    'actual_values': ['TCP'],
+                    'reason': 'user explicitly requested these traffic protocols',
+                },
+            ],
+        },
+        'prompt_coverage_retry_used': True,
         'validation': {
             'ok': True,
             'in_progress': False,
@@ -313,6 +328,8 @@ def test_save_xml_api_roundtrip_preserves_ai_generator_state(tmp_path, monkeypat
     assert restored.get('enabled_tools') == ['server.scenario.create_draft', 'server.scenario.preview_draft']
     assert len(restored.get('available_tools') or []) == 2
     assert (restored.get('last_generation_summary') or {}).get('hosts') == 2
+    assert restored.get('prompt_coverage_retry_used') is True
+    assert (restored.get('prompt_coverage_mismatch') or {}).get('reasons') == ['Traffic missing requested selected_values: UDP']
     validation = restored.get('validation') or {}
     assert validation.get('ok') is True
     assert validation.get('ollama_ok') is True
@@ -1455,7 +1472,7 @@ def test_build_recoverable_traffic_pattern_error_uses_add_traffic_item_retry():
     assert 'exact pattern values' in str(payload.get('guidance') or '')
 
 
-def test_build_recoverable_vulnerability_catalog_error_uses_type_vector_for_web_requests():
+def test_build_recoverable_vulnerability_catalog_error_uses_catalog_search_for_broad_requests():
     from webapp.routes import ai_provider
 
     payload = json.loads(ai_provider._build_recoverable_mcp_bridge_tool_error(
@@ -1473,12 +1490,13 @@ def test_build_recoverable_vulnerability_catalog_error_uses_type_vector_for_web_
 
     assert payload.get('recoverable') is True
     retry_hint = payload.get('retry_hint', {})
-    assert retry_hint.get('tool') == 'scenario.add_vulnerability_item'
-    assert retry_hint.get('selected') == 'Type/Vector'
-    assert retry_hint.get('v_type') == 'docker-compose'
-    assert retry_hint.get('v_vector') == 'web'
-    assert retry_hint.get('v_count') == 3
-    assert 'do not invent a specific vulnerability name/path' in str(payload.get('guidance') or '').lower()
+    assert retry_hint.get('tool') == 'scenario.search_vulnerability_catalog'
+    assert retry_hint.get('query') == 'web'
+    assert retry_hint.get('limit') == 9
+    guidance = str(payload.get('guidance') or '').lower()
+    assert 'do not invent a specific vulnerability name/path' in guidance
+    assert 'search the vulnerability catalog using the user\'s wording' in guidance
+    assert 'type/vector' not in guidance
 
 
 def test_mcp_bridge_goal_prompt_mentions_exact_traffic_patterns_for_varied_profiles():
@@ -1495,7 +1513,7 @@ def test_mcp_bridge_goal_prompt_mentions_exact_traffic_patterns_for_varied_profi
     assert 'create multiple Traffic rows' in prompt
 
 
-def test_mcp_bridge_goal_prompt_mentions_type_vector_for_broad_web_vulnerability_requests():
+def test_mcp_bridge_goal_prompt_mentions_catalog_search_for_broad_vulnerability_requests():
     from webapp.routes import ai_provider
 
     prompt = ai_provider._build_mcp_bridge_goal_prompt(
@@ -1505,8 +1523,77 @@ def test_mcp_bridge_goal_prompt_mentions_type_vector_for_broad_web_vulnerability
         user_prompt='I want 3 vulnerabilities related to web',
     )
 
-    assert 'do not invent a Specific vulnerability name' in prompt
-    assert 'selected="Type/Vector", v_type="docker-compose", v_vector="web"' in prompt
+    prompt_lower = prompt.lower()
+    assert 'do not invent a synthetic category row' in prompt_lower
+    assert 'search the vulnerability catalog using the user\'s wording' in prompt_lower
+    assert 'do not pass v_type or v_vector filters' in prompt_lower
+    assert 'type/vector' not in prompt.lower()
+
+
+def test_vulnerability_grounding_guidance_uses_web_query_hint_and_candidates(monkeypatch):
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        '_load_vulnerability_catalog_for_prompt',
+        lambda: [
+            {
+                'Name': 'appweb/CVE-2018-8715',
+                'Path': '/catalog/appweb/CVE-2018-8715/docker-compose.yml',
+                'Description': 'Web server vulnerability',
+                'Type': 'docker-compose',
+                'Vector': '',
+                'CVE': 'CVE-2018-8715',
+            },
+            {
+                'Name': 'jboss/CVE-2017-12149',
+                'Path': '/catalog/jboss/CVE-2017-12149/docker-compose.yml',
+                'Description': 'JBoss web console deserialization',
+                'Type': 'docker-compose',
+                'Vector': '',
+                'CVE': 'CVE-2017-12149',
+            },
+        ],
+    )
+
+    guidance = ai_provider._build_vulnerability_grounding_guidance('I want 2 vulnerabilities related to web')
+    joined = '\n'.join(guidance).lower()
+
+    assert 'query="web"' in joined
+    assert 'do one focused vulnerability search' in joined
+    assert 'appweb/cve-2018-8715' in joined
+    assert 'jboss/cve-2017-12149' in joined
+
+
+def test_mcp_bridge_goal_prompt_includes_grounded_vulnerability_candidates(monkeypatch):
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        '_load_vulnerability_catalog_for_prompt',
+        lambda: [
+            {
+                'Name': 'appweb/CVE-2018-8715',
+                'Path': '/catalog/appweb/CVE-2018-8715/docker-compose.yml',
+                'Description': 'Web server vulnerability',
+                'Type': 'docker-compose',
+                'Vector': '',
+                'CVE': 'CVE-2018-8715',
+            },
+        ],
+    )
+
+    prompt = ai_provider._build_mcp_bridge_goal_prompt(
+        draft_id='draft-web-2',
+        enabled_tools=['server.scenario.add_vulnerability_item', 'server.scenario.search_vulnerability_catalog'],
+        scenario_name='GroundedWebScenario',
+        user_prompt='I want 1 web vulnerability',
+    )
+
+    prompt_lower = prompt.lower()
+    assert 'query="web"' in prompt_lower
+    assert 'do one focused vulnerability search' in prompt_lower
+    assert 'appweb/cve-2018-8715' in prompt_lower
 
 
 def test_count_intent_guidance_derives_host_remainder_from_total_nodes_and_routers():
@@ -1523,6 +1610,653 @@ def test_count_intent_guidance_derives_host_remainder_from_total_nodes_and_route
     assert 'router nodes=10' in prompt
     assert 'Node Information host counts should sum to 20' in prompt
     assert 'Routing router count should be 10' in prompt
+
+
+def test_count_intent_guidance_accounts_for_vulnerability_docker_capacity():
+    from webapp.routes import ai_provider
+
+    prompt = ai_provider._build_mcp_bridge_goal_prompt(
+        draft_id='draft-3',
+        enabled_tools=['server.scenario.add_node_role_item', 'server.scenario.add_routing_item', 'server.scenario.add_vulnerability_item'],
+        scenario_name='CountWithVulnsScenario',
+        user_prompt='I want a network with 30 nodes, 8 routers, and 3 vulnerabilities related to web',
+    )
+
+    assert 'total topology nodes=30' in prompt
+    assert 'router nodes=8' in prompt
+    assert 'final preview host count should be 22' in prompt
+    assert '3 vulnerability target(s)' in prompt
+    assert 'keep the other Node Information host rows to 19' in prompt
+
+
+def test_count_intent_guidance_uses_existing_hosts_for_vulnerabilities_when_host_budget_is_full():
+    from webapp.routes import ai_provider
+
+    prompt = ai_provider._build_mcp_bridge_goal_prompt(
+        draft_id='draft-3b',
+        enabled_tools=['server.scenario.add_node_role_item', 'server.scenario.add_routing_item', 'server.scenario.add_vulnerability_item'],
+        scenario_name='CountWithExactHostCompositionScenario',
+        user_prompt='Create a network with 12 nodes, 3 routers, 4 servers, 5 workstations, and 1 web vulnerability',
+    )
+
+    prompt_lower = prompt.lower()
+    assert 'final preview host count should be 9' in prompt_lower
+    assert 'satisfy the requested vulnerabilities on those existing hosts instead of adding extra docker host rows' in prompt_lower
+
+
+def test_goal_prompt_orders_routing_before_vulnerability_search_for_combined_request():
+    from webapp.routes import ai_provider
+
+    prompt = ai_provider._build_mcp_bridge_goal_prompt(
+        draft_id='draft-4',
+        enabled_tools=[
+            'server.scenario.add_node_role_item',
+            'server.scenario.add_routing_item',
+            'server.scenario.search_vulnerability_catalog',
+            'server.scenario.add_vulnerability_item',
+        ],
+        scenario_name='OrderedScenario',
+        user_prompt='I want a network with 30 nodes, 8 routers with low router-to-router link ratio. I also want 3 vulnerabilities related to web',
+    )
+
+    prompt_lower = prompt.lower()
+    assert 'author routing first, then node information host rows, then vulnerabilities' in prompt_lower
+    assert 'do not postpone the routing section until after vulnerability search' in prompt_lower
+    assert 'do not pass v_type or v_vector filters' in prompt_lower
+    assert 'r2r_mode="min"' in prompt_lower
+
+
+def test_prompt_coverage_mismatch_detects_missing_requested_sections():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('CoverageScenario')
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'add 3 vulnerabilities, tcp traffic, services, segmentation, and 2 docker hosts',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Vulnerabilities']['expected_min_items'] == 3
+    assert missing['Vulnerabilities']['actual_items'] == 0
+    assert missing['Traffic']['expected_min_items'] == 1
+    assert missing['Services']['expected_min_items'] == 1
+    assert missing['Segmentation']['expected_min_items'] == 1
+    assert missing['Docker']['expected_min_items'] == 2
+
+
+def test_prompt_coverage_mismatch_detects_missing_requested_values():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('ValueCoverageScenario')
+    scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+    scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'OSPFv2', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create tcp and udp traffic with periodic pattern and bgp routing',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing_values = {(item['target'], item['field']): item for item in mismatch.get('missing_values') or []}
+    assert missing_values[('Traffic', 'selected_values')]['missing_values'] == ['UDP']
+    assert missing_values[('Traffic', 'pattern_values')]['missing_values'] == ['periodic']
+    assert missing_values[('Routing', 'selected_values')]['missing_values'] == ['BGP']
+
+
+def test_prompt_coverage_mismatch_detects_exact_node_role_counts():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('NodeRoleCoverageScenario')
+    scenario['sections']['Node Information'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 4, 'factor': 1.0},
+            {'selected': 'Workstation', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+        ],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create 5 servers and 2 workstations',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Node Information:Server']['expected_items'] == 5
+    assert missing['Node Information:Server']['actual_items'] == 4
+    assert 'exactly 5 Server hosts' in missing['Node Information:Server']['reason']
+    assert 'Node Information:Workstation' not in missing
+
+
+def test_prompt_coverage_mismatch_detects_routing_density_values():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('RoutingDensityScenario')
+    scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'OSPFv2', 'r2r_mode': 'max', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create 8 routers with low router-to-router link ratio',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing_values = {(item['target'], item['field']): item for item in mismatch.get('missing_values') or []}
+    assert missing_values[('Routing', 'r2r_density_values')]['missing_values'] == ['low']
+    assert missing_values[('Routing', 'r2r_density_values')]['actual_values'] == ['high']
+
+    retry_prompt = ai_provider._build_prompt_coverage_retry_prompt('base prompt', mismatch).lower()
+    assert 'missing value coverage: routing is missing requested r2r_density_values: low.' in retry_prompt
+    assert 'router-to-router density semantics match the request' in retry_prompt
+
+
+def test_prompt_coverage_mismatch_detects_exact_service_traffic_and_segmentation_counts():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('SectionCountCoverageScenario')
+    scenario['sections']['Services'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'SSH', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+            {'selected': 'HTTP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+    scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+    scenario['sections']['Segmentation'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Firewall', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create 2 ssh services, 2 tcp flows, 2 periodic flows, and 2 firewall segments',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Services:SSH']['expected_items'] == 2
+    assert missing['Services:SSH']['actual_items'] == 1
+    assert missing['Traffic:TCP']['expected_items'] == 2
+    assert missing['Traffic:TCP']['actual_items'] == 1
+    assert missing['Traffic Pattern:periodic']['expected_items'] == 2
+    assert missing['Traffic Pattern:periodic']['actual_items'] == 1
+    assert missing['Segmentation:Firewall']['expected_items'] == 2
+    assert missing['Segmentation:Firewall']['actual_items'] == 1
+
+    retry_prompt = ai_provider._build_prompt_coverage_retry_prompt('base prompt', mismatch).lower()
+    assert 'missing requirement: services:ssh expected exactly 2 item(s) but draft has 1.' in retry_prompt
+    assert 'missing requirement: traffic:tcp expected exactly 2 item(s) but draft has 1.' in retry_prompt
+    assert 'missing requirement: traffic pattern:periodic expected exactly 2 item(s) but draft has 1.' in retry_prompt
+    assert 'missing requirement: segmentation:firewall expected exactly 2 item(s) but draft has 1.' in retry_prompt
+    assert 'do not duplicate one label to satisfy another requested label' in retry_prompt
+    assert 'do not reuse one protocol label to satisfy another requested protocol' in retry_prompt
+    assert 'include each missing pattern explicitly rather than duplicating another pattern' in retry_prompt
+    assert 'use scenario.add_service_item to add or repair a row with selected="ssh" and count=2.' in retry_prompt
+    assert 'use scenario.add_traffic_item to add or repair row(s) with selected="tcp", content_type="text", and count=2.' in retry_prompt
+    assert 'use scenario.add_traffic_item to add or repair row(s) with pattern="periodic", content_type="text", and count=2.' in retry_prompt
+
+
+def test_prompt_coverage_mismatch_detects_word_number_and_pair_phrasings():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('WordNumberCoverageScenario')
+    scenario['sections']['Services'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'HTTP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+    scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+    scenario['sections']['Segmentation'] = {
+        'density': 0.0,
+        'items': [],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create two web services, a pair of periodic tcp streams, and a firewall segment',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Services:HTTP']['expected_items'] == 2
+    assert missing['Services:HTTP']['actual_items'] == 1
+    assert missing['Traffic:TCP']['expected_items'] == 2
+    assert missing['Traffic:TCP']['actual_items'] == 1
+    assert missing['Traffic Pattern:periodic']['expected_items'] == 2
+    assert missing['Traffic Pattern:periodic']['actual_items'] == 1
+    assert missing['Segmentation:Firewall']['expected_items'] == 1
+    assert missing['Segmentation:Firewall']['actual_items'] == 0
+
+
+def test_prompt_coverage_mismatch_detects_compound_service_and_protocol_phrasing():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('CompoundPhraseCoverageScenario')
+    scenario['sections']['Services'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'SSH', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+            {'selected': 'HTTP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+    scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+            {'selected': 'UDP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create two ssh and one web service, plus two tcp and one udp flows',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Services:SSH']['expected_items'] == 2
+    assert missing['Services:SSH']['actual_items'] == 1
+    assert 'Services:HTTP' not in missing
+    assert missing['Traffic:TCP']['expected_items'] == 2
+    assert missing['Traffic:TCP']['actual_items'] == 1
+    assert 'Traffic:UDP' not in missing
+
+
+def test_prompt_coverage_mismatch_detects_compound_traffic_pattern_phrasing():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('CompoundPatternCoverageScenario')
+    scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+            {'selected': 'TCP', 'pattern': 'burst', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create two periodic and one burst flows',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Traffic Pattern:periodic']['expected_items'] == 2
+    assert missing['Traffic Pattern:periodic']['actual_items'] == 1
+    assert 'Traffic Pattern:burst' not in missing
+
+
+def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_prompt_value_coverage_mismatch(monkeypatch):
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+    preview_attempt = {'index': 0}
+
+    first_scenario = _scenario_payload('CoverageValueRetryScenario')
+    first_scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [{'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'}],
+    }
+    first_scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [{'selected': 'OSPFv2', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0}],
+    }
+    second_scenario = _scenario_payload('CoverageValueRetryScenario')
+    second_scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+            {'selected': 'UDP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+    second_scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [{'selected': 'BGP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0}],
+    }
+
+    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+        observed_prompts.append(prompt)
+        preview_attempt['index'] = len(observed_prompts) - 1
+        return f'response-{len(observed_prompts)}'
+
+    async def fake_call_tool(client, qualified_tool_name, arguments):
+        if qualified_tool_name == 'server.scenario.get_draft':
+            scenario = first_scenario if preview_attempt['index'] == 0 else second_scenario
+            return {'draft': {'draft_id': 'draft-value-coverage-1', 'scenario': scenario}}
+        if qualified_tool_name == 'server.scenario.preview_draft':
+            return {
+                'preview': {'routers': [{'id': 1}], 'hosts': [{'id': 1}, {'id': 2}], 'switches': []},
+                'plan': {},
+                'flow_meta': {},
+            }
+        raise AssertionError(f'unexpected tool call: {qualified_tool_name}')
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_process_query_server_side', fake_process_query_server_side)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+
+    result = asyncio.run(ai_provider._execute_mcp_bridge_prompt_with_preview_retry(
+        object(),
+        draft_id='draft-value-coverage-1',
+        prompt='base prompt',
+        user_prompt='create tcp and udp traffic with periodic pattern and bgp routing',
+        model='gpt-oss:20b',
+        get_tool='server.scenario.get_draft',
+        preview_tool='server.scenario.preview_draft',
+    ))
+
+    assert len(observed_prompts) == 2
+    prompt_text = observed_prompts[1].lower()
+    assert 'missing value coverage: traffic is missing requested selected_values: udp.' in prompt_text
+    assert 'missing value coverage: routing is missing requested selected_values: bgp.' in prompt_text
+    assert result.get('prompt_coverage_retry_used') is True
+    assert result.get('prompt_coverage_mismatch') is None
+
+
+def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_prompt_coverage_mismatch(monkeypatch):
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+    preview_attempt = {'index': 0}
+
+    first_scenario = _scenario_payload('CoverageRetryScenario')
+    second_scenario = _scenario_payload('CoverageRetryScenario')
+    second_scenario['sections']['Vulnerabilities'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'demo/web-login-1', 'v_path': 'demo/web-login-1'},
+            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'demo/web-login-2', 'v_path': 'demo/web-login-2'},
+            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'demo/web-login-3', 'v_path': 'demo/web-login-3'},
+        ],
+        'flag_type': 'text',
+    }
+    second_scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [{'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'}],
+    }
+
+    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+        observed_prompts.append(prompt)
+        preview_attempt['index'] = len(observed_prompts) - 1
+        return f'response-{len(observed_prompts)}'
+
+    async def fake_call_tool(client, qualified_tool_name, arguments):
+        if qualified_tool_name == 'server.scenario.get_draft':
+            scenario = first_scenario if preview_attempt['index'] == 0 else second_scenario
+            return {
+                'draft': {
+                    'draft_id': 'draft-coverage-1',
+                    'scenario': scenario,
+                },
+            }
+        if qualified_tool_name == 'server.scenario.preview_draft':
+            return {
+                'preview': {
+                    'routers': [],
+                    'hosts': [{'id': idx + 1} for idx in range(2)],
+                    'switches': [],
+                },
+                'plan': {},
+                'flow_meta': {},
+            }
+        raise AssertionError(f'unexpected tool call: {qualified_tool_name}')
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_process_query_server_side', fake_process_query_server_side)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+
+    result = asyncio.run(ai_provider._execute_mcp_bridge_prompt_with_preview_retry(
+        object(),
+        draft_id='draft-coverage-1',
+        prompt='base prompt',
+        user_prompt='add 3 web vulnerabilities and tcp traffic',
+        model='gpt-oss:20b',
+        get_tool='server.scenario.get_draft',
+        preview_tool='server.scenario.preview_draft',
+    ))
+
+    assert len(observed_prompts) == 2
+    assert 'previous draft item counts: services=0, traffic=0, vulnerabilities=0, segmentation=0, docker=0.' in observed_prompts[1].lower()
+    assert 'missing requirement: vulnerabilities expected at least 3 item(s) but draft has 0.' in observed_prompts[1].lower()
+    assert 'add the missing traffic rows before finishing.' in observed_prompts[1].lower()
+    assert result.get('prompt_coverage_retry_used') is True
+    assert result.get('prompt_coverage_mismatch') is None
+
+
+def test_execute_mcp_bridge_prompt_with_preview_retry_can_apply_count_then_coverage_retries(monkeypatch):
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+    preview_attempt = {'index': 0}
+
+    first_scenario = _scenario_payload('CountThenCoverageScenario')
+    second_scenario = _scenario_payload('CountThenCoverageScenario')
+    second_scenario['sections']['Node Information'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 8, 'factor': 1.0},
+        ],
+    }
+    third_scenario = _scenario_payload('CountThenCoverageScenario')
+    third_scenario['sections']['Node Information'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 8, 'factor': 1.0},
+        ],
+    }
+    third_scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'OSPFv2', 'r2r_mode': 'min', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+        ],
+    }
+    third_scenario['sections']['Services'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'SSH', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+            {'selected': 'HTTP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+    third_scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0, 'content_type': 'text'},
+            {'selected': 'UDP', 'pattern': 'burst', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+
+    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+        observed_prompts.append(prompt)
+        preview_attempt['index'] = len(observed_prompts) - 1
+        return f'response-{len(observed_prompts)}'
+
+    async def fake_call_tool(client, qualified_tool_name, arguments):
+        if qualified_tool_name == 'server.scenario.get_draft':
+            if preview_attempt['index'] == 0:
+                scenario = first_scenario
+            elif preview_attempt['index'] == 1:
+                scenario = second_scenario
+            else:
+                scenario = third_scenario
+            return {
+                'draft': {
+                    'draft_id': 'draft-count-coverage-1',
+                    'scenario': scenario,
+                },
+            }
+        if qualified_tool_name == 'server.scenario.preview_draft':
+            if preview_attempt['index'] == 0:
+                return {
+                    'preview': {'routers': [], 'hosts': [{'id': idx + 1} for idx in range(2)], 'switches': []},
+                    'plan': {},
+                    'flow_meta': {},
+                }
+            return {
+                'preview': {'routers': [{'id': 1}, {'id': 2}], 'hosts': [{'id': idx + 1} for idx in range(8)], 'switches': []},
+                'plan': {},
+                'flow_meta': {},
+            }
+        raise AssertionError(f'unexpected tool call: {qualified_tool_name}')
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_process_query_server_side', fake_process_query_server_side)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+
+    result = asyncio.run(ai_provider._execute_mcp_bridge_prompt_with_preview_retry(
+        object(),
+        draft_id='draft-count-coverage-1',
+        prompt='base prompt',
+        user_prompt='create a network with 10 nodes, 2 routers with low router-to-router link ratio, two ssh and one web service, plus two tcp and one udp flows, and two periodic and one burst flows',
+        model='gpt-oss:20b',
+        get_tool='server.scenario.get_draft',
+        preview_tool='server.scenario.preview_draft',
+    ))
+
+    assert len(observed_prompts) == 3
+    assert result.get('count_intent_retry_used') is True
+    assert result.get('prompt_coverage_retry_used') is True
+    assert result.get('count_intent_mismatch') is None
+    assert result.get('prompt_coverage_mismatch') is None
+    assert 'previous preview counts:' in observed_prompts[1].lower()
+    assert 'missing value coverage: traffic is missing requested selected_values: tcp, udp.' in observed_prompts[2].lower()
+    assert 'missing requirement: services expected at least 1 item(s) but draft has 0.' in observed_prompts[2].lower()
+
+
+def test_build_seeded_traffic_rows_uses_single_explicit_pattern_without_pattern_count():
+    from webapp.routes import ai_provider
+
+    prompt = 'Create a network with 2 TCP flows with periodic pattern.'
+
+    assert ai_provider._extract_traffic_protocol_count_intent(prompt) == {'TCP': 2}
+    assert ai_provider._extract_traffic_pattern_count_intent(prompt) == {}
+    assert ai_provider._build_seeded_traffic_rows(prompt) == [
+        {'protocol': 'TCP', 'count': 2, 'pattern': 'periodic', 'content_type': 'text'},
+    ]
+
+
+def test_build_seeded_traffic_rows_skips_ambiguous_multi_pattern_prompt():
+    from webapp.routes import ai_provider
+
+    prompt = 'Create tcp and udp traffic with periodic and burst patterns.'
+
+    assert ai_provider._build_seeded_traffic_rows(prompt) == []
+
+
+def test_execute_mcp_bridge_prompt_with_preview_retry_can_retry_prompt_coverage_twice(monkeypatch):
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+    preview_attempt = {'index': 0}
+
+    first_scenario = _scenario_payload('CoverageRetryTwiceScenario')
+    second_scenario = _scenario_payload('CoverageRetryTwiceScenario')
+    second_scenario['sections']['Node Information'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 8, 'factor': 1.0},
+        ],
+    }
+    second_scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'OSPFv2', 'r2r_mode': 'min', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+        ],
+    }
+    second_scenario['sections']['Services'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'SSH', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+            {'selected': 'HTTP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+        ],
+    }
+    second_scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+    third_scenario = deepcopy(second_scenario)
+    third_scenario['sections']['Traffic'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'TCP', 'pattern': 'periodic', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0, 'content_type': 'text'},
+            {'selected': 'UDP', 'pattern': 'burst', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'},
+        ],
+    }
+
+    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+        observed_prompts.append(prompt)
+        preview_attempt['index'] = len(observed_prompts) - 1
+        return f'response-{len(observed_prompts)}'
+
+    async def fake_call_tool(client, qualified_tool_name, arguments):
+        if qualified_tool_name == 'server.scenario.get_draft':
+            if preview_attempt['index'] == 0:
+                scenario = first_scenario
+            elif preview_attempt['index'] == 1:
+                scenario = second_scenario
+            else:
+                scenario = third_scenario
+            return {
+                'draft': {
+                    'draft_id': 'draft-coverage-twice-1',
+                    'scenario': scenario,
+                },
+            }
+        if qualified_tool_name == 'server.scenario.preview_draft':
+            return {
+                'preview': {'routers': [{'id': 1}, {'id': 2}], 'hosts': [{'id': idx + 1} for idx in range(8)], 'switches': []},
+                'plan': {},
+                'flow_meta': {},
+            }
+        raise AssertionError(f'unexpected tool call: {qualified_tool_name}')
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_process_query_server_side', fake_process_query_server_side)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+
+    result = asyncio.run(ai_provider._execute_mcp_bridge_prompt_with_preview_retry(
+        object(),
+        draft_id='draft-coverage-twice-1',
+        prompt='base prompt',
+        user_prompt='create a network with 10 nodes, 2 routers with low router-to-router link ratio, two ssh and one web service, plus two tcp and one udp flows, and two periodic and one burst flows',
+        model='gpt-oss:20b',
+        get_tool='server.scenario.get_draft',
+        preview_tool='server.scenario.preview_draft',
+    ))
+
+    assert len(observed_prompts) == 3
+    assert result.get('count_intent_retry_used') is False
+    assert result.get('prompt_coverage_retry_used') is True
+    assert result.get('count_intent_mismatch') is None
+    assert result.get('prompt_coverage_mismatch') is None
+    assert 'missing value coverage: traffic is missing requested selected_values: tcp, udp.' in observed_prompts[1].lower()
+    assert 'missing value coverage: traffic is missing requested selected_values: udp.' in observed_prompts[2].lower()
+    assert 'missing value coverage: traffic is missing requested pattern_values: burst.' in observed_prompts[2].lower()
 
 
 def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_count_mismatch(monkeypatch):
@@ -1582,6 +2316,94 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_count_mis
     assert len(observed_prompts) == 2
     assert 'Previous preview counts: routers=0, hosts=10, switches=1.' in observed_prompts[1]
     assert 'Node Information host total=20' in observed_prompts[1]
+    assert result.get('count_intent_retry_used') is True
+    assert result.get('count_intent_mismatch') is None
+
+
+def test_execute_mcp_bridge_prompt_with_preview_retry_mentions_vulnerability_host_budget(monkeypatch):
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+    preview_attempt = {'index': 0}
+    repaired_scenario = _scenario_payload('CountWithVulnRetryScenario')
+    repaired_scenario['sections']['Node Information'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Server', 'v_metric': 'Count', 'v_count': 19, 'factor': 1.0},
+            {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 3, 'factor': 1.0},
+        ],
+    }
+    repaired_scenario['sections']['Routing'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'OSPFv2', 'r2r_mode': 'min', 'v_metric': 'Count', 'v_count': 8, 'factor': 1.0},
+        ],
+    }
+    repaired_scenario['sections']['Vulnerabilities'] = {
+        'density': 0.0,
+        'items': [
+            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'demo/web-1', 'v_path': 'demo/web-1'},
+            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'demo/web-2', 'v_path': 'demo/web-2'},
+            {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'demo/web-3', 'v_path': 'demo/web-3'},
+        ],
+        'flag_type': 'text',
+    }
+
+    async def fake_process_query_server_side(_client, prompt, model, **_kwargs):
+        observed_prompts.append(prompt)
+        return 'ok'
+
+    async def fake_call_tool(_session, qualified_tool_name, tool_args):
+        if qualified_tool_name == 'server.scenario.get_draft':
+            return {
+                'draft': {
+                    'draft_id': 'draft-vuln',
+                    'scenario': repaired_scenario if preview_attempt['index'] >= 1 else _scenario_payload('CountWithVulnRetryScenario'),
+                },
+            }
+        if qualified_tool_name == 'server.scenario.preview_draft':
+            preview_attempt['index'] += 1
+            if preview_attempt['index'] == 1:
+                return {
+                    'preview': {
+                        'routers': [{'id': idx + 1} for idx in range(8)],
+                        'hosts': [{'id': idx + 1} for idx in range(26)],
+                        'switches': [{'id': idx + 1} for idx in range(8)],
+                    },
+                    'plan': {},
+                    'flow_meta': {},
+                }
+            return {
+                'preview': {
+                    'routers': [{'id': idx + 1} for idx in range(8)],
+                    'hosts': [{'id': idx + 1} for idx in range(22)],
+                    'switches': [{'id': idx + 1} for idx in range(8)],
+                },
+                'plan': {},
+                'flow_meta': {},
+            }
+        raise AssertionError(f'unexpected tool call: {qualified_tool_name}')
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_process_query_server_side', fake_process_query_server_side)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+
+    result = asyncio.run(ai_provider._execute_mcp_bridge_prompt_with_preview_retry(
+        object(),
+        draft_id='draft-vuln',
+        prompt='base prompt',
+        user_prompt='I want a network with 30 nodes, 8 routers with low router-to-router link ratio. I also want 3 vulnerabilities related to web',
+        model='gpt-oss:20b',
+        get_tool='server.scenario.get_draft',
+        preview_tool='server.scenario.preview_draft',
+    ))
+
+    assert len(observed_prompts) == 2
+    assert 'Previous preview counts: routers=8, hosts=26, switches=8.' in observed_prompts[1]
+    assert 'Node Information host total=22' in observed_prompts[1]
+    assert '3 vulnerability target(s)' in observed_prompts[1]
+    assert 'keep the other Node Information host rows to 19' in observed_prompts[1]
+    assert 'author Routing first, then Node Information host rows, then Vulnerabilities' in observed_prompts[1]
+    assert 'do not pass v_type or v_vector filters' in observed_prompts[1].lower()
     assert result.get('count_intent_retry_used') is True
     assert result.get('count_intent_mismatch') is None
 
@@ -1770,6 +2592,55 @@ def test_backend_concretize_preview_placeholders_normalizes_routing_count_rows()
     assert routing_items[0].get('v_count') == 5
 
 
+def test_backend_concretize_preview_placeholders_resolves_routing_random_edge_modes():
+    from webapp import app_backend as backend
+
+    scenario = {
+        'name': 'RoutingRandomAi',
+        'density_count': 0,
+        'sections': {
+            'Node Information': {'density': 0, 'items': []},
+            'Routing': {
+                'density': 0,
+                'items': [
+                    {
+                        'selected': 'Random',
+                        'factor': 1.0,
+                        'v_metric': 'Count',
+                        'v_count': 3,
+                        'r2r_mode': 'Random',
+                        'r2s_mode': 'Random',
+                    },
+                ],
+            },
+            'Services': {'density': 0, 'items': []},
+            'Traffic': {'density': 0, 'items': []},
+            'Vulnerabilities': {'density': 0, 'flag_type': 'text', 'items': []},
+            'Segmentation': {'density': 0, 'items': []},
+        },
+    }
+
+    concretized = backend._concretize_preview_placeholders(scenario, seed=7)
+    routing_items = (concretized.get('sections') or {}).get('Routing', {}).get('items') or []
+
+    assert routing_items
+    routing_item = routing_items[0]
+    assert routing_item.get('selected') in {'RIP', 'RIPNG', 'BGP', 'OSPFv2', 'OSPFv3'}
+    assert routing_item.get('r2r_mode') in {'Min', 'Uniform', 'Exact', 'NonUniform'}
+    assert routing_item.get('r2s_mode') in {'Min', 'Uniform', 'Exact', 'NonUniform'}
+
+    if routing_item.get('r2r_mode') == 'Exact':
+        assert int(routing_item.get('r2r_edges') or 0) > 0
+    else:
+        assert routing_item.get('r2r_edges') in (None, '', 0)
+
+    if routing_item.get('r2s_mode') == 'Exact':
+        assert int(routing_item.get('r2s_edges') or 0) > 0
+    if routing_item.get('r2s_mode') == 'NonUniform':
+        assert int(routing_item.get('r2s_hosts_min') or 0) > 0
+        assert int(routing_item.get('r2s_hosts_max') or 0) >= int(routing_item.get('r2s_hosts_min') or 0)
+
+
 def test_backend_concretize_preview_placeholders_normalizes_other_section_aliases():
     from webapp import app_backend as backend
 
@@ -1891,7 +2762,7 @@ def test_ai_generate_scenario_preview_stream_surfaces_bridge_tool_error(tmp_path
         '/api/ai/generate_scenario_preview_stream',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'qwen2.5:32b',
             'prompt': 'Create a small scenario with an SQL vulnerability.',
@@ -1955,7 +2826,7 @@ def test_ai_generate_scenario_preview_recovers_from_unknown_draft_id_once(tmp_pa
         '/api/ai/generate_scenario_preview',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
             'mcp_server_path': 'MCP/server.py',
@@ -1998,7 +2869,7 @@ def test_ai_generate_scenario_preview_stream_recovers_from_unknown_draft_id_once
         '/api/ai/generate_scenario_preview_stream',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
             'mcp_server_path': 'MCP/server.py',
@@ -2211,7 +3082,7 @@ def test_ai_generate_scenario_preview_falls_back_to_plain_json_format(tmp_path, 
     assert attempts[0].get('format_mode') == 'json'
 
 
-def test_ai_provider_validate_accepts_legacy_ollmcp_alias_and_discovers_tools(tmp_path, monkeypatch):
+def test_ai_provider_validate_discovers_tools_for_mcp_python_sdk(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
 
@@ -2224,7 +3095,7 @@ def test_ai_provider_validate_accepts_legacy_ollmcp_alias_and_discovers_tools(tm
         '/api/ai/provider/validate',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
             'mcp_server_path': 'MCP/server.py',
@@ -2265,7 +3136,7 @@ def test_ai_provider_validate_skip_bridge_refreshes_models_without_mcp(tmp_path,
         '/api/ai/provider/validate',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'skip_bridge': True,
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
@@ -2311,7 +3182,7 @@ def test_ai_generate_scenario_preview_uses_mcp_python_sdk_bridge(tmp_path, monke
         '/api/ai/generate_scenario_preview',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
             'mcp_server_path': 'MCP/server.py',
@@ -2360,7 +3231,7 @@ def test_ai_generate_scenario_preview_disables_mcp_python_sdk_hil(tmp_path, monk
         '/api/ai/generate_scenario_preview',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
             'mcp_server_path': 'MCP/server.py',
@@ -2407,7 +3278,7 @@ def test_ai_generate_scenario_preview_can_reenable_mcp_python_sdk_hil(tmp_path, 
         '/api/ai/generate_scenario_preview',
         json={
             'provider': 'ollama',
-            'bridge_mode': 'ollmcp',
+            'bridge_mode': 'mcp-python-sdk',
             'base_url': 'http://127.0.0.1:11434',
             'model': 'gpt-oss:20b',
             'mcp_server_path': 'MCP/server.py',
@@ -2461,13 +3332,13 @@ def test_resolve_bridge_server_configs_dedupes_direct_path_against_servers_json(
     assert configs[0]['args'] == [ai_provider._DEFAULT_MCP_SERVER_PATH]
 
 
-def test_normalize_mcp_bridge_payload_remaps_legacy_servers_json_path():
+def test_normalize_mcp_bridge_payload_preserves_servers_json_path():
     from webapp.routes import ai_provider
 
     payload = ai_provider._normalize_mcp_bridge_payload({
         'bridge_mode': 'mcp-python-sdk',
         'mcp_server_path': 'MCP/server.py',
-        'servers_json_path': 'MCP/ollmcp-servers.json',
+        'servers_json_path': 'MCP/mcp-bridge-servers.json',
     })
 
     assert payload.get('servers_json_path') == ai_provider._DEFAULT_MCP_SERVERS_JSON_PATH

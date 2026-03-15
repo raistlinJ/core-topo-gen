@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from copy import deepcopy
@@ -327,7 +328,7 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.search_vulnerability_catalog': MCPTool(
                 name='scenario.search_vulnerability_catalog',
-                description='Search the local vulnerability catalog by free text or type/vector to find concrete vulnerabilities the draft can reference.',
+                description='Search the local vulnerability catalog by free text, catalog metadata, and available README content to find concrete vulnerabilities the draft can reference.',
                 input_schema={
                     'type': 'object',
                     'properties': {
@@ -341,7 +342,7 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.add_vulnerability_item': MCPTool(
                 name='scenario.add_vulnerability_item',
-                description='Append exactly one concrete vulnerability item to the draft Vulnerabilities section. Prefer search_vulnerability_catalog first, then pass explicit v_name and v_path from the chosen result, or pass explicit v_type and v_vector for a Type/Vector row. For requests like "3 different vulnerabilities", call this tool three separate times with one vulnerability per call. Do not pass factor.',
+                description='Append exactly one concrete vulnerability item to the draft Vulnerabilities section. Prefer search_vulnerability_catalog first, then pass explicit v_name and v_path from the chosen result. For requests like "3 different vulnerabilities", call this tool three separate times with one vulnerability per call. Do not pass factor.',
                 input_schema={
                     'type': 'object',
                     'properties': {
@@ -1112,6 +1113,74 @@ class ScenarioAuthoringMCPServer:
             self._vulnerability_catalog = list(load_vuln_catalog(ROOT_DIR) or [])
         return self._vulnerability_catalog
 
+    def _find_vulnerability_catalog_readme(self, entry: dict[str, Any]) -> str:
+        raw_path = str(entry.get('Path') or '').strip()
+        if not raw_path:
+            return ''
+        if re.match(r'^https?://', raw_path, re.IGNORECASE):
+            return ''
+        candidate_path = raw_path
+        if os.path.isfile(candidate_path):
+            base_dir = os.path.dirname(candidate_path)
+        elif os.path.isdir(candidate_path):
+            base_dir = candidate_path
+        else:
+            return ''
+        preferred_names = [
+            'README.md',
+            'README.markdown',
+            'README.txt',
+            'README',
+            'readme.md',
+            'readme.markdown',
+            'readme.txt',
+            'readme',
+        ]
+        for name in preferred_names:
+            readme_path = os.path.join(base_dir, name)
+            if os.path.isfile(readme_path):
+                return readme_path
+        try:
+            for name in sorted(os.listdir(base_dir)):
+                lowered = str(name or '').strip().lower()
+                if not lowered.startswith('readme'):
+                    continue
+                readme_path = os.path.join(base_dir, name)
+                if os.path.isfile(readme_path):
+                    return readme_path
+        except Exception:
+            return ''
+        return ''
+
+    def _read_vulnerability_catalog_readme(self, entry: dict[str, Any]) -> str:
+        cache = getattr(self, '_vulnerability_readme_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._vulnerability_readme_cache = cache
+        cache_key = str(entry.get('Path') or '').strip()
+        if cache_key in cache:
+            return str(cache.get(cache_key) or '')
+        readme_path = self._find_vulnerability_catalog_readme(entry)
+        if not readme_path:
+            cache[cache_key] = ''
+            return ''
+        try:
+            with open(readme_path, 'r', encoding='utf-8', errors='ignore') as handle:
+                text = handle.read(20000)
+        except Exception:
+            text = ''
+        cache[cache_key] = text
+        return text
+
+    def _tokenize_vulnerability_catalog_query(self, query: str) -> list[str]:
+        raw_tokens = [token for token in re.findall(r'[a-z0-9]+', str(query or '').lower()) if token]
+        stopwords = {
+            'a', 'an', 'and', 'any', 'attack', 'attacks', 'add', 'catalog', 'concrete', 'different', 'few', 'find',
+            'for', 'from', 'in', 'into', 'of', 'on', 'or', 'related', 'request', 'requests', 'some', 'that', 'the',
+            'these', 'this', 'to', 'use', 'user', 'with', 'vulnerability', 'vulnerabilities', 'vuln', 'vulns',
+        }
+        return [token for token in raw_tokens if token not in stopwords]
+
     def _search_vulnerability_catalog(self, arguments: dict[str, Any]) -> dict[str, Any]:
         catalog = self._load_vulnerability_catalog()
         query = str(
@@ -1131,7 +1200,7 @@ class ScenarioAuthoringMCPServer:
             limit = 10
         limit = max(1, min(limit, 50))
 
-        query_tokens = [token for token in query.lower().split() if token]
+        query_tokens = self._tokenize_vulnerability_catalog_query(query)
         matches: list[tuple[int, dict[str, str]]] = []
         for entry in catalog:
             entry_type = str(entry.get('Type') or '').strip().lower()
@@ -1141,6 +1210,8 @@ class ScenarioAuthoringMCPServer:
             if v_vector and entry_vector != v_vector:
                 continue
 
+            readme_text = self._read_vulnerability_catalog_readme(entry)
+
             haystack = ' '.join([
                 str(entry.get('Name') or ''),
                 str(entry.get('CVE') or ''),
@@ -1148,7 +1219,13 @@ class ScenarioAuthoringMCPServer:
                 str(entry.get('Type') or ''),
                 str(entry.get('Vector') or ''),
                 str(entry.get('Path') or ''),
+                readme_text,
             ]).lower()
+            name_text = str(entry.get('Name') or '').lower()
+            cve_text = str(entry.get('CVE') or '').lower()
+            path_text = str(entry.get('Path') or '').lower()
+            description_text = str(entry.get('Description') or '').lower()
+            readme_lower = readme_text.lower()
             score = 0
             if not query_tokens:
                 score = 1
@@ -1156,12 +1233,18 @@ class ScenarioAuthoringMCPServer:
                 for token in query_tokens:
                     if token in haystack:
                         score += 3
-                    if token in str(entry.get('Name') or '').lower():
+                    if token in name_text:
                         score += 4
-                    if token in str(entry.get('CVE') or '').lower():
+                    if token in cve_text:
                         score += 5
-                    if token in str(entry.get('Path') or '').lower():
+                    if token in path_text:
                         score += 2
+                    if token in description_text:
+                        score += 2
+                    if token in readme_lower:
+                        score += 2
+                if query and query.lower() in readme_lower:
+                    score += 6
             if score > 0:
                 matches.append((score, entry))
 
@@ -1179,6 +1262,7 @@ class ScenarioAuthoringMCPServer:
                 'vector': str(entry.get('Vector') or ''),
                 'cve': str(entry.get('CVE') or ''),
                 'description': str(entry.get('Description') or ''),
+                'readme_available': bool(readme_text),
                 'score': score,
             })
         response = {
