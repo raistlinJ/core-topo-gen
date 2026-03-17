@@ -15774,63 +15774,10 @@ def api_flow_latest_preview_plan():
                         core_validated = True
     except Exception:
         core_validated = False
-    if not core_validated:
-        return jsonify({
-            'ok': False,
-            'error': 'Flag sequencing requires a validated CORE VM. Validate in VM / Access and save XML, then retry.',
-        }), 422
-    flow_run_remote = True
-    core_validated = False
-    try:
-        if isinstance(flow_core_cfg, dict):
-            core_validated = _coerce_bool(flow_core_cfg.get('validated'))
-            if not core_validated:
-                status = str(flow_core_cfg.get('last_tested_status') or '').strip().lower()
-                if status == 'success':
-                    core_validated = True
-            if not core_validated:
-                try:
-                    hv_map = _load_scenario_hitl_validation_from_disk()
-                    hv = None
-                    if isinstance(hv_map, dict):
-                        hv = hv_map.get(scenario_norm)
-                        if hv is None:
-                            try:
-                                key = _scenario_match_key(scenario_norm)
-                            except Exception:
-                                key = ''
-                            if key:
-                                for k, v in hv_map.items():
-                                    try:
-                                        if _scenario_match_key(k) == key:
-                                            hv = v
-                                            break
-                                    except Exception:
-                                        continue
-                    hv_core = hv.get('core') if isinstance(hv, dict) else None
-                    if isinstance(hv_core, dict):
-                        if _coerce_bool(hv_core.get('validated')):
-                            core_validated = True
-                        else:
-                            hv_status = str(hv_core.get('last_tested_status') or '').strip().lower()
-                            if hv_status == 'success':
-                                core_validated = True
-                        if not core_validated and str(hv_core.get('core_secret_id') or '').strip():
-                            core_validated = True
-                except Exception:
-                    pass
-                if not core_validated:
-                    try:
-                        secret_record = _select_latest_core_secret_record(scenario_norm or None)
-                    except Exception:
-                        secret_record = None
-                    if secret_record and str(secret_record.get('identifier') or '').strip():
-                        core_validated = True
-    except Exception:
-        core_validated = False
-    def _flow_eligibility_from_payload(payload: dict) -> tuple[int, int, bool]:
+    def _flow_eligibility_from_payload(payload: dict) -> tuple[int, int, int, bool]:
         docker_count = 0
         vuln_count = 0
+        docker_nonvuln_count = 0
         try:
             preview = payload.get('full_preview') if isinstance(payload, dict) else None
             if isinstance(preview, dict):
@@ -15846,9 +15793,11 @@ def api_flow_latest_preview_plan():
                         if not isinstance(h, dict):
                             continue
                         role = str(h.get('role') or '').strip().lower()
+                        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
                         if role == 'docker':
                             docker_count += 1
-                        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                            if not vulns:
+                                docker_nonvuln_count += 1
                         if vulns:
                             vuln_count += 1
                 vuln_by_node = preview.get('vulnerabilities_by_node') if isinstance(preview.get('vulnerabilities_by_node'), dict) else None
@@ -15857,8 +15806,61 @@ def api_flow_latest_preview_plan():
         except Exception:
             docker_count = docker_count
             vuln_count = vuln_count
+            docker_nonvuln_count = docker_nonvuln_count
         flow_eligible = bool((docker_count or 0) > 0 or (vuln_count or 0) > 0)
-        return docker_count, vuln_count, flow_eligible
+        return docker_count, vuln_count, docker_nonvuln_count, flow_eligible
+
+    def _flow_eligibility_details(payload: dict | None) -> dict[str, Any]:
+        docker_count, vuln_count, docker_nonvuln_count, topology_eligible = _flow_eligibility_from_payload(payload or {})
+        try:
+            flag_generators, _ = _flag_generators_from_enabled_sources()
+            flag_generator_count = len([g for g in (flag_generators or []) if isinstance(g, dict)])
+        except Exception:
+            flag_generator_count = 0
+        try:
+            flag_node_generators, _ = _flag_node_generators_from_enabled_sources()
+            flag_node_generator_count = len([g for g in (flag_node_generators or []) if isinstance(g, dict)])
+        except Exception:
+            flag_node_generator_count = 0
+        try:
+            vuln_catalog_count = len(_load_backend_vuln_catalog_items() or [])
+        except Exception:
+            vuln_catalog_count = 0
+
+        has_vuln_generator_path = bool(vuln_count > 0 and flag_generator_count > 0)
+        has_node_generator_path = bool(docker_nonvuln_count > 0 and flag_node_generator_count > 0)
+        flow_eligible = bool(core_validated and (has_vuln_generator_path or has_node_generator_path))
+
+        reasons: list[str] = []
+        if not core_validated:
+            reasons.append('CORE VM must be validated in VM / Access.')
+        if not topology_eligible:
+            reasons.append('Topology must include Docker or vulnerability nodes.')
+        if vuln_catalog_count <= 0:
+            reasons.append('No vulnerabilities are available in the Vulnerability Catalog.')
+        if vuln_count > 0 and flag_generator_count <= 0:
+            reasons.append('No enabled flag-generators are available for vulnerability nodes.')
+        if docker_nonvuln_count > 0 and flag_node_generator_count <= 0:
+            reasons.append('No enabled flag-node-generators are available for non-vulnerability Docker nodes.')
+        if topology_eligible and not has_vuln_generator_path and not has_node_generator_path and flag_generator_count <= 0 and flag_node_generator_count <= 0:
+            reasons.append('No enabled generators are available for this topology.')
+
+        return {
+            'docker_count': docker_count,
+            'vuln_count': vuln_count,
+            'docker_nonvuln_count': docker_nonvuln_count,
+            'flow_topology_eligible': topology_eligible,
+            'flag_generator_count': flag_generator_count,
+            'flag_node_generator_count': flag_node_generator_count,
+            'vuln_catalog_count': vuln_catalog_count,
+            'flow_eligible': flow_eligible,
+            'flow_eligibility_reasons': reasons,
+        }
+
+    preview_payload: dict[str, Any] | None = None
+    preview_path = ''
+    preview_source = ''
+    preview_meta: dict[str, Any] = {}
 
     if xml_hint:
         try:
@@ -15867,42 +15869,53 @@ def api_flow_latest_preview_plan():
                 payload = _load_plan_preview_from_xml(xml_abs, scenario_label or scenario_norm)
                 if payload and isinstance(payload, dict):
                     meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
-                    docker_count, vuln_count, flow_eligible = _flow_eligibility_from_payload(payload)
                     scen_chk = str(meta.get('scenario') or '').strip()
-                    if (not scen_chk or _normalize_scenario_label(scen_chk) == scenario_norm) and flow_eligible:
-                        return jsonify({
-                            'ok': True,
-                            'scenario': scenario_label or scenario_norm,
-                            'preview_plan_path': xml_abs,
-                            'preview_source': 'xml',
-                            'metadata': meta or {},
-                            'docker_count': docker_count,
-                            'vuln_count': vuln_count,
-                            'flow_eligible': flow_eligible,
-                            'core_validated': core_validated,
-                        })
+                    if not scen_chk or _normalize_scenario_label(scen_chk) == scenario_norm:
+                        preview_payload = payload
+                        preview_path = xml_abs
+                        preview_source = 'xml'
+                        preview_meta = meta or {}
         except Exception:
             pass
-    try:
-        xml_path = _latest_xml_path_for_scenario(scenario_norm)
-        if xml_path:
-            payload = _load_plan_preview_from_xml(xml_path, scenario_label or scenario_norm)
-            if payload and isinstance(payload, dict):
-                meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
-                docker_count, vuln_count, flow_eligible = _flow_eligibility_from_payload(payload)
-                return jsonify({
-                    'ok': True,
-                    'scenario': scenario_label or scenario_norm,
-                    'preview_plan_path': xml_path,
-                    'preview_source': 'xml',
-                    'metadata': meta or {},
-                    'docker_count': docker_count,
-                    'vuln_count': vuln_count,
-                    'flow_eligible': flow_eligible,
-                    'core_validated': core_validated,
-                })
-    except Exception:
-        pass
+
+    if preview_payload is None:
+        try:
+            xml_path = _latest_xml_path_for_scenario(scenario_norm)
+            if xml_path:
+                payload = _load_plan_preview_from_xml(xml_path, scenario_label or scenario_norm)
+                if payload and isinstance(payload, dict):
+                    preview_payload = payload
+                    preview_path = xml_path
+                    preview_source = 'xml'
+                    preview_meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+        except Exception:
+            pass
+
+    if not core_validated:
+        details = _flow_eligibility_details(preview_payload)
+        return jsonify({
+            'ok': False,
+            'error': 'Flag sequencing requires a validated CORE VM. Validate in VM / Access and save XML, then retry.',
+            'scenario': scenario_label or scenario_norm,
+            'preview_plan_path': preview_path,
+            'preview_source': preview_source,
+            'metadata': preview_meta,
+            'core_validated': False,
+            **details,
+        }), 422
+
+    if preview_payload is not None:
+        details = _flow_eligibility_details(preview_payload)
+        return jsonify({
+            'ok': True,
+            'scenario': scenario_label or scenario_norm,
+            'preview_plan_path': preview_path,
+            'preview_source': preview_source,
+            'metadata': preview_meta,
+            'core_validated': True,
+            **details,
+        })
+
     return jsonify({'ok': False, 'error': 'No XML found for this scenario. Save XML with a PlanPreview first.'}), 404
 
 

@@ -438,6 +438,7 @@
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
   let flowEnabled = true;
   let flowEligible = true;
+  let flowEligibilityReasons = [];
   let topologyDirty = false;
   let topologyDirtyReason = '';
 
@@ -592,6 +593,16 @@
     }
   }
 
+  function flowIneligibleMessage() {
+    const reasons = (Array.isArray(flowEligibilityReasons) ? flowEligibilityReasons : [])
+      .map((reason) => String(reason || '').trim())
+      .filter(Boolean);
+    if (reasons.length) {
+      return 'Flag sequencing unavailable: ' + reasons.join(' ');
+    }
+    return 'Flag sequencing requires Docker or vulnerability nodes in the topology.';
+  }
+
   function updateFlowEnabledUi() {
     const enabled = !!flowEnabled;
     if (lengthEl) lengthEl.disabled = !enabled || !flowEligible;
@@ -605,7 +616,7 @@
     if (flowVizCardEl) flowVizCardEl.classList.toggle('d-none', !enabled);
     if (flowEnabledHelpEl) {
       if (!flowEligible) {
-        flowEnabledHelpEl.textContent = 'Disabled: CORE VM must be validated (VM / Access) and topology must include Docker or vulnerability nodes.';
+        flowEnabledHelpEl.textContent = 'Disabled: ' + flowIneligibleMessage().replace(/^Flag sequencing unavailable:\s*/, '');
       } else if (!enabled) {
         flowEnabledHelpEl.textContent = 'Flag sequencing disabled; Execute will run without flows.';
       } else {
@@ -2247,11 +2258,13 @@
       } catch (e) { }
       const data = await fetchJson(url);
       try {
+        flowEligibilityReasons = (data && Array.isArray(data.flow_eligibility_reasons))
+          ? data.flow_eligibility_reasons.map((reason) => String(reason || '').trim()).filter(Boolean)
+          : [];
         const eligible = (data && data.flow_eligible !== undefined) ? !!data.flow_eligible : true;
-        const coreValidated = (data && data.core_validated !== undefined) ? !!data.core_validated : true;
         const dockerCount = Number.isFinite(+data.docker_count) ? (+data.docker_count) : 0;
         const vulnCount = Number.isFinite(+data.vuln_count) ? (+data.vuln_count) : 0;
-        flowEligible = (coreValidated && (eligible || (dockerCount > 0 || vulnCount > 0)));
+        flowEligible = (eligible || (dockerCount > 0 || vulnCount > 0));
         if (!flowEligible) {
           // Guardrail: do not clear/persist FlowState on transient ineligibility checks
           // from stale XML pointers; only disable controls for this view.
@@ -2270,11 +2283,26 @@
         updateMeta();
         return path;
       }
-    } catch (e) { }
-    try {
-      flowEligible = true;
-      updateFlowEnabledUi();
-    } catch (e) { }
+    } catch (e) {
+      const payload = e && typeof e === 'object' ? e.payload : null;
+      const payloadError = payload && typeof payload === 'object' ? String(payload.error || payload.message || '').trim() : '';
+      if (payloadError && payloadError.includes('No XML found for this scenario')) {
+        flowEligibilityReasons = [];
+        flowEligible = true;
+        updateFlowEnabledUi();
+        return '';
+      }
+      try {
+        flowEligibilityReasons = (payload && Array.isArray(payload.flow_eligibility_reasons))
+          ? payload.flow_eligibility_reasons.map((reason) => String(reason || '').trim()).filter(Boolean)
+          : [String((payload && (payload.error || payload.message)) || (e && e.message) || 'Flag sequencing prerequisites are not met.').trim()].filter(Boolean);
+        flowEligible = (payload && typeof payload === 'object' && ('flow_eligible' in payload)) ? !!payload.flow_eligible : false;
+        if (!flowEligible) {
+          setFlowEnabled(false, { skipPersist: true, clearStateOnDisable: false });
+        }
+        updateFlowEnabledUi();
+      } catch (innerError) { }
+    }
     return '';
   }
 
@@ -2313,7 +2341,7 @@
         await renderMermaid(diagram);
       } catch (e) { }
       if (!flowEligible) {
-        setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+        setStatus(flowIneligibleMessage(), true);
       } else if (topologyDirty) {
         setStatus('Topology/IP changed. Re-run Generate to refresh flow and flags.', true);
       } else if (!flowEnabled) {
@@ -2371,7 +2399,7 @@
         if (!flowEligible && next) {
           try { flowEnabledToggleEl.checked = false; } catch (e) { }
           setFlowEnabled(false, { skipPersist: false });
-          setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+          setStatus(flowIneligibleMessage(), true);
           return;
         }
         setFlowEnabled(next, { skipPersist: false });
@@ -8267,7 +8295,7 @@
     lastResolvePayload = null;
 
     if (!flowEligible) {
-      setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+      setStatus(flowIneligibleMessage(), true);
       return;
     }
     if (!flowEnabled) {
@@ -9101,7 +9129,7 @@
       let previewPlan = '';
       if (flowEnabled) {
         if (!flowEligible) {
-          throw new Error('Flag sequencing requires Docker or vulnerability nodes in the topology.');
+          throw new Error(flowIneligibleMessage());
         }
         if (!Array.isArray(currentChain) || currentChain.length === 0) {
           throw new Error('Generate a chain first.');

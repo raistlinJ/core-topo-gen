@@ -8853,6 +8853,91 @@
 
     function concretizeRandomSelectionsForSave(scenarios) {
         const cloned = deepCloneJsonSafe(Array.isArray(scenarios) ? scenarios : []);
+
+    function nextRandomRerollToken() {
+        try {
+            return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+        } catch (e) {
+            return String(Date.now());
+        }
+    }
+
+    function ensureRandomRerollState(item) {
+        if (!item || typeof item !== 'object') return {};
+        const current = (item._random_reroll && typeof item._random_reroll === 'object') ? item._random_reroll : {};
+        item._random_reroll = current;
+        return current;
+    }
+
+    function markRandomReroll(item, key) {
+        try {
+            const bag = ensureRandomRerollState(item);
+            bag[String(key || 'selected')] = nextRandomRerollToken();
+        } catch (e) { }
+    }
+
+    function getRandomRerollSalt(item, key) {
+        try {
+            const bag = (item && item._random_reroll && typeof item._random_reroll === 'object') ? item._random_reroll : null;
+            const value = bag ? bag[String(key || 'selected')] : '';
+            return value ? `|${String(value)}` : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function resetItemForRandomSelection(sectionName, item, fieldName) {
+        if (!item || typeof item !== 'object') return;
+        const section = String(sectionName || '').trim();
+        const field = String(fieldName || 'selected').trim() || 'selected';
+
+        markRandomReroll(item, field);
+
+        if (section === 'Vulnerabilities' && field === 'selected') {
+            delete item.v_name;
+            delete item.v_path;
+            delete item.v_desc;
+            return;
+        }
+
+        if (section === 'Routing') {
+            if (field === 'r2r_mode') {
+                delete item.r2r_edges;
+                return;
+            }
+            if (field === 'r2s_mode') {
+                delete item.r2s_edges;
+                delete item.r2s_hosts_min;
+                delete item.r2s_hosts_max;
+                return;
+            }
+            return;
+        }
+
+        if (section === 'Traffic') {
+            if (field === 'selected') {
+                item.content_type = 'Random';
+                item.pattern = 'Random';
+                delete item.rate_kbps;
+                delete item.period_s;
+                delete item.jitter_pct;
+                markRandomReroll(item, 'content_type');
+                markRandomReroll(item, 'pattern');
+                return;
+            }
+            if (field === 'content_type') {
+                item.pattern = 'Random';
+                delete item.rate_kbps;
+                delete item.period_s;
+                delete item.jitter_pct;
+                markRandomReroll(item, 'pattern');
+                return;
+            }
+            if (field === 'pattern') {
+                return;
+            }
+        }
+    }
         let resolvedCount = 0;
         const resolvedBySection = {};
         const exampleChanges = [];
@@ -8923,7 +9008,7 @@
                             continue;
                         }
 
-                        const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|v_name|save-xml`);
+                        const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|v_name${getRandomRerollSalt(it, 'selected')}${getRandomRerollSalt(it, 'v_name')}|save-xml`);
                         const pick = eligibleAny[Math.floor(rng() * eligibleAny.length) % eligibleAny.length];
                         const pickedName = pick && (pick.Name || pick.name) ? String(pick.Name || pick.name) : '';
                         if (!pickedName) continue;
@@ -8958,7 +9043,7 @@
                         const edgeModeOptions = ['Min', 'Uniform', 'Exact', 'NonUniform'];
                         const rawR2rMode = (it.r2r_mode !== undefined && it.r2r_mode !== null) ? String(it.r2r_mode).trim() : '';
                         if (!rawR2rMode || rawR2rMode.toLowerCase() === 'random') {
-                            const rngMode = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2r_mode|save-xml`);
+                            const rngMode = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2r_mode${getRandomRerollSalt(it, 'r2r_mode')}|save-xml`);
                             const pickMode = edgeModeOptions[Math.floor(rngMode() * edgeModeOptions.length) % edgeModeOptions.length];
                             it.r2r_mode = pickMode;
                             // Only keep r2r_edges when Exact; otherwise clear it to reduce confusion.
@@ -8976,7 +9061,7 @@
                             const rawEdges = (it.r2r_edges !== undefined && it.r2r_edges !== null) ? String(it.r2r_edges).trim() : '';
                             const parsedEdges = parseInt(rawEdges, 10);
                             if (isExact && (!rawEdges || !Number.isFinite(parsedEdges) || parsedEdges <= 0)) {
-                                const rngEdges = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2r_edges|save-xml`);
+                                const rngEdges = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2r_edges${getRandomRerollSalt(it, 'r2r_mode')}|save-xml`);
                                 const pickEdges = 2 + (Math.floor(rngEdges() * 3) % 3); // 2..4
                                 it.r2r_edges = pickEdges;
                                 resolvedCount += 1;
@@ -8987,7 +9072,7 @@
 
                         const rawR2sMode = (it.r2s_mode !== undefined && it.r2s_mode !== null) ? String(it.r2s_mode).trim() : '';
                         if (!rawR2sMode || rawR2sMode.toLowerCase() === 'random') {
-                            const rngMode = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2s_mode|save-xml`);
+                            const rngMode = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2s_mode${getRandomRerollSalt(it, 'r2s_mode')}|save-xml`);
                             const pickMode = edgeModeOptions[Math.floor(rngMode() * edgeModeOptions.length) % edgeModeOptions.length];
                             it.r2s_mode = pickMode;
                             if (pickMode !== 'Exact') {
@@ -9004,7 +9089,7 @@
                             const rawEdges = (it.r2s_edges !== undefined && it.r2s_edges !== null) ? String(it.r2s_edges).trim() : '';
                             const parsedEdges = parseInt(rawEdges, 10);
                             if (isExact && (!rawEdges || !Number.isFinite(parsedEdges) || parsedEdges <= 0)) {
-                                const rngEdges = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2s_edges|save-xml`);
+                                const rngEdges = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2s_edges${getRandomRerollSalt(it, 'r2s_mode')}|save-xml`);
                                 const pickEdges = 1 + (Math.floor(rngEdges() * 3) % 3); // 1..3
                                 it.r2s_edges = pickEdges;
                                 resolvedCount += 1;
@@ -9032,7 +9117,7 @@
                     const rawSelected = (it.selected !== undefined && it.selected !== null) ? String(it.selected).trim() : '';
                     const isRandomSelected = !rawSelected || rawSelected.toLowerCase() === 'random';
                     if (isRandomSelected) {
-                        const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|selected|save-xml`);
+                        const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|selected${getRandomRerollSalt(it, 'selected')}|save-xml`);
                         const pick = options[Math.floor(rng() * options.length) % options.length];
                         const from = rawSelected || 'Random';
                         it.selected = pick;
@@ -9047,7 +9132,7 @@
                         const isRandomCt = !rawCt || rawCt.toLowerCase() === 'random';
                         if (isRandomCt) {
                             const ctOptions = ['text', 'photo', 'audio', 'video', 'gibberish'];
-                            const rngCt = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|content_type|save-xml`);
+                            const rngCt = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|content_type${getRandomRerollSalt(it, 'content_type')}|save-xml`);
                             const pickCt = ctOptions[Math.floor(rngCt() * ctOptions.length) % ctOptions.length];
                             const fromCt = rawCt || 'Random';
                             it.content_type = pickCt;
@@ -9064,7 +9149,7 @@
                             // Only resolve pattern when traffic is actually enabled (payload is not Random).
                             if (ctNow && ctNow.toLowerCase() !== 'random' && isRandomPattern) {
                                 const patOptions = ['continuous', 'periodic', 'burst', 'poisson', 'ramp'];
-                                const rngPat = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|pattern|save-xml`);
+                                const rngPat = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|pattern${getRandomRerollSalt(it, 'pattern')}|save-xml`);
                                 const pickPat = patOptions[Math.floor(rngPat() * patOptions.length) % patOptions.length];
                                 it.pattern = pickPat;
                                 resolvedCount += 1;
@@ -15870,8 +15955,11 @@
         if (secName === 'Vulnerabilities') {
             const curRaw = (it.selected || 'Random');
             const cur = (curRaw === 'Category' || curRaw === 'Type/Vector') ? 'Random' : curRaw;
-            const options = ['Random', 'Specific'];
-            opts = options.map(o => `<option ${o === cur ? 'selected' : ''}>${o}</option>`).join('');
+            const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+            const hasCatalogItems = vulnCatalogItems.length > 0;
+            const options = hasCatalogItems ? ['Random', 'Specific'] : ['Specific'];
+            const effectiveCur = hasCatalogItems ? cur : 'Specific';
+            opts = options.map(o => `<option ${o === effectiveCur ? 'selected' : ''}>${o}</option>`).join('');
         } else {
             const cur = it.selected || 'Random';
             // Per-section allowed options (excluding 'auto')
@@ -15985,6 +16073,8 @@
             if (secName === 'Vulnerabilities') {
                 const modeRaw = it.selected || 'Random';
                 const mode = (modeRaw === 'Category' || modeRaw === 'Type/Vector') ? 'Random' : modeRaw;
+                const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+                const hasCatalogItems = vulnCatalogItems.length > 0;
                 if (mode === 'Specific') {
                     const nm = it.v_name || '';
                     // Try to obtain full description (prefer stored v_desc, else look up in catalog)
@@ -16002,7 +16092,8 @@
                         .replace(/'/g, '&#39;');
                     const descShort = abbr(fullDesc);
                     const centerText = nm ? `${nm}${descShort ? ' — ' + descShort : ''}` : '<span class="text-muted">No selection</span>';
-                    return `<span class="small" ${fullDesc ? `data-bs-toggle="tooltip" data-bs-title="${esc(fullDesc)}"` : ''}>${centerText}</span>`;
+                    const emptyHint = !hasCatalogItems ? `<div class="small text-muted mt-1">No vulnerabilities available in Vulnerability Catalog.</div>` : '';
+                    return `<span class="small" ${fullDesc ? `data-bs-toggle="tooltip" data-bs-title="${esc(fullDesc)}"` : ''}>${centerText}</span>${emptyHint}`;
                 }
                 return '';
             }
@@ -16014,6 +16105,8 @@
             if (secName !== 'Vulnerabilities') return selectedCtl;
             const modeRaw = it.selected || 'Random';
             const mode = (modeRaw === 'Category' || modeRaw === 'Type/Vector') ? 'Random' : modeRaw;
+            const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+            const hasCatalogItems = vulnCatalogItems.length > 0;
             if (mode === 'Specific') {
                 const nm = it.v_name || '';
                 // Try to obtain full description (prefer stored v_desc, else look up in catalog)
@@ -16033,7 +16126,7 @@
                 return `
             <div class="d-flex flex-wrap gap-2 align-items-center">
                 <div style="min-width:160px">${selectedCtl}</div>
-                <button type="button" class="btn btn-sm btn-outline-primary" data-action="pick-specific" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Choose...</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" data-action="pick-specific" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" ${hasCatalogItems ? '' : 'disabled title="Install a vulnerability catalog pack first"'}>Choose...</button>
             </div>`;
             }
             return selectedCtl;
@@ -16072,10 +16165,15 @@
     // Render Vulnerabilities rows grouped with two row-headers
     function renderVulnRows(sidx, secName, items) {
         try {
+            const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+            const hasCatalogItems = vulnCatalogItems.length > 0;
             (items || []).forEach(it => {
                 if (!it) return;
                 if (it.selected === 'Category' || it.selected === 'Type/Vector') {
                     it.selected = 'Random';
+                }
+                if (!hasCatalogItems && (!it.selected || it.selected === 'Random')) {
+                    it.selected = 'Specific';
                 }
             });
         } catch (e) { }
@@ -16211,6 +16309,9 @@
                                 }
                             } else {
                                 item[field] = el.value;
+                                if (String(el.value || '').trim().toLowerCase() === 'random') {
+                                    resetItemForRandomSelection(sec, item, field);
+                                }
                             }
                             if (field === 'r2r_mode') {
                                 item.r2r_mode = el.value;
@@ -16230,6 +16331,13 @@
                                 // Vulnerabilities legacy: UI used to expose Category/Type/Vector.
                                 if (sec === 'Vulnerabilities' && (item.selected === 'Category' || item.selected === 'Type/Vector')) {
                                     item.selected = 'Random';
+                                }
+                                if (sec === 'Vulnerabilities' && item.selected === 'Random') {
+                                    const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+                                    if (!vulnCatalogItems.length) {
+                                        item.selected = 'Specific';
+                                        try { showToast('Random vulnerabilities require entries in the Vulnerability Catalog.', { autohide: true, delay: 3200 }); } catch (_) { }
+                                    }
                                 }
 
                                 const shouldAutoOpenSpecific = (sec === 'Vulnerabilities' && item.selected === 'Specific' && prev !== 'Specific');
@@ -16431,7 +16539,10 @@
                 }
                 const item = { selected: defaultSelected, factor: 1.0 };
                 if (sec === 'Traffic') { item.pattern = 'Random'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
-                if (sec === 'Vulnerabilities') { item.selected = 'Random'; }
+                if (sec === 'Vulnerabilities') {
+                    const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+                    item.selected = vulnCatalogItems.length ? 'Random' : 'Specific';
+                }
                 // Default new rows: Node Information -> Count; Vulnerabilities -> Count (1); others -> Weight.
                 if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 5; }
                 else if (sec === 'Vulnerabilities') { item.v_metric = 'Count'; item.v_count = 1; }
@@ -20345,6 +20456,7 @@
                 window.VULN_CATALOG = { types: [], vectors: [], items: [] };
             }
         } catch (e) { window.VULN_CATALOG = { types: [], vectors: [], items: [] }; }
+        try { renderMain(); } catch (e) { }
         return window.VULN_CATALOG;
     }
 

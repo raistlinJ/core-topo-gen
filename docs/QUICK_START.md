@@ -5,6 +5,9 @@
 - [uv](https://docs.astral.sh/uv/)
 - [CORE](https://www.nrl.navy.mil/Our-Work/Areas-of-Research/CORE/) 9.2 or newer with `core-daemon` running
 - Docker (optional) for nginx reverse proxy or vulnerability compose targets
+- Graphviz `dot` (optional, required for attack graph PDF export)
+	- macOS: `brew install graphviz`
+	- Debian/Ubuntu: `sudo apt-get install graphviz`
 
 ## Install dependencies
 Using **uv**:
@@ -27,6 +30,7 @@ docker compose up -d --build
 ```
 - Open `https://localhost`.
 - Verify HTTPS health: `curl -k https://localhost/healthz`
+- The Compose web image includes Graphviz, so attack graph PDF export is available without extra host setup.
 - Stop the stack: `docker compose down`
 - Host-network deploy mode keeps nginx on `80/443` while the web backend binds to `127.0.0.1:9090`.
 - Safety: in Execute → Advanced, `Delete all docker containers` is disabled when the Web UI is running in Docker.
