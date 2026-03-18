@@ -9133,9 +9133,6 @@
         return null;
     }
 
-    function concretizeRandomSelectionsForSave(scenarios) {
-        const cloned = deepCloneJsonSafe(Array.isArray(scenarios) ? scenarios : []);
-
     function nextRandomRerollToken() {
         try {
             return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -9250,6 +9247,9 @@
             }
         }
     }
+
+    function concretizeRandomSelectionsForSave(scenarios) {
+        const cloned = deepCloneJsonSafe(Array.isArray(scenarios) ? scenarios : []);
         let resolvedCount = 0;
         const resolvedBySection = {};
         const exampleChanges = [];
@@ -13148,6 +13148,16 @@
             if (!Number.isInteger(idx) || idx < 0) return false;
             const scenLabel = (scenarioName || '').toString().trim();
             if (!scenLabel) return false;
+            const liveScenarioSignatureBeforeFetch = (() => {
+                try {
+                    const current = (Array.isArray(state?.scenarios) && idx >= 0 && idx < state.scenarios.length)
+                        ? state.scenarios[idx]
+                        : null;
+                    return current ? JSON.stringify(current) : '';
+                } catch (e) {
+                    return '';
+                }
+            })();
             const scenObj = (Array.isArray(state?.scenarios) && idx >= 0 && idx < state.scenarios.length)
                 ? state.scenarios[idx]
                 : null;
@@ -13304,6 +13314,25 @@
 
             if (sid && nextScenario && typeof nextScenario === 'object') {
                 nextScenario._sid = sid;
+            }
+
+            const liveScenarioSignatureAfterFetch = (() => {
+                try {
+                    const current = (Array.isArray(state?.scenarios) && idx >= 0 && idx < state.scenarios.length)
+                        ? state.scenarios[idx]
+                        : null;
+                    return current ? JSON.stringify(current) : '';
+                } catch (e) {
+                    return '';
+                }
+            })();
+            const liveScenarioChangedDuringRefresh = !!(
+                liveScenarioSignatureBeforeFetch
+                && liveScenarioSignatureAfterFetch
+                && liveScenarioSignatureBeforeFetch !== liveScenarioSignatureAfterFetch
+            );
+            if (liveScenarioChangedDuringRefresh) {
+                return false;
             }
 
             if (Array.isArray(state.scenarios) && idx < state.scenarios.length) {

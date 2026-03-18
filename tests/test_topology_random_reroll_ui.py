@@ -58,3 +58,17 @@ def test_traffic_random_visibility_hierarchy_is_explicit() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, 'Missing traffic random visibility hierarchy snippets: ' + '; '.join(missing)
+
+
+def test_random_reset_helpers_are_not_nested_inside_save_concretizer() -> None:
+    text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    concretize_idx = text.find('function concretizeRandomSelectionsForSave(scenarios) {')
+    reroll_idx = text.find('function nextRandomRerollToken() {')
+    reset_idx = text.find('function resetItemForRandomSelection(sectionName, item, fieldName) {')
+
+    assert concretize_idx != -1, 'Missing concretizeRandomSelectionsForSave function'
+    assert reroll_idx != -1, 'Missing nextRandomRerollToken helper'
+    assert reset_idx != -1, 'Missing resetItemForRandomSelection helper'
+    assert reroll_idx < concretize_idx, 'Random reroll helper must be top-level, not nested inside concretizeRandomSelectionsForSave'
+    assert reset_idx < concretize_idx, 'Random reset helper must be top-level, not nested inside concretizeRandomSelectionsForSave'

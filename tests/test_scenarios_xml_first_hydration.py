@@ -106,13 +106,43 @@ def test_scenarios_tabs_xml_refresh_updates_live_window_state() -> None:
     text = TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
 
     expected_snippets = [
-        "if (scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {",
+        "if (!liveScenarioChangedDuringRefresh && scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {",
         "scenarios[idx] = mergeScenarioWithHitlGuard(existingScenario, incomingScenario);",
         "if (typeof window.renderMain === 'function') window.renderMain();",
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing live window.state XML rehydrate snippets: " + "; ".join(missing)
+
+
+def test_scenarios_tabs_xml_refresh_skips_live_overwrite_when_local_state_changed() -> None:
+    text = TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "const liveScenarioSignatureBeforeFetch = getLiveScenarioRefreshSignature();",
+        "const liveScenarioSignatureAfterFetch = getLiveScenarioRefreshSignature();",
+        "const liveScenarioChangedDuringRefresh = !!(",
+        "if (!liveScenarioChangedDuringRefresh && !STRICT_XML_STATE_MODE) {",
+        "if (!liveScenarioChangedDuringRefresh && scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing live-overwrite guard snippets in scenarios tab XML refresh: " + "; ".join(missing)
+
+
+def test_index_rehydrate_skips_overwrite_when_scenario_changed_mid_fetch() -> None:
+    text = (Path(__file__).resolve().parent.parent / "webapp" / "templates" / "index.html").read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "const liveScenarioSignatureBeforeFetch = (() => {",
+        "const liveScenarioSignatureAfterFetch = (() => {",
+        "const liveScenarioChangedDuringRefresh = !!(",
+        "if (liveScenarioChangedDuringRefresh) {",
+        "return false;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing index rehydrate overwrite guard snippets: " + "; ".join(missing)
 
 
 def test_scenarios_tabs_xml_refresh_prefers_latest_scenario_xml_path() -> None:

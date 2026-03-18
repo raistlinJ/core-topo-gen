@@ -501,6 +501,19 @@
     try {
       const scenario = (scenarioName || '').toString().trim();
       if (!scenario) return null;
+      const scenarioKey = normalizeScenarioKey(scenario);
+      const getLiveScenarioRefreshSignature = () => {
+        try {
+          if (!scenarioKey || !window.state || typeof window.state !== 'object' || !Array.isArray(window.state.scenarios)) return '';
+          const scenarios = window.state.scenarios;
+          const idx = scenarios.findIndex((s) => normalizeScenarioKey((s && s.name) ? s.name : '') === scenarioKey);
+          if (idx < 0) return '';
+          return JSON.stringify(scenarios[idx] || null);
+        } catch (e) {
+          return '';
+        }
+      };
+      const liveScenarioSignatureBeforeFetch = getLiveScenarioRefreshSignature();
       let explicitXmlPath = '';
       try {
         explicitXmlPath = (options.xmlPath || options.xml_path || '').toString().trim();
@@ -545,6 +558,13 @@
           setSavedFlowStateForScenario(scenario, flowState);
         }
       } catch (e) {}
+
+      const liveScenarioSignatureAfterFetch = getLiveScenarioRefreshSignature();
+      const liveScenarioChangedDuringRefresh = !!(
+        liveScenarioSignatureBeforeFetch
+        && liveScenarioSignatureAfterFetch
+        && liveScenarioSignatureBeforeFetch !== liveScenarioSignatureAfterFetch
+      );
 
       const hasMeaningfulValue = (value) => {
         if (value === null || value === undefined) return false;
@@ -644,7 +664,7 @@
       };
 
       try {
-        if (!STRICT_XML_STATE_MODE) {
+        if (!liveScenarioChangedDuringRefresh && !STRICT_XML_STATE_MODE) {
           const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
           if (projectStateMap && typeof projectStateMap === 'object') {
             const key = resolvePreferredProjectKey(projectStateMap);
@@ -672,10 +692,9 @@
       } catch (e) {}
 
       try {
-        const scenarioKey = normalizeScenarioKey(scenario);
         const incomingScenario = (data.scenario_state && typeof data.scenario_state === 'object') ? { ...data.scenario_state } : null;
         const incomingCore = (data.core && typeof data.core === 'object') ? { ...data.core } : null;
-        if (scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {
+        if (!liveScenarioChangedDuringRefresh && scenarioKey && incomingScenario && window.state && typeof window.state === 'object' && Array.isArray(window.state.scenarios)) {
           const scenarios = window.state.scenarios;
           const idx = scenarios.findIndex((s) => normalizeScenarioKey((s && s.name) ? s.name : '') === scenarioKey);
           if (idx >= 0) {
@@ -695,7 +714,7 @@
             }
           }
         }
-        if (incomingScenario && (!window.state || typeof window.state !== 'object' || !Array.isArray(window.state.scenarios) || !window.state.scenarios.length)) {
+        if (!liveScenarioChangedDuringRefresh && incomingScenario && (!window.state || typeof window.state !== 'object' || !Array.isArray(window.state.scenarios) || !window.state.scenarios.length)) {
           window.state = {
             scenarios: [incomingScenario],
             core: incomingCore || null,
