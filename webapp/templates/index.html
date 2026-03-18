@@ -980,18 +980,16 @@
                     </div>
 
                     <div class="row g-2 mb-3">
+                        {% if not webui_running_in_docker %}
                         <div class="col-12 col-md-6">
-                            {% if not webui_running_in_docker %}
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch"
                                     id="coreAdvFixDockerDaemon">
                                 <label class="form-check-label" for="coreAdvFixDockerDaemon">Fix Docker daemon for CORE
                                     (disable default bridge + iptables)</label>
                             </div>
-                            {% else %}
-                            <div class="small text-muted">Docker daemon repair controls are hidden while Web UI runs in Docker.</div>
-                            {% endif %}
                         </div>
+                        {% endif %}
                         <div class="col-12 col-md-6">
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch"
@@ -2624,6 +2622,9 @@
         }
         if (typeof scen.hitl.core.auto_start_daemon !== 'boolean') {
             scen.hitl.core.auto_start_daemon = false;
+        }
+        if (WEBUI_RUNNING_IN_DOCKER && scen.hitl.core.adv_fix_docker_daemon !== false) {
+            scen.hitl.core.adv_fix_docker_daemon = false;
         }
         if (typeof scen.hitl.core.adv_run_core_cleanup !== 'boolean') {
             // Default to enabled unless the user explicitly disables it.
@@ -12069,6 +12070,14 @@
         const scenario = state.scenarios[sidx];
         const hitlState = ensureHitlStateForScenario(scenario);
         const coreState = hitlState.core || (hitlState.core = {});
+        let effectiveAdvFixDockerDaemon = !!advFixDockerDaemon;
+        if (WEBUI_RUNNING_IN_DOCKER && effectiveAdvFixDockerDaemon) {
+            effectiveAdvFixDockerDaemon = false;
+            if (coreState.adv_fix_docker_daemon) {
+                coreState.adv_fix_docker_daemon = false;
+                persistEditorState();
+            }
+        }
         const vmKey = (coreState.vm_key || '').toString().trim();
         const vmNode = (coreState.vm_node || '').toString().trim();
         const body = {
@@ -12087,7 +12096,7 @@
                 auto_start_daemon: autoStartDaemon,
                 install_custom_services: installCustomServices,
                 stop_duplicate_daemons: stopDuplicateDaemons,
-                adv_fix_docker_daemon: advFixDockerDaemon,
+                adv_fix_docker_daemon: effectiveAdvFixDockerDaemon,
                 adv_run_core_cleanup: advRunCoreCleanup,
                 adv_check_core_version: advCheckCoreVersion,
                 adv_restart_core_daemon: advRestartCoreDaemon,
