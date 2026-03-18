@@ -16605,6 +16605,11 @@
                                 // Re-render to reflect show/hide of traffic-config inputs when Random is selected
                                 renderMain();
                             } else if (field === 'selected') {
+                                if (sec === 'Traffic') {
+                                    // Traffic protocol Random resets payload/pattern and numeric subfields,
+                                    // so the row needs a re-render to hide stale traffic-config controls.
+                                    renderMain();
+                                }
                                 // Vulnerabilities legacy: UI used to expose Category/Type/Vector.
                                 if (sec === 'Vulnerabilities' && (item.selected === 'Category' || item.selected === 'Type/Vector')) {
                                     item.selected = 'Random';

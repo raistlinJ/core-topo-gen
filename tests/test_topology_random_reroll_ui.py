@@ -18,6 +18,8 @@ def test_random_switches_use_reroll_tokens_and_reset_dependents() -> None:
         "delete item.rate_kbps;",
         "delete item.period_s;",
         "delete item.jitter_pct;",
+        "if (sec === 'Traffic') {",
+        'renderMain();',
         "delete item.v_name;",
         "delete item.v_path;",
     ]
