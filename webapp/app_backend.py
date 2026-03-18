@@ -30476,6 +30476,9 @@ _RANDOM_OPTIONS_BY_SECTION: Dict[str, List[str]] = {
 }
 _TRAFFIC_CONTENT_TYPE_OPTIONS: List[str] = ['text', 'photo', 'audio', 'video', 'gibberish']
 _TRAFFIC_PATTERN_OPTIONS: List[str] = ['continuous', 'periodic', 'burst', 'poisson', 'ramp']
+_TRAFFIC_RATE_OPTIONS: List[float] = [32.0, 128.0, 256.0, 512.0]
+_TRAFFIC_PERIOD_OPTIONS: List[float] = [0.5, 2.0, 5.0, 8.0]
+_TRAFFIC_JITTER_OPTIONS: List[float] = [5.0, 15.0, 25.0, 35.0]
 _ROUTING_EDGE_MODE_OPTIONS: List[str] = ['Min', 'Uniform', 'Exact', 'NonUniform']
 _TRAFFIC_NUMERIC_DEFAULTS: Dict[str, float] = {
     'rate_kbps': 64.0,
@@ -30816,6 +30819,30 @@ def _coerce_numeric_placeholder(value: Any, *, default: float, minimum: float | 
     return numeric
 
 
+def _random_reroll_salt(item: Any, key: str) -> str:
+    if not isinstance(item, dict):
+        return ''
+    bag = item.get('_random_reroll')
+    if not isinstance(bag, dict):
+        return ''
+    value = bag.get(str(key or 'selected'))
+    return f'|{value}' if value not in (None, '') else ''
+
+
+def _concretize_traffic_numeric_placeholder(value: Any, *, options: List[float], seed_text: Any, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    text = str(value or '').strip()
+    if not text or text.lower() == 'random':
+        picked = _deterministic_pick(options, seed_text)
+        numeric = float(picked if picked is not None else default)
+    else:
+        numeric = _coerce_numeric_placeholder(value, default=default, minimum=minimum, maximum=maximum)
+    if minimum is not None and numeric < minimum:
+        numeric = minimum
+    if maximum is not None and numeric > maximum:
+        numeric = maximum
+    return numeric
+
+
 def _load_backend_vuln_catalog_items() -> List[Dict[str, Any]]:
     try:
         from core_topo_gen.utils.vuln_process import load_vuln_catalog
@@ -31117,18 +31144,24 @@ def _concretize_preview_placeholders(scenario_payload: Any, *, seed: Any = None)
                     if pick_pattern is not None:
                         item['pattern'] = str(pick_pattern)
 
-                item['rate_kbps'] = _coerce_numeric_placeholder(
+                item['rate_kbps'] = _concretize_traffic_numeric_placeholder(
                     item.get('rate_kbps'),
+                    options=_TRAFFIC_RATE_OPTIONS,
+                    seed_text=f'{seed_int}|{scenario_name}|{section_name}|{index}|rate_kbps{_random_reroll_salt(item, "rate_kbps")}|save-xml',
                     default=_TRAFFIC_NUMERIC_DEFAULTS['rate_kbps'],
                     minimum=0.0,
                 )
-                item['period_s'] = _coerce_numeric_placeholder(
+                item['period_s'] = _concretize_traffic_numeric_placeholder(
                     item.get('period_s'),
+                    options=_TRAFFIC_PERIOD_OPTIONS,
+                    seed_text=f'{seed_int}|{scenario_name}|{section_name}|{index}|period_s{_random_reroll_salt(item, "period_s")}|save-xml',
                     default=_TRAFFIC_NUMERIC_DEFAULTS['period_s'],
                     minimum=0.0,
                 )
-                item['jitter_pct'] = _coerce_numeric_placeholder(
+                item['jitter_pct'] = _concretize_traffic_numeric_placeholder(
                     item.get('jitter_pct'),
+                    options=_TRAFFIC_JITTER_OPTIONS,
+                    seed_text=f'{seed_int}|{scenario_name}|{section_name}|{index}|jitter_pct{_random_reroll_salt(item, "jitter_pct")}|save-xml',
                     default=_TRAFFIC_NUMERIC_DEFAULTS['jitter_pct'],
                     minimum=0.0,
                     maximum=100.0,

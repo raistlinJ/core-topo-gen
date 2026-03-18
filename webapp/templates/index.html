@@ -9168,6 +9168,24 @@
         }
     }
 
+    function pickDeterministicTrafficNumericValue(seedText, fieldName) {
+        const field = String(fieldName || '').trim();
+        const optionMap = {
+            rate_kbps: [32.0, 128.0, 256.0, 512.0],
+            period_s: [0.5, 2.0, 5.0, 8.0],
+            jitter_pct: [5.0, 15.0, 25.0, 35.0],
+        };
+        const options = optionMap[field] || [];
+        if (!options.length) return null;
+        try {
+            const rng = makeDeterministicRng(seedText);
+            const idx = Math.floor(rng() * options.length) % options.length;
+            return options[idx];
+        } catch (e) {
+            return options[0];
+        }
+    }
+
     function resetItemForRandomSelection(sectionName, item, fieldName) {
         if (!item || typeof item !== 'object') return;
         const section = String(sectionName || '').trim();
@@ -9205,6 +9223,9 @@
                 delete item.jitter_pct;
                 markRandomReroll(item, 'content_type');
                 markRandomReroll(item, 'pattern');
+                markRandomReroll(item, 'rate_kbps');
+                markRandomReroll(item, 'period_s');
+                markRandomReroll(item, 'jitter_pct');
                 return;
             }
             if (field === 'content_type') {
@@ -9213,9 +9234,18 @@
                 delete item.period_s;
                 delete item.jitter_pct;
                 markRandomReroll(item, 'pattern');
+                markRandomReroll(item, 'rate_kbps');
+                markRandomReroll(item, 'period_s');
+                markRandomReroll(item, 'jitter_pct');
                 return;
             }
             if (field === 'pattern') {
+                delete item.rate_kbps;
+                delete item.period_s;
+                delete item.jitter_pct;
+                markRandomReroll(item, 'rate_kbps');
+                markRandomReroll(item, 'period_s');
+                markRandomReroll(item, 'jitter_pct');
                 return;
             }
         }
@@ -9438,6 +9468,23 @@
                                 bumpSection('Traffic');
                                 pushExample({ scenario: scenName, section: 'Traffic', row: i + 1, field: 'pattern', from: rawPattern || 'Random', to: pickPat });
                             }
+
+                            const numericFields = [
+                                { key: 'rate_kbps', label: 'rate_kbps' },
+                                { key: 'period_s', label: 'period_s' },
+                                { key: 'jitter_pct', label: 'jitter_pct' },
+                            ];
+                            numericFields.forEach(({ key, label }) => {
+                                const rawValue = (it[key] !== undefined && it[key] !== null) ? String(it[key]).trim() : '';
+                                const isRandomNumeric = !rawValue || rawValue.toLowerCase() === 'random';
+                                if (!ctNow || ctNow.toLowerCase() === 'random' || !isRandomNumeric) return;
+                                const pickValue = pickDeterministicTrafficNumericValue(`${seedVal}|${scenName}|${sectionName}|${i}|${key}${getRandomRerollSalt(it, key)}|save-xml`, key);
+                                if (pickValue === null || pickValue === undefined) return;
+                                it[key] = pickValue;
+                                resolvedCount += 1;
+                                bumpSection('Traffic');
+                                pushExample({ scenario: scenName, section: 'Traffic', row: i + 1, field: label, from: rawValue || 'Random', to: String(pickValue) });
+                            });
                         } catch (e) { }
                     }
                 }
@@ -16319,31 +16366,35 @@
                 </div>`;
             }
             if (secName === 'Traffic') {
+                const payloadValue = (it.content_type || 'Random');
+                const patternValue = (it.pattern || 'Random');
+                const showPayloadDependents = payloadValue !== 'Random';
+                const showPatternDependents = showPayloadDependents && patternValue !== 'Random';
                 return `
                 <div class="d-flex flex-wrap gap-2">
                     <div>
                         <label class="form-label mb-0">Payload</label>
                         <select class="form-select form-select-sm" data-field="content_type" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
-                            ${['Random', 'text', 'photo', 'audio', 'video', 'gibberish'].map(ct => `<option value="${ct}" ${((it.content_type || 'Random') === ct) ? 'selected' : ''}>${ct}</option>`).join('')}
+                            ${['Random', 'text', 'photo', 'audio', 'video', 'gibberish'].map(ct => `<option value="${ct}" ${(payloadValue === ct) ? 'selected' : ''}>${ct}</option>`).join('')}
                         </select>
                     </div>
-                    <div class="traffic-config" style="display:${((it.content_type || 'Random') === 'Random') ? 'none' : 'block'};">
+                    <div class="traffic-config" style="display:${showPayloadDependents ? 'block' : 'none'};">
                         <label class="form-label mb-0">Pattern</label>
                         <select class="form-select form-select-sm" data-field="pattern" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
-                            ${['Random', 'continuous', 'periodic', 'burst', 'poisson', 'ramp'].map(p => `<option ${((it.pattern || 'Random') === p) ? 'selected' : ''}>${p}</option>`).join('')}
+                            ${['Random', 'continuous', 'periodic', 'burst', 'poisson', 'ramp'].map(p => `<option ${(patternValue === p) ? 'selected' : ''}>${p}</option>`).join('')}
                         </select>
                     </div>
-                    <div class="traffic-config" style="display:${((it.content_type || 'Random') === 'Random') ? 'none' : 'block'};">
+                    <div class="traffic-config" style="display:${showPatternDependents ? 'block' : 'none'};">
                         <label class="form-label mb-0">Rate (kbps)</label>
-                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.rate_kbps ?? 64.0}" data-field="rate_kbps" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.rate_kbps ?? ''}" placeholder="Random" data-field="rate_kbps" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                     </div>
-                    <div class="traffic-config" style="display:${((it.content_type || 'Random') === 'Random') ? 'none' : 'block'};">
+                    <div class="traffic-config" style="display:${showPatternDependents ? 'block' : 'none'};">
                         <label class="form-label mb-0">Period (s)</label>
-                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.period_s ?? 1.0}" data-field="period_s" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.period_s ?? ''}" placeholder="Random" data-field="period_s" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                     </div>
-                    <div class="traffic-config" style="display:${((it.content_type || 'Random') === 'Random') ? 'none' : 'block'};">
+                    <div class="traffic-config" style="display:${showPatternDependents ? 'block' : 'none'};">
                         <label class="form-label mb-0">Jitter (%)</label>
-                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.jitter_pct ?? 10.0}" data-field="jitter_pct" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.jitter_pct ?? ''}" placeholder="Random" data-field="jitter_pct" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                     </div>
                 </div>`;
             }
@@ -16555,7 +16606,11 @@
                     if (rowIdx !== null && !Number.isNaN(rowIdx)) {
                         const item = state.scenarios[sidx].sections[sec].items[rowIdx];
                         if (['factor', 'rate_kbps', 'period_s', 'jitter_pct', 'total_nodes', 'density', 'r2r_edges', 'r2s_edges', 'r2s_hosts_min', 'r2s_hosts_max'].includes(field)) {
-                            item ? (item[field] = parseFloat(el.value)) : state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
+                            const parsedValue = parseFloat(el.value);
+                            item ? (item[field] = parsedValue) : state.scenarios[sidx].sections[sec][field] = parsedValue;
+                            if (['rate_kbps', 'period_s', 'jitter_pct'].includes(field) && (el.value === '' || !Number.isFinite(parsedValue))) {
+                                delete item[field];
+                            }
                             if ((field === 'edges' || field === 'r2s_edges') && (isNaN(item[field]) || el.value === '')) {
                                 // Allow blank to mean "unset" so generator can apply defaults
                                 delete item[field];
@@ -16601,8 +16656,8 @@
                                 if (el.value !== 'Exact') { delete item.r2s_edges; }
                                 renderMain();
                                 updateHsBoundsVisibility();
-                            } else if (field === 'content_type') {
-                                // Re-render to reflect show/hide of traffic-config inputs when Random is selected
+                            } else if (field === 'content_type' || field === 'pattern') {
+                                // Re-render to reflect traffic dependency visibility when Random is selected.
                                 renderMain();
                             } else if (field === 'selected') {
                                 if (sec === 'Traffic') {
@@ -16820,7 +16875,7 @@
                     } catch (e) { }
                 }
                 const item = { selected: defaultSelected, factor: 1.0 };
-                if (sec === 'Traffic') { item.pattern = 'Random'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
+                if (sec === 'Traffic') { item.pattern = 'Random'; item.content_type = 'Random'; }
                 if (sec === 'Vulnerabilities') {
                     const vulnCatalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
                     item.selected = vulnCatalogItems.length ? 'Random' : 'Specific';

@@ -2549,9 +2549,10 @@ def test_backend_concretize_preview_placeholders_handles_non_routing_randoms(mon
     assert traffic_items[0].get('selected') in {'TCP', 'UDP'}
     assert traffic_items[0].get('content_type') in {'text', 'photo', 'audio', 'video', 'gibberish'}
     assert traffic_items[0].get('pattern') in {'continuous', 'periodic', 'burst', 'poisson', 'ramp'}
-    assert traffic_items[0].get('rate_kbps') == 64.0
-    assert traffic_items[0].get('period_s') == 1.0
-    assert traffic_items[0].get('jitter_pct') == 10.0
+    assert traffic_items[0].get('rate_kbps') in {32.0, 128.0, 256.0, 512.0}
+    assert traffic_items[0].get('period_s') in {0.5, 2.0, 5.0, 8.0}
+    assert traffic_items[0].get('jitter_pct') in {5.0, 15.0, 25.0, 35.0}
+    assert (traffic_items[0].get('rate_kbps'), traffic_items[0].get('period_s'), traffic_items[0].get('jitter_pct')) != (64.0, 1.0, 10.0)
 
     vuln_items = (sections.get('Vulnerabilities') or {}).get('items') or []
     assert vuln_items[0].get('selected') == 'Specific'
