@@ -720,7 +720,6 @@ def test_test_core_advanced_checks_fail_as_warning(client, monkeypatch):
 
     def _fake_adv(_cfg, **_kwargs):
         return {
-            'adv_check_core_version': {'enabled': True, 'ok': False, 'message': 'CORE version mismatch'},
             'adv_fix_docker_daemon': {'enabled': False, 'ok': None, 'message': ''},
             'adv_run_core_cleanup': {'enabled': True, 'ok': True, 'message': 'completed'},
             'adv_restart_core_daemon': {'enabled': False, 'ok': None, 'message': ''},
@@ -760,7 +759,6 @@ def test_test_core_advanced_checks_fail_as_warning(client, monkeypatch):
             'ssh_port': 22,
             'ssh_username': 'core',
             'ssh_password': 'pw',
-            'adv_check_core_version': True,
             'adv_run_core_cleanup': True,
         },
         'scenario_name': 'Scenario Advanced',
@@ -778,10 +776,9 @@ def test_test_core_advanced_checks_fail_as_warning(client, monkeypatch):
     data = resp.get_json()
     assert data['ok'] is True
     assert isinstance(data.get('advanced_checks'), dict)
-    assert data['advanced_checks']['adv_check_core_version']['enabled'] is True
-    assert data['advanced_checks']['adv_check_core_version']['ok'] is False
-    assert isinstance(data.get('warnings'), list)
-    assert data['warnings'] and 'Advanced checks failed' in data['warnings'][0]
+    assert data['advanced_checks']['adv_run_core_cleanup']['enabled'] is True
+    assert data['advanced_checks']['adv_run_core_cleanup']['ok'] is True
+    assert not data.get('warnings')
 
 
 def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):

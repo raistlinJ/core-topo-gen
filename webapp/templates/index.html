@@ -1000,14 +1000,6 @@
                         <div class="col-12 col-md-6">
                             <div class="form-check form-switch">
                                 <input class="form-check-input" type="checkbox" role="switch"
-                                    id="coreAdvCheckCoreVersion">
-                                <label class="form-check-label" for="coreAdvCheckCoreVersion">Check CORE version is
-                                    9.2.1</label>
-                            </div>
-                        </div>
-                        <div class="col-12 col-md-6">
-                            <div class="form-check form-switch">
-                                <input class="form-check-input" type="checkbox" role="switch"
                                     id="coreAdvRestartCoreDaemon">
                                 <label class="form-check-label" for="coreAdvRestartCoreDaemon">Restart
                                     core-daemon</label>
@@ -1315,11 +1307,6 @@
                         {% else %}
                         <div class="small text-muted">Docker repair/cleanup options are hidden while Web UI runs in Docker.</div>
                         {% endif %}
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="executeAdvCheckCoreVersion">
-                            <label class="form-check-label" for="executeAdvCheckCoreVersion">Check CORE version is
-                                9.2.1</label>
-                        </div>
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvRestartCoreDaemon">
                             <label class="form-check-label" for="executeAdvRestartCoreDaemon">Restart
@@ -2625,6 +2612,9 @@
         }
         if (WEBUI_RUNNING_IN_DOCKER && scen.hitl.core.adv_fix_docker_daemon !== false) {
             scen.hitl.core.adv_fix_docker_daemon = false;
+        }
+        if (scen.hitl.core.adv_check_core_version !== false) {
+            scen.hitl.core.adv_check_core_version = false;
         }
         if (typeof scen.hitl.core.adv_run_core_cleanup !== 'boolean') {
             // Default to enabled unless the user explicitly disables it.
@@ -10980,7 +10970,6 @@
             const installCustomServices = !!(core.install_custom_services);
             const advFixDockerDaemon = !!(core.adv_fix_docker_daemon);
             const advRunCoreCleanup = !!(core.adv_run_core_cleanup);
-            const advCheckCoreVersion = !!(core.adv_check_core_version);
             const advRestartCoreDaemon = !!(core.adv_restart_core_daemon);
             const advStartCoreDaemon = !!(core.adv_start_core_daemon);
             const advAutoKillSessions = !!(core.adv_auto_kill_sessions);
@@ -10989,7 +10978,6 @@
             if (installCustomServices) enabledFlags.push('Install custom services');
             if (advFixDockerDaemon) enabledFlags.push('Advanced: Fix Docker daemon');
             if (advRunCoreCleanup) enabledFlags.push('Advanced: Run core-cleanup');
-            if (advCheckCoreVersion) enabledFlags.push('Advanced: Check CORE version');
             if (advRestartCoreDaemon) enabledFlags.push('Advanced: Restart core-daemon');
             if (advStartCoreDaemon) enabledFlags.push('Advanced: Start core-daemon');
             if (advAutoKillSessions) enabledFlags.push('Advanced: Auto-kill sessions');
@@ -11011,7 +10999,6 @@
                 installCustomServices,
                 advFixDockerDaemon,
                 advRunCoreCleanup,
-                advCheckCoreVersion,
                 advRestartCoreDaemon,
                 advStartCoreDaemon,
                 advAutoKillSessions,
@@ -11022,7 +11009,6 @@
                 const formatAdvancedCheckLines = (advObj) => {
                     if (!advObj || typeof advObj !== 'object') return [];
                     const rows = [
-                        { key: 'adv_check_core_version', label: 'Check CORE version (9.2.1)' },
                         { key: 'adv_fix_docker_daemon', label: 'Fix Docker daemon' },
                         { key: 'adv_run_core_cleanup', label: 'Run core-cleanup' },
                         { key: 'adv_restart_core_daemon', label: 'Restart core-daemon' },
@@ -11956,7 +11942,6 @@
             stopDuplicateDaemons = false,
             advFixDockerDaemon = false,
             advRunCoreCleanup = false,
-            advCheckCoreVersion = false,
             advRestartCoreDaemon = false,
             advStartCoreDaemon = false,
             advAutoKillSessions = true,
@@ -12098,7 +12083,6 @@
                 stop_duplicate_daemons: stopDuplicateDaemons,
                 adv_fix_docker_daemon: effectiveAdvFixDockerDaemon,
                 adv_run_core_cleanup: advRunCoreCleanup,
-                adv_check_core_version: advCheckCoreVersion,
                 adv_restart_core_daemon: advRestartCoreDaemon,
                 adv_start_core_daemon: advStartCoreDaemon,
                 adv_auto_kill_sessions: advAutoKillSessions,
@@ -12154,7 +12138,6 @@
             const _formatAdvancedCheckLines = (advObj) => {
                 if (!advObj || typeof advObj !== 'object') return [];
                 const rows = [
-                    { key: 'adv_check_core_version', label: 'Check CORE version (9.2.1)' },
                     { key: 'adv_fix_docker_daemon', label: 'Fix Docker daemon' },
                     { key: 'adv_run_core_cleanup', label: 'Run core-cleanup' },
                     { key: 'adv_restart_core_daemon', label: 'Restart core-daemon' },
@@ -12547,17 +12530,15 @@
 
         const advFixDockerToggle = document.getElementById('coreAdvFixDockerDaemon');
         const advRunCleanupToggle = document.getElementById('coreAdvRunCoreCleanup');
-        const advCheckVersionToggle = document.getElementById('coreAdvCheckCoreVersion');
         const advRestartDaemonToggle = document.getElementById('coreAdvRestartCoreDaemon');
         const advAutoKillToggle = document.getElementById('coreAdvAutoKillSessions');
             const advFixDocker = (WEBUI_RUNNING_IN_DOCKER ? false : (advFixDockerToggle ? !!advFixDockerToggle.checked : !!(coreState.adv_fix_docker_daemon)));
         const advRunCleanup = advRunCleanupToggle ? !!advRunCleanupToggle.checked : !!(coreState.adv_run_core_cleanup);
-        const advCheckVersion = advCheckVersionToggle ? !!advCheckVersionToggle.checked : !!(coreState.adv_check_core_version);
         const advRestartDaemon = advRestartDaemonToggle ? !!advRestartDaemonToggle.checked : !!(coreState.adv_restart_core_daemon);
         const advAutoKill = advAutoKillToggle ? !!advAutoKillToggle.checked : !!(coreState.adv_auto_kill_sessions);
             coreState.adv_fix_docker_daemon = advFixDocker;
         coreState.adv_run_core_cleanup = advRunCleanup;
-        coreState.adv_check_core_version = advCheckVersion;
+        coreState.adv_check_core_version = false;
         coreState.adv_restart_core_daemon = advRestartDaemon;
         coreState.adv_auto_kill_sessions = advAutoKill;
         const proxState = hitlState.proxmox || {};
@@ -12640,7 +12621,6 @@
             installCustomServices: installCustomServices,
             advFixDockerDaemon: advFixDocker,
             advRunCoreCleanup: advRunCleanup,
-            advCheckCoreVersion: advCheckVersion,
             advRestartCoreDaemon: advRestartDaemon,
             advAutoKillSessions: advAutoKill,
             showSummaryOnSuccess: true,
@@ -15285,10 +15265,6 @@
                 coreAdvRunCoreCleanupInput.checked = !!(coreState.adv_run_core_cleanup);
                 coreAdvRunCoreCleanupInput.disabled = builderLocked || inputsDisabled;
             }
-            if (coreAdvCheckCoreVersionInput) {
-                coreAdvCheckCoreVersionInput.checked = !!(coreState.adv_check_core_version);
-                coreAdvCheckCoreVersionInput.disabled = builderLocked || inputsDisabled;
-            }
             if (coreAdvRestartCoreDaemonInput) {
                 coreAdvRestartCoreDaemonInput.checked = !!(coreState.adv_restart_core_daemon);
                 coreAdvRestartCoreDaemonInput.disabled = builderLocked || inputsDisabled;
@@ -17581,7 +17557,6 @@
         coreAutoStartInput = document.getElementById('coreAutoStartDaemon');
         coreAdvFixDockerDaemonInput = document.getElementById('coreAdvFixDockerDaemon');
         coreAdvRunCoreCleanupInput = document.getElementById('coreAdvRunCoreCleanup');
-        coreAdvCheckCoreVersionInput = document.getElementById('coreAdvCheckCoreVersion');
         coreAdvRestartCoreDaemonInput = document.getElementById('coreAdvRestartCoreDaemon');
         coreAdvAutoKillSessionsInput = document.getElementById('coreAdvAutoKillSessions');
         setCoreConnectionHint = (message, tone = 'info') => {
@@ -17643,7 +17618,6 @@
         };
         bindCoreAdvToggle(coreAdvFixDockerDaemonInput, 'adv_fix_docker_daemon');
         bindCoreAdvToggle(coreAdvRunCoreCleanupInput, 'adv_run_core_cleanup');
-        bindCoreAdvToggle(coreAdvCheckCoreVersionInput, 'adv_check_core_version');
         bindCoreAdvToggle(coreAdvRestartCoreDaemonInput, 'adv_restart_core_daemon');
         bindCoreAdvToggle(coreAdvAutoKillSessionsInput, 'adv_auto_kill_sessions');
         document.querySelectorAll('[data-proxmox-assign]').forEach(btn => {
@@ -18056,7 +18030,6 @@
     let coreAutoStartInput = null;
     let coreAdvFixDockerDaemonInput = null;
     let coreAdvRunCoreCleanupInput = null;
-    let coreAdvCheckCoreVersionInput = null;
     let coreAdvRestartCoreDaemonInput = null;
     let coreAdvAutoKillSessionsInput = null;
     let coreTestVenvBtn = null;
@@ -18092,7 +18065,6 @@
     let executeAdvancedWrap = null;
     let executeAdvFixDockerDaemon = null;
     let executeAdvRunCoreCleanup = null;
-    let executeAdvCheckCoreVersion = null;
     let executeAdvRestartCoreDaemon = null;
     let executeAdvStartCoreDaemon = null;
     let executeAdvAutoKillSessions = null;
@@ -18179,7 +18151,6 @@
             runCoreCleanup: remoteExecution && !!(executeAdvRunCoreCleanup && executeAdvRunCoreCleanup.checked),
             dockerCleanupBeforeRun: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvDockerCleanupBeforeRun && executeAdvDockerCleanupBeforeRun.checked),
             dockerNukeAll: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvDockerNukeAll && executeAdvDockerNukeAll.checked),
-            checkCoreVersion: remoteExecution && !!(executeAdvCheckCoreVersion && executeAdvCheckCoreVersion.checked),
             restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
             startCoreDaemon: remoteExecution && !!(executeAdvStartCoreDaemon && executeAdvStartCoreDaemon.checked),
             autoKillSessions: remoteExecution && !!(executeAdvAutoKillSessions && executeAdvAutoKillSessions.checked),
@@ -18542,9 +18513,6 @@
         if (!executeAdvDockerNukeAll) {
             executeAdvDockerNukeAll = document.getElementById('executeAdvDockerNukeAll');
         }
-        if (!executeAdvCheckCoreVersion) {
-            executeAdvCheckCoreVersion = document.getElementById('executeAdvCheckCoreVersion');
-        }
         if (!executeAdvRestartCoreDaemon) {
             executeAdvRestartCoreDaemon = document.getElementById('executeAdvRestartCoreDaemon');
         }
@@ -18586,7 +18554,6 @@
                         executeAdvRunCoreCleanup,
                         executeAdvDockerCleanupBeforeRun,
                         executeAdvDockerNukeAll,
-                        executeAdvCheckCoreVersion,
                         executeAdvRestartCoreDaemon,
                         executeAdvStartCoreDaemon,
                         executeAdvAutoKillSessions,
@@ -19611,7 +19578,6 @@
             const enabled = [];
             if (adv.fixDockerDaemon) enabled.push('fix docker daemon');
             if (adv.runCoreCleanup) enabled.push('run core cleanup');
-            if (adv.checkCoreVersion) enabled.push('check CORE version');
             if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
             if (adv.startCoreDaemon) enabled.push('start core-daemon if inactive');
             if (adv.autoKillSessions) enabled.push('auto-kill sessions');
@@ -19638,7 +19604,6 @@
                         const enabled = [];
                         if (adv.fixDockerDaemon) enabled.push('fix docker daemon');
                         if (adv.runCoreCleanup) enabled.push('run core cleanup');
-                        if (adv.checkCoreVersion) enabled.push('check CORE version');
                         if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
                         if (adv.startCoreDaemon) enabled.push('start core-daemon if inactive');
                         if (adv.autoKillSessions) enabled.push('auto-kill sessions');
@@ -21592,7 +21557,6 @@
             if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');
             if (adv && adv.dockerCleanupBeforeRun) form.append('docker_cleanup_before_run', '1');
             if (adv && adv.dockerNukeAll) form.append('docker_remove_all_containers', '1');
-            if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');
             if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
             if (adv && adv.startCoreDaemon) form.append('adv_start_core_daemon', '1');
             if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
@@ -24016,7 +23980,6 @@
                             const adv = formOptions && typeof formOptions.advanced === 'object' ? formOptions.advanced : null;
                             if (adv && adv.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
                             if (adv && adv.runCoreCleanup) payload.adv_run_core_cleanup = true;
-                            if (adv && adv.checkCoreVersion) payload.adv_check_core_version = true;
                             if (adv && adv.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                             if (adv && adv.startCoreDaemon) payload.adv_start_core_daemon = true;
                             if (adv && adv.autoKillSessions) payload.adv_auto_kill_sessions = true;
@@ -24470,7 +24433,6 @@
                     if (advancedSelections && typeof advancedSelections === 'object') {
                         if (advancedSelections.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
                         if (advancedSelections.runCoreCleanup) payload.adv_run_core_cleanup = true;
-                        if (advancedSelections.checkCoreVersion) payload.adv_check_core_version = true;
                         if (advancedSelections.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                         if (advancedSelections.startCoreDaemon) payload.adv_start_core_daemon = true;
                         if (advancedSelections.autoKillSessions) payload.adv_auto_kill_sessions = true;
