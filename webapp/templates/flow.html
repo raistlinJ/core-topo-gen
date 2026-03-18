@@ -130,7 +130,7 @@
                   <div>
                     <label class="form-label small text-muted mb-1" for="flowGenerateMaxRetries">Max retries</label>
                     <input id="flowGenerateMaxRetries" class="form-control form-control-sm" type="number" min="0"
-                      max="50" value="5" style="width: 90px;">
+                      max="50" value="10" style="width: 90px;">
                   </div>
                   <div class="dropdown">
 
@@ -195,7 +195,7 @@
               </table>
             </div>
             <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
-              <div id="flowDiagram" class="mermaid">graph LR\n A[Generate] --> B[Flow]</div>
+              <div id="flowDiagram">Please generate a chain. It will appear here.</div>
             </div>
 
             <dialog id="flowNodeDetailsDialog" class="p-0 border rounded"
@@ -436,7 +436,7 @@
   const scenarioNamesCache = {{ (scenarios or[])| tojson }};
   const initialScenario = {{ (active_scenario or '')| tojson }};
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
-  let flowEnabled = true;
+        const fallbackText = 'Please generate a chain. It will appear here.';
   let flowEligible = true;
   let flowEligibilityReasons = [];
   let topologyDirty = false;
@@ -8267,7 +8267,7 @@
       // If rendering fails, keep a stable fallback state.
       const wrap = document.getElementById('flowDiagram');
       if (wrap) {
-        wrap.textContent = 'No Chain Exists';
+        wrap.textContent = 'Please generate a chain. It will appear here.';
         wrap.removeAttribute('data-processed');
       }
     }
@@ -8489,9 +8489,9 @@
       let retriesRemaining = 0;
       try {
         if (generateMaxRetriesEl) {
-          retriesRemaining = Math.max(0, Math.min(50, parseInt(generateMaxRetriesEl.value || '0', 10) || 0));
+          retriesRemaining = Math.max(0, Math.min(50, parseInt(generateMaxRetriesEl.value || '10', 10) || 10));
         }
-      } catch (e) { retriesRemaining = 0; }
+      } catch (e) { retriesRemaining = 10; }
       let attemptedRetries = 0;
       let retryIndex = 0;
       const _resolvedFlagValue = (fa) => {

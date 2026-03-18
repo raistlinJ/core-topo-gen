@@ -2,6 +2,28 @@
     function createCoretgAiGeneratorWorkflow(deps) {
         const streamApi = (deps && deps.streamApi) || {};
 
+        function getProviderMeta(provider) {
+            const key = String(provider || 'ollama').trim().toLowerCase();
+            if (key === 'litellm') {
+                return {
+                    label: 'LiteLLM',
+                    supportsBridge: true,
+                };
+            }
+            return {
+                label: 'Ollama',
+                supportsBridge: true,
+            };
+        }
+
+        function normalizeBridgeMode(value) {
+            const text = String(value || '').trim().toLowerCase();
+            if (!text || text === 'ollmcp' || text === 'mcp_python_sdk' || text === 'python-sdk' || text === 'mcp-sdk') {
+                return 'mcp-python-sdk';
+            }
+            return text;
+        }
+
         function extractCountIntent(promptValue) {
             const text = String(promptValue || '').toLowerCase();
             const totalNodesMatch = text.match(/\b(?:topology|scenario)\s+with\s+(\d+)\s+nodes?\b|\b(\d+)\s+total\s+nodes?\b|\b(\d+)\s+nodes?\b/);
@@ -158,33 +180,51 @@
 
         function buildPromptPacket(scenario, idx) {
             const aiState = deps.ensureAiGeneratorStateForScenario(scenario, idx);
+            const providerMeta = getProviderMeta(aiState.provider);
             const scenarioName = (scenario && scenario.name) ? String(scenario.name).trim() : `Scenario ${idx + 1}`;
             const objective = (aiState.draft_prompt || '').toString().trim() || 'Describe the desired topology, services, vulnerabilities, and flag-sequencing goals.';
             return JSON.stringify({
                 provider: aiState.provider,
-                    bridge_mode: aiState.bridge_mode || 'mcp-python-sdk',
+                ...(providerMeta.supportsBridge ? { bridge_mode: normalizeBridgeMode(aiState.bridge_mode || 'mcp-python-sdk') } : {}),
                 base_url: aiState.base_url,
+                enforce_ssl: aiState.enforce_ssl === false ? false : true,
                 model: aiState.model,
-                mcp_server_path: aiState.mcp_server_path || 'MCP/server.py',
-                mcp_server_url: aiState.mcp_server_url || '',
-                servers_json_path: aiState.servers_json_path || '',
-                auto_discovery: !!aiState.auto_discovery,
-                hil_enabled: !!aiState.hil_enabled,
-                enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],
+                ...(providerMeta.supportsBridge ? {
+                    mcp_server_path: aiState.mcp_server_path || 'MCP/server.py',
+                    mcp_server_url: aiState.mcp_server_url || '',
+                    servers_json_path: aiState.servers_json_path || '',
+                    auto_discovery: !!aiState.auto_discovery,
+                    hil_enabled: !!aiState.hil_enabled,
+                    enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],
+                } : {}),
                 scenario_name: scenarioName,
                 goal: objective,
-                expected_backend_flow: [
+                expected_backend_flow: providerMeta.supportsBridge
+                    ? [
                         'Connect Ollama to the repo MCP server through the MCP Python SDK bridge',
-                    'Use enabled scenario authoring tools to mutate a draft',
-                    'Preview the draft through the existing planner flow',
-                    'POST /save_xml_api to persist XML once accepted',
-                ],
-                prompt: [
-                    `You are authoring a valid CORE TopoGen scenario draft for "${scenarioName}" through MCP tools.`,
-                    'Prefer tool calls over raw JSON generation.',
-                    'Keep all section payloads backend-compatible and preview before finishing.',
-                    `User objective: ${objective}`,
-                ].join('\n'),
+                        'Use enabled scenario authoring tools to mutate a draft',
+                        'Preview the draft through the existing planner flow',
+                        'POST /save_xml_api to persist XML once accepted',
+                    ]
+                    : [
+                        `Validate direct ${providerMeta.label} access`,
+                        'Generate backend-compatible scenario JSON',
+                        'Preview the draft through the existing planner flow',
+                        'POST /save_xml_api to persist XML once accepted',
+                    ],
+                prompt: providerMeta.supportsBridge
+                    ? [
+                        `You are authoring a valid CORE TopoGen scenario draft for "${scenarioName}" through MCP tools.`,
+                        'Prefer tool calls over raw JSON generation.',
+                        'Keep all section payloads backend-compatible and preview before finishing.',
+                        `User objective: ${objective}`,
+                    ].join('\n')
+                    : [
+                        `You are authoring a valid CORE TopoGen scenario draft for "${scenarioName}".`,
+                        'Return backend-compatible JSON for the scenario structure.',
+                        'Keep all section payloads backend-compatible and preview-safe.',
+                        `User objective: ${objective}`,
+                    ].join('\n'),
             }, null, 2);
         }
 
@@ -192,6 +232,7 @@
             const { idx, scenario } = deps.getActiveScenarioContext();
             if (idx === null || !scenario) return;
             const aiState = deps.ensureAiGeneratorStateForScenario(scenario, idx);
+            const providerMeta = getProviderMeta(aiState.provider);
             const validateBtn = document.getElementById('aiGeneratorValidateBtn');
             if (validateBtn) {
                 validateBtn.disabled = true;
@@ -216,6 +257,8 @@
                     body: JSON.stringify({
                         provider: aiState.provider,
                         base_url: aiState.base_url,
+                        api_key: aiState.api_key || '',
+                        enforce_ssl: aiState.enforce_ssl === false ? false : true,
                         model: aiState.model,
                         ...deps.buildAiGeneratorBridgePayload(aiState),
                     }),
@@ -224,9 +267,15 @@
                 try { data = await resp.json(); } catch (err) { data = null; }
                 if (!resp.ok || !data || data.success === false) {
                     const message = (data && (data.error || data.message)) ? (data.error || data.message) : `Validation failed (HTTP ${resp.status})`;
+                    const nextAvailableTools = data && Array.isArray(data.tools)
+                        ? data.tools
+                        : (Array.isArray(aiState.available_tools) ? aiState.available_tools : []);
+                    const nextEnabledTools = data && Array.isArray(data.enabled_tools)
+                        ? data.enabled_tools
+                        : (Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : []);
                     deps.persistAiGeneratorStateForScenario(scenario, idx, {
-                        available_tools: data && Array.isArray(data.tools) ? data.tools : [],
-                        enabled_tools: data && Array.isArray(data.enabled_tools) ? data.enabled_tools : (Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : []),
+                        available_tools: nextAvailableTools,
+                        enabled_tools: nextEnabledTools,
                         validation: {
                             ok: false,
                             in_progress: false,
@@ -244,6 +293,17 @@
                 }
                 const models = Array.isArray(data.models) ? data.models : [];
                 const bridge = (data.bridge && typeof data.bridge === 'object') ? data.bridge : {};
+                const nextAvailableTools = Array.isArray(data.tools)
+                    ? data.tools
+                    : (Array.isArray(bridge.tools)
+                        ? bridge.tools
+                        : (Array.isArray(aiState.available_tools) ? aiState.available_tools : []));
+                const nextEnabledTools = Array.isArray(data.enabled_tools)
+                    ? data.enabled_tools
+                    : (Array.isArray(bridge.enabled_tools)
+                        ? bridge.enabled_tools
+                        : (Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : []));
+                const hasDiscoveredTools = Array.isArray(nextAvailableTools) && nextAvailableTools.length > 0;
                 deps.persistAiGeneratorStateForScenario(scenario, idx, {
                     model: aiState.model || data.model || (models[0] || ''),
                     mcp_server_path: bridge.mcp_server_path || aiState.mcp_server_path,
@@ -251,15 +311,18 @@
                     servers_json_path: bridge.servers_json_path || aiState.servers_json_path,
                     auto_discovery: bridge.auto_discovery !== undefined ? !!bridge.auto_discovery : !!aiState.auto_discovery,
                     hil_enabled: bridge.hil_enabled !== undefined ? !!bridge.hil_enabled : !!aiState.hil_enabled,
-                    available_tools: Array.isArray(data.tools) ? data.tools : (Array.isArray(bridge.tools) ? bridge.tools : []),
-                    enabled_tools: Array.isArray(data.enabled_tools) ? data.enabled_tools : (Array.isArray(bridge.enabled_tools) ? bridge.enabled_tools : []),
+                    enforce_ssl: data && Object.prototype.hasOwnProperty.call(data, 'enforce_ssl') ? !!data.enforce_ssl : (aiState.enforce_ssl === false ? false : true),
+                    available_tools: nextAvailableTools,
+                    enabled_tools: nextEnabledTools,
                     validation: {
                         ok: !!data.success,
                         in_progress: false,
                         ollama_ok: true,
-                        bridge_ok: true,
+                        bridge_ok: providerMeta.supportsBridge ? hasDiscoveredTools : false,
                         checked_at: data.checked_at || new Date().toISOString(),
-                        message: data.message || 'Connection validated.',
+                        message: providerMeta.supportsBridge && !hasDiscoveredTools
+                            ? (data.message || 'Connected, but no MCP tools were discovered. Refresh Connection and verify bridge settings.')
+                            : (data.message || 'Connection validated.'),
                         models,
                         model_found: data.model_found !== false,
                         provider: aiState.provider,
@@ -269,8 +332,8 @@
             } catch (err) {
                 const message = (err && err.message) ? err.message : 'Validation request failed.';
                 deps.persistAiGeneratorStateForScenario(scenario, idx, {
-                    available_tools: [],
-                    enabled_tools: [],
+                    available_tools: Array.isArray(aiState.available_tools) ? aiState.available_tools : [],
+                    enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],
                     validation: {
                         ok: false,
                         in_progress: false,
@@ -295,6 +358,7 @@
             const { idx, scenario } = deps.getActiveScenarioContext();
             if (idx === null || !scenario) return;
             const aiState = deps.ensureAiGeneratorStateForScenario(scenario, idx);
+            const providerMeta = getProviderMeta(aiState.provider);
             const fetchModelsBtn = document.getElementById('aiGeneratorFetchModelsBtn');
             if (fetchModelsBtn) {
                 fetchModelsBtn.disabled = true;
@@ -305,7 +369,7 @@
                     ...aiState.validation,
                     in_progress: true,
                     checked_at: new Date().toISOString(),
-                    message: 'Refreshing models from Ollama...',
+                    message: `Refreshing models from ${providerMeta.label}...`,
                     provider: aiState.provider,
                 },
             });
@@ -318,8 +382,10 @@
                     body: JSON.stringify({
                         provider: aiState.provider,
                         base_url: aiState.base_url,
+                        api_key: aiState.api_key || '',
+                        enforce_ssl: aiState.enforce_ssl === false ? false : true,
                         model: '',
-                        bridge_mode: aiState.bridge_mode || 'mcp-python-sdk',
+                        bridge_mode: normalizeBridgeMode(aiState.bridge_mode || 'mcp-python-sdk'),
                         skip_bridge: true,
                     }),
                 });
@@ -352,8 +418,8 @@
                     return models[0] || currentModel;
                 })();
                 const refreshMessage = models.length
-                    ? `Fetched ${models.length} model${models.length === 1 ? '' : 's'} from Ollama.`
-                    : 'Reached Ollama, but no models were returned.';
+                    ? `Fetched ${models.length} model${models.length === 1 ? '' : 's'} from ${providerMeta.label}.`
+                    : `Reached ${providerMeta.label}, but no models were returned.`;
                 deps.persistAiGeneratorStateForScenario(scenario, idx, {
                     model: nextModel,
                     validation: {
@@ -399,6 +465,7 @@
             if (idx === null || !scenario) return;
             const state = getState();
             const aiState = deps.ensureAiGeneratorStateForScenario(scenario, idx);
+            const providerMeta = getProviderMeta(aiState.provider);
             const generateBtn = document.getElementById('aiGeneratorGenerateBtn');
             const originalLabel = generateBtn ? generateBtn.textContent : '';
             const promptInput = document.getElementById('aiGeneratorPromptInput');
@@ -408,6 +475,16 @@
                 deps.persistAiGeneratorStateForScenario(scenario, idx, { last_generation_error: 'Prompt / command intent is required.' });
                 renderPanel();
                 return;
+            }
+            if (providerMeta.supportsBridge) {
+                const enabledTools = Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools.filter(Boolean) : [];
+                if (!enabledTools.length) {
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        last_generation_error: 'No MCP tools are enabled. Refresh Connection and enable at least one tool before generating.',
+                    });
+                    renderPanel();
+                    return;
+                }
             }
             if (!skipConfirmation) {
                 try {
@@ -479,6 +556,8 @@
                     request_id: streamApi.createRequestId(),
                     provider: aiState.provider,
                     base_url: aiState.base_url,
+                    api_key: aiState.api_key || '',
+                    enforce_ssl: aiState.enforce_ssl === false ? false : true,
                     model: aiState.model,
                     ...deps.buildAiGeneratorBridgePayload(aiState),
                     prompt: promptValue,

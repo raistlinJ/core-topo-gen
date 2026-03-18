@@ -4883,6 +4883,130 @@
         return 'default';
     }
 
+    function getAiProviderDefaults(provider = 'ollama') {
+        const key = String(provider || 'ollama').trim().toLowerCase();
+        if (key === 'litellm') {
+            return {
+                provider: 'litellm',
+                label: 'LiteLLM',
+                defaultBaseUrl: 'https://localhost:4000/v1',
+                supportsBridge: false,
+            };
+        }
+        return {
+            provider: 'ollama',
+            label: 'Ollama',
+            defaultBaseUrl: 'http://127.0.0.1:11434',
+            supportsBridge: true,
+        };
+    }
+
+    function stripSensitiveAiGeneratorState(nextState) {
+        if (!nextState || typeof nextState !== 'object') return nextState;
+        return { ...nextState };
+    }
+
+    function getDefaultAiProviderCatalog() {
+        return {
+            loaded: false,
+            default_provider: 'ollama',
+            providers: [
+                {
+                    provider: 'ollama',
+                    label: 'Ollama',
+                    enabled: true,
+                    mode: 'offline-first',
+                    description: 'Local or LAN-hosted Ollama models for offline-capable scenario authoring.',
+                    default_base_url: 'http://127.0.0.1:11434',
+                    requires_model: true,
+                    requires_api_key: false,
+                    supports_mcp_bridge: true,
+                },
+                {
+                    provider: 'litellm',
+                    label: 'LiteLLM',
+                    enabled: true,
+                    mode: 'remote',
+                    description: 'OpenAI-compatible LiteLLM proxy for hosted or routed model access.',
+                    default_base_url: 'https://localhost:4000/v1',
+                    requires_model: true,
+                    requires_api_key: false,
+                    supports_mcp_bridge: true,
+                },
+                {
+                    provider: 'openai',
+                    label: 'OpenAI',
+                    enabled: false,
+                    mode: 'remote',
+                    description: 'Planned adapter for hosted OpenAI chat or responses APIs.',
+                    default_base_url: '',
+                    requires_model: true,
+                    requires_api_key: true,
+                    supports_mcp_bridge: false,
+                },
+                {
+                    provider: 'anthropic',
+                    label: 'Claude / Anthropic',
+                    enabled: false,
+                    mode: 'remote',
+                    description: 'Planned adapter for hosted Anthropic messages APIs.',
+                    default_base_url: '',
+                    requires_model: true,
+                    requires_api_key: true,
+                    supports_mcp_bridge: false,
+                },
+            ],
+        };
+    }
+
+    let aiProviderCatalogState = getDefaultAiProviderCatalog();
+    let aiProviderCatalogPromise = null;
+
+    function getAiProviderCatalog() {
+        return aiProviderCatalogState || getDefaultAiProviderCatalog();
+    }
+
+    async function refreshAiProviderCatalog(options = {}) {
+        const { force = false } = options || {};
+        if (!force && aiProviderCatalogState && aiProviderCatalogState.loaded) {
+            return aiProviderCatalogState;
+        }
+        if (!force && aiProviderCatalogPromise) {
+            return aiProviderCatalogPromise;
+        }
+        aiProviderCatalogPromise = (async () => {
+            try {
+                const resp = await fetch('/api/ai/providers', {
+                    method: 'GET',
+                    credentials: 'same-origin',
+                    headers: { 'Accept': 'application/json' },
+                });
+                if (!resp.ok) {
+                    throw new Error(`Provider catalog request failed (HTTP ${resp.status})`);
+                }
+                const data = await resp.json();
+                if (!data || data.success === false || !Array.isArray(data.providers)) {
+                    throw new Error((data && (data.error || data.message)) || 'Provider catalog response was invalid.');
+                }
+                aiProviderCatalogState = {
+                    loaded: true,
+                    default_provider: String(data.default_provider || 'ollama').trim().toLowerCase() || 'ollama',
+                    providers: data.providers.map((entry) => ({ ...(entry || {}) })),
+                };
+            } catch (err) {
+                console.warn('[ai-generator] failed to load provider catalog; using fallback defaults', err);
+                aiProviderCatalogState = {
+                    ...getDefaultAiProviderCatalog(),
+                    loaded: false,
+                };
+            } finally {
+                aiProviderCatalogPromise = null;
+            }
+            return aiProviderCatalogState;
+        })();
+        return aiProviderCatalogPromise;
+    }
+
     function getDefaultAiGeneratorState() {
         let defaultServerUrl = 'http://127.0.0.1:9090/mcp';
         try {
@@ -4895,6 +5019,8 @@
             bridge_mode: 'mcp-python-sdk',
             hil_enabled: false,
             base_url: 'http://127.0.0.1:11434',
+            api_key: '',
+            enforce_ssl: true,
             model: '',
             mcp_server_path: 'MCP/server.py',
             mcp_server_url: defaultServerUrl,
@@ -4930,6 +5056,14 @@
 
     function saveAiGeneratorStateMap(nextMap) {
         writeJsonToLocalStorage(AI_GENERATOR_STATE_STORAGE_KEY, nextMap || {});
+    }
+
+    function normalizeAiBridgeMode(rawValue) {
+        const text = String(rawValue || '').trim().toLowerCase();
+        if (!text || text === 'ollmcp' || text === 'mcp_python_sdk' || text === 'python-sdk' || text === 'mcp-sdk') {
+            return 'mcp-python-sdk';
+        }
+        return text;
     }
 
     function ensureAiGeneratorStateForScenario(scenario, idx = null) {
@@ -4970,8 +5104,11 @@
         if (!String(merged.mcp_server_path || '').trim()) merged.mcp_server_path = defaults.mcp_server_path;
         if (!String(merged.mcp_server_url || '').trim()) merged.mcp_server_url = defaults.mcp_server_url;
         if (!String(merged.servers_json_path || '').trim()) merged.servers_json_path = defaults.servers_json_path;
+        merged.bridge_mode = normalizeAiBridgeMode(merged.bridge_mode || defaults.bridge_mode);
+        if (typeof merged.api_key !== 'string') merged.api_key = '';
+        merged.enforce_ssl = merged.enforce_ssl === false ? false : true;
         if (scenario && typeof scenario === 'object') {
-            scenario.ai_generator = merged;
+            scenario.ai_generator = stripSensitiveAiGeneratorState(merged);
         }
         return merged;
     }
@@ -4980,15 +5117,18 @@
         const scriptPath = String(aiState && aiState.mcp_server_path || '').trim();
         const serverUrl = String(aiState && aiState.mcp_server_url || '').trim();
         const serversJsonPath = String(aiState && aiState.servers_json_path || '').trim();
+        const hasDiscoveredTools = Array.isArray(aiState && aiState.available_tools) && aiState.available_tools.length > 0;
         const payload = {
-            bridge_mode: aiState.bridge_mode || 'mcp-python-sdk',
+            bridge_mode: normalizeAiBridgeMode(aiState.bridge_mode || 'mcp-python-sdk'),
             auto_discovery: !!aiState.auto_discovery,
             hil_enabled: !!aiState.hil_enabled,
-            enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],
             mcp_server_path: '',
             mcp_server_url: '',
             servers_json_path: '',
         };
+        if (hasDiscoveredTools) {
+            payload.enabled_tools = Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [];
+        }
         if (scriptPath) {
             payload.mcp_server_path = scriptPath;
             return payload;
@@ -5015,7 +5155,9 @@
                 ...(partialState && partialState.validation && typeof partialState.validation === 'object' ? partialState.validation : {}),
             },
         };
-        scenario.ai_generator = next;
+        next.enforce_ssl = next.enforce_ssl === false ? false : true;
+        if (typeof next.api_key !== 'string') next.api_key = '';
+        scenario.ai_generator = stripSensitiveAiGeneratorState(next);
         const localMap = loadAiGeneratorStateMap();
         localMap[getAiGeneratorScenarioKey(scenario, idx)] = next;
         saveAiGeneratorStateMap(localMap);
@@ -5069,6 +5211,8 @@
     renderAiGeneratorPanel = window.createCoretgAiGeneratorPanel({
         getScenariosActiveTab: () => SCENARIOS_ACTIVE_TAB,
         getActiveScenarioContext,
+        getAiProviderCatalog,
+        refreshAiProviderCatalog,
         ensureAiGeneratorStateForScenario,
         persistAiGeneratorStateForScenario,
         buildAiGeneratorPromptPacket,

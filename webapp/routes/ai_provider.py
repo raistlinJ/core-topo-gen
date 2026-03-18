@@ -45,7 +45,7 @@ _SUPPORTED_SECTION_NAMES = [
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CANONICAL_AI_BRIDGE_MODE = 'mcp-python-sdk'
-_SUPPORTED_AI_BRIDGE_MODE_ALIASES = {'mcp-python-sdk', 'mcp_python_sdk', 'python-sdk', 'mcp-sdk'}
+_SUPPORTED_AI_BRIDGE_MODE_ALIASES = {'mcp-python-sdk', 'mcp_python_sdk', 'python-sdk', 'mcp-sdk', 'ollmcp'}
 _DEFAULT_MCP_SERVER_PATH = os.path.join(_REPO_ROOT, 'MCP', 'server.py')
 _DEFAULT_MCP_SERVERS_JSON_PATH = os.path.join(_REPO_ROOT, 'MCP', 'mcp-bridge-servers.json')
 _ACTIVE_AI_STREAMS: dict[str, dict[str, Any]] = {}
@@ -83,16 +83,57 @@ def _is_ollama_tool_parse_error(exc: BaseException) -> bool:
     return 'error parsing tool call' in message
 
 
-def _build_mcp_bridge_tool_parse_retry_prompt(prompt: str) -> str:
+def _build_mcp_bridge_tool_parse_retry_prompt(prompt: str, *, user_prompt: str | None = None) -> str:
+    source_prompt = str(user_prompt or prompt or '')
     retry_lines = [
         '',
         'Retry note: your previous response failed because Ollama could not parse a generated tool call.',
         'Every tool call arguments object must be strict valid JSON with no duplicate keys, no dangling text, and no partial numbers or strings.',
         'For vulnerabilities, do not pass factor.',
+        'For traffic, if you provide count then do not also send factor or density for the same row.',
         'For vulnerabilities, use scenario.search_vulnerability_catalog first, then call scenario.add_vulnerability_item with only draft_id plus explicit v_name and v_path from the chosen concrete catalog match.',
         'For broad vulnerability requests, call scenario.search_vulnerability_catalog with only a free-text query from the user wording. Do not pass v_type or v_vector filters unless the user explicitly asked for those exact filters.',
         'If the user asks for multiple different vulnerabilities, make multiple separate add_vulnerability_item calls with v_count=1 instead of trying to encode them in one weighted row.',
+        'For scenario.add_vulnerability_item, pass only strict JSON keys draft_id, v_name, v_path, and v_count unless the user explicitly requested exact type/vector filters.',
+        'When v_path contains dots or slashes, keep it as one quoted JSON string copied exactly from a catalog search result. Never emit bare path fragments, ellipses, comments, or truncated JSON.',
     ]
+    vulnerability_target_count = _extract_vulnerability_target_count(source_prompt)
+    if vulnerability_target_count > 0:
+        retry_lines.extend(_build_vulnerability_grounding_guidance(source_prompt))
+        retry_lines.append('If you choose a vulnerability match, copy the exact v_name and v_path returned by scenario.search_vulnerability_catalog before calling scenario.add_vulnerability_item.')
+        query_hint = _extract_vulnerability_query_hint(source_prompt)
+        if query_hint:
+            retry_lines.append(f'For this request, run scenario.search_vulnerability_catalog with query="{query_hint}" before any vulnerability add call.')
+            candidates = _search_vulnerability_catalog_for_prompt(query_hint, limit=max(1, vulnerability_target_count))
+            formatted_candidates = []
+            for candidate in candidates:
+                candidate_name = str(candidate.get('name') or '').strip()
+                candidate_path = str(candidate.get('path') or '').strip()
+                if candidate_name and candidate_path:
+                    formatted_candidates.append(f'"{candidate_name}" -> "{candidate_path}"')
+            if formatted_candidates:
+                retry_lines.append('Example concrete catalog matches: ' + '; '.join(formatted_candidates[:3]) + '.')
+    traffic_rows = _build_seeded_traffic_rows(source_prompt)
+    requested_traffic_patterns = _extract_requested_traffic_patterns(source_prompt)
+    if traffic_rows or requested_traffic_patterns or re.search(r'\b(?:tcp|udp|traffic\s+flows?|flows?|traffic\s+streams?|streams?)\b', source_prompt.lower()):
+        retry_lines.extend([
+            'For scenario.add_traffic_item, pass only strict JSON keys draft_id, protocol or selected, count, pattern, and content_type unless you intentionally need one of the numeric traffic tuning fields.',
+            'When count is present, omit factor entirely instead of sending factor="0", blank factor strings, or duplicate factor keys.',
+            'Use one exact pattern per traffic row from: continuous, periodic, burst, poisson, or ramp.',
+            'Use content_type="text" unless the user explicitly requested photo, audio, video, or gibberish traffic.',
+        ])
+        formatted_rows = []
+        for row in traffic_rows[:3]:
+            protocol = str(row.get('protocol') or '').strip()
+            count = row.get('count')
+            pattern = str(row.get('pattern') or '').strip()
+            content_type = str(row.get('content_type') or 'text').strip() or 'text'
+            if protocol and pattern and count not in (None, ''):
+                formatted_rows.append(
+                    f'{{"draft_id":"<draft_id>","protocol":"{protocol}","count":{int(count)},"pattern":"{pattern}","content_type":"{content_type}"}}'
+                )
+        if formatted_rows:
+            retry_lines.append('Example valid traffic tool call JSON: ' + '; '.join(formatted_rows) + '.')
     return prompt + '\n'.join(retry_lines)
 
 
@@ -1305,7 +1346,7 @@ def _build_prompt_repair_decision(
             category='ollama-tool-parse-error',
             retryable=True,
             status_message='Retrying after Ollama tool-call parse failure...',
-            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt),
+            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt),
         )
     if isinstance(mismatch, dict):
         if isinstance(mismatch.get('missing'), list):
@@ -1351,6 +1392,8 @@ def _classify_tool_repair(tool_response: str, *, qualified_tool_name: str) -> tu
 
     if tool_name == 'scenario.add_routing_item' or (tool_name == 'scenario.replace_section' and section_name == 'routing'):
         return 'routing-tool-error', f'Auto-healing a routing tool error for {qualified_tool_name}.'
+    if tool_name == 'scenario.add_service_item' or (tool_name == 'scenario.replace_section' and section_name == 'services'):
+        return 'service-tool-error', f'Auto-healing a service tool error for {qualified_tool_name}.'
     if tool_name == 'scenario.add_traffic_item' or (tool_name == 'scenario.replace_section' and section_name == 'traffic'):
         return 'traffic-tool-error', f'Auto-healing a traffic tool error for {qualified_tool_name}.'
     if tool_name in {'scenario.add_vulnerability_item', 'scenario.search_vulnerability_catalog'} or (tool_name == 'scenario.replace_section' and section_name == 'vulnerabilities'):
@@ -1408,6 +1451,7 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
             client,
             prompt=current_prompt,
             model=model,
+            user_prompt=user_prompt,
             initial_draft_id=draft_id,
             emit=emit,
             cancel_check=cancel_check,
@@ -1521,6 +1565,87 @@ def _build_recoverable_mcp_bridge_tool_error(
             'random': 'TCP',
         }
         return aliases.get(text, 'TCP')
+
+    def normalize_service_for_retry(item: dict[str, Any]) -> str:
+        for key in ('selected', 'service', 'name', 'type', 'kind'):
+            normalized = app_backend._normalize_service_item_selection(item.get(key))
+            if normalized:
+                return normalized
+        message_lower = message.lower()
+        if 'https' in message_lower or 'http' in message_lower or 'web' in message_lower:
+            return 'HTTP'
+        if 'dhcp' in message_lower:
+            return 'DHCPClient'
+        if 'ssh' in message_lower:
+            return 'SSH'
+        return 'HTTP'
+
+    service_selection_error = any(fragment in message.lower() for fragment in (
+        'selected or service must be one of:',
+        'services selected must be one of:',
+        'service must be one of:',
+        'selected must be one of: ssh, http, dhcpclient, or random',
+    ))
+    service_replace_error = tool_name.endswith('scenario.replace_section') and str((tool_args or {}).get('section_name') or '').strip().lower() == 'services' and service_selection_error
+    service_add_error = tool_name.endswith('scenario.add_service_item') and service_selection_error
+    if service_replace_error or service_add_error:
+        enabled = [str(name or '').strip() for name in (enabled_tool_names or []) if str(name or '').strip()]
+        add_service_available = any(name.endswith('scenario.add_service_item') for name in enabled)
+        replace_section_available = any(name.endswith('scenario.replace_section') for name in enabled)
+
+        item = None
+        if service_add_error:
+            item = tool_args if isinstance(tool_args, dict) else {}
+        else:
+            payload = tool_args.get('section_payload') if isinstance(tool_args, dict) else None
+            items = payload.get('items') if isinstance(payload, dict) and isinstance(payload.get('items'), list) else []
+            item = items[0] if items and isinstance(items[0], dict) else {}
+        item = item if isinstance(item, dict) else {}
+
+        retry_service = normalize_service_for_retry(item)
+        count_raw = item.get('v_count') if item.get('v_count') not in (None, '') else item.get('count')
+        try:
+            count = max(1, int(count_raw)) if count_raw not in (None, '') else 1
+        except Exception:
+            count = 1
+
+        guidance = (
+            'Services rows must use one exact canonical label: SSH, HTTP, or DHCPClient. '
+            'Normalize aliases such as https/web to HTTP and dhcp to DHCPClient. '
+            f'Retry with selected="{retry_service}" and count={count}. '
+            'Do not use free-text service labels or generic placeholders inside the Services section.'
+        )
+
+        if add_service_available or not enabled:
+            return json.dumps({
+                'error': message,
+                'recoverable': True,
+                'guidance': guidance,
+                'retry_hint': {
+                    'tool': 'scenario.add_service_item',
+                    'selected': retry_service,
+                    'count': count,
+                },
+            })
+        if replace_section_available:
+            return json.dumps({
+                'error': message,
+                'recoverable': True,
+                'guidance': guidance,
+                'retry_hint': {
+                    'tool': 'scenario.replace_section',
+                    'section_name': 'Services',
+                    'section_payload': {
+                        'items': [{
+                            'selected': retry_service,
+                            'v_metric': 'Count',
+                            'v_count': count,
+                            'factor': 1.0,
+                        }],
+                    },
+                },
+            })
+        return None
 
     vulnerability_catalog_error = 'specific vulnerability must match an enabled catalog entry by v_path or v_name' in message.lower()
     if tool_name.endswith('scenario.add_vulnerability_item') and vulnerability_catalog_error:
@@ -1823,6 +1948,7 @@ class ProviderCapability:
     default_base_url: str = ''
     requires_model: bool = True
     requires_api_key: bool = False
+    supports_mcp_bridge: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1834,6 +1960,7 @@ class ProviderCapability:
             'default_base_url': self.default_base_url,
             'requires_model': self.requires_model,
             'requires_api_key': self.requires_api_key,
+            'supports_mcp_bridge': self.supports_mcp_bridge,
         }
 
 
@@ -1887,8 +2014,19 @@ def _normalize_base_url(raw_value: Any) -> str:
     return normalized.rstrip('/')
 
 
-def _fetch_json(url: str, *, timeout: float) -> dict[str, Any]:
-    request_obj = Request(url, headers={'Accept': 'application/json'})
+def _build_request_headers(*, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {'Accept': 'application/json'}
+    if isinstance(extra_headers, dict):
+        for key, value in extra_headers.items():
+            key_text = str(key or '').strip()
+            value_text = str(value or '').strip()
+            if key_text and value_text:
+                headers[key_text] = value_text
+    return headers
+
+
+def _fetch_json(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    request_obj = Request(url, headers=_build_request_headers(extra_headers=headers))
     with urlopen(request_obj, timeout=timeout) as response:
         payload = response.read().decode('utf-8')
     data = json.loads(payload)
@@ -1897,12 +2035,12 @@ def _fetch_json(url: str, *, timeout: float) -> dict[str, Any]:
     return data
 
 
-def _post_json(url: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+def _post_json(url: str, payload: dict[str, Any], *, timeout: float, headers: dict[str, str] | None = None) -> dict[str, Any]:
     body = json.dumps(payload).encode('utf-8')
     request_obj = Request(
         url,
         data=body,
-        headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+        headers={**_build_request_headers(extra_headers=headers), 'Content-Type': 'application/json'},
         method='POST',
     )
     with urlopen(request_obj, timeout=timeout) as response:
@@ -1918,6 +2056,7 @@ def _stream_json_lines(
     payload: dict[str, Any],
     *,
     timeout: float,
+    headers: dict[str, str] | None = None,
     cancellation_check: Callable[[], bool] | None = None,
     on_open: Callable[[Any], None] | None = None,
 ):
@@ -1925,7 +2064,7 @@ def _stream_json_lines(
     request_obj = Request(
         url,
         data=body,
-        headers={'Accept': 'application/json', 'Content-Type': 'application/json'},
+        headers={**_build_request_headers(extra_headers=headers), 'Content-Type': 'application/json'},
         method='POST',
     )
     with urlopen(request_obj, timeout=timeout) as response:
@@ -2085,6 +2224,105 @@ def _extract_json_candidate(raw_text: str) -> dict[str, Any] | None:
             except Exception:
                 pass
     return None
+
+
+def _is_ollama_direct_json_generation_failure(exc: ProviderAdapterError | None) -> bool:
+    if exc is None:
+        return False
+    message = str(getattr(exc, 'message', '') or '').strip().lower()
+    return 'ollama did not return valid json for scenario generation' in message
+
+
+def _build_bridge_fallback_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    next_payload = dict(payload or {})
+    next_payload['bridge_mode'] = _CANONICAL_AI_BRIDGE_MODE
+    next_payload.pop('skip_bridge', None)
+    return next_payload
+
+
+def _should_use_mcp_bridge_for_request(adapter: ProviderAdapter, payload: dict[str, Any], *, skip_bridge: bool) -> bool:
+    if skip_bridge or not adapter.capability.supports_mcp_bridge:
+        return False
+    provider = str(payload.get('provider') or getattr(adapter.capability, 'provider', '') or '').strip().lower()
+    if provider == 'ollama':
+        has_bridge_config = any([
+            str(payload.get('mcp_server_path') or '').strip(),
+            str(payload.get('mcp_server_url') or '').strip(),
+            str(payload.get('servers_json_path') or '').strip(),
+            bool(payload.get('auto_discovery')),
+        ])
+        return has_bridge_config or _is_mcp_python_sdk_bridge_mode(payload.get('bridge_mode'))
+    return _is_mcp_python_sdk_bridge_mode(payload.get('bridge_mode'))
+
+
+def _payload_bool(raw_value: Any, *, default: bool) -> bool:
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    text = str(raw_value or '').strip().lower()
+    if text in {'1', 'true', 'yes', 'on'}:
+        return True
+    if text in {'0', 'false', 'no', 'off'}:
+        return False
+    return default
+
+
+def _normalize_litellm_base_url(raw_value: Any, *, enforce_ssl: bool) -> str:
+    base_url = _normalize_base_url(raw_value)
+    parsed = urlparse(base_url)
+    if enforce_ssl and (parsed.scheme or '').lower() != 'https':
+        raise ValueError('Base URL must use https when Enforce SSL is enabled.')
+    return base_url
+
+
+def _litellm_request_headers(api_key: Any) -> dict[str, str] | None:
+    key_text = str(api_key or '').strip()
+    if not key_text:
+        return None
+    return {'Authorization': f'Bearer {key_text}'}
+
+
+def _litellm_models_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    path = (parsed.path or '').rstrip('/')
+    if path.endswith('/v1'):
+        return f'{base_url}/models'
+    return f'{base_url}/v1/models'
+
+
+def _litellm_chat_completions_url(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    path = (parsed.path or '').rstrip('/')
+    if path.endswith('/v1'):
+        return f'{base_url}/chat/completions'
+    return f'{base_url}/v1/chat/completions'
+
+
+def _extract_litellm_message_text(raw_payload: dict[str, Any]) -> str:
+    choices = raw_payload.get('choices') if isinstance(raw_payload.get('choices'), list) else []
+    if not choices:
+        return ''
+    message = choices[0].get('message') if isinstance(choices[0], dict) else {}
+    content = message.get('content') if isinstance(message, dict) else ''
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item.strip():
+                    parts.append(item.strip())
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get('type') or '').strip().lower()
+            if item_type in {'text', 'output_text'}:
+                text = str(item.get('text') or '').strip()
+                if text:
+                    parts.append(text)
+        return '\n'.join(parts).strip()
+    return str(content or '').strip()
 
 
 def _default_section_payload(name: str) -> dict[str, Any]:
@@ -2268,6 +2506,36 @@ def _build_ollama_repair_prompt(current_scenario: dict[str, Any], user_prompt: s
     return json.dumps(rules, indent=2)
 
 
+def _build_ollama_strict_json_repair_prompt(current_scenario: dict[str, Any], user_prompt: str, raw_generation: str) -> str:
+    template = _build_ai_seed_scenario(current_scenario)
+    template.pop('hitl', None)
+    template.pop('flow_state', None)
+    template.pop('plan_preview', None)
+    template.pop('ai_generator', None)
+    template.pop('_sid', None)
+    rules = {
+        'instructions': [
+            'Return exactly one valid JSON object and nothing else.',
+            'Do not output commentary, explanations, markdown, code fences, or schema notes.',
+            'Do not repeat phrases like "Return JSON only" or "Top-level object must be" in the output.',
+            'The output must start with { and end with }.',
+            'The only allowed top-level key is "scenario".',
+            'Use the clean template and fill only backend-compatible values.',
+            'If some details are missing, keep the template structure valid and leave optional arrays empty rather than adding prose.',
+            'For explicit host counts, use Node Information items with v_metric="Count" and v_count.',
+            'For explicit router counts, use Routing items with v_metric="Count" and v_count.',
+            'For traffic, use selected="TCP" or "UDP" and backend-supported pattern labels only.',
+            *_build_count_intent_guidance(user_prompt),
+        ],
+        'required_output_shape': {
+            'scenario': template,
+        },
+        'user_request': user_prompt,
+        'previous_invalid_response': raw_generation[:4000],
+    }
+    return json.dumps(rules, indent=2)
+
+
 def _normalize_tool_selection(raw_value: Any) -> list[str]:
     if isinstance(raw_value, dict):
         selected = []
@@ -2392,6 +2660,7 @@ def _normalize_mcp_bridge_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if servers_json_path and not os.path.exists(servers_json_path):
         raise ProviderAdapterError(f'servers_json_path not found: {servers_json_path}', status_code=400)
 
+    enabled_tools_specified = 'enabled_tools' in payload
     enabled_tools = _normalize_tool_selection(payload.get('enabled_tools'))
     hil_enabled_raw = payload.get('hil_enabled')
     if hil_enabled_raw is None:
@@ -2405,6 +2674,7 @@ def _normalize_mcp_bridge_payload(payload: dict[str, Any]) -> dict[str, Any]:
         'servers_json_path': servers_json_path,
         'auto_discovery': auto_discovery,
         'enabled_tools': enabled_tools,
+        'enabled_tools_specified': enabled_tools_specified,
         'hil_enabled': hil_enabled,
     }
 
@@ -2778,6 +3048,7 @@ def _normalize_ollama_chat_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any
         if not isinstance(tool_args, dict):
             tool_args = {'value': tool_args}
         tool_calls.append({
+            'id': str(entry.get('id') or '').strip(),
             'function': {
                 'name': tool_name,
                 'arguments': tool_args,
@@ -2803,10 +3074,71 @@ def _extract_ollama_chat_message(raw_payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _normalize_openai_chat_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_tool_calls, list):
+        return []
+    tool_calls: list[dict[str, Any]] = []
+    for entry in raw_tool_calls:
+        if not isinstance(entry, dict):
+            continue
+        function = entry.get('function') if isinstance(entry.get('function'), dict) else {}
+        tool_name = _normalize_mcp_bridge_tool_name(function.get('name'))
+        if not tool_name:
+            continue
+        tool_args = function.get('arguments')
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception:
+                tool_args = {'raw': tool_args}
+        if not isinstance(tool_args, dict):
+            tool_args = {'value': tool_args}
+        tool_calls.append({
+            'id': str(entry.get('id') or '').strip(),
+            'function': {
+                'name': tool_name,
+                'arguments': tool_args,
+            },
+        })
+    return tool_calls
+
+
+def _extract_openai_chat_message(raw_payload: dict[str, Any]) -> dict[str, Any]:
+    choices = raw_payload.get('choices') if isinstance(raw_payload.get('choices'), list) else []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = first_choice.get('message') if isinstance(first_choice.get('message'), dict) else {}
+    role = str(message.get('role') or 'assistant').strip() or 'assistant'
+    content = message.get('content')
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                item_type = str(item.get('type') or '').strip().lower()
+                if item_type in {'text', 'output_text'}:
+                    text = str(item.get('text') or '').strip()
+                    if text:
+                        text_parts.append(text)
+            elif isinstance(item, str) and item.strip():
+                text_parts.append(item.strip())
+        content_text = '\n'.join(text_parts).strip()
+    else:
+        content_text = str(content or '')
+    tool_calls = _normalize_openai_chat_tool_calls(message.get('tool_calls'))
+    result = {
+        'role': role,
+        'content': content_text,
+    }
+    if tool_calls:
+        result['tool_calls'] = tool_calls
+    return result
+
+
 class _RepoMcpBridgeClient:
-    def __init__(self, *, model: str, host: str):
+    def __init__(self, *, model: str, host: str, provider: str = 'ollama', api_key: str = ''):
         self.model = model
         self.host = host
+        self.provider = str(provider or 'ollama').strip().lower() or 'ollama'
+        self.api_key = str(api_key or '').strip()
         self.sessions: dict[str, dict[str, Any]] = {}
         self.connection_errors: dict[str, str] = {}
         self.tool_manager = _BridgeToolManager()
@@ -2907,6 +3239,67 @@ class _RepoMcpBridgeClient:
             })
         return payload
 
+    def _uses_openai_chat_completions(self) -> bool:
+        return self.provider in {'litellm', 'openai'}
+
+    def _chat_request_headers(self) -> dict[str, str] | None:
+        if self._uses_openai_chat_completions() and self.api_key:
+            return {'Authorization': f'Bearer {self.api_key}'}
+        return None
+
+    def _provider_label(self) -> str:
+        if self.provider == 'litellm':
+            return 'LiteLLM'
+        if self.provider == 'openai':
+            return 'OpenAI-compatible provider'
+        return 'Ollama'
+
+    def _prepare_messages_for_provider(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get('role') or '').strip().lower()
+            if role not in {'user', 'assistant', 'tool', 'system'}:
+                continue
+            if self._uses_openai_chat_completions():
+                out: dict[str, Any] = {'role': role, 'content': str(message.get('content') or '')}
+                if role == 'assistant' and isinstance(message.get('tool_calls'), list):
+                    out['tool_calls'] = [
+                        {
+                            'id': str(tool_call.get('id') or f'call_{idx + 1}').strip(),
+                            'type': 'function',
+                            'function': {
+                                'name': str(((tool_call.get('function') or {}).get('name')) or '').strip(),
+                                'arguments': json.dumps(((tool_call.get('function') or {}).get('arguments')) or {}, ensure_ascii=False),
+                            },
+                        }
+                        for idx, tool_call in enumerate(message.get('tool_calls') or [])
+                        if isinstance(tool_call, dict) and str(((tool_call.get('function') or {}).get('name')) or '').strip()
+                    ]
+                if role == 'tool':
+                    out['tool_call_id'] = str(message.get('tool_call_id') or '').strip() or str(message.get('tool_name') or '').strip() or 'tool_call'
+                prepared.append(out)
+                continue
+            out = {'role': role, 'content': str(message.get('content') or '')}
+            if role == 'assistant' and isinstance(message.get('tool_calls'), list):
+                out['tool_calls'] = message.get('tool_calls')
+            if role == 'tool':
+                out['tool_name'] = str(message.get('tool_name') or '').strip()
+            prepared.append(out)
+        return prepared
+
+    def _openai_tool_choice(self, tools_payload: list[dict[str, Any]]) -> str | None:
+        if not tools_payload:
+            return None
+        return 'required'
+
+    def _has_enabled_chat_tools(self) -> bool:
+        try:
+            return bool(self._build_chat_tools_payload())
+        except Exception:
+            return False
+
     def _post_chat(self, *, messages: list[dict[str, Any]]) -> dict[str, Any]:
         self._set_query_debug_state(
             phase='awaiting_llm_response',
@@ -2914,16 +3307,36 @@ class _RepoMcpBridgeClient:
             message_count=len(messages),
         )
         try:
+            if self._uses_openai_chat_completions():
+                tools_payload = self._build_chat_tools_payload()
+                payload = {
+                    'model': self.model,
+                    'messages': self._prepare_messages_for_provider(messages),
+                    'stream': False,
+                    'temperature': 0.1,
+                }
+                if tools_payload:
+                    payload['tools'] = tools_payload
+                    tool_choice = self._openai_tool_choice(tools_payload)
+                    if tool_choice:
+                        payload['tool_choice'] = tool_choice
+                return _post_json(
+                    _litellm_chat_completions_url(self.host),
+                    payload,
+                    timeout=self.timeout_seconds,
+                    headers=self._chat_request_headers(),
+                )
             return _post_json(
                 f'{self.host}/api/chat',
                 {
                     'model': self.model,
-                    'messages': messages,
+                    'messages': self._prepare_messages_for_provider(messages),
                     'tools': self._build_chat_tools_payload(),
                     'stream': False,
                     'options': {'temperature': 0.1},
                 },
                 timeout=self.timeout_seconds,
+                headers=self._chat_request_headers(),
             )
         except HTTPError as exc:
             detail = ''
@@ -2931,16 +3344,16 @@ class _RepoMcpBridgeClient:
                 detail = exc.read().decode('utf-8').strip()
             except Exception:
                 detail = ''
-            message = f'Ollama returned HTTP {exc.code}.'
+            message = f'{self._provider_label()} returned HTTP {exc.code}.'
             if detail:
                 message = f'{message} {detail[:240]}'
             raise ProviderAdapterError(message, status_code=502) from exc
         except URLError as exc:
             reason = getattr(exc, 'reason', exc)
-            raise ProviderAdapterError(f'Could not reach Ollama at {self.host}: {reason}', status_code=502) from exc
+            raise ProviderAdapterError(f'Could not reach {self._provider_label()} at {self.host}: {reason}', status_code=502) from exc
         except (TimeoutError, socket.timeout) as exc:
             raise ProviderAdapterError(
-                f'Ollama chat request timed out after {self.timeout_seconds:.0f}s.',
+                f'{self._provider_label()} chat request timed out after {self.timeout_seconds:.0f}s.',
                 status_code=502,
             ) from exc
 
@@ -2953,8 +3366,22 @@ class _RepoMcpBridgeClient:
         on_response_open: Callable[[Any], None] | None = None,
     ) -> dict[str, Any]:
         accumulated_text = ''
-        accumulated_thinking = ''
         tool_calls: list[dict[str, Any]] = []
+        if self._uses_openai_chat_completions():
+            response = self._post_chat(messages=messages)
+            assistant_message = _extract_openai_chat_message(response)
+            content_delta = str(assistant_message.get('content') or '')
+            if content_delta:
+                accumulated_text = content_delta
+                emit('llm_delta', text=content_delta)
+            for tool_call in assistant_message.get('tool_calls') if isinstance(assistant_message.get('tool_calls'), list) else []:
+                tool_calls.append(tool_call)
+                emit('tool_call', tool_name=str(((tool_call.get('function') or {}).get('name')) or ''))
+            assistant_message['content'] = accumulated_text
+            if tool_calls:
+                assistant_message['tool_calls'] = tool_calls
+            return assistant_message
+        accumulated_thinking = ''
         self._set_query_debug_state(
             phase='awaiting_llm_response',
             llm_mode='stream',
@@ -3053,7 +3480,12 @@ class _RepoMcpBridgeClient:
                     on_response_open=on_response_open,
                 )
             else:
-                assistant_message = _extract_ollama_chat_message(self._post_chat(messages=messages))
+                raw_response = self._post_chat(messages=messages)
+                assistant_message = (
+                    _extract_openai_chat_message(raw_response)
+                    if self._uses_openai_chat_completions()
+                    else _extract_ollama_chat_message(raw_response)
+                )
 
             content = str(assistant_message.get('content') or '')
             if content:
@@ -3071,6 +3503,13 @@ class _RepoMcpBridgeClient:
                 message_count=len(messages),
                 current_draft_id=current_draft_id,
             )
+            if self._uses_openai_chat_completions() and self._has_enabled_chat_tools() and not tool_calls:
+                provider_response = content.strip()
+                raise ProviderAdapterError(
+                    'Provider returned plain text instead of MCP tool calls. Verify that MCP tools are enabled and that the selected model supports tool calling.',
+                    status_code=502,
+                    details={'provider_response': provider_response[:4000]},
+                )
             if not tool_calls:
                 self._set_query_debug_state(
                     phase='completed_without_tool_calls',
@@ -3165,6 +3604,7 @@ class _RepoMcpBridgeClient:
                 messages.append({
                     'role': 'tool',
                     'tool_name': qualified_tool_name,
+                    'tool_call_id': str(tool_call.get('id') or '').strip(),
                     'content': tool_response,
                 })
 
@@ -3213,6 +3653,7 @@ async def _mcp_bridge_process_query_server_side(
     *,
     prompt: str,
     model: str,
+    user_prompt: str | None = None,
     initial_draft_id: str = '',
     emit: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
@@ -3246,7 +3687,7 @@ async def _mcp_bridge_process_query_server_side(
     try:
         return await process_query(prompt)
     except ProviderAdapterError as exc:
-        repair = _build_prompt_repair_decision(prompt=prompt, exc=exc)
+        repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, exc=exc)
         if not repair.retryable:
             raise
         if emit is not None and repair.status_message:
@@ -3319,7 +3760,20 @@ def _configure_mcp_bridge_client_for_web(client: Any, *, hil_enabled: bool) -> N
 
 async def _mcp_bridge_connect(payload: dict[str, Any], *, model: str, host: str) -> tuple[Any, dict[str, Any]]:
     bridge_cfg = _normalize_mcp_bridge_payload(payload)
-    client = McpBridgeClient(model=model, host=host)
+    try:
+        client = McpBridgeClient(
+            model=model,
+            host=host,
+            provider=str(payload.get('provider') or 'ollama').strip().lower() or 'ollama',
+            api_key=str(payload.get('api_key') or '').strip(),
+        )
+    except TypeError:
+        client = McpBridgeClient(model=model, host=host)
+        try:
+            setattr(client, 'provider', str(payload.get('provider') or 'ollama').strip().lower() or 'ollama')
+            setattr(client, 'api_key', str(payload.get('api_key') or '').strip())
+        except Exception:
+            pass
     _configure_mcp_bridge_client_for_web(client, hil_enabled=bridge_cfg['hil_enabled'])
     setattr(client, 'timeout_seconds', _normalize_bridge_timeout_seconds(payload.get('timeout_seconds')))
     server_paths = [bridge_cfg['mcp_server_path']] if bridge_cfg['mcp_server_path'] else None
@@ -3339,7 +3793,7 @@ async def _mcp_bridge_connect(payload: dict[str, Any], *, model: str, host: str)
     return client, bridge_cfg
 
 
-def _apply_mcp_bridge_tool_selection(client: Any, enabled_tools: list[str]) -> dict[str, bool]:
+def _apply_mcp_bridge_tool_selection(client: Any, enabled_tools: list[str], *, selection_provided: bool) -> dict[str, bool]:
     enabled_map = client.tool_manager.get_enabled_tools().copy()
     selected = {tool_name for tool_name in enabled_tools if _is_user_exposed_mcp_bridge_tool(tool_name)}
     dedicated_mutation_suffixes = (
@@ -3357,9 +3811,9 @@ def _apply_mcp_bridge_tool_selection(client: Any, enabled_tools: list[str]) -> d
     for tool_name in list(enabled_map.keys()):
         if not _is_user_exposed_mcp_bridge_tool(tool_name):
             new_state = False
-        elif has_dedicated_mutation_tools and tool_name.endswith('scenario.replace_section'):
+        elif selection_provided and has_dedicated_mutation_tools and tool_name.endswith('scenario.replace_section'):
             new_state = False
-        elif not selected:
+        elif not selection_provided and not selected:
             new_state = True
         else:
             new_state = tool_name in selected
@@ -3371,7 +3825,11 @@ def _apply_mcp_bridge_tool_selection(client: Any, enabled_tools: list[str]) -> d
 async def _mcp_bridge_discover(payload: dict[str, Any], *, model: str, host: str) -> dict[str, Any]:
     client, bridge_cfg = await _mcp_bridge_connect(payload, model=model, host=host)
     try:
-        enabled_map = _apply_mcp_bridge_tool_selection(client, bridge_cfg['enabled_tools'])
+        enabled_map = _apply_mcp_bridge_tool_selection(
+            client,
+            bridge_cfg['enabled_tools'],
+            selection_provided=bool(bridge_cfg.get('enabled_tools_specified')),
+        )
         tools = [
             _mcp_bridge_tool_payload(tool, enabled_map)
             for tool in client.tool_manager.get_available_tools()
@@ -3679,9 +4137,18 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
         ) from exc
     try:
         seed_scenario = _build_ai_seed_scenario(current_scenario)
-        enabled_map = _apply_mcp_bridge_tool_selection(client, bridge_cfg['enabled_tools'])
+        enabled_map = _apply_mcp_bridge_tool_selection(
+            client,
+            bridge_cfg['enabled_tools'],
+            selection_provided=bool(bridge_cfg.get('enabled_tools_specified')),
+        )
         available_tools = [str(getattr(tool, 'name', '') or '').strip() for tool in client.tool_manager.get_available_tools()]
         enabled_tools = [name for name in available_tools if enabled_map.get(name, True) and _is_user_exposed_mcp_bridge_tool(name)]
+        if str(payload.get('provider') or 'ollama').strip().lower() in {'litellm', 'openai'} and not enabled_tools:
+            raise ProviderAdapterError(
+                'No enabled MCP tools are available for AI generation. Refresh Connection and enable at least one tool before generating.',
+                status_code=400,
+            )
 
         create_tool = _find_required_mcp_bridge_tool(available_tools, 'scenario.create_draft')
         get_tool = _find_required_mcp_bridge_tool(available_tools, 'scenario.get_draft')
@@ -3786,7 +4253,7 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
                 client=client,
             ) from exc
         return {
-            'provider': 'ollama',
+            'provider': str(payload.get('provider') or 'ollama').strip().lower() or 'ollama',
             'bridge_mode': bridge_cfg['bridge_mode'],
             'base_url': host,
             'model': model,
@@ -3840,9 +4307,18 @@ async def _mcp_bridge_generate_with_events(
         on_client_ready(client)
 
     try:
-        enabled_map = _apply_mcp_bridge_tool_selection(client, bridge_cfg['enabled_tools'])
+        enabled_map = _apply_mcp_bridge_tool_selection(
+            client,
+            bridge_cfg['enabled_tools'],
+            selection_provided=bool(bridge_cfg.get('enabled_tools_specified')),
+        )
         available_tools = [str(getattr(tool, 'name', '') or '').strip() for tool in client.tool_manager.get_available_tools()]
         enabled_tools = [name for name in available_tools if enabled_map.get(name, True) and _is_user_exposed_mcp_bridge_tool(name)]
+        if str(payload.get('provider') or 'ollama').strip().lower() in {'litellm', 'openai'} and not enabled_tools:
+            raise ProviderAdapterError(
+                'No enabled MCP tools are available for AI generation. Refresh Connection and enable at least one tool before generating.',
+                status_code=400,
+            )
 
         create_tool = _find_required_mcp_bridge_tool(available_tools, 'scenario.create_draft')
         get_tool = _find_required_mcp_bridge_tool(available_tools, 'scenario.get_draft')
@@ -3962,7 +4438,7 @@ async def _mcp_bridge_generate_with_events(
                 client=client,
             ) from exc
         return {
-            'provider': 'ollama',
+            'provider': str(payload.get('provider') or 'ollama').strip().lower() or 'ollama',
             'bridge_mode': bridge_cfg['bridge_mode'],
             'base_url': host,
             'model': model,
@@ -4168,6 +4644,14 @@ def _generate_ollama_streaming_result(
             provider_attempts.append({'attempt': 'repair', 'format_mode': format_mode, 'response': raw_generation})
             prompt = repair_prompt
         if not isinstance(parsed_generation, dict) or not parsed_generation:
+            if cancellation_check and cancellation_check():
+                raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
+            emit('status', message='Repair draft was still invalid JSON. Requesting a strict JSON rewrite…')
+            strict_prompt = _build_ollama_strict_json_repair_prompt(current_scenario, user_prompt, raw_generation)
+            raw_generation, parsed_generation, format_mode = _generate_once_streaming(prompt=strict_prompt)
+            provider_attempts.append({'attempt': 'strict-rewrite', 'format_mode': format_mode, 'response': raw_generation})
+            prompt = strict_prompt
+        if not isinstance(parsed_generation, dict) or not parsed_generation:
             raise ProviderAdapterError(
                 'Ollama did not return valid JSON for scenario generation.',
                 status_code=502,
@@ -4212,6 +4696,7 @@ class OllamaProviderAdapter(ProviderAdapter):
         default_base_url='http://127.0.0.1:11434',
         requires_model=True,
         requires_api_key=False,
+        supports_mcp_bridge=True,
     )
 
     def validate(self, payload: dict[str, Any], *, log: Any = None) -> dict[str, Any]:
@@ -4361,6 +4846,16 @@ class OllamaProviderAdapter(ProviderAdapter):
                 provider_attempts.append({'attempt': 'repair', 'format_mode': format_mode, 'response': raw_generation})
                 prompt = repair_prompt
             if not isinstance(parsed_generation, dict) or not parsed_generation:
+                strict_prompt = _build_ollama_strict_json_repair_prompt(current_scenario, user_prompt, raw_generation)
+                raw_generation, parsed_generation, format_mode = self._generate_once(
+                    base_url=base_url,
+                    model=model,
+                    prompt=strict_prompt,
+                    timeout_seconds=timeout_seconds,
+                )
+                provider_attempts.append({'attempt': 'strict-rewrite', 'format_mode': format_mode, 'response': raw_generation})
+                prompt = strict_prompt
+            if not isinstance(parsed_generation, dict) or not parsed_generation:
                 raise ProviderAdapterError(
                     'Ollama did not return valid JSON for scenario generation.',
                     status_code=502,
@@ -4405,8 +4900,207 @@ class OllamaProviderAdapter(ProviderAdapter):
             ) from exc
 
 
+class LiteLlmProviderAdapter(ProviderAdapter):
+    capability = ProviderCapability(
+        provider='litellm',
+        label='LiteLLM',
+        enabled=True,
+        mode='remote',
+        description='OpenAI-compatible LiteLLM proxy for hosted or routed model access.',
+        default_base_url='https://localhost:4000/v1',
+        requires_model=True,
+        requires_api_key=False,
+        supports_mcp_bridge=True,
+    )
+
+    def validate(self, payload: dict[str, Any], *, log: Any = None) -> dict[str, Any]:
+        model = str(payload.get('model') or '').strip()
+        timeout_raw = payload.get('timeout_seconds')
+        try:
+            timeout_seconds = float(timeout_raw) if timeout_raw is not None else 8.0
+        except (TypeError, ValueError):
+            timeout_seconds = 8.0
+        timeout_seconds = min(max(timeout_seconds, 1.0), 20.0)
+        enforce_ssl = _payload_bool(payload.get('enforce_ssl'), default=True)
+
+        try:
+            base_url = _normalize_litellm_base_url(payload.get('base_url'), enforce_ssl=enforce_ssl)
+        except ValueError as exc:
+            raise ProviderAdapterError(str(exc), details={'checked_at': _utc_timestamp()}) from exc
+
+        headers = _litellm_request_headers(payload.get('api_key'))
+        models_url = _litellm_models_url(base_url)
+        try:
+            data = _fetch_json(models_url, timeout=timeout_seconds, headers=headers)
+            raw_models = data.get('data') if isinstance(data, dict) else []
+            models: list[str] = []
+            if isinstance(raw_models, list):
+                for entry in raw_models:
+                    if isinstance(entry, dict):
+                        name = str(entry.get('id') or entry.get('name') or '').strip()
+                    else:
+                        name = str(entry or '').strip()
+                    if name:
+                        models.append(name)
+            model_found = (not model) or (model in models)
+            message = f'Reached LiteLLM at {base_url}.'
+            if model and not model_found:
+                message = f'Reached LiteLLM at {base_url}, but model {model!r} was not found.'
+            return {
+                'success': True,
+                'provider': 'litellm',
+                'base_url': base_url,
+                'models': models,
+                'model': model,
+                'model_found': model_found,
+                'message': message,
+                'checked_at': _utc_timestamp(),
+                'enforce_ssl': enforce_ssl,
+            }
+        except HTTPError as exc:
+            detail = ''
+            try:
+                detail = exc.read().decode('utf-8').strip()
+            except Exception:
+                detail = ''
+            message = f'LiteLLM returned HTTP {exc.code}.'
+            if detail:
+                message = f'{message} {detail[:240]}'
+            raise ProviderAdapterError(message, status_code=502, details={'checked_at': _utc_timestamp()}) from exc
+        except URLError as exc:
+            reason = getattr(exc, 'reason', exc)
+            raise ProviderAdapterError(
+                f'Could not reach LiteLLM at {base_url}: {reason}',
+                status_code=502,
+                details={'checked_at': _utc_timestamp()},
+            ) from exc
+        except Exception as exc:  # pragma: no cover
+            try:
+                if log is not None:
+                    log.exception('[ai-provider] litellm validation failed: %s', exc)
+            except Exception:
+                pass
+            raise ProviderAdapterError(
+                'Unexpected validation failure while contacting LiteLLM.',
+                status_code=500,
+                details={'checked_at': _utc_timestamp()},
+            ) from exc
+
+    def _build_generate_payload(self, *, model: str, prompt: str, response_format: dict[str, Any]) -> dict[str, Any]:
+        return {
+            'model': model,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': prompt,
+                },
+            ],
+            'temperature': 0.1,
+            'response_format': response_format,
+            'stream': False,
+        }
+
+    def _generate_once(self, *, base_url: str, api_key: str, model: str, prompt: str, timeout_seconds: float) -> tuple[str, dict[str, Any], str]:
+        response_format = {'type': 'json_object'}
+        response = _post_json(
+            _litellm_chat_completions_url(base_url),
+            self._build_generate_payload(model=model, prompt=prompt, response_format=response_format),
+            timeout=timeout_seconds,
+            headers=_litellm_request_headers(api_key),
+        )
+        raw_generation = _extract_litellm_message_text(response)
+        parsed_generation = _extract_json_candidate(raw_generation)
+        return raw_generation, parsed_generation or {}, 'json_object'
+
+    def generate(self, payload: dict[str, Any], *, current_scenario: dict[str, Any], user_prompt: str, log: Any = None) -> dict[str, Any]:
+        model = str(payload.get('model') or '').strip()
+        if not model:
+            raise ProviderAdapterError('model is required.')
+
+        enforce_ssl = _payload_bool(payload.get('enforce_ssl'), default=True)
+        try:
+            base_url = _normalize_litellm_base_url(payload.get('base_url'), enforce_ssl=enforce_ssl)
+        except ValueError as exc:
+            raise ProviderAdapterError(str(exc)) from exc
+
+        timeout_raw = payload.get('timeout_seconds')
+        try:
+            timeout_seconds = float(timeout_raw) if timeout_raw is not None else 90.0
+        except (TypeError, ValueError):
+            timeout_seconds = 90.0
+        timeout_seconds = min(max(timeout_seconds, 5.0), 240.0)
+
+        api_key = str(payload.get('api_key') or '').strip()
+        prompt = _build_ollama_prompt(current_scenario, user_prompt)
+        provider_attempts: list[dict[str, Any]] = []
+        try:
+            raw_generation, parsed_generation, format_mode = self._generate_once(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+            )
+            provider_attempts.append({'attempt': 'initial', 'format_mode': format_mode, 'response': raw_generation})
+            if not isinstance(parsed_generation, dict) or not parsed_generation:
+                repair_prompt = _build_ollama_repair_prompt(current_scenario, user_prompt, raw_generation)
+                raw_generation, parsed_generation, format_mode = self._generate_once(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    prompt=repair_prompt,
+                    timeout_seconds=timeout_seconds,
+                )
+                provider_attempts.append({'attempt': 'repair', 'format_mode': format_mode, 'response': raw_generation})
+                prompt = repair_prompt
+            if not isinstance(parsed_generation, dict) or not parsed_generation:
+                raise ProviderAdapterError(
+                    'LiteLLM did not return valid JSON for scenario generation.',
+                    status_code=502,
+                    details={
+                        'provider_response': provider_attempts[-1]['response'][:4000] if provider_attempts else '',
+                        'provider_attempts': provider_attempts,
+                    },
+                )
+            return {
+                'provider': 'litellm',
+                'base_url': base_url,
+                'model': model,
+                'prompt_used': prompt,
+                'provider_response': provider_attempts[-1]['response'],
+                'provider_attempts': provider_attempts,
+                'parsed_generation': parsed_generation,
+            }
+        except ProviderAdapterError:
+            raise
+        except HTTPError as exc:
+            detail = ''
+            try:
+                detail = exc.read().decode('utf-8').strip()
+            except Exception:
+                detail = ''
+            message = f'LiteLLM returned HTTP {exc.code}.'
+            if detail:
+                message = f'{message} {detail[:240]}'
+            raise ProviderAdapterError(message, status_code=502) from exc
+        except URLError as exc:
+            reason = getattr(exc, 'reason', exc)
+            raise ProviderAdapterError(f'Could not reach LiteLLM at {base_url}: {reason}', status_code=502) from exc
+        except Exception as exc:  # pragma: no cover
+            try:
+                if log is not None:
+                    log.exception('[ai-provider] litellm generation failed: %s', exc)
+            except Exception:
+                pass
+            raise ProviderAdapterError(
+                'Unexpected generation failure while contacting LiteLLM.',
+                status_code=500,
+            ) from exc
+
+
 _PROVIDER_REGISTRY: dict[str, ProviderAdapter] = {
     'ollama': OllamaProviderAdapter(),
+    'litellm': LiteLlmProviderAdapter(),
     'openai': UnsupportedProviderAdapter(
         ProviderCapability(
             provider='openai',
@@ -4481,7 +5175,7 @@ def register(app, *, logger=None) -> None:
             adapter = _get_provider_adapter(payload.get('provider'))
             response = adapter.validate(payload, log=log)
             skip_bridge = bool(payload.get('skip_bridge'))
-            if _is_mcp_python_sdk_bridge_mode(payload.get('bridge_mode')) and not skip_bridge:
+            if _should_use_mcp_bridge_for_request(adapter, payload, skip_bridge=skip_bridge):
                 bridge = asyncio.run(_mcp_bridge_discover(
                     payload,
                     model=str(response.get('model') or payload.get('model') or '').strip() or 'qwen2.5:7b',
@@ -4526,7 +5220,8 @@ def register(app, *, logger=None) -> None:
         if not user_prompt:
             return jsonify({'success': False, 'error': 'prompt is required.'}), 400
 
-        if _is_mcp_python_sdk_bridge_mode(payload.get('bridge_mode')):
+        skip_bridge = bool(payload.get('skip_bridge'))
+        if _should_use_mcp_bridge_for_request(adapter, payload, skip_bridge=skip_bridge):
             model = str(payload.get('model') or '').strip()
             if not model:
                 return jsonify({'success': False, 'error': 'model is required.'}), 400
@@ -4581,7 +5276,54 @@ def register(app, *, logger=None) -> None:
                 log=log,
             )
         except ProviderAdapterError as exc:
-            return jsonify({'success': False, 'error': exc.message, **exc.details}), exc.status_code
+            if isinstance(adapter, OllamaProviderAdapter) and _is_ollama_direct_json_generation_failure(exc):
+                model = str(payload.get('model') or '').strip()
+                if not model:
+                    return jsonify({'success': False, 'error': exc.message, **exc.details}), exc.status_code
+                try:
+                    base_url = _normalize_base_url(payload.get('base_url'))
+                    generation_result = asyncio.run(_mcp_bridge_generate(
+                        _build_bridge_fallback_payload(payload),
+                        current_scenario=current_scenario,
+                        user_prompt=user_prompt,
+                        model=model,
+                        host=base_url,
+                    ))
+                except ProviderAdapterError as bridge_exc:
+                    details = dict(bridge_exc.details or {})
+                    details.setdefault('direct_generation_error', exc.message)
+                    return jsonify({'success': False, 'error': bridge_exc.message, **details}), bridge_exc.status_code
+                next_scenarios = deepcopy(scenarios)
+                next_scenarios[scenario_index] = app_backend._concretize_preview_placeholders(_restore_preserved_scenario_metadata(
+                    current_scenario,
+                    generation_result.get('generated_scenario') or current_scenario,
+                ), seed=payload.get('seed'))
+                return jsonify({
+                    'success': True,
+                    'provider': generation_result.get('provider') or 'ollama',
+                    'bridge_mode': _normalize_ai_bridge_mode(generation_result.get('bridge_mode')),
+                    'base_url': generation_result.get('base_url') or base_url,
+                    'model': generation_result.get('model') or model,
+                    'prompt_used': generation_result.get('prompt_used') or '',
+                    'provider_response': generation_result.get('provider_response') or '',
+                    'count_intent_mismatch': generation_result.get('count_intent_mismatch'),
+                    'count_intent_retry_used': bool(generation_result.get('count_intent_retry_used')),
+                    'prompt_coverage_mismatch': generation_result.get('prompt_coverage_mismatch'),
+                    'prompt_coverage_retry_used': bool(generation_result.get('prompt_coverage_retry_used')),
+                    'generated_scenario': next_scenarios[scenario_index],
+                    'generated_scenarios': next_scenarios,
+                    'preview': generation_result.get('preview') or {},
+                    'flow_meta': generation_result.get('flow_meta') or {},
+                    'plan': generation_result.get('plan') or {},
+                    'breakdowns': generation_result.get('breakdowns'),
+                    'bridge_tools': generation_result.get('bridge_tools') or [],
+                    'enabled_tools': generation_result.get('enabled_tools') or [],
+                    'draft_id': generation_result.get('draft_id') or '',
+                    'checked_at': _utc_timestamp(),
+                    'direct_generation_error': exc.message,
+                })
+            else:
+                return jsonify({'success': False, 'error': exc.message, **exc.details}), exc.status_code
 
         try:
             provider = generation_result.get('provider') or str(payload.get('provider') or 'ollama').strip().lower()
@@ -4667,13 +5409,15 @@ def register(app, *, logger=None) -> None:
             return jsonify({'success': False, 'error': 'prompt is required.'}), 400
 
         bridge_mode = payload.get('bridge_mode')
+        skip_bridge = bool(payload.get('skip_bridge'))
         request_id = str(payload.get('request_id') or '').strip() or _create_stream_request_id()
         stream_entry = _register_ai_stream(request_id)
 
         @stream_with_context
         def _stream_events():
             try:
-                if _is_mcp_python_sdk_bridge_mode(bridge_mode):
+                adapter = _get_provider_adapter(payload.get('provider'))
+                if _should_use_mcp_bridge_for_request(adapter, payload, skip_bridge=skip_bridge):
                     model = str(payload.get('model') or '').strip()
                     if not model:
                         yield _ndjson_event('error', error='model is required.')
@@ -4759,14 +5503,46 @@ def register(app, *, logger=None) -> None:
 
                 def worker() -> None:
                     try:
-                        generation_result = _generate_ollama_streaming_result(
-                            payload,
-                            current_scenario=current_scenario,
-                            user_prompt=user_prompt,
-                            emit=emit,
-                            cancellation_check=is_cancelled,
-                            on_response_open=on_response_open,
-                        )
+                        if isinstance(adapter, OllamaProviderAdapter):
+                            try:
+                                generation_result = _generate_ollama_streaming_result(
+                                    payload,
+                                    current_scenario=current_scenario,
+                                    user_prompt=user_prompt,
+                                    emit=emit,
+                                    cancellation_check=is_cancelled,
+                                    on_response_open=on_response_open,
+                                )
+                            except ProviderAdapterError as exc:
+                                if not _is_ollama_direct_json_generation_failure(exc):
+                                    raise
+                                model = str(payload.get('model') or '').strip()
+                                if not model:
+                                    raise
+                                emit('status', message='Direct Ollama JSON generation failed. Falling back to MCP bridge…')
+                                base_url = _normalize_base_url(payload.get('base_url'))
+                                generation_result = asyncio.run(_mcp_bridge_generate_with_events(
+                                    _build_bridge_fallback_payload(payload),
+                                    current_scenario=current_scenario,
+                                    user_prompt=user_prompt,
+                                    model=model,
+                                    host=base_url,
+                                    emit=emit,
+                                    cancel_check=is_cancelled,
+                                    on_client_ready=lambda client: stream_entry.__setitem__('client', client),
+                                    on_response_open=on_response_open,
+                                ))
+                        else:
+                            emit('status', message='Contacting provider...')
+                            generation_result = adapter.generate(
+                                payload,
+                                current_scenario=current_scenario,
+                                user_prompt=user_prompt,
+                                log=log,
+                            )
+                            raw_generation = str(generation_result.get('provider_response') or '').strip()
+                            if raw_generation:
+                                emit('llm_delta', text=raw_generation)
                         if is_cancelled():
                             emit('error', error='Generation cancelled by user.', status_code=499)
                             return
@@ -4788,7 +5564,8 @@ def register(app, *, logger=None) -> None:
                                 log.exception('[ai-provider] streaming generation failed: %s', exc)
                         except Exception:
                             pass
-                        emit('error', error='Unexpected generation failure while contacting Ollama.')
+                        provider_label = getattr(adapter.capability, 'label', 'provider')
+                        emit('error', error=f'Unexpected generation failure while contacting {provider_label}.')
                     finally:
                         stream_entry['response'] = None
                         event_queue.put(None)

@@ -2,6 +2,7 @@ import json
 import asyncio
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from urllib.error import HTTPError
 
 from webapp.app_backend import app
@@ -75,6 +76,26 @@ def _fake_ollama_urlopen_factory(*, generated_payload, models=None):
     return fake_urlopen
 
 
+def _fake_litellm_urlopen_factory(*, generated_payload, models=None, expected_api_key='test-litellm-key'):
+    discovered_models = list(models or ['gpt-4o-mini'])
+
+    def fake_urlopen(request_obj, timeout=0):
+        url = request_obj.full_url
+        auth_header = request_obj.headers.get('Authorization')
+        if expected_api_key:
+            assert auth_header == f'Bearer {expected_api_key}'
+        if url.endswith('/v1/models') or url.endswith('/models'):
+            return _FakeResponse({'data': [{'id': name} for name in discovered_models]})
+        assert url.endswith('/v1/chat/completions') or url.endswith('/chat/completions')
+        body = json.loads(request_obj.data.decode('utf-8'))
+        assert body.get('model') in discovered_models
+        assert body.get('response_format') == {'type': 'json_object'}
+        content = json.dumps(generated_payload)
+        return _FakeResponse({'choices': [{'message': {'role': 'assistant', 'content': content}}]})
+
+    return fake_urlopen
+
+
 class _FakeTool:
     def __init__(self, name, description, input_schema=None):
         self.name = name
@@ -97,6 +118,45 @@ class _FakeErrorToolResult:
     def __init__(self, payload):
         self.content = [_FakeToolText(json.dumps(payload))]
         self.isError = True
+
+
+def _fake_bridge_generation_result(name='BridgeFallbackScenario'):
+    return {
+        'provider': 'ollama',
+        'bridge_mode': 'mcp-python-sdk',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'llama3.1',
+        'prompt_used': 'fallback prompt',
+        'provider_response': 'Updated draft via MCP bridge fallback.',
+        'generated_scenario': {
+            'name': name,
+            'notes': 'Recovered through MCP bridge fallback.',
+            'sections': {
+                'Node Information': {
+                    'density': 0,
+                    'items': [
+                        {'selected': 'PC', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+                    ],
+                },
+                'Routing': {'density': 0.0, 'items': []},
+                'Services': {'density': 0.0, 'items': []},
+                'Traffic': {'density': 0.0, 'items': []},
+                'Vulnerabilities': {'density': 0.0, 'items': [], 'flag_type': 'text'},
+                'Segmentation': {'density': 0.0, 'items': []},
+            },
+        },
+        'preview': {'hosts': [{}, {}], 'routers': [], 'switches': []},
+        'plan': {},
+        'flow_meta': {},
+        'breakdowns': None,
+        'bridge_tools': [],
+        'enabled_tools': ['server.scenario.create_draft', 'server.scenario.preview_draft'],
+        'draft_id': 'draft-fallback-1',
+        'count_intent_mismatch': None,
+        'count_intent_retry_used': False,
+        'prompt_coverage_mismatch': None,
+        'prompt_coverage_retry_used': False,
+    }
 
 
 class _ClosableResponse:
@@ -259,6 +319,8 @@ def test_save_xml_api_roundtrip_preserves_ai_generator_state(tmp_path, monkeypat
         'bridge_mode': 'mcp-python-sdk',
         'hil_enabled': True,
         'base_url': 'http://127.0.0.1:11434',
+        'api_key': 'persist-me',
+        'enforce_ssl': True,
         'model': 'llama3.1',
         'mcp_server_path': 'MCP/server.py',
         'mcp_server_url': 'http://127.0.0.1:9090/mcp',
@@ -316,6 +378,8 @@ def test_save_xml_api_roundtrip_preserves_ai_generator_state(tmp_path, monkeypat
     assert restored.get('bridge_mode') == 'mcp-python-sdk'
     assert restored.get('hil_enabled') is True
     assert restored.get('base_url') == 'http://127.0.0.1:11434'
+    assert restored.get('api_key') == 'persist-me'
+    assert restored.get('enforce_ssl') is True
     assert restored.get('model') == 'llama3.1'
     assert restored.get('mcp_server_path') == 'MCP/server.py'
     assert restored.get('mcp_server_url') == 'http://127.0.0.1:9090/mcp'
@@ -404,6 +468,271 @@ def test_ai_generate_scenario_preview_uses_ollama_and_returns_preview(tmp_path, 
     preview = payload.get('preview') or {}
     hosts = preview.get('hosts') or []
     assert len(hosts) == 3
+
+
+def test_ai_provider_validate_litellm_uses_optional_api_key_and_ssl(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example.com/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'bridge_mode': 'mcp-python-sdk',
+            'mcp_server_path': 'MCP/server.py',
+            'enabled_tools': ['server.scenario.replace_section'],
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('provider') == 'litellm'
+    assert payload.get('model_found') is True
+    assert payload.get('enforce_ssl') is True
+    assert payload.get('bridge', {}).get('bridge_mode') == 'mcp-python-sdk'
+    tool_names = [tool.get('name') for tool in (payload.get('tools') or [])]
+    assert 'server.scenario.replace_section' in tool_names
+    assert payload.get('enabled_tools') == ['server.scenario.replace_section']
+    assert 'gpt-4o-mini' in (payload.get('models') or [])
+
+
+def test_ai_provider_catalog_includes_litellm_and_bridge_capabilities() -> None:
+    client = app.test_client()
+    _login(client)
+
+    resp = client.get('/api/ai/providers')
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    providers = payload.get('providers') or []
+    provider_map = {
+        str(entry.get('provider') or '').strip().lower(): entry
+        for entry in providers
+        if isinstance(entry, dict)
+    }
+    assert 'litellm' in provider_map
+    assert provider_map['litellm'].get('enabled') is True
+    assert provider_map['litellm'].get('supports_mcp_bridge') is True
+    assert provider_map['litellm'].get('default_base_url') == 'https://localhost:4000/v1'
+    assert provider_map['ollama'].get('supports_mcp_bridge') is True
+
+
+def test_ai_provider_validate_skip_bridge_refreshes_litellm_models_without_mcp(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini', 'gpt-4.1-mini']),
+    )
+
+    def _unexpected_client(*args, **kwargs):
+        raise AssertionError('MCP Python SDK bridge should not be initialized when skip_bridge is true')
+
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _unexpected_client)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'litellm',
+            'bridge_mode': 'mcp-python-sdk',
+            'skip_bridge': True,
+            'base_url': 'https://litellm.example.com/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'mcp_server_path': 'MCP/server.py',
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('bridge') is None
+    assert payload.get('tools') is None
+    assert 'gpt-4o-mini' in (payload.get('models') or [])
+    assert 'gpt-4.1-mini' in (payload.get('models') or [])
+
+
+def test_ai_provider_validate_litellm_rejects_http_when_ssl_enforced(tmp_path):
+    client = app.test_client()
+    _login(client)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'litellm',
+            'base_url': 'http://litellm.example.com/v1',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+        },
+    )
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert 'https' in str(payload.get('error') or '').lower()
+
+
+def test_ai_generate_scenario_preview_uses_litellm_direct_provider(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    generated = {
+        'scenario': {
+            'name': 'GeneratedLiteLlmScenario',
+            'density_count': 0,
+            'notes': 'Generated by mocked litellm.',
+            'sections': {
+                'Node Information': {
+                    'density': 0,
+                    'items': [
+                        {'selected': 'PC', 'v_metric': 'Count', 'v_count': 3, 'factor': 1.0},
+                    ],
+                },
+                'Routing': {'density': 0.0, 'items': []},
+                'Services': {'density': 0.0, 'items': []},
+                'Traffic': {'density': 0.0, 'items': []},
+                'Vulnerabilities': {'density': 0.0, 'items': [], 'flag_type': 'text'},
+                'Segmentation': {'density': 0.0, 'items': []},
+            },
+        }
+    }
+
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_litellm_urlopen_factory(generated_payload=generated, models=['gpt-4o-mini']),
+    )
+
+    scenario = _scenario_payload('LiteLlmPromptScenario')
+    scenario['ai_generator'] = {
+        'provider': 'litellm',
+        'base_url': 'https://litellm.example.com/v1',
+        'api_key': 'test-litellm-key',
+        'enforce_ssl': True,
+        'model': 'gpt-4o-mini',
+    }
+
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example.com/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'bridge_mode': 'mcp-python-sdk',
+            'skip_bridge': True,
+            'prompt': 'Generate a small offline scenario with three PCs.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('provider') == 'litellm'
+    assert payload.get('generated_scenario', {}).get('name') == 'LiteLlmPromptScenario'
+    assert payload.get('generated_scenario', {}).get('notes') == 'Generated by mocked litellm.'
+    assert len((payload.get('preview') or {}).get('hosts') or []) == 3
+    attempts = payload.get('provider_attempts') or []
+    assert attempts
+    assert attempts[0].get('format_mode') == 'json_object'
+
+
+def test_ai_generate_scenario_preview_uses_mcp_python_sdk_bridge_for_litellm(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    scenario = _scenario_payload('LiteLlmBridgeScenario')
+    scenario['ai_generator'] = {
+        'provider': 'litellm',
+        'bridge_mode': 'mcp-python-sdk',
+        'base_url': 'https://litellm.example.com/v1',
+        'api_key': 'test-litellm-key',
+        'enforce_ssl': True,
+        'model': 'gpt-4o-mini',
+        'mcp_server_path': 'MCP/server.py',
+        'enabled_tools': ['server.scenario.replace_section'],
+    }
+
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'litellm',
+            'bridge_mode': 'mcp-python-sdk',
+            'base_url': 'https://litellm.example.com/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'mcp_server_path': 'MCP/server.py',
+            'enabled_tools': ['server.scenario.replace_section'],
+            'prompt': 'Build a small offline three-host scenario with MCP tools.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('provider') == 'litellm'
+    assert payload.get('bridge_mode') == 'mcp-python-sdk'
+    assert payload.get('generated_scenario', {}).get('name') == 'LiteLlmBridgeScenario'
+    assert payload.get('generated_scenario', {}).get('notes') == 'Generated through MCP bridge.'
+    assert len((payload.get('preview') or {}).get('hosts') or []) == 3
+    assert payload.get('enabled_tools') == ['server.scenario.replace_section']
+
+
+def test_ai_generator_refresh_connection_failure_preserves_existing_mcp_tools_snippets() -> None:
+    workflow_text = (Path(__file__).resolve().parent.parent / 'webapp' / 'static' / 'ai_generator_workflow.js').read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "const nextAvailableTools = data && Array.isArray(data.tools)",
+        ": (Array.isArray(aiState.available_tools) ? aiState.available_tools : []);",
+        "available_tools: Array.isArray(aiState.available_tools) ? aiState.available_tools : [],",
+        "enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in workflow_text]
+    assert not missing, 'Missing MCP tool preservation snippets during AI Generator refresh: ' + '; '.join(missing)
 
 
 def test_ai_generate_scenario_preview_adds_docker_capacity_for_vuln_targets(tmp_path, monkeypatch):
@@ -820,6 +1149,347 @@ def test_ai_generate_scenario_preview_stream_emits_llm_output_and_result(tmp_pat
     assert result_data.get('generated_scenario', {}).get('notes') == 'Generated through streamed ollama output.'
 
 
+def test_ai_generate_scenario_preview_stream_uses_strict_json_rewrite_after_two_invalid_attempts(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    generated = {
+        'scenario': {
+            'name': 'StreamedStrictRewriteScenario',
+            'density_count': 0,
+            'notes': 'Recovered after strict JSON rewrite.',
+            'sections': {
+                'Node Information': {
+                    'density': 0,
+                    'items': [
+                        {'selected': 'PC', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+                    ],
+                },
+                'Routing': {'density': 0.0, 'items': []},
+                'Services': {'density': 0.0, 'items': []},
+                'Traffic': {'density': 0.0, 'items': []},
+                'Vulnerabilities': {'density': 0.0, 'items': [], 'flag_type': 'text'},
+                'Segmentation': {'density': 0.0, 'items': []},
+            },
+        }
+    }
+
+    call_state = {'generate_calls': 0}
+
+    def fake_urlopen(request_obj, timeout=0):
+        url = request_obj.full_url
+        if url.endswith('/api/tags'):
+            return _FakeResponse({'models': [{'name': 'llama3.1'}]})
+        assert url.endswith('/api/generate')
+        body = json.loads(request_obj.data.decode('utf-8'))
+        assert body.get('model') == 'llama3.1'
+        if body.get('stream') is True:
+            call_state['generate_calls'] += 1
+            if call_state['generate_calls'] < 3:
+                raw = 'We need to output JSON only, top-level object must be {": {"scenario":{}}}'
+            else:
+                raw = json.dumps(generated)
+            return _FakeStreamingResponse([
+                json.dumps({'response': raw, 'done': False}).encode('utf-8') + b'\n',
+                json.dumps({'response': '', 'done': True}).encode('utf-8') + b'\n',
+            ])
+        raise AssertionError('expected streaming generate request')
+
+    monkeypatch.setattr(ai_provider, 'urlopen', fake_urlopen)
+
+    scenario = _scenario_payload('StreamingStrictRewritePromptScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview_stream',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'prompt': 'Generate a streamed scenario with two PCs.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+        buffered=False,
+    )
+    assert resp.status_code == 200
+
+    events = []
+    for chunk in resp.response:
+        text = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
+        for line in text.splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+
+    status_messages = [str(event.get('message') or '') for event in events if event.get('type') == 'status']
+    assert any('Initial draft was not valid JSON' in message for message in status_messages)
+    assert any('strict JSON rewrite' in message for message in status_messages)
+    result_event = next(event for event in events if event.get('type') == 'result')
+    result_data = result_event.get('data') or {}
+    assert result_data.get('success') is True
+    assert result_data.get('generated_scenario', {}).get('name') == 'StreamingStrictRewritePromptScenario'
+    assert result_data.get('generated_scenario', {}).get('notes') == 'Recovered after strict JSON rewrite.'
+    attempts = result_data.get('provider_attempts') or []
+    assert [attempt.get('attempt') for attempt in attempts] == ['initial', 'repair', 'strict-rewrite']
+
+
+def test_ai_generate_scenario_preview_falls_back_to_mcp_bridge_after_ollama_json_failure(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    def fake_generate(self, payload, *, current_scenario, user_prompt, log=None):
+        raise ai_provider.ProviderAdapterError('Ollama did not return valid JSON for scenario generation.', status_code=502)
+
+    async def fake_bridge_generate(payload, *, current_scenario, user_prompt, model, host):
+        return _fake_bridge_generation_result('FallbackPreviewScenario')
+
+    monkeypatch.setattr(ai_provider.OllamaProviderAdapter, 'generate', fake_generate)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_generate', fake_bridge_generate)
+
+    scenario = _scenario_payload('FallbackPreviewScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'prompt': 'Generate a scenario with two PCs.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('bridge_mode') == 'mcp-python-sdk'
+    assert payload.get('direct_generation_error') == 'Ollama did not return valid JSON for scenario generation.'
+    assert payload.get('generated_scenario', {}).get('name') == 'FallbackPreviewScenario'
+
+
+def test_ai_provider_validate_defaults_ollama_to_mcp_bridge_without_explicit_bridge_mode(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_ollama_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['llama3.1']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'mcp_server_path': 'MCP/server.py',
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('bridge', {}).get('bridge_mode') == 'mcp-python-sdk'
+    assert any(tool.get('name') == 'server.scenario.replace_section' for tool in (payload.get('tools') or []))
+
+
+def test_ai_provider_validate_accepts_legacy_ollmcp_bridge_mode_alias(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_ollama_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['llama3.1']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'bridge_mode': 'ollmcp',
+            'mcp_server_path': 'MCP/server.py',
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('bridge', {}).get('bridge_mode') == 'mcp-python-sdk'
+
+
+def test_ai_generate_scenario_preview_defaults_ollama_to_mcp_bridge_without_explicit_bridge_mode(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_ollama_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['llama3.1']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    scenario = _scenario_payload('DefaultBridgeScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'mcp_server_path': 'MCP/server.py',
+            'enabled_tools': ['server.scenario.replace_section'],
+            'prompt': 'Generate a simple scenario through MCP tools.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('bridge_mode') == 'mcp-python-sdk'
+    assert payload.get('generated_scenario', {}).get('name') == 'DefaultBridgeScenario'
+
+
+def test_ai_generate_scenario_preview_stream_defaults_ollama_to_mcp_bridge_without_explicit_bridge_mode(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_ollama_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['llama3.1']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    scenario = _scenario_payload('DefaultBridgeStreamScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview_stream',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'mcp_server_path': 'MCP/server.py',
+            'enabled_tools': ['server.scenario.replace_section'],
+            'prompt': 'Generate a simple streamed scenario through MCP tools.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+        buffered=False,
+    )
+
+    assert resp.status_code == 200
+    events = []
+    for chunk in resp.response:
+        text = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
+        for line in text.splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+
+    status_messages = [str(event.get('message') or '') for event in events if event.get('type') == 'status']
+    assert any('Connecting MCP bridge' in message for message in status_messages)
+    result_event = next(event for event in events if event.get('type') == 'result')
+    result_data = result_event.get('data') or {}
+    assert result_data.get('success') is True
+    assert result_data.get('bridge_mode') == 'mcp-python-sdk'
+
+
+def test_ai_generate_scenario_preview_stream_falls_back_to_mcp_bridge_after_ollama_json_failure(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    def fake_streaming_result(*args, **kwargs):
+        raise ai_provider.ProviderAdapterError('Ollama did not return valid JSON for scenario generation.', status_code=502)
+
+    async def fake_bridge_generate_with_events(payload, *, current_scenario, user_prompt, model, host, emit, cancel_check=None, on_client_ready=None, on_response_open=None):
+        emit('status', message='Connecting MCP bridge...')
+        emit('tool_call', tool_name='server.scenario.create_draft')
+        return _fake_bridge_generation_result('FallbackStreamScenario')
+
+    monkeypatch.setattr(ai_provider, '_generate_ollama_streaming_result', fake_streaming_result)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_generate_with_events', fake_bridge_generate_with_events)
+
+    scenario = _scenario_payload('FallbackStreamScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview_stream',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'prompt': 'Generate a scenario with two PCs.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+        buffered=False,
+    )
+    assert resp.status_code == 200
+
+    events = []
+    for chunk in resp.response:
+        text = chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
+        for line in text.splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+
+    status_messages = [str(event.get('message') or '') for event in events if event.get('type') == 'status']
+    assert any('Falling back to MCP bridge' in message for message in status_messages)
+    result_event = next(event for event in events if event.get('type') == 'result')
+    result_data = result_event.get('data') or {}
+    assert result_data.get('success') is True
+    assert result_data.get('bridge_mode') == 'mcp-python-sdk'
+    assert result_data.get('generated_scenario', {}).get('name') == 'FallbackStreamScenario'
+
+
 def test_ai_generate_scenario_preview_repairs_router_rows_misplaced_in_node_information(monkeypatch):
     client = app.test_client()
     _login(client)
@@ -1011,6 +1681,172 @@ def test_repo_mcp_bridge_client_recovers_from_router_replace_section_error(monke
     assert 'Router counts belong in Routing' in str(tool_result_events[0].get('message') or '')
 
 
+def test_repo_mcp_bridge_client_uses_openai_parser_for_litellm_nonstream(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+    client._draft = {
+        'draft_id': 'draft-bridge-1',
+        'scenario': _scenario_payload('BridgeScenario'),
+    }
+    client.sessions = {'server': {'session': _FakeSession(client)}}
+
+    responses = [
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'server.scenario.get_draft',
+                            'arguments': json.dumps({'draft_id': 'draft-bridge-1'}),
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': 'done',
+                },
+            }],
+        },
+    ]
+
+    def fake_post_chat(*, messages):
+        return responses.pop(0)
+
+    monkeypatch.setattr(client, '_post_chat', fake_post_chat)
+
+    result = asyncio.run(client._run_query('use MCP tools', initial_draft_id='draft-bridge-1'))
+
+    assert result == 'done'
+    assert responses == []
+
+
+def test_repo_mcp_bridge_client_requires_tools_for_litellm_requests(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+
+    captured = {}
+
+    def fake_post_json(url, payload, *, timeout, headers=None):
+        captured['url'] = url
+        captured['payload'] = payload
+        captured['headers'] = headers
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+    monkeypatch.setattr(ai_provider, '_post_json', fake_post_json)
+    monkeypatch.setattr(
+        client.tool_manager,
+        'get_enabled_tool_objects',
+        lambda: [_FakeTool('server.scenario.get_draft', 'Get draft', {'type': 'object', 'properties': {'draft_id': {'type': 'string'}}})],
+    )
+
+    client._post_chat(messages=[{'role': 'user', 'content': 'test prompt'}])
+
+    assert captured['url'].endswith('/chat/completions')
+    assert captured['payload'].get('tool_choice') == 'required'
+    assert isinstance(captured['payload'].get('tools'), list)
+    assert captured['payload']['tools']
+    assert captured['headers'] == {'Authorization': 'Bearer test-litellm-key'}
+
+
+def test_repo_mcp_bridge_client_rejects_plain_text_litellm_bridge_reply(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+    monkeypatch.setattr(
+        client.tool_manager,
+        'get_enabled_tool_objects',
+        lambda: [_FakeTool('server.scenario.get_draft', 'Get draft', {'type': 'object', 'properties': {'draft_id': {'type': 'string'}}})],
+    )
+
+    def fake_post_chat(*, messages):
+        return {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': 'We need to output JSON only, top-level object must be {": {"scenario":{}}}',
+                },
+            }],
+        }
+
+    monkeypatch.setattr(client, '_post_chat', fake_post_chat)
+
+    try:
+        asyncio.run(client._run_query('use MCP tools'))
+    except ai_provider.ProviderAdapterError as exc:
+        assert exc.status_code == 502
+        assert 'plain text instead of MCP tool calls' in exc.message
+        assert 'top-level object' in str(exc.details.get('provider_response') or '').lower()
+    else:  # pragma: no cover
+        raise AssertionError('expected ProviderAdapterError')
+
+
+def test_ai_generate_scenario_preview_rejects_bridge_generation_without_enabled_tools(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
+    )
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    scenario = _scenario_payload('LiteLlmBridgeScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'litellm',
+            'bridge_mode': 'mcp-python-sdk',
+            'base_url': 'https://litellm.example.com/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'mcp_server_path': 'MCP/server.py',
+            'enabled_tools': [],
+            'prompt': 'Build a small offline three-host scenario with MCP tools.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert 'No enabled MCP tools are available' in str(payload.get('error') or '')
+
+
 def test_mcp_bridge_call_tool_wraps_raw_mcp_exception():
     from webapp.routes import ai_provider
 
@@ -1196,6 +2032,56 @@ def test_build_prompt_repair_decision_recognizes_ollama_tool_parse_error():
     assert 'do not pass factor' in str(decision.retry_prompt or '').lower()
 
 
+def test_build_prompt_repair_decision_adds_vulnerability_grounding_for_tool_parse_error(monkeypatch):
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(
+        ai_provider,
+        '_search_vulnerability_catalog_for_prompt',
+        lambda query, limit=3: [
+            {
+                'name': 'Next JS Demo Vuln',
+                'path': '/tmp/catalog/next-js/CVE-2025-1234/docker-compose.yml',
+            },
+        ],
+    )
+
+    decision = ai_provider._build_prompt_repair_decision(
+        prompt='base prompt',
+        user_prompt='add 1 vulnerability for next js',
+        exc=ai_provider.ProviderAdapterError(
+            'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=..."}',
+            status_code=502,
+        ),
+    )
+
+    retry_prompt = str(decision.retry_prompt or '')
+    assert 'scenario.search_vulnerability_catalog' in retry_prompt
+    assert 'pass only strict json keys draft_id, v_name, v_path, and v_count' in retry_prompt.lower()
+    assert 'quoted json string' in retry_prompt.lower()
+    assert 'Next JS Demo Vuln' in retry_prompt
+    assert '/tmp/catalog/next-js/CVE-2025-1234/docker-compose.yml' in retry_prompt
+
+
+def test_build_prompt_repair_decision_adds_traffic_grounding_for_tool_parse_error():
+    from webapp.routes import ai_provider
+
+    decision = ai_provider._build_prompt_repair_decision(
+        prompt='base prompt',
+        user_prompt='create 3 tcp flows with periodic pattern',
+        exc=ai_provider.ProviderAdapterError(
+            'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=..."}',
+            status_code=502,
+        ),
+    )
+
+    retry_prompt = str(decision.retry_prompt or '')
+    assert 'for scenario.add_traffic_item, pass only strict json keys' in retry_prompt.lower()
+    assert 'when count is present, omit factor entirely' in retry_prompt.lower()
+    assert 'example valid traffic tool call json' in retry_prompt.lower()
+    assert '"protocol":"TCP","count":3,"pattern":"periodic","content_type":"text"' in retry_prompt
+
+
 def test_build_generation_repair_decision_recognizes_unknown_draft_id():
     from webapp.routes import ai_provider
 
@@ -1256,6 +2142,73 @@ def test_classify_tool_repair_detects_traffic_and_vulnerability_categories():
     assert 'traffic tool error' in traffic_message.lower()
     assert vuln_category == 'vulnerability-tool-error'
     assert 'vulnerability tool error' in vuln_message.lower()
+
+
+def test_classify_tool_repair_detects_service_category():
+    from webapp.routes import ai_provider
+
+    service_category, service_message = ai_provider._classify_tool_repair(
+        json.dumps({
+            'recoverable': True,
+            'retry_hint': {'tool': 'scenario.add_service_item', 'selected': 'HTTP'},
+        }),
+        qualified_tool_name='server.scenario.add_service_item',
+    )
+
+    assert service_category == 'service-tool-error'
+    assert 'service tool error' in service_message.lower()
+
+
+def test_build_tool_repair_decision_repairs_add_service_item_selection_error():
+    from webapp.routes import ai_provider
+
+    decision = ai_provider._build_tool_repair_decision(
+        'server.scenario.add_service_item',
+        {
+            'service': 'https',
+            'count': 3,
+        },
+        ai_provider.ProviderAdapterError(
+            'selected or service must be one of: SSH, HTTP, DHCPClient, or Random',
+            status_code=400,
+        ),
+        enabled_tool_names=['server.scenario.add_service_item'],
+    )
+
+    assert decision.category == 'service-tool-error'
+    assert decision.retryable is True
+    assert 'scenario.add_service_item' in str(decision.tool_response or '')
+    assert '"selected": "HTTP"' in str(decision.tool_response or '')
+    assert '"count": 3' in str(decision.tool_response or '')
+    assert 'service tool error' in str(decision.status_message or '').lower()
+
+
+def test_build_tool_repair_decision_repairs_services_replace_section_selection_error():
+    from webapp.routes import ai_provider
+
+    decision = ai_provider._build_tool_repair_decision(
+        'server.scenario.replace_section',
+        {
+            'section_name': 'Services',
+            'section_payload': {
+                'items': [
+                    {'service': 'dhcp', 'v_count': 2},
+                ],
+            },
+        },
+        ai_provider.ProviderAdapterError(
+            'selected or service must be one of: SSH, HTTP, DHCPClient, or Random',
+            status_code=400,
+        ),
+        enabled_tool_names=['server.scenario.replace_section'],
+    )
+
+    assert decision.category == 'service-tool-error'
+    assert decision.retryable is True
+    assert 'scenario.replace_section' in str(decision.tool_response or '')
+    assert '"section_name": "Services"' in str(decision.tool_response or '')
+    assert '"selected": "DHCPClient"' in str(decision.tool_response or '')
+    assert '"v_count": 2' in str(decision.tool_response or '')
 
 
 def test_mcp_bridge_call_tool_accepts_repaired_server_prefix_separator():
@@ -1942,7 +2895,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_prompt_va
         'items': [{'selected': 'BGP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0}],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -2002,7 +2955,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_prompt_co
         'items': [{'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'}],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -2091,7 +3044,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_can_apply_count_then_cover
         ],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -2209,7 +3162,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_can_retry_prompt_coverage_
         ],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -2265,7 +3218,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_count_mis
     observed_prompts = []
     preview_attempt = {'index': 0}
 
-    async def fake_process_query_server_side(client, *, prompt, model, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -2427,12 +3380,42 @@ def test_mcp_bridge_process_query_retries_once_on_ollama_tool_parse_error():
         _FakeClient(),
         prompt='create a scenario with 3 different types of sql vulnerabilities',
         model='gpt-oss:20b',
+        user_prompt='create a scenario with 3 different types of sql vulnerabilities',
     ))
 
     assert result == 'ok'
     assert len(observed_prompts) == 2
     assert 'do not pass factor' in observed_prompts[1].lower()
     assert 'multiple separate add_vulnerability_item calls' in observed_prompts[1].lower()
+    assert 'pass only strict json keys draft_id, v_name, v_path, and v_count' in observed_prompts[1].lower()
+
+
+def test_mcp_bridge_process_query_retry_prompt_mentions_traffic_factor_omission():
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+
+    class _FakeClient:
+        async def process_query(self, prompt):
+            observed_prompts.append(prompt)
+            if len(observed_prompts) == 1:
+                raise ai_provider.ProviderAdapterError(
+                    'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=..."}',
+                    status_code=502,
+                )
+            return 'ok'
+
+    result = asyncio.run(ai_provider._mcp_bridge_process_query_server_side(
+        _FakeClient(),
+        prompt='base prompt',
+        model='gpt-oss:20b',
+        user_prompt='create 3 tcp flows with periodic pattern',
+    ))
+
+    assert result == 'ok'
+    assert len(observed_prompts) == 2
+    assert 'when count is present, omit factor entirely' in observed_prompts[1].lower()
+    assert 'example valid traffic tool call json' in observed_prompts[1].lower()
 
 
 def test_ai_generate_scenario_preview_concretizes_random_routing_before_preview(tmp_path, monkeypatch):
