@@ -95,8 +95,9 @@
                             {% if current_user.is_authenticated %}
                             <span class="small text-white-50">{{ current_user.username }}</span>
                             <a class="btn btn-sm btn-outline-light" href="{{ url_for('me_password') }}">Password</a>
-                            <form action="{{ url_for('logout') }}" method="post" class="d-inline">
-                                <button class="btn btn-sm btn-outline-danger">Logout</button>
+                            <form action="{{ url_for('logout') }}" method="post" class="d-inline"
+                                data-coretg-logout-form="1">
+                                <button class="btn btn-sm btn-outline-danger" type="submit">Logout</button>
                             </form>
                             {% if current_user.role == 'admin' and ui_view_mode == 'admin' %}
                             <div class="dropdown">
@@ -428,6 +429,79 @@
         window.alertWithModal = function (title, message, confirmLabel = 'OK', tone = 'primary', options = {}) {
             return window.confirmWithModal(title, message, confirmLabel, tone, { ...(options || {}), hideCancel: true });
         };
+    </script>
+
+    <script>
+        (function () {
+            const logoutForms = Array.from(document.querySelectorAll('form[data-coretg-logout-form="1"]'));
+            if (!logoutForms.length) return;
+
+            let logoutSubmitInFlight = false;
+
+            async function prepareBeforeLogout() {
+                const handler = window.CORETG_PREPARE_LOGOUT;
+                if (typeof handler !== 'function') {
+                    return { ok: true, skipped: true };
+                }
+                try {
+                    const result = await handler();
+                    if (result === false) {
+                        return { ok: false, error: 'Unable to persist the current VM/access state before logout.' };
+                    }
+                    if (result && typeof result === 'object') {
+                        if (result.ok === false) {
+                            return result;
+                        }
+                        return { ok: true, ...(result || {}) };
+                    }
+                    return { ok: true };
+                } catch (err) {
+                    return {
+                        ok: false,
+                        error: (err && err.message) ? err.message : 'Unable to persist the current VM/access state before logout.',
+                    };
+                }
+            }
+
+            logoutForms.forEach((form) => {
+                form.addEventListener('submit', async (event) => {
+                    if (logoutSubmitInFlight) return;
+                    event.preventDefault();
+
+                    const submitButton = form.querySelector('button[type="submit"]');
+                    const originalLabel = submitButton ? submitButton.textContent : '';
+                    if (submitButton) {
+                        submitButton.disabled = true;
+                        submitButton.textContent = 'Saving...';
+                    }
+
+                    const result = await prepareBeforeLogout();
+                    if (result && result.ok === false) {
+                        if (submitButton) {
+                            submitButton.disabled = false;
+                            submitButton.textContent = originalLabel || 'Logout';
+                        }
+                        if (typeof window.alertWithModal === 'function') {
+                            await window.alertWithModal(
+                                'Logout blocked',
+                                (result.error || 'Unable to persist the current VM/access state before logout. Please try again.').toString(),
+                                'OK',
+                                'danger'
+                            );
+                        } else {
+                            window.alert((result.error || 'Unable to persist the current VM/access state before logout. Please try again.').toString());
+                        }
+                        return;
+                    }
+
+                    logoutSubmitInFlight = true;
+                    if (submitButton) {
+                        submitButton.textContent = 'Logging out...';
+                    }
+                    HTMLFormElement.prototype.submit.call(form);
+                });
+            });
+        })();
     </script>
 
     {% if not hide_chrome %}

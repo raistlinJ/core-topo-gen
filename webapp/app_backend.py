@@ -25910,6 +25910,73 @@ def _sanitize_snapshot_scenario(raw: Any) -> Optional[Dict[str, Any]]:
     return scenario
 
 
+def _sanitize_snapshot_ui_prefs(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    prefs: Dict[str, Any] = {}
+
+    collapse_state = raw.get('section_collapse_state')
+    if isinstance(collapse_state, dict) and collapse_state:
+        prefs['section_collapse_state'] = {
+            str(key): bool(value)
+            for key, value in collapse_state.items()
+            if isinstance(key, str) and key.strip()
+        }
+
+    proxmox_defaults = raw.get('proxmox_defaults')
+    if isinstance(proxmox_defaults, dict):
+        prox_out: Dict[str, Any] = {}
+        if isinstance(proxmox_defaults.get('url'), str) and proxmox_defaults.get('url').strip():
+            prox_out['url'] = proxmox_defaults.get('url').strip()
+        port = proxmox_defaults.get('port')
+        if isinstance(port, int) and 1 <= port <= 65535:
+            prox_out['port'] = port
+        if isinstance(proxmox_defaults.get('username'), str) and proxmox_defaults.get('username').strip():
+            prox_out['username'] = proxmox_defaults.get('username').strip()
+        if isinstance(proxmox_defaults.get('verify_ssl'), bool):
+            prox_out['verify_ssl'] = proxmox_defaults.get('verify_ssl')
+        if prox_out:
+            prefs['proxmox_defaults'] = prox_out
+
+    ai_generator_state = raw.get('ai_generator_state')
+    if isinstance(ai_generator_state, dict) and ai_generator_state:
+        prefs['ai_generator_state'] = copy.deepcopy(ai_generator_state)
+
+    full_preview_history = raw.get('full_preview_history')
+    if isinstance(full_preview_history, list) and full_preview_history:
+        prefs['full_preview_history'] = copy.deepcopy(full_preview_history[:25])
+
+    execute_confirm_prefs = raw.get('execute_confirm_prefs')
+    if isinstance(execute_confirm_prefs, dict) and execute_confirm_prefs:
+        prefs['execute_confirm_prefs'] = copy.deepcopy(execute_confirm_prefs)
+
+    last_preview_seed = raw.get('last_preview_seed')
+    if last_preview_seed not in (None, ''):
+        prefs['last_preview_seed'] = str(last_preview_seed).strip()
+
+    last_selected_scenario = raw.get('last_selected_scenario')
+    if isinstance(last_selected_scenario, str) and last_selected_scenario.strip():
+        prefs['last_selected_scenario'] = last_selected_scenario.strip()
+
+    selected_scenarios = raw.get('selected_scenarios')
+    if isinstance(selected_scenarios, list) and selected_scenarios:
+        prefs['selected_scenarios'] = [
+            str(value).strip()
+            for value in selected_scenarios
+            if str(value).strip()
+        ]
+
+    vuln_picker_filter = raw.get('vuln_picker_filter')
+    if isinstance(vuln_picker_filter, str) and vuln_picker_filter:
+        prefs['vuln_picker_filter'] = vuln_picker_filter
+
+    graph_labels_state = raw.get('graph_labels_state')
+    if isinstance(graph_labels_state, str) and graph_labels_state.strip():
+        prefs['graph_labels_state'] = graph_labels_state.strip()
+
+    return prefs or None
+
+
 def _build_editor_snapshot_payload(raw_state: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(raw_state, dict):
         return None
@@ -25966,6 +26033,9 @@ def _build_editor_snapshot_payload(raw_state: Any) -> Optional[Dict[str, Any]]:
     scenario_query = raw_state.get('scenario_query')
     if isinstance(scenario_query, str) and scenario_query.strip():
         snapshot['scenario_query'] = scenario_query.strip()
+    ui_prefs = _sanitize_snapshot_ui_prefs(raw_state.get('ui_prefs'))
+    if ui_prefs:
+        snapshot['ui_prefs'] = ui_prefs
     return snapshot
 
 

@@ -8,6 +8,13 @@
 {% else %}
 {% set scenarios_active_tab = 'topology' %}
 {% endif %}
+{% block header_right_extra %}
+<div id="snapshotSyncStatus" class="snapshot-sync-indicator is-idle" role="status" aria-live="polite"
+    title="User snapshot sync status">
+    <span id="snapshotSyncDot" class="snapshot-sync-dot" aria-hidden="true"></span>
+    <span id="snapshotSyncText">Sync active</span>
+</div>
+{% endblock %}
 {% block extra_head %}
 <style>
     #executeSummaryModal .modal-dialog {
@@ -98,6 +105,73 @@
 
     .hitl-entry-btn {
         min-height: 38px;
+    }
+
+    .snapshot-sync-indicator {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.14);
+        color: rgba(255, 255, 255, 0.92);
+        font-size: 0.82rem;
+        line-height: 1;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+    }
+
+    .snapshot-sync-dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: currentColor;
+        opacity: 0.9;
+        flex: 0 0 auto;
+    }
+
+    .snapshot-sync-indicator.is-idle {
+        color: rgba(255, 255, 255, 0.82);
+    }
+
+    .snapshot-sync-indicator.is-pending {
+        color: #ffe082;
+        background: rgba(255, 193, 7, 0.16);
+        border-color: rgba(255, 193, 7, 0.28);
+    }
+
+    .snapshot-sync-indicator.is-syncing {
+        color: #b3e5fc;
+        background: rgba(13, 202, 240, 0.18);
+        border-color: rgba(13, 202, 240, 0.3);
+    }
+
+    .snapshot-sync-indicator.is-syncing .snapshot-sync-dot {
+        animation: snapshotSyncPulse 1.1s ease-in-out infinite;
+    }
+
+    .snapshot-sync-indicator.is-saved {
+        color: #c8f7dc;
+        background: rgba(25, 135, 84, 0.2);
+        border-color: rgba(25, 135, 84, 0.3);
+    }
+
+    .snapshot-sync-indicator.is-error {
+        color: #ffd4da;
+        background: rgba(220, 53, 69, 0.22);
+        border-color: rgba(220, 53, 69, 0.36);
+    }
+
+    @keyframes snapshotSyncPulse {
+        0%,
+        100% {
+            transform: scale(1);
+            opacity: 0.75;
+        }
+
+        50% {
+            transform: scale(1.35);
+            opacity: 1;
+        }
     }
 
     .ai-generator-shell {
@@ -1676,6 +1750,18 @@
     const DELETED_SCENARIO_IDS_STORAGE_KEY = 'coretg_deleted_scenario_ids_v3';
     const DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY = 'coretg_deleted_scenario_name_keys_v3';
     const AI_GENERATOR_STATE_STORAGE_KEY = 'coretg_ai_generator_state_v1';
+    const USER_UI_PREFS_SECTION_COLLAPSE_KEY = 'sectionCollapseState';
+    const USER_UI_PREFS_PROXMOX_DEFAULTS_KEY = 'coretg_proxmox_defaults';
+    const USER_UI_PREFS_FULL_PREVIEW_HISTORY_KEY = 'coretg_full_preview_history';
+    const USER_UI_PREFS_EXECUTE_CONFIRM_KEY = 'coretg_execute_confirm_prefs';
+    const USER_UI_PREFS_LAST_PREVIEW_SEED_KEY = 'coretg_last_preview_seed';
+    const USER_UI_PREFS_LAST_SELECTED_SCENARIO_KEY = 'coretg_last_selected_scenario_v3';
+    const USER_UI_PREFS_SELECTED_SCENARIOS_KEY = 'coretg_selected_scenarios';
+    const USER_UI_PREFS_VULN_PICKER_FILTER_KEY = 'vulnPickerFilter';
+    const USER_UI_PREFS_GRAPH_LABELS_STATE_KEY = 'coretg_graph_labels_state';
+    const initialEditorSnapshot = (initialPayload && typeof initialPayload.editor_snapshot === 'object')
+        ? initialPayload.editor_snapshot
+        : null;
 
     // HITL attachment constants must be defined early because the editor can merge
     // persisted snapshots during initial load, and that merge path calls
@@ -1734,6 +1820,59 @@
             localStorage.setItem(key, JSON.stringify(arr));
         } catch (err) { }
     }
+
+    function hydrateBrowserUiPrefsFromServerSnapshot(snapshot) {
+        const prefs = (snapshot && typeof snapshot.ui_prefs === 'object') ? snapshot.ui_prefs : null;
+        if (!prefs) return;
+        try {
+            if (prefs.section_collapse_state && typeof prefs.section_collapse_state === 'object') {
+                localStorage.setItem(USER_UI_PREFS_SECTION_COLLAPSE_KEY, JSON.stringify(prefs.section_collapse_state));
+            }
+        } catch (err) { }
+        try {
+            if (prefs.proxmox_defaults && typeof prefs.proxmox_defaults === 'object') {
+                localStorage.setItem(USER_UI_PREFS_PROXMOX_DEFAULTS_KEY, JSON.stringify(prefs.proxmox_defaults));
+            }
+        } catch (err) { }
+        try {
+            if (prefs.ai_generator_state && typeof prefs.ai_generator_state === 'object') {
+                localStorage.setItem(AI_GENERATOR_STATE_STORAGE_KEY, JSON.stringify(prefs.ai_generator_state));
+            }
+        } catch (err) { }
+        try {
+            if (Array.isArray(prefs.full_preview_history)) {
+                localStorage.setItem(USER_UI_PREFS_FULL_PREVIEW_HISTORY_KEY, JSON.stringify(prefs.full_preview_history.slice(-25)));
+            }
+        } catch (err) { }
+        try {
+            if (prefs.execute_confirm_prefs && typeof prefs.execute_confirm_prefs === 'object') {
+                localStorage.setItem(USER_UI_PREFS_EXECUTE_CONFIRM_KEY, JSON.stringify(prefs.execute_confirm_prefs));
+            }
+        } catch (err) { }
+        try {
+            const seed = (prefs.last_preview_seed ?? '').toString().trim();
+            if (seed) localStorage.setItem(USER_UI_PREFS_LAST_PREVIEW_SEED_KEY, seed);
+        } catch (err) { }
+        try {
+            const scenario = (prefs.last_selected_scenario ?? '').toString().trim();
+            if (scenario) localStorage.setItem(USER_UI_PREFS_LAST_SELECTED_SCENARIO_KEY, scenario);
+        } catch (err) { }
+        try {
+            if (Array.isArray(prefs.selected_scenarios)) {
+                localStorage.setItem(USER_UI_PREFS_SELECTED_SCENARIOS_KEY, JSON.stringify(prefs.selected_scenarios));
+            }
+        } catch (err) { }
+        try {
+            const filter = (prefs.vuln_picker_filter ?? '').toString();
+            if (filter) localStorage.setItem(USER_UI_PREFS_VULN_PICKER_FILTER_KEY, filter);
+        } catch (err) { }
+        try {
+            const graphLabelsState = (prefs.graph_labels_state ?? '').toString().trim();
+            if (graphLabelsState) sessionStorage.setItem(USER_UI_PREFS_GRAPH_LABELS_STATE_KEY, graphLabelsState);
+        } catch (err) { }
+    }
+
+    hydrateBrowserUiPrefsFromServerSnapshot(initialEditorSnapshot);
 
     let deletedScenarioIds = readStringSetFromLocalStorage(DELETED_SCENARIO_IDS_STORAGE_KEY);
     let deletedScenarioNameKeys = readStringSetFromLocalStorage(DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY);
@@ -1983,11 +2122,9 @@
     // Must be in the outer scope because multiple handlers (including the generic
     // [data-action="toggle-collapse"] handler) reference it.
     let collapseState = {};
-    try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch (e) { collapseState = {}; }
+    try { collapseState = JSON.parse(localStorage.getItem(USER_UI_PREFS_SECTION_COLLAPSE_KEY) || '{}'); } catch (e) { collapseState = {}; }
     if (!activeIdxMap || typeof activeIdxMap !== 'object') activeIdxMap = {};
-    const serverEditorSnapshot = (initialPayload && typeof initialPayload.editor_snapshot === 'object')
-        ? initialPayload.editor_snapshot
-        : null;
+    const serverEditorSnapshot = initialEditorSnapshot;
     const serverProjectKeyHint = (serverEditorSnapshot && typeof serverEditorSnapshot.project_key_hint === 'string')
         ? serverEditorSnapshot.project_key_hint.trim()
         : '';
@@ -5701,16 +5838,115 @@
     let serverSnapshotPendingPayload = null;
     let serverSnapshotTimerId = null;
     let serverSnapshotDisabled = false;
-    // Explicit-save mode: avoid background snapshot writes that can race and overwrite
-    // recent HITL validation state on delayed refresh.
-    const ENABLE_SERVER_SNAPSHOT_AUTOSAVE = false;
+    let serverSnapshotPersistPromise = null;
+    let snapshotSyncState = { status: 'idle', lastSuccessAt: null, error: '' };
+    // Keep the user-scoped server snapshot current so the editor restores across
+    // logout/login and across browsers for the same account.
+    const ENABLE_SERVER_SNAPSHOT_AUTOSAVE = true;
+
+    function formatSnapshotSyncTime(timestamp) {
+        if (!timestamp) return '';
+        try {
+            return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        } catch (err) {
+            return '';
+        }
+    }
+
+    function renderSnapshotSyncIndicator() {
+        const indicatorEl = document.getElementById('snapshotSyncStatus');
+        const textEl = document.getElementById('snapshotSyncText');
+        if (!indicatorEl || !textEl) return;
+        const status = snapshotSyncState?.status || 'idle';
+        indicatorEl.classList.remove('is-idle', 'is-pending', 'is-syncing', 'is-saved', 'is-error');
+        indicatorEl.classList.add(`is-${status}`);
+        let label = 'Sync active';
+        let title = 'User snapshot sync status';
+        if (status === 'pending') {
+            label = 'Unsynced changes';
+            title = 'Changes are queued for sync to your user snapshot.';
+        } else if (status === 'syncing') {
+            label = 'Syncing...';
+            title = 'Writing the latest user snapshot to the server.';
+        } else if (status === 'saved') {
+            const formatted = formatSnapshotSyncTime(snapshotSyncState.lastSuccessAt);
+            label = formatted ? `Saved ${formatted}` : 'Saved';
+            title = formatted
+                ? `Last synced to your user snapshot at ${formatted}.`
+                : 'The latest changes are synced to your user snapshot.';
+        } else if (status === 'error') {
+            label = 'Sync failed';
+            title = snapshotSyncState.error || 'Failed to sync the latest user snapshot.';
+        }
+        textEl.textContent = label;
+        indicatorEl.setAttribute('title', title);
+    }
+
+    function updateSnapshotSyncState(nextStatus, options = {}) {
+        snapshotSyncState = {
+            status: nextStatus || 'idle',
+            lastSuccessAt: options.lastSuccessAt ?? snapshotSyncState.lastSuccessAt ?? null,
+            error: options.error ? String(options.error) : '',
+        };
+        renderSnapshotSyncIndicator();
+    }
+
+    updateSnapshotSyncState(ENABLE_SERVER_SNAPSHOT_AUTOSAVE ? 'idle' : 'saved');
 
     function scrubHitlForServerSnapshot(snapshotPayload) {
         return;
     }
 
+    function collectUserScopedUiPrefs() {
+        const prefs = {};
+        try {
+            const parsed = JSON.parse(localStorage.getItem(USER_UI_PREFS_SECTION_COLLAPSE_KEY) || '{}');
+            if (parsed && typeof parsed === 'object' && Object.keys(parsed).length) prefs.section_collapse_state = parsed;
+        } catch (err) { }
+        try {
+            const parsed = JSON.parse(localStorage.getItem(USER_UI_PREFS_PROXMOX_DEFAULTS_KEY) || 'null');
+            if (parsed && typeof parsed === 'object' && Object.keys(parsed).length) prefs.proxmox_defaults = parsed;
+        } catch (err) { }
+        try {
+            const parsed = readJsonFromLocalStorage(AI_GENERATOR_STATE_STORAGE_KEY, {});
+            if (parsed && typeof parsed === 'object' && Object.keys(parsed).length) prefs.ai_generator_state = parsed;
+        } catch (err) { }
+        try {
+            if (Array.isArray(previewState.fullPreviewHistory) && previewState.fullPreviewHistory.length) {
+                prefs.full_preview_history = previewState.fullPreviewHistory.slice(-25);
+            }
+        } catch (err) { }
+        try {
+            if (executeConfirmPrefs && typeof executeConfirmPrefs === 'object' && Object.keys(executeConfirmPrefs).length) {
+                prefs.execute_confirm_prefs = executeConfirmPrefs;
+            }
+        } catch (err) { }
+        try {
+            const seed = (localStorage.getItem(USER_UI_PREFS_LAST_PREVIEW_SEED_KEY) || '').trim();
+            if (seed) prefs.last_preview_seed = seed;
+        } catch (err) { }
+        try {
+            const scenario = (localStorage.getItem(USER_UI_PREFS_LAST_SELECTED_SCENARIO_KEY) || '').trim();
+            if (scenario) prefs.last_selected_scenario = scenario;
+        } catch (err) { }
+        try {
+            const selected = JSON.parse(localStorage.getItem(USER_UI_PREFS_SELECTED_SCENARIOS_KEY) || '[]');
+            if (Array.isArray(selected) && selected.length) prefs.selected_scenarios = selected;
+        } catch (err) { }
+        try {
+            const filter = localStorage.getItem(USER_UI_PREFS_VULN_PICKER_FILTER_KEY);
+            if (typeof filter === 'string' && filter) prefs.vuln_picker_filter = filter;
+        } catch (err) { }
+        try {
+            const graphLabelsState = (sessionStorage.getItem(USER_UI_PREFS_GRAPH_LABELS_STATE_KEY) || '').trim();
+            if (graphLabelsState) prefs.graph_labels_state = graphLabelsState;
+        } catch (err) { }
+        return prefs;
+    }
+
     async function transmitEditorSnapshotToServer(payload) {
         if (!payload || serverSnapshotDisabled) return;
+        updateSnapshotSyncState('syncing');
         try {
             const resp = await fetch('/api/editor_snapshot', {
                 method: 'POST',
@@ -5720,6 +5956,7 @@
             });
             if (resp.status === 401) {
                 serverSnapshotDisabled = true;
+                updateSnapshotSyncState('error', { error: 'Authentication required' });
                 return { ok: false, error: 'Authentication required' };
             }
             let data = null;
@@ -5732,18 +5969,47 @@
                 const detail = (data && typeof data.error === 'string' && data.error.trim())
                     ? data.error.trim()
                     : await resp.text().catch(() => '');
+                updateSnapshotSyncState('error', { error: (detail || `HTTP ${resp.status}`) });
                 return { ok: false, error: (detail || `HTTP ${resp.status}`) };
             }
             if (data && typeof data === 'object' && data.success === false) {
                 const err = (typeof data.error === 'string' && data.error.trim()) ? data.error.trim() : 'Snapshot rejected';
+                updateSnapshotSyncState('error', { error: err });
                 return { ok: false, error: err };
             }
+            updateSnapshotSyncState('saved', { lastSuccessAt: Date.now(), error: '' });
             return { ok: true };
         } catch (err) {
             const message = (err && err.message) ? err.message : 'Failed to persist editor snapshot on server';
             console.warn('Failed to persist editor snapshot on server', err);
+            updateSnapshotSyncState('error', { error: message });
             return { ok: false, error: message };
         }
+    }
+
+    async function persistNextQueuedServerSnapshot() {
+        if (serverSnapshotDisabled) return { ok: false, error: 'Authentication required' };
+        if (serverSnapshotPersistPromise) {
+            return serverSnapshotPersistPromise;
+        }
+        const payload = serverSnapshotPendingPayload;
+        if (!payload) {
+            return { ok: true, skipped: true };
+        }
+        serverSnapshotPendingPayload = null;
+        serverSnapshotPersistPromise = (async () => {
+            try {
+                return await transmitEditorSnapshotToServer(payload);
+            } finally {
+                serverSnapshotPersistPromise = null;
+                if (serverSnapshotPendingPayload) {
+                    try {
+                        await persistNextQueuedServerSnapshot();
+                    } catch (_) { }
+                }
+            }
+        })();
+        return serverSnapshotPersistPromise;
     }
 
     function scheduleServerSnapshotPersist(snapshot) {
@@ -5767,17 +6033,13 @@
         } catch (err) {
             /* ignore */
         }
+        updateSnapshotSyncState('pending', { error: '' });
         if (serverSnapshotTimerId) {
             window.clearTimeout(serverSnapshotTimerId);
         }
         serverSnapshotTimerId = window.setTimeout(() => {
-            const payload = serverSnapshotPendingPayload;
-            serverSnapshotPendingPayload = null;
             serverSnapshotTimerId = null;
-            if (!payload) {
-                return;
-            }
-            transmitEditorSnapshotToServer(payload);
+            void persistNextQueuedServerSnapshot();
         }, 900);
     }
 
@@ -5786,15 +6048,12 @@
             return { ok: true, skipped: true, disabled: true };
         }
         if (serverSnapshotDisabled) return { ok: false, error: 'Authentication required' };
-        const payload = serverSnapshotPendingPayload;
-        if (!payload) return { ok: true, skipped: true };
-        serverSnapshotPendingPayload = null;
         if (serverSnapshotTimerId) {
             window.clearTimeout(serverSnapshotTimerId);
             serverSnapshotTimerId = null;
         }
         try {
-            return await transmitEditorSnapshotToServer(payload);
+            return await persistNextQueuedServerSnapshot();
         } catch (err) {
             const message = (err && err.message) ? err.message : 'Snapshot persist failed';
             return { ok: false, error: message };
@@ -6167,6 +6426,7 @@
     }
     function saveFullPreviewHistory() {
         try { localStorage.setItem('coretg_full_preview_history', JSON.stringify(previewState.fullPreviewHistory.slice(-25))); } catch (e) { }
+        try { persistUserScopedUiPrefsSoon(); } catch (e) { }
     }
     loadFullPreviewHistory();
 
@@ -7774,6 +8034,7 @@
                 const show = !!labelToggle.checked;
                 labelToggle.dataset.graphLabelsState = show ? 'on' : 'off';
                 try { sessionStorage.setItem(labelStateKey, show ? 'on' : 'off'); } catch (e) { }
+                try { persistUserScopedUiPrefsSoon(); } catch (e) { }
                 if (wrap) {
                     wrap.dataset.showLabels = show ? 'on' : 'off';
                     d3.select(wrap).selectAll('.node-label-wrapper').style('display', show ? null : 'none');
@@ -8737,6 +8998,7 @@
             host_interfaces_source: state.host_interfaces_source || null,
             host_interfaces_metadata: state.host_interfaces_metadata || null,
             host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
+            ui_prefs: collectUserScopedUiPrefs(),
         };
         snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
         const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
@@ -8771,6 +9033,26 @@
         }
     }
 
+    function persistUserScopedUiPrefsSoon() {
+        try {
+            persistEditorState({ skipXml: true });
+        } catch (_) { }
+    }
+
+    window.CORETG_PREPARE_LOGOUT = async function () {
+        try {
+            persistEditorState({ skipXml: true });
+        } catch (_) { }
+        try {
+            storeCorePasswordInSession();
+        } catch (_) { }
+        const result = await persistEditorSnapshotToServerNow();
+        if (result && typeof result === 'object') {
+            return result;
+        }
+        return { ok: true };
+    };
+
     function persistEditorState(options = {}) {
         try {
             const skipXml = !!(options && options.skipXml);
@@ -8780,6 +9062,15 @@
             try { scheduleServerSnapshotPersist(snapshot); } catch (_) { }
             try { storeCorePasswordInSession(); } catch (_) { }
             // Auto-save disabled: only explicit Save actions should write XML.
+
+            try {
+                const activeScenarioName = (Array.isArray(state.scenarios) && state.scenarios[activeIdx] && typeof state.scenarios[activeIdx].name === 'string')
+                    ? state.scenarios[activeIdx].name.trim()
+                    : '';
+                if (activeScenarioName) {
+                    localStorage.setItem(USER_UI_PREFS_LAST_SELECTED_SCENARIO_KEY, activeScenarioName);
+                }
+            } catch (_) { }
 
             // Local persistence is admin-only (and disabled in builder view).
             syncCurrentProjectKeyGlobal();
@@ -12559,6 +12850,7 @@
 
     function persistScenarioSelection() {
         try { localStorage.setItem('coretg_selected_scenarios', JSON.stringify(Array.from(selectedScenarioIds))); } catch (e) { }
+        try { persistUserScopedUiPrefsSoon(); } catch (e) { }
     }
 
     function syncExternalIfxModalSaveLabel() {
@@ -16572,6 +16864,7 @@
                 const collapseKey = `${activeIdx}::${secName}`;
                 collapseState[collapseKey] = visible; // store collapsed state (true means now collapsed)
                 try { localStorage.setItem('sectionCollapseState', JSON.stringify(collapseState)); } catch (e) { }
+                try { persistUserScopedUiPrefsSoon(); } catch (e) { }
                 logDebug(`Section toggle ${targetSel} -> ${visible ? 'collapsed' : 'expanded'}`);
             };
         });
@@ -17824,6 +18117,7 @@
         try {
             localStorage.setItem(EXECUTE_CONFIRM_PREFS_STORAGE_KEY, JSON.stringify(executeConfirmPrefs || {}));
         } catch (err) { /* ignore */ }
+        try { persistUserScopedUiPrefsSoon(); } catch (err) { }
     }
 
     function getExecuteConfirmUpdateRemotePref() {
@@ -21213,6 +21507,7 @@
         const applyFilter = () => {
             const raw = (filterInput.value || '').trim();
             try { localStorage.setItem('vulnPickerFilter', raw); } catch (e) { }
+            try { persistUserScopedUiPrefsSoon(); } catch (e) { }
             filterInput.classList.remove('is-invalid');
             if (filterError) filterError.style.display = '';
             if (!raw) {

@@ -226,6 +226,53 @@ def test_editor_snapshot_api_accepts_empty_scenario_list(tmp_path, monkeypatch):
     assert snapshot.get('scenarios') == []
 
 
+def test_editor_snapshot_api_persists_user_ui_prefs(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        'scenarios': [],
+        'active_index': 0,
+        'ui_prefs': {
+            'section_collapse_state': {'Topology': True},
+            'proxmox_defaults': {
+                'url': 'https://proxmox.example.local',
+                'port': 8006,
+                'username': 'root@pam',
+                'verify_ssl': False,
+            },
+            'execute_confirm_prefs': {'updateRemoteRepo': True},
+            'last_preview_seed': '12345',
+            'last_selected_scenario': 'Scenario A',
+            'selected_scenarios': ['scenario-1', 'scenario-2'],
+            'vuln_picker_filter': 'auth',
+            'graph_labels_state': 'on',
+        },
+    }
+
+    resp = client.post(
+        '/api/editor_snapshot',
+        data=json.dumps(payload),
+        content_type='application/json',
+    )
+    assert resp.status_code == 200
+    assert resp.get_json() == {'success': True}
+
+    snapshot = backend._load_editor_state_snapshot({'username': 'coreadmin', 'role': 'admin'})
+    assert snapshot is not None
+    assert snapshot.get('ui_prefs', {}).get('section_collapse_state') == {'Topology': True}
+    assert snapshot.get('ui_prefs', {}).get('proxmox_defaults', {}).get('url') == 'https://proxmox.example.local'
+    assert snapshot.get('ui_prefs', {}).get('execute_confirm_prefs', {}).get('updateRemoteRepo') is True
+    assert snapshot.get('ui_prefs', {}).get('graph_labels_state') == 'on'
+
+
 def test_index_preserves_empty_snapshot_on_reload(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
