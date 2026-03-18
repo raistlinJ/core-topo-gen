@@ -42729,7 +42729,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     update_remote_repo = True
     adv_fix_docker_daemon = job_spec.get('adv_fix_docker_daemon')
     adv_run_core_cleanup = job_spec.get('adv_run_core_cleanup')
-    adv_check_core_version = job_spec.get('adv_check_core_version')
+    adv_check_core_version = False
     adv_restart_core_daemon = job_spec.get('adv_restart_core_daemon')
     adv_start_core_daemon = job_spec.get('adv_start_core_daemon')
     adv_auto_kill_sessions = job_spec.get('adv_auto_kill_sessions')
@@ -44008,7 +44008,7 @@ def run_cli_async():
             scenario_core_override = None
         adv_fix_docker_daemon = _coerce_bool(request.form.get('adv_fix_docker_daemon'))
         adv_run_core_cleanup = _coerce_bool(request.form.get('adv_run_core_cleanup'))
-        adv_check_core_version = _coerce_bool(request.form.get('adv_check_core_version'))
+        adv_check_core_version = False
         adv_restart_core_daemon = _coerce_bool(request.form.get('adv_restart_core_daemon'))
         adv_start_core_daemon = _coerce_bool(request.form.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = _coerce_bool(request.form.get('adv_auto_kill_sessions'))
@@ -44048,7 +44048,7 @@ def run_cli_async():
                     scenario_index_hint = None
             adv_fix_docker_daemon = _coerce_bool(j.get('adv_fix_docker_daemon'))
             adv_run_core_cleanup = _coerce_bool(j.get('adv_run_core_cleanup'))
-            adv_check_core_version = _coerce_bool(j.get('adv_check_core_version'))
+            adv_check_core_version = False
             adv_restart_core_daemon = _coerce_bool(j.get('adv_restart_core_daemon'))
             adv_start_core_daemon = _coerce_bool(j.get('adv_start_core_daemon'))
             adv_auto_kill_sessions = _coerce_bool(j.get('adv_auto_kill_sessions'))
@@ -47651,7 +47651,7 @@ def test_core():
         stop_duplicate_daemons = bool(cfg.get('stop_duplicate_daemons'))
         adv_fix_docker_daemon = bool(cfg.get('adv_fix_docker_daemon'))
         adv_run_core_cleanup = bool(cfg.get('adv_run_core_cleanup'))
-        adv_check_core_version = bool(cfg.get('adv_check_core_version'))
+        adv_check_core_version = False
         adv_restart_core_daemon = bool(cfg.get('adv_restart_core_daemon'))
         adv_start_core_daemon = bool(cfg.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = bool(cfg.get('adv_auto_kill_sessions'))
