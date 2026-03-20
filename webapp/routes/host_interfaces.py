@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Type
 
-from flask import jsonify, request
+from flask import Blueprint, jsonify, request
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -25,9 +26,13 @@ def register(
     - GET: enumerates interfaces on the Web UI host (via psutil when available).
     """
 
-    log = logger or getattr(app, "logger", None)
+    if not begin_route_registration(app, 'host_interfaces_routes'):
+        return
 
-    @app.route("/api/host_interfaces", methods=["GET", "POST"])
+    log = logger or getattr(app, "logger", None)
+    blueprint = Blueprint('host_interfaces', __name__)
+
+    @blueprint.route("/api/host_interfaces", methods=["GET", "POST"])
     def api_host_interfaces():
         if request.method == "POST":
             payload = request.get_json(silent=True) or {}
@@ -200,3 +205,12 @@ def register(
             except Exception:
                 pass
             return jsonify({"success": False, "error": "Failed to enumerate host interfaces"}), 500
+
+    app.register_blueprint(blueprint)
+    app.add_url_rule(
+        "/api/host_interfaces",
+        endpoint="api_host_interfaces",
+        view_func=app.view_functions['host_interfaces.api_host_interfaces'],
+        methods=["GET", "POST"],
+    )
+    mark_routes_registered(app, 'host_interfaces_routes')

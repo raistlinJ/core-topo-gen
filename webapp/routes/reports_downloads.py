@@ -6,6 +6,8 @@ from typing import Any, Callable
 
 from flask import jsonify, render_template, request, send_file
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -28,6 +30,9 @@ def register(
     logger=None,
 ) -> None:
     """Register report + download routes extracted from app_backend."""
+
+    if not begin_route_registration(app, "reports_downloads_routes"):
+        return
 
     log = logger or getattr(app, "logger", None)
 
@@ -350,3 +355,5 @@ def register(
             except Exception:
                 pass
             return jsonify({'error': 'internal error'}), 500
+
+    mark_routes_registered(app, "reports_downloads_routes")

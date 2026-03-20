@@ -4,6 +4,8 @@ from typing import Any, Callable
 
 from flask import jsonify, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -16,6 +18,9 @@ def register(
 
     Extracted from `webapp.app_backend`.
     """
+
+    if not begin_route_registration(app, "planner_routes"):
+        return
 
     @app.route("/api/planner/ensure_plan", methods=["POST"])
     def api_planner_ensure_plan():
@@ -63,3 +68,5 @@ def register(
             return jsonify({"ok": True, "preview_plan_path": xml_path, "xml_path": xml_path})
 
         return jsonify({"ok": False, "error": "No XML found for scenario."}), 404
+
+    mark_routes_registered(app, "planner_routes")

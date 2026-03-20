@@ -610,3 +610,149 @@ def test_canonicalize_flow_state_derives_chain_ids_from_chain() -> None:
     assert isinstance(normalized, dict)
     assert normalized.get('chain_ids') == ['h2', 'h7']
     assert normalized.get('length') == 2
+
+
+def test_flow_state_from_xml_scrubs_duplicate_chain_ids_when_duplicates_not_allowed(tmp_path) -> None:
+    scenario = 'FlowDuplicateScrub'
+    xml_path = tmp_path / 'flow-duplicate-scrub.xml'
+    raw_state = {
+        'scenario': scenario,
+        'chain_ids': ['h5', 'h5', 'h7'],
+        'chain': [{'id': 'h5'}, {'id': 'h5'}, {'id': 'h7'}],
+        'length': 3,
+        'flag_assignments': [
+            {'node_id': 'h5', 'id': 'g1'},
+            {'node_id': 'h5', 'id': 'g2'},
+            {'node_id': 'h7', 'id': 'g3'},
+        ],
+    }
+    xml_path.write_text(
+        '<Scenarios>'
+        f'<Scenario name="{scenario}"><ScenarioEditor><FlagSequencing><FlowState>{json.dumps(raw_state)}</FlowState></FlagSequencing></ScenarioEditor></Scenario>'
+        '</Scenarios>',
+        encoding='utf-8',
+    )
+
+    flow_state = app_backend._flow_state_from_xml_path(str(xml_path), scenario)
+
+    assert isinstance(flow_state, dict)
+    assert flow_state.get('allow_node_duplicates') is False
+    assert (flow_state.get('chain_ids') or []) == []
+    assert (flow_state.get('chain') or []) == []
+    assert (flow_state.get('flag_assignments') or []) == []
+    assert flow_state.get('length') == 0
+    assert any('duplicates are disabled' in str(err).lower() for err in (flow_state.get('flow_errors') or []))
+
+
+def test_save_flow_state_rejects_duplicate_chain_ids_when_duplicates_disabled(tmp_path):
+    app_backend.app.config['TESTING'] = True
+    client = app_backend.app.test_client()
+
+    login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert login_resp.status_code in (302, 303)
+
+    scenario = 'FlowDuplicateReject'
+    xml_path = tmp_path / 'flow-duplicate-reject.xml'
+    xml_path.write_text(
+        '<Scenarios>'
+        f'<Scenario name="{scenario}"><ScenarioEditor/></Scenario>'
+        '</Scenarios>',
+        encoding='utf-8',
+    )
+
+    resp = client.post(
+        '/api/flag-sequencing/save_flow_state_to_xml',
+        data=json.dumps({
+            'xml_path': str(xml_path),
+            'scenario': scenario,
+            'flow_state': {
+                'scenario': scenario,
+                'chain_ids': ['h5', 'h5'],
+                'length': 2,
+                'allow_node_duplicates': False,
+                'flag_assignments': [
+                    {'node_id': 'h5', 'id': 'g1'},
+                    {'node_id': 'h5', 'id': 'g2'},
+                ],
+            },
+        }),
+        content_type='application/json',
+    )
+
+    assert resp.status_code == 422
+    data = resp.get_json() or {}
+    assert data.get('ok') is False
+    assert 'reuses nodes while duplicates are disabled' in str(data.get('error') or '').lower()
+    assert app_backend._flow_state_from_xml_path(str(xml_path), scenario) is None
+
+
+def test_attackflow_preview_ignores_saved_duplicate_xml_flow_when_duplicates_disabled(tmp_path, monkeypatch):
+    app_backend.app.config['TESTING'] = True
+    client = app_backend.app.test_client()
+
+    login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert login_resp.status_code in (302, 303)
+
+    scenario = f'FlowDuplicateSavedState-{uuid.uuid4().hex[:8]}'
+    full_preview = {
+        'seed': 123,
+        'routers': [],
+        'switches': [],
+        'switches_detail': [],
+        'hosts': [
+            {'node_id': 'h1', 'name': 'docker-1', 'role': 'Docker', 'vulnerabilities': ['v1']},
+            {'node_id': 'h2', 'name': 'docker-2', 'role': 'Docker', 'vulnerabilities': ['v2']},
+        ],
+        'host_router_map': {},
+        'r2r_links_preview': [],
+    }
+
+    plan_path, plan_dir = _seed_xml_plan(scenario, full_preview)
+
+    try:
+        ok, err = app_backend._update_flow_state_in_xml(
+            str(plan_path),
+            scenario,
+            {
+                'scenario': scenario,
+                'chain_ids': ['h1', 'h1'],
+                'chain': [{'id': 'h1'}, {'id': 'h1'}],
+                'length': 2,
+                'allow_node_duplicates': True,
+                'flag_assignments': [
+                    {'node_id': 'h1', 'id': 'g1', 'type': 'flag-generator'},
+                    {'node_id': 'h1', 'id': 'g2', 'type': 'flag-generator'},
+                ],
+            },
+        )
+        assert ok, err
+
+        monkeypatch.setattr(
+            app_backend,
+            '_flow_compute_flag_assignments',
+            lambda _preview, chain, _scenario_label, **kwargs: [
+                {
+                    'node_id': str((node or {}).get('id') or ''),
+                    'id': f'g{i + 1}',
+                    'generator_id': f'g{i + 1}',
+                    'name': f'Generator {i + 1}',
+                    'type': 'flag-generator',
+                }
+                for i, node in enumerate(chain or [])
+            ],
+        )
+        monkeypatch.setattr(app_backend, '_flow_validate_chain_order_by_requires_produces', lambda *args, **kwargs: (True, []))
+
+        resp = client.get('/api/flag-sequencing/attackflow_preview', query_string={
+            'scenario': scenario,
+            'length': 2,
+            'preview_plan': str(plan_path),
+        })
+        assert resp.status_code == 200, resp.get_json()
+        data = resp.get_json() or {}
+        assert data.get('ok') is True
+        chain_ids = [str(item.get('id') or '') for item in (data.get('chain') or []) if isinstance(item, dict)]
+        assert len(chain_ids) == 2
+        assert len(set(chain_ids)) == 2
+    finally:
+        shutil.rmtree(plan_dir, ignore_errors=True)

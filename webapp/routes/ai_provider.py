@@ -20,7 +20,22 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from flask import Response, jsonify, request, stream_with_context
+from core_topo_gen.planning.ai_topology_intent import apply_compiled_sections_to_scenario
+from core_topo_gen.planning.ai_topology_intent import build_seeded_traffic_rows as _compiler_build_seeded_traffic_rows
+from core_topo_gen.planning.ai_topology_intent import compile_ai_topology_intent
+from core_topo_gen.planning.ai_topology_intent import explicit_host_role_count_total as _compiler_explicit_host_role_count_total
+from core_topo_gen.planning.ai_topology_intent import extract_node_role_count_intent as _compiler_extract_node_role_count_intent
+from core_topo_gen.planning.ai_topology_intent import extract_r2r_density_intent as _compiler_extract_r2r_density_intent
+from core_topo_gen.planning.ai_topology_intent import extract_requested_traffic_patterns as _compiler_extract_requested_traffic_patterns
+from core_topo_gen.planning.ai_topology_intent import extract_segmentation_control_count_intent as _compiler_extract_segmentation_control_count_intent
+from core_topo_gen.planning.ai_topology_intent import extract_service_count_intent as _compiler_extract_service_count_intent
+from core_topo_gen.planning.ai_topology_intent import extract_traffic_pattern_count_intent as _compiler_extract_traffic_pattern_count_intent
+from core_topo_gen.planning.ai_topology_intent import extract_traffic_protocol_count_intent as _compiler_extract_traffic_protocol_count_intent
+from core_topo_gen.planning.ai_topology_intent import extract_vulnerability_query_hint as _compiler_extract_vulnerability_query_hint
+from core_topo_gen.planning.ai_topology_intent import has_low_r2r_intent as _compiler_has_low_r2r_intent
+from core_topo_gen.planning.ai_topology_intent import search_vulnerability_catalog_for_prompt as _compiler_search_vulnerability_catalog_for_prompt
 from webapp import app_backend
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 try:
     from mcp.client.session import ClientSession
@@ -51,6 +66,20 @@ _DEFAULT_MCP_SERVERS_JSON_PATH = os.path.join(_REPO_ROOT, 'MCP', 'mcp-bridge-ser
 _ACTIVE_AI_STREAMS: dict[str, dict[str, Any]] = {}
 _ACTIVE_AI_STREAMS_LOCK = threading.Lock()
 _PROMPT_VULNERABILITY_CATALOG_CACHE: list[dict[str, str]] | None = None
+_EXPLICIT_VULNERABILITY_QUERY_KEYWORDS: tuple[str, ...] = (
+    'appweb',
+    'jboss',
+    'tomcat',
+    'nginx',
+    'apache',
+    'openssh',
+    'jwt',
+    'oauth',
+    'mysql',
+    'postgres',
+    'mongodb',
+    'redis',
+)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -197,70 +226,67 @@ def _load_vulnerability_catalog_for_prompt() -> list[dict[str, str]]:
     return list(_PROMPT_VULNERABILITY_CATALOG_CACHE)
 
 
-def _extract_vulnerability_query_hint(user_prompt: str) -> str:
-    text = str(user_prompt or '').strip().lower()
-    if not text or _extract_vulnerability_target_count(text) <= 0:
-        return ''
+def _get_ai_compiler_vulnerability_catalog() -> list[dict[str, Any]]:
+    loader = getattr(app_backend, '_load_backend_vuln_catalog_items', None)
+    if callable(loader):
+        try:
+            return list(loader() or [])
+        except Exception:
+            return []
+    return []
 
-    keyword_groups = (
-        ('web', ('web', 'http', 'https', 'apache', 'nginx', 'appweb', 'tomcat', 'jboss')),
-        ('ssh', ('ssh', 'openssh')),
-        ('auth', ('auth', 'authentication', 'login', 'jwt', 'token', 'oauth')),
-        ('database', ('database', 'db', 'mysql', 'postgres', 'mongodb', 'redis')),
+
+def _compile_ai_intent(user_prompt: str):
+    return compile_ai_topology_intent(
+        user_prompt,
+        vuln_catalog=_get_ai_compiler_vulnerability_catalog(),
     )
-    for canonical, keywords in keyword_groups:
-        if any(keyword in text for keyword in keywords):
-            return canonical
 
-    phrase_match = re.search(r'\b(?:related to|for|about)\s+([a-z0-9][a-z0-9\s-]{0,40})', text)
-    if phrase_match:
-        phrase = ' '.join(phrase_match.group(1).split())
-        return phrase[:40].strip()
 
-    return 'vulnerability'
+def _extract_vulnerability_query_hint(user_prompt: str) -> str:
+    return _compiler_extract_vulnerability_query_hint(user_prompt)
+
+
+def _extract_explicit_vulnerability_query_keyword(user_prompt: str) -> str:
+    query_hint = _extract_vulnerability_query_hint(user_prompt).strip().lower()
+    if query_hint in _EXPLICIT_VULNERABILITY_QUERY_KEYWORDS:
+        return query_hint
+    return ''
+
+
+def _ensure_explicit_vulnerability_query_matches_or_raise(user_prompt: str, scenario_payload: dict[str, Any]) -> None:
+    keyword = _extract_explicit_vulnerability_query_keyword(user_prompt)
+    if not keyword:
+        return
+
+    sections = scenario_payload.get('sections') if isinstance(scenario_payload.get('sections'), dict) else {}
+    vulnerabilities = sections.get('Vulnerabilities') if isinstance(sections.get('Vulnerabilities'), dict) else {}
+    items = vulnerabilities.get('items') if isinstance(vulnerabilities.get('items'), list) else []
+    specific_items = [
+        item
+        for item in items
+        if isinstance(item, dict) and str(item.get('selected') or '').strip().lower() == 'specific'
+    ]
+    if not specific_items:
+        return
+
+    for item in specific_items:
+        haystack = ' '.join([
+            str(item.get('v_name') or '').strip().lower(),
+            str(item.get('v_path') or '').strip().lower(),
+        ])
+        if keyword in haystack:
+            return
+
+    raise ProviderAdapterError('Specific vulnerability must match an enabled catalog entry by v_path or v_name', status_code=400)
 
 
 def _search_vulnerability_catalog_for_prompt(query: str, *, limit: int = 3) -> list[dict[str, str]]:
-    query_text = str(query or '').strip().lower()
-    if not query_text:
-        return []
-
-    catalog = _load_vulnerability_catalog_for_prompt()
-    if not catalog:
-        return []
-
-    tokens = [token for token in re.findall(r'[a-z0-9]+', query_text) if token]
-    if not tokens:
-        return []
-
-    ranked: list[tuple[int, dict[str, str]]] = []
-    for entry in catalog:
-        name = str(entry.get('Name') or '').strip()
-        path = str(entry.get('Path') or '').strip()
-        description = str(entry.get('Description') or '').strip()
-        haystack = ' '.join([
-            name.lower(),
-            path.lower(),
-            description.lower(),
-            str(entry.get('Type') or '').strip().lower(),
-            str(entry.get('Vector') or '').strip().lower(),
-            str(entry.get('CVE') or '').strip().lower(),
-        ])
-        score = 0
-        for token in tokens:
-            if token in haystack:
-                score += 2
-            if token in name.lower():
-                score += 3
-            if token in path.lower():
-                score += 2
-            if token in description.lower():
-                score += 1
-        if score > 0:
-            ranked.append((score, {'name': name, 'path': path}))
-
-    ranked.sort(key=lambda item: (-item[0], item[1]['name'].lower(), item[1]['path'].lower()))
-    return [entry for _score, entry in ranked[:max(1, limit)]]
+    return _compiler_search_vulnerability_catalog_for_prompt(
+        query,
+        catalog=_load_vulnerability_catalog_for_prompt(),
+        limit=limit,
+    )
 
 
 def _build_vulnerability_grounding_guidance(user_prompt: str) -> list[str]:
@@ -287,16 +313,7 @@ def _build_vulnerability_grounding_guidance(user_prompt: str) -> list[str]:
 
 
 def _has_low_r2r_intent(user_prompt: str) -> bool:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return False
-    patterns = [
-        r'\blow\s+router(?:-to-router|\s+to\s+router)\s+link\s+ratio\b',
-        r'\blow\s+r2r\b',
-        r'\bminimal\s+router(?:-to-router|\s+to\s+router)\b',
-        r'\bsparse\s+router(?:-to-router|\s+to\s+router)\b',
-    ]
-    return any(re.search(pattern, text) for pattern in patterns)
+    return _compiler_has_low_r2r_intent(user_prompt)
 
 
 def _build_mcp_bridge_execution_guidance(user_prompt: str) -> list[str]:
@@ -342,58 +359,15 @@ def _build_mcp_bridge_execution_guidance(user_prompt: str) -> list[str]:
 
 
 def _extract_node_role_count_intent(user_prompt: str) -> dict[str, int]:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return {}
-
-    role_patterns = (
-        ('Server', r'\b(\d+)\s+servers?\b'),
-        ('Workstation', r'\b(\d+)\s+workstations?\b|\b(\d+)\s+desktops?\b'),
-        ('PC', r'\b(\d+)\s+pcs?\b|\b(\d+)\s+clients?\b|\b(\d+)\s+hosts?\b'),
-        ('Docker', r'\b(\d+)\s+docker\s+(?:hosts?|nodes?|containers?)\b|\b(\d+)\s+containers?\b'),
-    )
-
-    counts: dict[str, int] = {}
-    for role, pattern in role_patterns:
-        total = 0
-        for match in re.finditer(pattern, text):
-            for group in match.groups():
-                if group is None:
-                    continue
-                try:
-                    total += max(0, int(group))
-                except Exception:
-                    continue
-        if total > 0:
-            counts[role] = total
-    return counts
+    return _compiler_extract_node_role_count_intent(user_prompt)
 
 
 def _explicit_host_role_count_total(user_prompt: str) -> int:
-    return sum(_extract_node_role_count_intent(user_prompt).values())
+    return _compiler_explicit_host_role_count_total(user_prompt)
 
 
 def _extract_r2r_density_intent(user_prompt: str) -> str:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return ''
-    low_patterns = [
-        r'\blow\s+router(?:-to-router|\s+to\s+router)\s+link\s+ratio\b',
-        r'\blow\s+r2r\b',
-        r'\bminimal\s+router(?:-to-router|\s+to\s+router)\b',
-        r'\bsparse\s+router(?:-to-router|\s+to\s+router)\b',
-    ]
-    high_patterns = [
-        r'\bhigh\s+router(?:-to-router|\s+to\s+router)\s+link\s+ratio\b',
-        r'\bdense\s+router(?:-to-router|\s+to\s+router)\b',
-        r'\bmesh(?:ed)?\s+routers?\b',
-        r'\bhigh\s+r2r\b',
-    ]
-    if any(re.search(pattern, text) for pattern in low_patterns):
-        return 'low'
-    if any(re.search(pattern, text) for pattern in high_patterns):
-        return 'high'
-    return ''
+    return _compiler_extract_r2r_density_intent(user_prompt)
 
 
 _COUNT_WORDS: dict[str, int] = {
@@ -473,95 +447,23 @@ def _extract_shared_suffix_count_intent(
 
 
 def _extract_service_count_intent(user_prompt: str) -> dict[str, int]:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return {}
-
-    return _extract_shared_suffix_count_intent(
-        text,
-        suffix_pattern=r'services?',
-        label_patterns=(
-            ('SSH', r'ssh'),
-            ('HTTP', r'http|https|web'),
-            ('DHCPClient', r'dhcp'),
-        ),
-        qualifier_max_words=3,
-    )
+    return _compiler_extract_service_count_intent(user_prompt)
 
 
 def _extract_traffic_protocol_count_intent(user_prompt: str) -> dict[str, int]:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return {}
-
-    flow_suffix = r'(?:traffic\s+flows?|flows?|traffic\s+streams?|streams?)'
-    return _extract_shared_suffix_count_intent(
-        text,
-        suffix_pattern=flow_suffix,
-        label_patterns=(
-            ('TCP', r'tcp'),
-            ('UDP', r'udp'),
-        ),
-        qualifier_max_words=3,
-    )
+    return _compiler_extract_traffic_protocol_count_intent(user_prompt)
 
 
 def _extract_traffic_pattern_count_intent(user_prompt: str) -> dict[str, int]:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return {}
-
-    flow_suffix = r'(?:traffic\s+flows?|flows?|traffic\s+streams?|streams?)'
-    return _extract_shared_suffix_count_intent(
-        text,
-        suffix_pattern=rf'(?:(?:tcp|udp)\s+)?{flow_suffix}',
-        label_patterns=(
-            ('continuous', r'continuous|always\s+on|constant\s+rate'),
-            ('periodic', r'periodic'),
-            ('burst', r'burst(?:y)?'),
-            ('poisson', r'poisson'),
-            ('ramp', r'ramp'),
-        ),
-        qualifier_max_words=2,
-    )
+    return _compiler_extract_traffic_pattern_count_intent(user_prompt)
 
 
 def _extract_requested_traffic_patterns(user_prompt: str) -> list[str]:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return []
-
-    matches: list[str] = []
-    for pattern, canonical in (
-        (r'\bcontinuous\b|\balways\s+on\b|\bconstant\s+rate\b', 'continuous'),
-        (r'\bperiodic\b', 'periodic'),
-        (r'\bburst(?:y)?\b', 'burst'),
-        (r'\bpoisson\b', 'poisson'),
-        (r'\bramp\b', 'ramp'),
-    ):
-        if re.search(pattern, text) and canonical not in matches:
-            matches.append(canonical)
-    return matches
+    return _compiler_extract_requested_traffic_patterns(user_prompt)
 
 
 def _extract_segmentation_control_count_intent(user_prompt: str) -> dict[str, int]:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return {}
-
-    count_token = r'(\d+|a\s+pair\s+of|pair\s+of|a\s+couple\s+of|couple\s+of|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)'
-    qualifier_words = r'(?:[a-z][a-z0-9-]*\s+){0,3}'
-    patterns = (
-        ('Firewall', rf'\b({count_token})\s+{qualifier_words}(?:firewalls?|fw)(?:\s+(?:segments?|rules?|controls?))?\b'),
-        ('NAT', rf'\b({count_token})\s+{qualifier_words}(?:nat|snat|dnat)(?:\s+(?:segments?|rules?|controls?))?\b'),
-    )
-
-    counts: dict[str, int] = {}
-    for control, pattern in patterns:
-        total = _sum_count_matches(text, pattern)
-        if total > 0:
-            counts[control] = total
-    return counts
+    return _compiler_extract_segmentation_control_count_intent(user_prompt)
 
 
 def _build_count_intent_guidance(user_prompt: str) -> list[str]:
@@ -2027,8 +1929,10 @@ def _build_request_headers(*, extra_headers: dict[str, str] | None = None) -> di
 
 def _fetch_json(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> dict[str, Any]:
     request_obj = Request(url, headers=_build_request_headers(extra_headers=headers))
-    with urlopen(request_obj, timeout=timeout) as response:
-        payload = response.read().decode('utf-8')
+    payload = _run_with_wall_clock_timeout(
+        lambda: _read_response_text(request_obj, timeout=timeout),
+        timeout_seconds=timeout,
+    )
     data = json.loads(payload)
     if not isinstance(data, dict):
         raise ValueError('Provider returned a non-object JSON payload.')
@@ -2043,12 +1947,44 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout: float, headers: di
         headers={**_build_request_headers(extra_headers=headers), 'Content-Type': 'application/json'},
         method='POST',
     )
-    with urlopen(request_obj, timeout=timeout) as response:
-        raw = response.read().decode('utf-8')
+    raw = _run_with_wall_clock_timeout(
+        lambda: _read_response_text(request_obj, timeout=timeout),
+        timeout_seconds=timeout,
+    )
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError('Provider returned a non-object JSON payload.')
     return data
+
+
+def _read_response_text(request_obj: Request, *, timeout: float) -> str:
+    with urlopen(request_obj, timeout=timeout) as response:
+        return response.read().decode('utf-8')
+
+
+def _run_with_wall_clock_timeout(func: Callable[[], Any], *, timeout_seconds: float) -> Any:
+    result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_queue.put(('result', func()))
+        except BaseException as exc:  # pragma: no cover - propagated to caller
+            result_queue.put(('error', exc))
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise URLError(TimeoutError(f'timed out after {timeout_seconds:.0f}s (wall clock)'))
+
+    try:
+        outcome, value = result_queue.get_nowait()
+    except queue.Empty:
+        raise URLError(TimeoutError(f'timed out after {timeout_seconds:.0f}s (wall clock)'))
+
+    if outcome == 'error':
+        raise value
+    return value
 
 
 def _stream_json_lines(
@@ -2067,18 +2003,54 @@ def _stream_json_lines(
         headers={**_build_request_headers(extra_headers=headers), 'Content-Type': 'application/json'},
         method='POST',
     )
-    with urlopen(request_obj, timeout=timeout) as response:
-        if callable(on_open):
-            on_open(response)
-        for raw_line in response:
-            if cancellation_check and cancellation_check():
-                break
-            line = raw_line.decode('utf-8').strip()
+    event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    stop_event = threading.Event()
+
+    def _worker() -> None:
+        try:
+            with urlopen(request_obj, timeout=timeout) as response:
+                if callable(on_open):
+                    on_open(response)
+                event_queue.put(('opened', None))
+                for raw_line in response:
+                    if stop_event.is_set():
+                        break
+                    event_queue.put(('line', raw_line))
+        except BaseException as exc:  # pragma: no cover - surfaced to caller
+            event_queue.put(('error', exc))
+        finally:
+            event_queue.put(('done', None))
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    deadline = time.monotonic() + timeout
+
+    while True:
+        if cancellation_check and cancellation_check():
+            stop_event.set()
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stop_event.set()
+            raise URLError(TimeoutError(f'timed out after {timeout:.0f}s (wall clock)'))
+        try:
+            event_type, event_value = event_queue.get(timeout=min(0.25, remaining))
+        except queue.Empty:
+            continue
+        if event_type == 'opened':
+            continue
+        if event_type == 'line':
+            line = event_value.decode('utf-8').strip()
             if not line:
                 continue
             parsed = json.loads(line)
             if isinstance(parsed, dict):
                 yield parsed
+            continue
+        if event_type == 'error':
+            raise event_value
+        if event_type == 'done':
+            break
 
 
 def _ndjson_event(event_type: str, **payload: Any) -> str:
@@ -2362,6 +2334,48 @@ def _build_ai_seed_scenario(current_scenario: dict[str, Any]) -> dict[str, Any]:
     return seed_scenario
 
 
+def _build_ai_seed_scenario_for_prompt(current_scenario: dict[str, Any], user_prompt: str | None = None) -> dict[str, Any]:
+    seed_scenario = _build_ai_seed_scenario(current_scenario)
+    if not str(user_prompt or '').strip():
+        return seed_scenario
+    compiled = _compile_ai_intent(user_prompt)
+    return apply_compiled_sections_to_scenario(seed_scenario, compiled)
+
+
+def _overlay_compiled_intent_sections(scenario_payload: dict[str, Any], user_prompt: str | None = None) -> dict[str, Any]:
+    if not str(user_prompt or '').strip():
+        return scenario_payload
+    compiled = _compile_ai_intent(user_prompt)
+    result = apply_compiled_sections_to_scenario(scenario_payload, compiled)
+    if 'Routing' not in compiled.locked_sections:
+        return result
+
+    sections = result.get('sections') if isinstance(result.get('sections'), dict) else {}
+    node_information = sections.get('Node Information') if isinstance(sections.get('Node Information'), dict) else None
+    if not isinstance(node_information, dict):
+        return result
+
+    items = node_information.get('items') if isinstance(node_information.get('items'), list) else []
+    filtered_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        selection = app_backend._normalize_routing_item_selection(item.get('selected'))
+        if selection:
+            continue
+        filtered_items.append(item)
+
+    if len(filtered_items) == len(items):
+        return result
+
+    next_sections = deepcopy(sections)
+    next_node_information = deepcopy(node_information)
+    next_node_information['items'] = filtered_items
+    next_sections['Node Information'] = next_node_information
+    result['sections'] = next_sections
+    return result
+
+
 def _restore_preserved_scenario_metadata(source_scenario: dict[str, Any], target_scenario: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(target_scenario if isinstance(target_scenario, dict) else {})
     source_name = str(source_scenario.get('name') or '').strip()
@@ -2441,8 +2455,82 @@ def _canonicalize_generated_vulnerabilities_or_raise(scenario_payload: dict[str,
         raise ProviderAdapterError(str(exc), status_code=400) from exc
 
 
+def _canonicalize_generated_routing_modes(scenario_payload: dict[str, Any]) -> dict[str, Any]:
+    sections = scenario_payload.get('sections') if isinstance(scenario_payload.get('sections'), dict) else {}
+    routing_section = sections.get('Routing') if isinstance(sections.get('Routing'), dict) else None
+    if not routing_section:
+        return scenario_payload
+    items = routing_section.get('items') if isinstance(routing_section.get('items'), list) else None
+    if items is None:
+        return scenario_payload
+
+    canonical_modes = {
+        'min': 'Min',
+        'uniform': 'Uniform',
+        'exact': 'Exact',
+        'nonuniform': 'NonUniform',
+    }
+    next_items: list[Any] = []
+    changed = False
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            next_items.append(raw_item)
+            continue
+        item = deepcopy(raw_item)
+        for mode_key in ('r2r_mode', 'r2s_mode'):
+            raw_mode = str(item.get(mode_key) or '').strip()
+            canonical = canonical_modes.get(raw_mode.lower())
+            if canonical and canonical != raw_mode:
+                item[mode_key] = canonical
+                changed = True
+        next_items.append(item)
+    if not changed:
+        return scenario_payload
+
+    next_payload = deepcopy(scenario_payload)
+    next_sections = next_payload.get('sections') if isinstance(next_payload.get('sections'), dict) else {}
+    next_routing = next_sections.get('Routing') if isinstance(next_sections.get('Routing'), dict) else {}
+    next_routing['items'] = next_items
+    next_sections['Routing'] = next_routing
+    next_payload['sections'] = next_sections
+    return next_payload
+
+
+def _build_intent_compiler_guidance(compiled: Any, *, strict_json: bool = False) -> list[str]:
+    locked_sections = tuple(
+        str(section_name or '').strip()
+        for section_name in (getattr(compiled, 'locked_sections', ()) or ())
+        if str(section_name or '').strip()
+    )
+    if not locked_sections:
+        return []
+
+    section_list = ', '.join(locked_sections)
+    guidance = [
+        f'Treat compiler-seeded sections in the template as authoritative for explicit structured requests: {section_list}.',
+    ]
+    if strict_json:
+        guidance.append('Do not remove or rewrite those seeded rows unless the user request clearly requires different values.')
+    else:
+        guidance.append('Preserve those seeded rows unless the user request clearly requires different values.')
+    guidance.append('Prefer filling missing optional details around the seeded template instead of re-authoring compiler-managed rows from scratch.')
+
+    locked_set = set(locked_sections)
+    if 'Routing' in locked_set:
+        guidance.extend([
+            'If routers are requested, Routing v_count is router quantity, while r2r_* and r2s_* fields are connectivity hints.',
+            'There is no r2h field. Map router-to-host wording to Routing r2s_* fields.',
+        ])
+    if 'Traffic' in locked_set:
+        guidance.append('If you add or adjust traffic rows beyond the seed, use selected="TCP" or "UDP" and backend-supported pattern labels only.')
+    if 'Vulnerabilities' in locked_set:
+        guidance.append('If you add or adjust vulnerabilities beyond the seed, use concrete Specific rows with explicit v_name and v_path from catalog matches.')
+    return guidance
+
+
 def _build_ollama_prompt(current_scenario: dict[str, Any], user_prompt: str) -> str:
-    template = _build_ai_seed_scenario(current_scenario)
+    template = _build_ai_seed_scenario_for_prompt(current_scenario, user_prompt)
+    compiled = _compile_ai_intent(user_prompt)
     template.pop('hitl', None)
     template.pop('flow_state', None)
     template.pop('plan_preview', None)
@@ -2455,11 +2543,9 @@ def _build_ollama_prompt(current_scenario: dict[str, Any], user_prompt: str) -> 
             'Recreate the scenario from scratch using the clean template.',
             'Populate sections with backend-friendly values only.',
             'If the prompt specifies host counts, encode them in Node Information items using v_metric="Count" and v_count.',
-            'If the prompt specifies how many routers should exist, encode that as a Routing item using v_metric="Count" and v_count. Router count means the number of router nodes, not link density.',
-            'If the prompt specifies router-to-router or router-to-host connectivity or ratios, encode them in Routing items using r2r_mode/r2r_edges and r2s_mode/r2s_edges/r2s_hosts_min/r2s_hosts_max. These fields control connectivity density, not how many routers exist.',
-            'There is no r2h field. Map router-to-host wording to Routing r2s_* fields because hosts attach through routed segments/switches.',
             'Do not leave prior scenario rows in place unless they are explicitly requested in the prompt.',
             'Do not include markdown, commentary, or code fences.',
+            *_build_intent_compiler_guidance(compiled),
             *_build_count_intent_guidance(user_prompt),
         ],
         'section_expectations': {
@@ -2473,11 +2559,14 @@ def _build_ollama_prompt(current_scenario: dict[str, Any], user_prompt: str) -> 
         'user_request': user_prompt,
         'template': template,
     }
+    if compiled.applied_actions:
+        rules['intent_compiler_seed'] = compiled.applied_actions
     return json.dumps(rules, indent=2)
 
 
 def _build_ollama_repair_prompt(current_scenario: dict[str, Any], user_prompt: str, raw_generation: str) -> str:
-    template = _build_ai_seed_scenario(current_scenario)
+    template = _build_ai_seed_scenario_for_prompt(current_scenario, user_prompt)
+    compiled = _compile_ai_intent(user_prompt)
     template.pop('hitl', None)
     template.pop('flow_state', None)
     template.pop('plan_preview', None)
@@ -2492,22 +2581,21 @@ def _build_ollama_repair_prompt(current_scenario: dict[str, Any], user_prompt: s
             'Ensure sections remain backend-friendly and rebuild the scenario from the clean template.',
             'Use Node Information items with v_metric="Count" and v_count for host counts.',
             'Use selected="Docker" in Node Information for docker hosts.',
-            'Use Routing items with v_metric="Count" and v_count when the prompt specifies how many routers should exist. v_count is router quantity, not connectivity.',
-            'Use Routing r2r_* and r2s_* fields only for router-to-router or router-to-host connectivity hints and ratios. Those fields describe connectivity density, not router quantity.',
-            'There is no r2h field. Map router-to-host wording to Routing r2s_* fields.',
-            'Use Traffic items with selected="TCP" or "UDP" and either v_metric="Count" with v_count or a positive factor so flows appear in preview.',
-            'For vulnerabilities, search the catalog first and then write concrete Specific rows with explicit v_name and v_path from the chosen matches.',
+            *_build_intent_compiler_guidance(compiled),
             *_build_count_intent_guidance(user_prompt),
         ],
         'user_request': user_prompt,
         'template': template,
         'previous_invalid_response': raw_generation[:4000],
     }
+    if compiled.applied_actions:
+        rules['intent_compiler_seed'] = compiled.applied_actions
     return json.dumps(rules, indent=2)
 
 
 def _build_ollama_strict_json_repair_prompt(current_scenario: dict[str, Any], user_prompt: str, raw_generation: str) -> str:
-    template = _build_ai_seed_scenario(current_scenario)
+    template = _build_ai_seed_scenario_for_prompt(current_scenario, user_prompt)
+    compiled = _compile_ai_intent(user_prompt)
     template.pop('hitl', None)
     template.pop('flow_state', None)
     template.pop('plan_preview', None)
@@ -2524,7 +2612,7 @@ def _build_ollama_strict_json_repair_prompt(current_scenario: dict[str, Any], us
             'If some details are missing, keep the template structure valid and leave optional arrays empty rather than adding prose.',
             'For explicit host counts, use Node Information items with v_metric="Count" and v_count.',
             'For explicit router counts, use Routing items with v_metric="Count" and v_count.',
-            'For traffic, use selected="TCP" or "UDP" and backend-supported pattern labels only.',
+            *_build_intent_compiler_guidance(compiled, strict_json=True),
             *_build_count_intent_guidance(user_prompt),
         ],
         'required_output_shape': {
@@ -2533,6 +2621,8 @@ def _build_ollama_strict_json_repair_prompt(current_scenario: dict[str, Any], us
         'user_request': user_prompt,
         'previous_invalid_response': raw_generation[:4000],
     }
+    if compiled.applied_actions:
+        rules['intent_compiler_seed'] = compiled.applied_actions
     return json.dumps(rules, indent=2)
 
 
@@ -2618,6 +2708,63 @@ def _build_bridge_query_state_details(client: Any) -> dict[str, Any]:
     return details
 
 
+def _append_provider_attempt(
+    provider_attempts: list[dict[str, Any]],
+    *,
+    attempt: str,
+    format_mode: str = '',
+    started_at: float,
+    status: str,
+    response: str = '',
+    error: str = '',
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        'attempt': attempt,
+        'status': status,
+        'elapsed_seconds': round(max(0.0, time.monotonic() - started_at), 2),
+    }
+    if format_mode:
+        entry['format_mode'] = format_mode
+    if response or status == 'completed':
+        entry['response'] = response
+    if error:
+        entry['error'] = error[:4000]
+    provider_attempts.append(entry)
+    return entry
+
+
+def _build_provider_generation_error_details(
+    *,
+    provider: str,
+    stage: str,
+    started_at: float,
+    base_url: str = '',
+    model: str = '',
+    timeout_seconds: float | None = None,
+    attempt: str = '',
+    provider_attempts: list[dict[str, Any]] | None = None,
+    error_category: str = '',
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        'provider_generation_stage': stage,
+        'provider_generation_elapsed_seconds': round(max(0.0, time.monotonic() - started_at), 2),
+        'provider': provider,
+    }
+    if base_url:
+        details['base_url'] = base_url
+    if model:
+        details['model'] = model
+    if isinstance(timeout_seconds, (int, float)):
+        details['timeout_seconds'] = float(timeout_seconds)
+    if attempt:
+        details['provider_current_attempt'] = attempt
+    if provider_attempts:
+        details['provider_attempts'] = provider_attempts
+    if error_category:
+        details['provider_error_category'] = error_category
+    return details
+
+
 def _augment_provider_error_for_bridge_stage(
     exc: BaseException,
     *,
@@ -2648,7 +2795,7 @@ def _augment_provider_error_for_bridge_stage(
 def _normalize_mcp_bridge_payload(payload: dict[str, Any]) -> dict[str, Any]:
     bridge_mode = _normalize_ai_bridge_mode(payload.get('bridge_mode'))
 
-    mcp_server_path = _normalize_local_path(payload.get('mcp_server_path'), default_path=_DEFAULT_MCP_SERVER_PATH)
+    mcp_server_path = _normalize_local_path(payload.get('mcp_server_path'))
     mcp_server_url = str(payload.get('mcp_server_url') or '').strip()
     servers_json_path = _normalize_mcp_servers_json_path(payload.get('servers_json_path'))
     auto_discovery = bool(payload.get('auto_discovery'))
@@ -3911,63 +4058,7 @@ def _find_optional_mcp_bridge_tool(available_tools: list[str], suffix: str) -> s
 
 
 def _build_seeded_traffic_rows(user_prompt: str) -> list[dict[str, Any]]:
-    protocol_counts = _extract_traffic_protocol_count_intent(user_prompt)
-    pattern_counts = _extract_traffic_pattern_count_intent(user_prompt)
-    if not protocol_counts:
-        return []
-
-    requested_patterns = _extract_requested_traffic_patterns(user_prompt)
-
-    rows: list[dict[str, Any]] = []
-    protocol_queue = [[protocol, count] for protocol, count in protocol_counts.items() if count > 0]
-    pattern_queue = [[pattern_name, count] for pattern_name, count in pattern_counts.items() if count > 0]
-
-    if pattern_queue and sum(count for _pattern, count in pattern_queue) == sum(count for _protocol, count in protocol_queue):
-        pattern_index = 0
-        for protocol, protocol_count in protocol_queue:
-            remaining = protocol_count
-            while remaining > 0 and pattern_index < len(pattern_queue):
-                pattern_name, pattern_count = pattern_queue[pattern_index]
-                if pattern_count <= 0:
-                    pattern_index += 1
-                    continue
-                assigned = min(remaining, pattern_count)
-                rows.append({
-                    'protocol': protocol,
-                    'count': assigned,
-                    'pattern': pattern_name,
-                    'content_type': 'text',
-                })
-                remaining -= assigned
-                pattern_queue[pattern_index][1] -= assigned
-                if pattern_queue[pattern_index][1] <= 0:
-                    pattern_index += 1
-            if remaining > 0:
-                rows.append({
-                    'protocol': protocol,
-                    'count': remaining,
-                    'pattern': 'continuous',
-                    'content_type': 'text',
-                })
-        return rows
-
-    if len(requested_patterns) > 1:
-        return []
-
-    default_pattern = next(iter(pattern_counts.keys()), '')
-    if not default_pattern and len(requested_patterns) == 1:
-        default_pattern = requested_patterns[0]
-    if not default_pattern:
-        default_pattern = 'continuous'
-
-    for protocol, count in protocol_counts.items():
-        rows.append({
-            'protocol': protocol,
-            'count': count,
-            'pattern': default_pattern,
-            'content_type': 'text',
-        })
-    return rows
+    return _compiler_build_seeded_traffic_rows(user_prompt)
 
 
 async def _apply_deterministic_mcp_bridge_seed(
@@ -3986,61 +4077,47 @@ async def _apply_deterministic_mcp_bridge_seed(
     segmentation_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_segmentation_item')
     vuln_tool = _find_optional_mcp_bridge_tool(available_tools, 'scenario.add_vulnerability_item')
 
-    count_intent = _extract_count_intent(user_prompt)
-    router_count = count_intent.get('router_count')
-    derived_host_count = count_intent.get('derived_host_count')
-    vulnerability_target_count = _extract_vulnerability_target_count(user_prompt)
-
-    if routing_tool and router_count:
-        routing_args: dict[str, Any] = {
-            'draft_id': draft_id,
-            'protocol': 'OSPFv2',
-            'count': router_count,
-        }
-        if _has_low_r2r_intent(user_prompt):
-            routing_args['r2r_mode'] = 'Min'
-        await _mcp_bridge_call_tool(client, routing_tool, routing_args)
-        applied.append(f'Routing routers={router_count}')
-
-    node_role_counts = _extract_node_role_count_intent(user_prompt)
-    explicit_host_total = sum(node_role_counts.values())
-    if derived_host_count is not None:
-        remaining_hosts = max(0, derived_host_count - vulnerability_target_count - explicit_host_total)
-        if remaining_hosts > 0:
-            node_role_counts['PC'] = node_role_counts.get('PC', 0) + remaining_hosts
-    if node_tool:
-        for role in ('Server', 'Workstation', 'PC', 'Docker'):
-            count = int(node_role_counts.get(role) or 0)
-            if count <= 0:
-                continue
+    compiled = _compile_ai_intent(user_prompt)
+    has_seeded_vulnerability_ops = any(op.get('kind') == 'vulnerability' for op in compiled.tool_seed_ops)
+    for op in compiled.tool_seed_ops:
+        if op.get('kind') == 'routing' and routing_tool:
+            routing_args: dict[str, Any] = {
+                'draft_id': draft_id,
+                'protocol': op.get('protocol') or 'OSPFv2',
+                'count': int(op.get('count') or 1),
+            }
+            if op.get('r2r_mode'):
+                routing_args['r2r_mode'] = op.get('r2r_mode')
+            await _mcp_bridge_call_tool(client, routing_tool, routing_args)
+        elif op.get('kind') == 'node' and node_tool:
             await _mcp_bridge_call_tool(client, node_tool, {
                 'draft_id': draft_id,
-                'role': role,
-                'count': count,
+                'role': op.get('role'),
+                'count': int(op.get('count') or 1),
             })
-            applied.append(f'Node {role}={count}')
-
-    if service_tool:
-        for service_name, count in _extract_service_count_intent(user_prompt).items():
-            if count <= 0:
-                continue
+        elif op.get('kind') == 'service' and service_tool:
             await _mcp_bridge_call_tool(client, service_tool, {
                 'draft_id': draft_id,
-                'service': service_name,
-                'count': count,
+                'service': op.get('service'),
+                'count': int(op.get('count') or 1),
             })
-            applied.append(f'Service {service_name}={count}')
-
-    if traffic_tool:
-        for row in _build_seeded_traffic_rows(user_prompt):
+        elif op.get('kind') == 'traffic' and traffic_tool:
             await _mcp_bridge_call_tool(client, traffic_tool, {
                 'draft_id': draft_id,
-                'protocol': row['protocol'],
-                'count': row['count'],
-                'pattern': row['pattern'],
-                'content_type': row['content_type'],
+                'protocol': op.get('protocol'),
+                'count': int(op.get('count') or 1),
+                'pattern': op.get('pattern') or 'continuous',
+                'content_type': op.get('content_type') or 'text',
             })
-            applied.append(f'Traffic {row["protocol"]} {row["pattern"]}={row["count"]}')
+        elif op.get('kind') == 'segmentation' and segmentation_tool:
+            await _mcp_bridge_call_tool(client, segmentation_tool, {
+                'draft_id': draft_id,
+                'kind': op.get('selected'),
+                'count': int(op.get('count') or 1),
+            })
+    applied.extend(compiled.applied_actions)
+
+    vulnerability_target_count = _extract_vulnerability_target_count(user_prompt)
 
     if segmentation_tool:
         for control, count in _extract_segmentation_control_count_intent(user_prompt).items():
@@ -4053,7 +4130,7 @@ async def _apply_deterministic_mcp_bridge_seed(
             })
             applied.append(f'Segmentation {control}={count}')
 
-    if vuln_tool and vulnerability_target_count > 0:
+    if vuln_tool and vulnerability_target_count > 0 and not has_seeded_vulnerability_ops:
         query_hint = _extract_vulnerability_query_hint(user_prompt)
         candidates = _search_vulnerability_catalog_for_prompt(query_hint, limit=vulnerability_target_count)
         for candidate in candidates[:max(0, vulnerability_target_count)]:
@@ -4081,12 +4158,15 @@ def _build_mcp_bridge_goal_prompt(
     seeded_actions: list[str] | None = None,
 ) -> str:
     normalized_seeded_actions = [str(action or '').strip() for action in (seeded_actions or []) if str(action or '').strip()]
+    compiled = _compile_ai_intent(user_prompt)
     opening_line = 'Use MCP tools to rebuild the current scenario draft from scratch. Do not create a second draft.'
     seed_lines: list[str] = []
     if normalized_seeded_actions:
         opening_line = 'The current draft already contains deterministic seed rows for obvious count-based requirements. Treat those seeded rows as provisionally correct and do not duplicate them. Only adjust or replace a seeded row when the current draft or preview shows a concrete mismatch with the user request.'
         seed_lines.append('Deterministic seed already added: ' + '; '.join(normalized_seeded_actions) + '.')
         seed_lines.append('Do not call scenario.get_authoring_schema merely to reinterpret already-seeded Routing, Services, or Traffic rows. Only call it when you need allowed values for an unseeded section or for a concrete field you still cannot author safely.')
+    if compiled.locked_sections:
+        seed_lines.append('Compiler-managed sections for phase 1: ' + ', '.join(compiled.locked_sections) + '. Preserve those seeded Node Information/Routing rows unless preview proves they mismatch the user request.')
     return '\n'.join([
         opening_line,
         f'Target draft_id: {draft_id}',
@@ -4136,7 +4216,7 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
             fallback='MCP bridge generation failed while connecting to MCP servers.',
         ) from exc
     try:
-        seed_scenario = _build_ai_seed_scenario(current_scenario)
+        seed_scenario = _build_ai_seed_scenario_for_prompt(current_scenario, user_prompt)
         enabled_map = _apply_mcp_bridge_tool_selection(
             client,
             bridge_cfg['enabled_tools'],
@@ -4240,9 +4320,13 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
         draft_payload = execution_result.get('draft_payload') if isinstance(execution_result.get('draft_payload'), dict) else {}
         previewed = execution_result.get('previewed') if isinstance(execution_result.get('previewed'), dict) else {}
         scenario_payload = draft_payload.get('scenario') if isinstance(draft_payload.get('scenario'), dict) else deepcopy(current_scenario)
+        scenario_payload = _restore_preserved_scenario_metadata(current_scenario, scenario_payload)
+        scenario_payload = _overlay_compiled_intent_sections(scenario_payload, user_prompt)
         canonicalize_started_at = time.monotonic()
         try:
             scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
+            _ensure_explicit_vulnerability_query_matches_or_raise(user_prompt, scenario_payload)
+            scenario_payload = _canonicalize_generated_routing_modes(scenario_payload)
         except BaseException as exc:
             raise _augment_provider_error_for_bridge_stage(
                 exc,
@@ -4472,6 +4556,7 @@ def _build_stream_success_payload(
     scenarios: list[Any],
     scenario_index: int,
     current_scenario: dict[str, Any],
+    user_prompt: str,
     generation_result: dict[str, Any],
 ) -> dict[str, Any]:
     bridge_mode = str(generation_result.get('bridge_mode') or '').strip().lower()
@@ -4512,10 +4597,13 @@ def _build_stream_success_payload(
     model = generation_result.get('model') or str(payload.get('model') or '').strip()
     prompt = generation_result.get('prompt_used') or ''
     raw_generation = str(generation_result.get('provider_response') or '').strip()
-    seed_scenario = _build_ai_seed_scenario(current_scenario)
+    seed_scenario = _build_ai_seed_scenario_for_prompt(current_scenario, user_prompt)
     merged_scenario = _normalize_generated_scenario(seed_scenario, generation_result.get('parsed_generation') or {})
     merged_scenario = _restore_preserved_scenario_metadata(current_scenario, merged_scenario)
+    merged_scenario = _overlay_compiled_intent_sections(merged_scenario, user_prompt)
     merged_scenario = _canonicalize_generated_vulnerabilities_or_raise(merged_scenario)
+    _ensure_explicit_vulnerability_query_matches_or_raise(user_prompt, merged_scenario)
+    merged_scenario = _canonicalize_generated_routing_modes(merged_scenario)
     merged_scenario = app_backend._concretize_preview_placeholders(merged_scenario, seed=payload.get('seed'))
     next_scenarios = deepcopy(scenarios)
     next_scenarios[scenario_index] = merged_scenario
@@ -4527,12 +4615,7 @@ def _build_stream_success_payload(
     if payload.get('seed') is not None:
         preview_body['seed'] = payload.get('seed')
 
-    with app.test_request_context('/api/plan/preview_full', method='POST', json=preview_body):
-        preview_view = app.view_functions.get('api_plan_preview_full')
-        if preview_view is None:
-            raise ProviderAdapterError('Preview route is unavailable.', status_code=500)
-        preview_resp = app.make_response(preview_view())
-        preview_json = preview_resp.get_json(silent=True) or {}
+    preview_resp, preview_json = _dispatch_preview_full(preview_body)
 
     if not preview_resp.status_code or preview_resp.status_code >= 400 or preview_json.get('ok') is False:
         raise ProviderAdapterError(
@@ -4560,6 +4643,16 @@ def _build_stream_success_payload(
         'breakdowns': preview_json.get('breakdowns'),
         'checked_at': _utc_timestamp(),
     }
+
+
+def _dispatch_preview_full(preview_body: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    current_app = _app if _app is not None else getattr(app_backend, 'app', None)
+    if current_app is None:
+        raise ProviderAdapterError('Preview route is unavailable.', status_code=500)
+    with current_app.test_request_context('/api/plan/preview_full', method='POST', json=preview_body):
+        preview_resp = current_app.make_response(current_app.dispatch_request())
+        preview_json = preview_resp.get_json(silent=True) or {}
+    return preview_resp, preview_json
 
 
 def _generate_ollama_streaming_result(
@@ -4608,10 +4701,18 @@ def _generate_ollama_streaming_result(
                 if delta:
                     raw_parts.append(delta)
                     emit('llm_delta', text=delta)
+            if cancellation_check and cancellation_check():
+                raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
             return ''.join(raw_parts).strip()
 
         try:
             raw_generation = _request_stream(format_mode)
+        except URLError as exc:
+            reason = getattr(exc, 'reason', exc)
+            raise ProviderAdapterError(
+                f'Could not reach Ollama at {base_url}: {reason}',
+                status_code=502,
+            ) from exc
         except HTTPError as exc:
             detail = ''
             try:
@@ -4656,7 +4757,7 @@ def _generate_ollama_streaming_result(
                 'Ollama did not return valid JSON for scenario generation.',
                 status_code=502,
                 details={
-                    'provider_response': provider_attempts[-1]['response'][:4000] if provider_attempts else '',
+                    'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or '')[:4000],
                     'provider_attempts': provider_attempts,
                 },
             )
@@ -4665,7 +4766,7 @@ def _generate_ollama_streaming_result(
             'base_url': base_url,
             'model': model,
             'prompt_used': prompt,
-            'provider_response': provider_attempts[-1]['response'],
+            'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or ''),
             'provider_attempts': provider_attempts,
             'parsed_generation': parsed_generation,
         }
@@ -4827,40 +4928,112 @@ class OllamaProviderAdapter(ProviderAdapter):
 
         prompt = _build_ollama_prompt(current_scenario, user_prompt)
         provider_attempts: list[dict[str, Any]] = []
-        try:
-            raw_generation, parsed_generation, format_mode = self._generate_once(
-                base_url=base_url,
-                model=model,
-                prompt=prompt,
-                timeout_seconds=timeout_seconds,
-            )
-            provider_attempts.append({'attempt': 'initial', 'format_mode': format_mode, 'response': raw_generation})
-            if not isinstance(parsed_generation, dict) or not parsed_generation:
-                repair_prompt = _build_ollama_repair_prompt(current_scenario, user_prompt, raw_generation)
-                raw_generation, parsed_generation, format_mode = self._generate_once(
-                    base_url=base_url,
-                    model=model,
-                    prompt=repair_prompt,
+        generation_started_at = time.monotonic()
+
+        def _run_attempt(*, attempt_name: str, prompt_text: str) -> tuple[str, dict[str, Any], str]:
+            attempt_started_at = time.monotonic()
+            try:
+                raw_generation, parsed_generation, format_mode = _run_with_wall_clock_timeout(
+                    lambda: self._generate_once(
+                        base_url=base_url,
+                        model=model,
+                        prompt=prompt_text,
+                        timeout_seconds=timeout_seconds,
+                    ),
                     timeout_seconds=timeout_seconds,
                 )
-                provider_attempts.append({'attempt': 'repair', 'format_mode': format_mode, 'response': raw_generation})
+            except HTTPError as exc:
+                detail = ''
+                try:
+                    detail = exc.read().decode('utf-8').strip()
+                except Exception:
+                    detail = ''
+                message = f'Ollama returned HTTP {exc.code}.'
+                if detail:
+                    message = f'{message} {detail[:240]}'
+                _append_provider_attempt(
+                    provider_attempts,
+                    attempt=attempt_name,
+                    started_at=attempt_started_at,
+                    status='failed',
+                    error=message,
+                )
+                raise ProviderAdapterError(
+                    message,
+                    status_code=502,
+                    details=_build_provider_generation_error_details(
+                        provider='ollama',
+                        stage='direct_generate',
+                        started_at=generation_started_at,
+                        base_url=base_url,
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                        attempt=attempt_name,
+                        provider_attempts=provider_attempts,
+                        error_category='http_error',
+                    ),
+                ) from exc
+            except URLError as exc:
+                reason = getattr(exc, 'reason', exc)
+                reason_text = str(reason)
+                _append_provider_attempt(
+                    provider_attempts,
+                    attempt=attempt_name,
+                    started_at=attempt_started_at,
+                    status='failed',
+                    error=reason_text,
+                )
+                error_category = 'timeout' if 'timed out' in reason_text.lower() else 'connection_error'
+                raise ProviderAdapterError(
+                    f'Could not reach Ollama at {base_url}: {reason}',
+                    status_code=502,
+                    details=_build_provider_generation_error_details(
+                        provider='ollama',
+                        stage='direct_generate',
+                        started_at=generation_started_at,
+                        base_url=base_url,
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                        attempt=attempt_name,
+                        provider_attempts=provider_attempts,
+                        error_category=error_category,
+                    ),
+                ) from exc
+            _append_provider_attempt(
+                provider_attempts,
+                attempt=attempt_name,
+                format_mode=format_mode,
+                started_at=attempt_started_at,
+                status='completed',
+                response=raw_generation,
+            )
+            return raw_generation, parsed_generation, format_mode
+
+        try:
+            raw_generation, parsed_generation, format_mode = _run_attempt(
+                attempt_name='initial',
+                prompt_text=prompt,
+            )
+            if not isinstance(parsed_generation, dict) or not parsed_generation:
+                repair_prompt = _build_ollama_repair_prompt(current_scenario, user_prompt, raw_generation)
+                raw_generation, parsed_generation, format_mode = _run_attempt(
+                    attempt_name='repair',
+                    prompt_text=repair_prompt,
+                )
                 prompt = repair_prompt
             if not isinstance(parsed_generation, dict) or not parsed_generation:
                 strict_prompt = _build_ollama_strict_json_repair_prompt(current_scenario, user_prompt, raw_generation)
-                raw_generation, parsed_generation, format_mode = self._generate_once(
-                    base_url=base_url,
-                    model=model,
-                    prompt=strict_prompt,
-                    timeout_seconds=timeout_seconds,
+                raw_generation, parsed_generation, format_mode = _run_attempt(
+                    attempt_name='strict-rewrite',
+                    prompt_text=strict_prompt,
                 )
-                provider_attempts.append({'attempt': 'strict-rewrite', 'format_mode': format_mode, 'response': raw_generation})
                 prompt = strict_prompt
             if not isinstance(parsed_generation, dict) or not parsed_generation:
                 raise ProviderAdapterError(
                     'Ollama did not return valid JSON for scenario generation.',
                     status_code=502,
                     details={
-                        'provider_response': provider_attempts[-1]['response'][:4000] if provider_attempts else '',
+                        'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or '')[:4000],
                         'provider_attempts': provider_attempts,
                     },
                 )
@@ -4869,25 +5042,12 @@ class OllamaProviderAdapter(ProviderAdapter):
                 'base_url': base_url,
                 'model': model,
                 'prompt_used': prompt,
-                'provider_response': provider_attempts[-1]['response'],
+                'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or ''),
                 'provider_attempts': provider_attempts,
                 'parsed_generation': parsed_generation,
             }
         except ProviderAdapterError:
             raise
-        except HTTPError as exc:
-            detail = ''
-            try:
-                detail = exc.read().decode('utf-8').strip()
-            except Exception:
-                detail = ''
-            message = f'Ollama returned HTTP {exc.code}.'
-            if detail:
-                message = f'{message} {detail[:240]}'
-            raise ProviderAdapterError(message, status_code=502) from exc
-        except URLError as exc:
-            reason = getattr(exc, 'reason', exc)
-            raise ProviderAdapterError(f'Could not reach Ollama at {base_url}: {reason}', status_code=502) from exc
         except Exception as exc:  # pragma: no cover
             try:
                 if log is not None:
@@ -4897,6 +5057,16 @@ class OllamaProviderAdapter(ProviderAdapter):
             raise ProviderAdapterError(
                 'Unexpected generation failure while contacting Ollama.',
                 status_code=500,
+                details=_build_provider_generation_error_details(
+                    provider='ollama',
+                    stage='direct_generate',
+                    started_at=generation_started_at,
+                    base_url=base_url,
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    provider_attempts=provider_attempts,
+                    error_category='unexpected_error',
+                ),
             ) from exc
 
 
@@ -5058,7 +5228,7 @@ class LiteLlmProviderAdapter(ProviderAdapter):
                     'LiteLLM did not return valid JSON for scenario generation.',
                     status_code=502,
                     details={
-                        'provider_response': provider_attempts[-1]['response'][:4000] if provider_attempts else '',
+                        'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or '')[:4000],
                         'provider_attempts': provider_attempts,
                     },
                 )
@@ -5067,7 +5237,7 @@ class LiteLlmProviderAdapter(ProviderAdapter):
                 'base_url': base_url,
                 'model': model,
                 'prompt_used': prompt,
-                'provider_response': provider_attempts[-1]['response'],
+                'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or ''),
                 'provider_attempts': provider_attempts,
                 'parsed_generation': parsed_generation,
             }
@@ -5135,6 +5305,9 @@ def _get_provider_adapter(provider: Any) -> ProviderAdapter:
 
 
 def register(app, *, logger=None) -> None:
+    if not begin_route_registration(app, 'ai_provider_routes'):
+        return
+
     log = logger or getattr(app, 'logger', None)
 
     @app.route('/api/ai/download_transcript', methods=['POST'])
@@ -5331,10 +5504,13 @@ def register(app, *, logger=None) -> None:
             model = generation_result.get('model') or str(payload.get('model') or '').strip()
             prompt = generation_result.get('prompt_used') or ''
             raw_generation = str(generation_result.get('provider_response') or '').strip()
-            seed_scenario = _build_ai_seed_scenario(current_scenario)
+            seed_scenario = _build_ai_seed_scenario_for_prompt(current_scenario, user_prompt)
             merged_scenario = _normalize_generated_scenario(seed_scenario, generation_result.get('parsed_generation') or {})
             merged_scenario = _restore_preserved_scenario_metadata(current_scenario, merged_scenario)
+            merged_scenario = _overlay_compiled_intent_sections(merged_scenario, user_prompt)
             merged_scenario = _canonicalize_generated_vulnerabilities_or_raise(merged_scenario)
+            _ensure_explicit_vulnerability_query_matches_or_raise(user_prompt, merged_scenario)
+            merged_scenario = _canonicalize_generated_routing_modes(merged_scenario)
             merged_scenario = app_backend._concretize_preview_placeholders(merged_scenario, seed=payload.get('seed'))
             next_scenarios = deepcopy(scenarios)
             next_scenarios[scenario_index] = merged_scenario
@@ -5346,12 +5522,7 @@ def register(app, *, logger=None) -> None:
             if payload.get('seed') is not None:
                 preview_body['seed'] = payload.get('seed')
 
-            with app.test_request_context('/api/plan/preview_full', method='POST', json=preview_body):
-                preview_view = app.view_functions.get('api_plan_preview_full')
-                if preview_view is None:
-                    return jsonify({'success': False, 'error': 'Preview route is unavailable.'}), 500
-                preview_resp = app.make_response(preview_view())
-                preview_json = preview_resp.get_json(silent=True) or {}
+            preview_resp, preview_json = _dispatch_preview_full(preview_body)
 
             if not preview_resp.status_code or preview_resp.status_code >= 400 or preview_json.get('ok') is False:
                 return jsonify({
@@ -5465,6 +5636,7 @@ def register(app, *, logger=None) -> None:
                                 scenarios=scenarios,
                                 scenario_index=scenario_index,
                                 current_scenario=current_scenario,
+                                user_prompt=user_prompt,
                                 generation_result=generation_result,
                             )
                             emit('result', data=final_payload)
@@ -5553,6 +5725,7 @@ def register(app, *, logger=None) -> None:
                             scenarios=scenarios,
                             scenario_index=scenario_index,
                             current_scenario=current_scenario,
+                            user_prompt=user_prompt,
                             generation_result=generation_result,
                         )
                         emit('result', data=final_payload)
@@ -5598,3 +5771,13 @@ def register(app, *, logger=None) -> None:
         if not cancelled:
             return jsonify({'success': False, 'error': 'No active generation stream found for request_id.', 'request_id': request_id}), 404
         return jsonify({'success': True, 'request_id': request_id, 'message': 'Cancellation requested.'})
+
+    mark_routes_registered(app, 'ai_provider_routes')
+
+
+try:
+    _app = getattr(app_backend, 'app', None)
+    if _app is not None:
+        register(_app, logger=getattr(_app, 'logger', None))
+except Exception:
+    pass

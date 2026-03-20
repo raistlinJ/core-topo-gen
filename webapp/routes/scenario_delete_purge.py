@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from flask import jsonify, request
+from flask import Blueprint, jsonify, request
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -18,9 +19,13 @@ def register(
 ) -> None:
     """Register scenario purge/delete routes extracted from app_backend."""
 
-    log = logger or getattr(app, "logger", None)
+    if not begin_route_registration(app, 'scenario_delete_purge_routes'):
+        return
 
-    @app.route('/purge_history_for_scenario', methods=['POST'])
+    log = logger or getattr(app, "logger", None)
+    blueprint = Blueprint('scenario_delete_purge', __name__)
+
+    @blueprint.route('/purge_history_for_scenario', methods=['POST'])
     def purge_history_for_scenario():
         try:
             data = request.get_json(silent=True) or {}
@@ -38,7 +43,7 @@ def register(
         except Exception as e:
             return jsonify({'removed': 0, 'error': str(e)}), 200
 
-    @app.route('/delete_scenarios', methods=['POST'])
+    @blueprint.route('/delete_scenarios', methods=['POST'])
     def delete_scenarios():
         """Persist scenario deletions across refresh."""
         try:
@@ -86,3 +91,6 @@ def register(
             except Exception:
                 pass
             return jsonify({'ok': False, 'error': str(e)}), 500
+
+    app.register_blueprint(blueprint)
+    mark_routes_registered(app, 'scenario_delete_purge_routes')

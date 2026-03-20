@@ -6,6 +6,7 @@ import subprocess
 from typing import Any, Callable
 
 from flask import jsonify, request
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -19,6 +20,9 @@ def register(
     get_repo_root: Callable[[], str],
 ) -> None:
     """Register /flag_compose/* endpoints."""
+
+    if not begin_route_registration(app, 'flag_compose_routes'):
+        return
 
     def _flag_resolve_path(raw_path: str) -> str:
         """Resolve a flag path that may be repo-relative."""
@@ -357,3 +361,4 @@ def register(
     app.add_url_rule('/flag_compose/download', endpoint='flag_compose_download', view_func=_download_view, methods=['POST'])
     app.add_url_rule('/flag_compose/pull', endpoint='flag_compose_pull', view_func=_pull_view, methods=['POST'])
     app.add_url_rule('/flag_compose/remove', endpoint='flag_compose_remove', view_func=_remove_view, methods=['POST'])
+    mark_routes_registered(app, 'flag_compose_routes')

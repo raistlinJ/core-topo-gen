@@ -5,6 +5,8 @@ from typing import Any, Callable
 from flask import flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -30,6 +32,9 @@ def register(
     Important: most dependencies are injected so tests that monkeypatch
     `webapp.app_backend` symbols continue to work.
     """
+
+    if not begin_route_registration(app, "auth_users_routes"):
+        return
 
     @app.route("/login", methods=["GET", "POST"])
     def login():
@@ -302,3 +307,5 @@ def register(
             flash("User not found")
 
         return redirect(url_for("index"))
+
+    mark_routes_registered(app, "auth_users_routes")

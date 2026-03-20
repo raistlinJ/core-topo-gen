@@ -203,3 +203,33 @@ def test_flow_generate_max_retries_defaults_to_ten() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing flow max-retries default snippets: " + "; ".join(missing)
+
+
+def test_flow_generate_dialog_has_explicit_submit_wiring() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'id="flowGenerateOptionsForm"',
+        'id="flowGenerateOptionsSubmitBtn"',
+        'let generateOptionsHandled = false;',
+        'function runGenerateFromDialogOptions() {',
+        "generateOptionsFormEl.addEventListener('submit'",
+        "generateOptionsDialogEl.close('generate');",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing explicit generate-dialog submit wiring in flow template: " + "; ".join(missing)
+
+
+def test_flow_enabled_state_is_declared_before_use() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const flowEnabledToggleEl = document.getElementById('flowEnabledToggle');",
+        "let flowEnabled = !!(flowEnabledToggleEl ? flowEnabledToggleEl.checked : true);",
+        'const enabled = !!flowEnabled;',
+        'if (!flowEnabled) {',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing declared flowEnabled state binding in flow template: " + "; ".join(missing)

@@ -334,7 +334,7 @@
 
 <!-- Generate options (minimal) -->
 <dialog id="flowGenerateOptionsDialog" class="p-0 border rounded" style="max-width: 520px; width: calc(100% - 2rem);">
-  <form method="dialog" class="m-0">
+  <form method="dialog" class="m-0" id="flowGenerateOptionsForm">
     <div class="p-3 border-bottom d-flex align-items-center justify-content-between">
       <div class="fw-semibold">Generate options</div>
       <button class="btn btn-sm btn-outline-secondary" value="cancel" type="submit">Close</button>
@@ -351,7 +351,7 @@
     </div>
     <div class="p-3 border-top d-flex justify-content-end gap-2">
       <button class="btn btn-outline-secondary" value="cancel" type="submit">Cancel</button>
-      <button class="btn btn-primary" value="generate" type="submit">Generate</button>
+      <button class="btn btn-primary" value="generate" type="submit" id="flowGenerateOptionsSubmitBtn">Generate</button>
     </div>
   </form>
 </dialog>
@@ -422,7 +422,9 @@
     const loadingLogLabelEl = document.getElementById('flowLoadingLogLabel');
     const loadingLogEl = document.getElementById('flowLoadingLog');
     const generateOptionsDialogEl = document.getElementById('flowGenerateOptionsDialog');
+    const generateOptionsFormEl = document.getElementById('flowGenerateOptionsForm');
     const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
+    const generateOptionsSubmitBtnEl = document.getElementById('flowGenerateOptionsSubmitBtn');
     const flowEnabledToggleEl = document.getElementById('flowEnabledToggle');
     const flowEnabledHelpEl = document.getElementById('flowEnabledHelp');
     const flowControlsCardEl = document.getElementById('flowControlsCard');
@@ -436,11 +438,13 @@
   const scenarioNamesCache = {{ (scenarios or[])| tojson }};
   const initialScenario = {{ (active_scenario or '')| tojson }};
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
-        const fallbackText = 'Please generate a chain. It will appear here.';
+    let flowEnabled = !!(flowEnabledToggleEl ? flowEnabledToggleEl.checked : true);
+    const fallbackText = 'Please generate a chain. It will appear here.';
   let flowEligible = true;
   let flowEligibilityReasons = [];
   let topologyDirty = false;
   let topologyDirtyReason = '';
+  let generateOptionsHandled = false;
 
   function normalizeTopologyDirtyState(isDirty, reason) {
     const dirty = !!isDirty;
@@ -9430,6 +9434,12 @@
   } catch (e) { }
 
   // Generate options dialog.
+  function runGenerateFromDialogOptions() {
+    const allowDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : false;
+    allowNodeDuplicates = !!allowDupes;
+    generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates, resolveOnGenerate: true });
+  }
+
   try {
     if (generateOptionsDialogEl) {
       try {
@@ -9437,13 +9447,46 @@
           generateNoDuplicatesEl.checked = !!allowNodeDuplicates;
         }
       } catch (e) { }
+      if (generateOptionsFormEl) {
+        generateOptionsFormEl.addEventListener('submit', (event) => {
+          try {
+            const submitter = event && event.submitter ? event.submitter : null;
+            const submitValue = String((submitter && submitter.value) || '');
+            if (submitValue !== 'generate') {
+              generateOptionsHandled = false;
+              return;
+            }
+            generateOptionsHandled = true;
+            try { event.preventDefault(); } catch (e) { }
+            try {
+              if (generateOptionsDialogEl.open && typeof generateOptionsDialogEl.close === 'function') {
+                generateOptionsDialogEl.close('generate');
+              }
+            } catch (e) { }
+            runGenerateFromDialogOptions();
+          } catch (e) { }
+        });
+      } else if (generateOptionsSubmitBtnEl) {
+        generateOptionsSubmitBtnEl.addEventListener('click', (event) => {
+          try { event.preventDefault(); } catch (e) { }
+          generateOptionsHandled = true;
+          try {
+            if (generateOptionsDialogEl.open && typeof generateOptionsDialogEl.close === 'function') {
+              generateOptionsDialogEl.close('generate');
+            }
+          } catch (e) { }
+          runGenerateFromDialogOptions();
+        });
+      }
       generateOptionsDialogEl.addEventListener('close', () => {
         try {
           const rv = String(generateOptionsDialogEl.returnValue || '');
+          if (generateOptionsHandled) {
+            generateOptionsHandled = false;
+            return;
+          }
           if (rv !== 'generate') return;
-          const allowDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : false;
-          allowNodeDuplicates = !!allowDupes;
-          generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates, resolveOnGenerate: true });
+          runGenerateFromDialogOptions();
         } catch (e) { }
       });
     }

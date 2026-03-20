@@ -1,5 +1,5 @@
 cache_dir: null
 hub_name: huggingface
 lang: en
-last_model: SmolLM-135M
+last_model: GPT-OSS-20B-Thinking
 path_dict: {}

@@ -4,6 +4,8 @@ from typing import Any, Callable
 
 from flask import jsonify, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -17,6 +19,9 @@ def register(
 
     Extracted from `webapp.app_backend` as a low-risk first HITL refactor step.
     """
+
+    if not begin_route_registration(app, "hitl_clear_routes"):
+        return
 
     log = logger or getattr(app, "logger", None)
 
@@ -73,3 +78,5 @@ def register(
             return jsonify({"success": False, "error": "Failed to clear HITL config"}), 500
 
         return jsonify({"success": True, "scenario_name": scenario_name, "scenario_index": scenario_index})
+
+    mark_routes_registered(app, "hitl_clear_routes")

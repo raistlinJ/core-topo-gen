@@ -5,6 +5,7 @@ import os
 from typing import Any, Callable, Optional
 
 from flask import jsonify, request
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -24,6 +25,9 @@ def register(
     They intentionally store only a pointer file under outputs/ and keep the password
     encrypted via the existing CORE secret store.
     """
+
+    if not begin_route_registration(app, 'flag_generators_test_core_credentials_routes'):
+        return
 
     def _hint_path() -> str:
         return os.path.join(outputs_dir(), 'flag_generators_test_core_hint.json')
@@ -160,3 +164,4 @@ def register(
         view_func=_get_view,
         methods=['POST'],
     )
+    mark_routes_registered(app, 'flag_generators_test_core_credentials_routes')

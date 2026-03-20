@@ -1,8 +1,12 @@
 import json
 import os
 import re
+from pathlib import Path
 
 from webapp.app_backend import app
+
+
+FULL_PREVIEW_SCRIPTS_PATH = Path(__file__).resolve().parent.parent / 'webapp' / 'templates' / 'full_preview_scripts.html'
 
 
 def _sample_xml_path() -> str:
@@ -53,3 +57,20 @@ def test_full_preview_page_matches_modal_preview():
         'layout_positions',
     ):
         assert page_preview.get(key) == api_preview.get(key), f"Mismatch for key '{key}'"
+
+
+def test_full_preview_scripts_support_duplicate_sequence_nodes() -> None:
+    text = FULL_PREVIEW_SCRIPTS_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'function sequenceIndices(node) {',
+        'function sequenceOccurrencesForNode(node, flow) {',
+        'const faByIndex = Array.isArray(fas) ? fas : [];',
+        'const indexAssignment = (idx < faByIndex.length && faByIndex[idx] && typeof faByIndex[idx] === \'object\')',
+        'target.sequence_indices = Array.from(new Set([...',
+        'const seqLabel = sequenceRomanLabel(d);',
+        '.text(d => sequenceRomanLabel(d));',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing duplicate-sequence preview handling snippets: ' + '; '.join(missing)

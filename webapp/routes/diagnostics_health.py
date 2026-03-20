@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
-from flask import Response, abort, jsonify, redirect, request, session, url_for
+from flask import Blueprint, Response, abort, jsonify, redirect, request, session, url_for
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -22,7 +23,12 @@ def register(
 ) -> None:
     """Register diagnostics and health routes extracted from app_backend."""
 
-    @app.route('/diag/modules')
+    if not begin_route_registration(app, 'diagnostics_health_routes'):
+        return
+
+    blueprint = Blueprint('diagnostics_health', __name__)
+
+    @blueprint.route('/diag/modules')
     def diag_modules():
         out: dict[str, Any] = {}
         try:
@@ -40,7 +46,7 @@ def register(
             out['planning_import_error'] = str(e)
         return jsonify(out)
 
-    @app.route('/ui-view', methods=['POST'])
+    @blueprint.route('/ui-view', methods=['POST'])
     def set_ui_view_mode():
         user = current_user_getter()
         if not user or not is_admin_view_role(user.get('role')):
@@ -79,10 +85,17 @@ def register(
             redirect_target = resolve_ui_view_redirect_target(target)
         return redirect(redirect_target)
 
-    @app.route('/healthz')
+    @blueprint.route('/healthz')
     def healthz():
         return Response('ok', mimetype='text/plain')
 
-    @app.route('/favicon.ico')
+    @blueprint.route('/favicon.ico')
     def favicon():
         return ('', 204)
+
+    app.register_blueprint(blueprint)
+    app.add_url_rule('/diag/modules', endpoint='diag_modules', view_func=app.view_functions['diagnostics_health.diag_modules'])
+    app.add_url_rule('/ui-view', endpoint='set_ui_view_mode', view_func=app.view_functions['diagnostics_health.set_ui_view_mode'], methods=['POST'])
+    app.add_url_rule('/healthz', endpoint='healthz', view_func=app.view_functions['diagnostics_health.healthz'])
+    app.add_url_rule('/favicon.ico', endpoint='favicon', view_func=app.view_functions['diagnostics_health.favicon'])
+    mark_routes_registered(app, 'diagnostics_health_routes')

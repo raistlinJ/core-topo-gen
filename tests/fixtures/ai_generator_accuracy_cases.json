@@ -1,0 +1,728 @@
+[
+  {
+    "id": "routers_hosts_basic",
+    "scenario_name": "EvalRoutersHosts",
+    "prompt": "Create a network with 12 nodes and 3 routers.",
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Server",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Routing": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "BGP",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      }
+    },
+    "expected_compiled": {
+      "locked_sections": ["Routing", "Node Information"],
+      "applied_actions": ["Routing routers=3", "Node PC=9"],
+      "section_payloads": {
+        "Node Information": {
+          "items": [
+            {
+              "selected": "PC",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 9
+            }
+          ]
+        },
+        "Routing": {
+          "items": [
+            {
+              "selected": "OSPFv2",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 3
+            }
+          ]
+        }
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Node Information": {
+          "items": [
+            {
+              "selected": "PC",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 9
+            }
+          ]
+        },
+        "Routing": {
+          "items": [
+            {
+              "selected": "OSPFv2",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 3
+            }
+          ]
+        }
+      },
+      "preview_counts": {
+        "hosts_count": 9,
+        "routers_count": 3
+      }
+    }
+  },
+  {
+    "id": "services_traffic_basic",
+    "scenario_name": "EvalServicesTraffic",
+    "prompt": "create a network with 10 nodes, 2 routers, two ssh and one web service, plus two tcp and one udp flows, and two periodic and one burst flows",
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Server",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Routing": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "BGP",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Services": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "DHCPClient",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Traffic": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "UDP",
+            "pattern": "continuous",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0,
+            "content_type": "text"
+          }
+        ]
+      }
+    },
+    "expected_compiled": {
+      "locked_sections": ["Routing", "Node Information", "Services", "Traffic"],
+      "section_payloads": {
+        "Services": {
+          "items": [
+            {
+              "selected": "SSH",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2
+            },
+            {
+              "selected": "HTTP",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 1
+            }
+          ]
+        },
+        "Traffic": {
+          "items": [
+            {
+              "selected": "TCP",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2,
+              "pattern": "periodic",
+              "content_type": "text"
+            },
+            {
+              "selected": "UDP",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 1,
+              "pattern": "burst",
+              "content_type": "text"
+            }
+          ]
+        }
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Services": {
+          "items": [
+            {
+              "selected": "SSH",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2
+            },
+            {
+              "selected": "HTTP",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 1
+            }
+          ]
+        },
+        "Traffic": {
+          "items": [
+            {
+              "selected": "TCP",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2,
+              "pattern": "periodic",
+              "content_type": "text"
+            },
+            {
+              "selected": "UDP",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 1,
+              "pattern": "burst",
+              "content_type": "text"
+            }
+          ]
+        }
+      },
+      "preview_counts": {
+        "hosts_count": 8,
+        "routers_count": 2
+      }
+    }
+  },
+  {
+    "id": "vulnerability_docker_allocation",
+    "scenario_name": "EvalVulnDocker",
+    "prompt": "Create a network with 12 nodes, 3 routers, and 2 web vulnerabilities.",
+    "vuln_catalog": [
+      {
+        "Name": "appweb/CVE-2018-8715",
+        "Path": "/catalog/appweb/CVE-2018-8715/docker-compose.yml",
+        "Description": "Web server vulnerability"
+      },
+      {
+        "Name": "jboss/CVE-2017-12149",
+        "Path": "/catalog/jboss/CVE-2017-12149/docker-compose.yml",
+        "Description": "JBoss Java deserialization"
+      }
+    ],
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Server",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Routing": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "BGP",
+            "v_metric": "Count",
+            "v_count": 99,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Vulnerabilities": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "Specific",
+            "v_metric": "Count",
+            "v_count": 1,
+            "v_name": "bogus",
+            "v_path": "/bad/path"
+          }
+        ],
+        "flag_type": "text"
+      }
+    },
+    "expected_compiled": {
+      "locked_sections": ["Routing", "Node Information", "Vulnerabilities"],
+      "section_payloads": {
+        "Node Information": {
+          "items": [
+            {
+              "selected": "PC",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 7
+            },
+            {
+              "selected": "Docker",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2
+            }
+          ]
+        },
+        "Vulnerabilities": {
+          "items": [
+            {
+              "selected": "Specific",
+              "v_metric": "Count",
+              "v_count": 1,
+              "v_name": "appweb/CVE-2018-8715",
+              "v_path": "/catalog/appweb/CVE-2018-8715/docker-compose.yml"
+            },
+            {
+              "selected": "Specific",
+              "v_metric": "Count",
+              "v_count": 1,
+              "v_name": "jboss/CVE-2017-12149",
+              "v_path": "/catalog/jboss/CVE-2017-12149/docker-compose.yml"
+            }
+          ]
+        }
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Node Information": {
+          "items": [
+            {
+              "selected": "PC",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 7
+            },
+            {
+              "selected": "Docker",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2
+            }
+          ]
+        },
+        "Vulnerabilities": {
+          "items": [
+            {
+              "selected": "Specific",
+              "v_metric": "Count",
+              "v_count": 1,
+              "v_name": "appweb/CVE-2018-8715",
+              "v_path": "/catalog/appweb/CVE-2018-8715/docker-compose.yml"
+            },
+            {
+              "selected": "Specific",
+              "v_metric": "Count",
+              "v_count": 1,
+              "v_name": "jboss/CVE-2017-12149",
+              "v_path": "/catalog/jboss/CVE-2017-12149/docker-compose.yml"
+            }
+          ]
+        }
+      },
+      "preview_counts": {
+        "hosts_count": 9,
+        "routers_count": 3
+      }
+    }
+  },
+  {
+    "id": "segmentation_counts",
+    "scenario_name": "EvalSegmentation",
+    "prompt": "Create a network with 2 firewall segments and 1 nat segment.",
+    "llm_sections": {
+      "Segmentation": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "Random",
+            "factor": 1.0
+          }
+        ]
+      }
+    },
+    "expected_compiled": {
+      "locked_sections": ["Segmentation"],
+      "section_payloads": {
+        "Segmentation": {
+          "items": [
+            {
+              "selected": "Firewall",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2
+            },
+            {
+              "selected": "NAT",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 1
+            }
+          ]
+        }
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Segmentation": {
+          "items": [
+            {
+              "selected": "Firewall",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 2
+            },
+            {
+              "selected": "NAT",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 1
+            }
+          ]
+        }
+      },
+      "preview_counts": {
+        "hosts_count": 10,
+        "routers_count": 0
+      }
+    }
+  },
+  {
+    "id": "low_r2r_server_mix",
+    "scenario_name": "EvalLowR2R",
+    "prompt": "Create a topology with 30 nodes, 8 routers with low router-to-router link ratio, and 4 servers.",
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Workstation",
+            "v_metric": "Count",
+            "v_count": 1,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Routing": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "BGP",
+            "v_metric": "Count",
+            "v_count": 1,
+            "factor": 1.0,
+            "r2r_mode": "Max"
+          }
+        ]
+      }
+    },
+    "expected_compiled": {
+      "locked_sections": ["Routing", "Node Information"],
+      "applied_actions": ["Routing routers=8", "Node Server=4", "Node PC=18"],
+      "section_payloads": {
+        "Node Information": {
+          "total_nodes": 22,
+          "items": [
+            {
+              "selected": "Server",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 4
+            },
+            {
+              "selected": "PC",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 18
+            }
+          ]
+        },
+        "Routing": {
+          "items": [
+            {
+              "selected": "OSPFv2",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 8,
+              "r2r_mode": "Min"
+            }
+          ]
+        }
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Node Information": {
+          "items": [
+            {
+              "selected": "Server",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 4
+            },
+            {
+              "selected": "PC",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 18
+            }
+          ]
+        },
+        "Routing": {
+          "items": [
+            {
+              "selected": "OSPFv2",
+              "factor": 1.0,
+              "v_metric": "Count",
+              "v_count": 8,
+              "r2r_mode": "Min"
+            }
+          ]
+        }
+      },
+      "preview_counts": {
+        "hosts_count": 22,
+        "routers_count": 8
+      }
+    }
+  },
+  {
+    "id": "docker_capacity_pressure",
+    "scenario_name": "EvalDockerCapacity",
+    "prompt": "Generate two servers and three vulnerable docker targets.",
+    "vuln_catalog": [
+      {
+        "Name": "Demo Vuln",
+        "Path": "demo/path",
+        "Description": "Demo desc"
+      }
+    ],
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Docker",
+            "v_metric": "Count",
+            "v_count": 1,
+            "factor": 1.0
+          },
+          {
+            "selected": "Server",
+            "v_metric": "Count",
+            "v_count": 2,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Vulnerabilities": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "Specific",
+            "v_metric": "Count",
+            "v_count": 3,
+            "v_name": "Demo Vuln",
+            "v_path": "demo/path"
+          }
+        ],
+        "flag_type": "text"
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Node Information": {
+          "items": [
+            {
+              "selected": "Server",
+              "v_metric": "Count",
+              "v_count": 2,
+              "factor": 1.0
+            },
+            {
+              "selected": "Docker",
+              "v_metric": "Count",
+              "v_count": 3,
+              "factor": 1.0
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "canonicalize_vuln_name_from_path",
+    "scenario_name": "EvalCanonicalizeVuln",
+    "prompt": "Add a jboss vulnerability.",
+    "vuln_catalog": [
+      {
+        "Name": "jboss/CVE-2017-12149",
+        "Path": "https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149",
+        "Description": "JBoss Java deserialization"
+      }
+    ],
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Docker",
+            "v_metric": "Count",
+            "v_count": 1,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Vulnerabilities": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "Specific",
+            "v_metric": "Count",
+            "v_count": 1,
+            "v_name": "jboss",
+            "v_path": "https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149"
+          }
+        ],
+        "flag_type": "text"
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Vulnerabilities": {
+          "items": [
+            {
+              "selected": "Specific",
+              "v_metric": "Count",
+              "v_count": 1,
+              "v_name": "jboss/CVE-2017-12149",
+              "v_path": "https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149"
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "reject_vuln_outside_catalog",
+    "scenario_name": "EvalRejectVuln",
+    "prompt": "Add a jboss vulnerability.",
+    "vuln_catalog": [
+      {
+        "Name": "mysql/CVE-2012-2122",
+        "Path": "https://github.com/vulhub/vulhub/tree/master/mysql/CVE-2012-2122",
+        "Description": "MySQL Authentication Bypass"
+      }
+    ],
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Docker",
+            "v_metric": "Count",
+            "v_count": 1,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Vulnerabilities": {
+        "density": 0.0,
+        "items": [
+          {
+            "selected": "Specific",
+            "v_metric": "Count",
+            "v_count": 1,
+            "v_name": "jboss",
+            "v_path": "https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149"
+          }
+        ],
+        "flag_type": "text"
+      }
+    },
+    "expected_endpoint": {
+      "success": false,
+      "status_code": 400,
+      "error": "Specific vulnerability must match an enabled catalog entry by v_path or v_name"
+    }
+  },
+  {
+    "id": "repair_router_rows_from_node_info",
+    "scenario_name": "EvalRepairRouterRows",
+    "prompt": "Create a router-only topology with 5 routers.",
+    "llm_sections": {
+      "Node Information": {
+        "density": 0,
+        "items": [
+          {
+            "selected": "Router",
+            "v_metric": "Count",
+            "v_count": 5,
+            "factor": 1.0
+          }
+        ]
+      },
+      "Routing": {
+        "density": 0.0,
+        "items": []
+      }
+    },
+    "expected_endpoint": {
+      "success": true,
+      "sections": {
+        "Node Information": {
+          "items": []
+        },
+        "Routing": {
+          "items": [
+            {
+              "selected": "OSPFv2",
+              "v_metric": "Count",
+              "v_count": 5
+            }
+          ]
+        }
+      },
+      "preview_counts": {
+        "hosts_count": 0,
+        "routers_count": 5
+      }
+    }
+  }
+]

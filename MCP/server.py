@@ -22,6 +22,8 @@ from webapp import app_backend
 JSONRPC_VERSION = '2.0'
 PROTOCOL_VERSION = '2025-11-05'
 PROTOCOL_VERSION = '2025-03-26'
+_VULN_CATALOG_JSON_PATH_ENV = 'CORE_TOPO_GEN_VULN_CATALOG_JSON_PATH'
+_VULN_CATALOG_JSON_ENV = 'CORE_TOPO_GEN_VULN_CATALOG_JSON'
 
 
 def _jsonrpc_result(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -40,6 +42,30 @@ def _jsonrpc_error(message_id: Any, code: int, message: str, data: dict[str, Any
     if data:
         payload['error']['data'] = data
     return payload
+
+
+def _load_vulnerability_catalog_override() -> list[dict[str, str]] | None:
+    raw_path = str(os.environ.get(_VULN_CATALOG_JSON_PATH_ENV) or '').strip()
+    raw_json = str(os.environ.get(_VULN_CATALOG_JSON_ENV) or '').strip()
+
+    payload: Any = None
+    if raw_path:
+        try:
+            with open(raw_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except Exception:
+            return None
+    elif raw_json:
+        try:
+            payload = json.loads(raw_json)
+        except Exception:
+            return None
+    else:
+        return None
+
+    if not isinstance(payload, list):
+        return None
+    return [dict(entry) for entry in payload if isinstance(entry, dict)]
 
 
 @dataclass
@@ -1110,7 +1136,11 @@ class ScenarioAuthoringMCPServer:
 
     def _load_vulnerability_catalog(self) -> list[dict[str, str]]:
         if self._vulnerability_catalog is None:
-            self._vulnerability_catalog = list(load_vuln_catalog(ROOT_DIR) or [])
+            override_catalog = _load_vulnerability_catalog_override()
+            if isinstance(override_catalog, list):
+                self._vulnerability_catalog = override_catalog
+            else:
+                self._vulnerability_catalog = list(load_vuln_catalog(ROOT_DIR) or [])
         return self._vulnerability_catalog
 
     def _find_vulnerability_catalog_readme(self, entry: dict[str, Any]) -> str:
@@ -1285,6 +1315,35 @@ class ScenarioAuthoringMCPServer:
         if resolved:
             return resolved
 
+        normalized_name = str(v_name or '').strip().lower()
+        normalized_path = str(v_path or '').strip().lower().rstrip('/')
+        fallback_matches: list[dict[str, str]] = []
+        for entry in catalog:
+            entry_name = str(entry.get('Name') or '').strip()
+            entry_path = str(entry.get('Path') or '').strip()
+            entry_name_lower = entry_name.lower()
+            entry_path_lower = entry_path.lower().rstrip('/')
+
+            path_match = bool(normalized_path) and (
+                entry_path_lower == normalized_path
+                or entry_path_lower.endswith(normalized_path)
+                or normalized_path.endswith(entry_path_lower)
+            )
+            name_match = bool(normalized_name) and (
+                entry_name_lower == normalized_name
+                or entry_name_lower.startswith(normalized_name + '/')
+                or normalized_name in entry_name_lower
+            )
+            if not path_match and not name_match:
+                continue
+            fallback_matches.append({
+                'name': canonical_vulnerability_name(entry_name, entry_path, str(entry.get('CVE') or '')),
+                'path': entry_path,
+            })
+
+        if len(fallback_matches) == 1:
+            return fallback_matches[0]
+
         raise ValueError('Specific vulnerability must match an enabled catalog entry by v_path or v_name')
 
     def _touch_draft_after_mutation(self, draft: ScenarioDraft) -> None:
@@ -1292,6 +1351,25 @@ class ScenarioAuthoringMCPServer:
         draft.preview = None
         draft.preview_plan = None
         draft.flow_meta = None
+
+    def _upsert_explicit_count_item(self, items: list[Any], *, selected: str, new_item: dict[str, Any]) -> list[Any]:
+        normalized_selected = str(selected or '').strip().lower()
+        if not normalized_selected:
+            return list(items) + [new_item]
+        next_items = list(items)
+        for index, existing in enumerate(next_items):
+            if not isinstance(existing, dict):
+                continue
+            existing_selected = str(existing.get('selected') or '').strip().lower()
+            existing_metric = str(existing.get('v_metric') or '').strip().lower()
+            if existing_selected != normalized_selected or existing_metric != 'count':
+                continue
+            merged = dict(existing)
+            merged.update(new_item)
+            next_items[index] = merged
+            return next_items
+        next_items.append(new_item)
+        return next_items
 
     def _add_node_role_item(self, draft: ScenarioDraft, arguments: dict[str, Any]) -> dict[str, Any]:
         sections = draft.scenario.get('sections') if isinstance(draft.scenario.get('sections'), dict) else {}
@@ -1346,7 +1424,7 @@ class ScenarioAuthoringMCPServer:
         if 'density' not in node_section:
             node_section['density'] = 0
 
-        node_section['items'] = list(items) + [new_item]
+        node_section['items'] = self._upsert_explicit_count_item(items, selected=selected, new_item=new_item)
         sections['Node Information'] = node_section
         draft.scenario['sections'] = sections
         self._touch_draft_after_mutation(draft)
@@ -1448,9 +1526,9 @@ class ScenarioAuthoringMCPServer:
             routing_section['density'] = 0.0 if count is not None else 0.5
 
         try:
-            factor = float(arguments.get('factor') or 0.0)
+            factor = float(arguments.get('factor') or 1.0)
         except Exception:
-            factor = 0.0
+            factor = 1.0
         factor = max(0.0, factor)
         if count is None and factor <= 0:
             factor = 1.0
@@ -1495,7 +1573,7 @@ class ScenarioAuthoringMCPServer:
         if r2s_hosts_max is not None:
             new_item['r2s_hosts_max'] = r2s_hosts_max
 
-        routing_section['items'] = list(items) + [new_item]
+        routing_section['items'] = self._upsert_explicit_count_item(items, selected=selected, new_item=new_item)
         sections['Routing'] = routing_section
         draft.scenario['sections'] = sections
         self._touch_draft_after_mutation(draft)
@@ -1762,7 +1840,7 @@ class ScenarioAuthoringMCPServer:
         if seed is not None:
             payload['seed'] = seed
         with app_backend.app.test_request_context('/api/plan/preview_full', method='POST', json=payload):
-            response = app_backend.app.make_response(app_backend.api_plan_preview_full())
+            response = app_backend.app.make_response(app_backend.app.dispatch_request())
             data = response.get_json(silent=True) or {}
         if response.status_code >= 400 or data.get('ok') is False:
             raise ValueError(data.get('error') or f'Preview failed (HTTP {response.status_code})')

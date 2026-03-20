@@ -109,3 +109,40 @@ def test_vuln_catalog_test_start_defaults_execute_like_real(monkeypatch, tmp_pat
     assert meta.get('cleanup_generated_artifacts') is True
 
     app_backend.RUNS.pop(run_id, None)
+
+
+def test_vuln_catalog_test_start_rejects_active_core_sessions(monkeypatch, tmp_path):
+    compose_path = tmp_path / 'catalog-compose.yml'
+    compose_path.write_text("version: '3.8'\nservices:\n  app:\n    image: alpine:latest\n", encoding='utf-8')
+
+    monkeypatch.setattr(app_backend, '_load_vuln_catalogs_state', lambda: {'catalogs': []})
+    monkeypatch.setattr(app_backend, '_get_active_vuln_catalog_entry', lambda _state: {'id': 'cat1'})
+    monkeypatch.setattr(app_backend, '_normalize_vuln_catalog_items', lambda _entry: [{'id': 1, 'name': 'Demo Vuln'}])
+    monkeypatch.setattr(app_backend, '_vuln_catalog_item_abs_compose_path', lambda **_kwargs: str(compose_path))
+    monkeypatch.setattr(
+        app_backend,
+        '_merge_core_configs',
+        lambda *_args, **_kwargs: {
+            'ssh_host': '127.0.0.1',
+            'ssh_port': 22,
+            'ssh_username': 'u',
+            'ssh_password': 'p',
+            'host': '127.0.0.1',
+            'port': 50051,
+        },
+    )
+    monkeypatch.setattr(app_backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(app_backend, '_list_active_core_sessions', lambda *_args, **_kwargs: [{'id': 'session-1'}])
+
+    app_backend.app.config['TESTING'] = True
+    client = app_backend.app.test_client()
+    login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert login_resp.status_code in (200, 302)
+
+    resp = client.post('/vuln_catalog_items/test/start', json={'item_id': 1, 'core': {}})
+
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        'ok': False,
+        'error': 'CORE VM has active session(s). Stop running scenario before testing.',
+    }

@@ -419,6 +419,31 @@ def test_mcp_add_node_role_item_appends_docker_count_row():
     assert items[-1].get('v_count') == 3
 
 
+def test_mcp_add_node_role_item_upserts_existing_count_row_for_same_role():
+    server = ScenarioAuthoringMCPServer()
+
+    created = _tool_call(server, 'scenario.create_draft', {'name': 'NodeUpsertScenario'})
+    draft_id = (created.get('draft') or {}).get('draft_id')
+
+    _tool_call(server, 'scenario.add_node_role_item', {
+        'draft_id': draft_id,
+        'role': 'pc',
+        'count': 9,
+    })
+    updated = _tool_call(server, 'scenario.add_node_role_item', {
+        'draft_id': draft_id,
+        'role': 'pc',
+        'count': 7,
+    })
+
+    node_info = (((updated.get('draft') or {}).get('scenario') or {}).get('sections') or {}).get('Node Information') or {}
+    items = node_info.get('items') or []
+    assert len(items) == 1
+    assert items[0].get('selected') == 'PC'
+    assert items[0].get('v_metric') == 'Count'
+    assert items[0].get('v_count') == 7
+
+
 def test_mcp_add_node_role_item_rejects_router_values():
     server = ScenarioAuthoringMCPServer()
 
@@ -487,6 +512,7 @@ def test_mcp_add_routing_item_appends_protocol_count_row_with_edge_hints():
     items = section.get('items') or []
     assert items
     assert items[-1].get('selected') == 'OSPFv2'
+    assert items[-1].get('factor') == 1.0
     assert items[-1].get('v_metric') == 'Count'
     assert items[-1].get('v_count') == 2
     assert items[-1].get('r2r_mode') == 'full_mesh'
@@ -496,6 +522,38 @@ def test_mcp_add_routing_item_appends_protocol_count_row_with_edge_hints():
     assert items[-1].get('r2s_hosts_min') == 2
     assert items[-1].get('r2s_hosts_max') == 4
     assert float(section.get('density') or 0.0) == 0.5
+
+
+def test_mcp_add_routing_item_upserts_existing_count_row_for_same_protocol():
+    server = ScenarioAuthoringMCPServer()
+
+    created = _tool_call(server, 'scenario.create_draft', {'name': 'RoutingUpsertScenario'})
+    draft_id = (created.get('draft') or {}).get('draft_id')
+
+    _tool_call(server, 'scenario.add_routing_item', {
+        'draft_id': draft_id,
+        'protocol': 'ospf',
+        'count': 3,
+    })
+    updated = _tool_call(server, 'scenario.add_routing_item', {
+        'draft_id': draft_id,
+        'protocol': 'ospf',
+        'count': 3,
+        'r2r_mode': 'mesh',
+        'r2s_mode': 'count',
+        'r2s_edges': 2,
+    })
+
+    section = (((updated.get('draft') or {}).get('scenario') or {}).get('sections') or {}).get('Routing') or {}
+    items = section.get('items') or []
+    assert len(items) == 1
+    assert items[0].get('selected') == 'OSPFv2'
+    assert items[0].get('factor') == 1.0
+    assert items[0].get('v_metric') == 'Count'
+    assert items[0].get('v_count') == 3
+    assert items[0].get('r2r_mode') == 'full_mesh'
+    assert items[0].get('r2s_mode') == 'count'
+    assert items[0].get('r2s_edges') == 2
 
 
 def test_mcp_add_segmentation_item_appends_firewall_row_with_density_default():
@@ -767,6 +825,36 @@ def test_mcp_add_vulnerability_item_canonicalizes_name_from_matching_path(monkey
         'draft_id': draft_id,
         'v_name': 'jboss',
         'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+        'v_count': 1,
+    })
+
+    added_item = updated.get('added_item') or {}
+    assert added_item.get('v_name') == 'jboss/CVE-2017-12149'
+    assert added_item.get('v_path') == 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149'
+
+
+def test_mcp_add_vulnerability_item_recovers_from_noncanonical_path_variant(monkeypatch):
+    import MCP.server as mcp_server
+
+    monkeypatch.setattr(mcp_server, 'load_vuln_catalog', lambda repo_root: [
+        {
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'Type': 'docker-compose',
+            'Vector': 'remote',
+            'CVE': 'CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        },
+    ])
+
+    server = ScenarioAuthoringMCPServer()
+    created = _tool_call(server, 'scenario.create_draft', {'name': 'CanonicalizeFallbackScenario'})
+    draft_id = (created.get('draft') or {}).get('draft_id')
+
+    updated = _tool_call(server, 'scenario.add_vulnerability_item', {
+        'draft_id': draft_id,
+        'v_name': 'jboss',
+        'v_path': 'github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149/',
         'v_count': 1,
     })
 

@@ -38,6 +38,79 @@
       return out;
     }
 
+    function sequenceIndices(node) {
+      try {
+        const rawList = Array.isArray(node && (node.sequence_indices ?? node.sequenceIndices))
+          ? (node.sequence_indices ?? node.sequenceIndices)
+          : null;
+        const nums = (rawList || [])
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value) && value > 0);
+        if (nums.length) {
+          return Array.from(new Set(nums)).sort((a, b) => a - b);
+        }
+        const raw = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
+        return (raw && Number.isFinite(raw)) ? [raw] : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function primarySequenceIndex(node) {
+      const list = sequenceIndices(node);
+      return list.length ? list[0] : null;
+    }
+
+    function sequenceRomanLabel(node) {
+      return sequenceIndices(node).map((value) => toRoman(value)).filter(Boolean).join(', ');
+    }
+
+    function flowChainEntries(flow) {
+      if (flow && Array.isArray(flow.chain) && flow.chain.length) return flow.chain;
+      const ids = (flow && Array.isArray(flow.chain_ids)) ? flow.chain_ids : [];
+      return ids.map((id) => ({ id }));
+    }
+
+    function nodeIdFromChainEntry(entry) {
+      try {
+        if (entry && typeof entry === 'object') {
+          let nested = entry;
+          if (entry.node && typeof entry.node === 'object') nested = entry.node;
+          else if (entry.target && typeof entry.target === 'object') nested = entry.target;
+          else if (entry.host && typeof entry.host === 'object') nested = entry.host;
+          const raw = nested.id ?? nested.node_id ?? nested.nodeId ?? nested.host_id ?? nested.hostId ?? entry.value ?? null;
+          return raw === null || raw === undefined ? '' : String(raw).trim();
+        }
+        return entry === null || entry === undefined ? '' : String(entry).trim();
+      } catch (e) {
+        return '';
+      }
+    }
+
+    function sequenceOccurrencesForNode(node, flow) {
+      try {
+        const nodeId = (node && node.id !== undefined && node.id !== null) ? String(node.id).trim() : '';
+        if (!nodeId) return [];
+        const chain = flowChainEntries(flow && typeof flow === 'object' ? flow : null);
+        const assignments = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+        const out = [];
+        chain.forEach((entry, idx) => {
+          if (nodeIdFromChainEntry(entry) !== nodeId) return;
+          const assignment = (idx < assignments.length && assignments[idx] && typeof assignments[idx] === 'object')
+            ? assignments[idx]
+            : null;
+          out.push({
+            index: idx + 1,
+            entry,
+            assignment,
+          });
+        });
+        return out;
+      } catch (e) {
+        return [];
+      }
+    }
+
     function openFlowNodeFlagModal(node) {
       try {
         if (!flowNodeFlagModalEl || !flowNodeFlagModalBodyEl) return;
@@ -68,8 +141,7 @@
 
         const nodeId = (node && node.id !== undefined && node.id !== null) ? String(node.id) : '';
         const nodeName = (node && (node.label || node.name)) ? String(node.label || node.name) : (nodeId || 'Node');
-        const seq = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
-        const roman = (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
+        const roman = sequenceRomanLabel(node);
 
         if (flowNodeFlagModalTitleEl) {
           flowNodeFlagModalTitleEl.textContent = (roman ? (roman + '. ') : '') + nodeName;
@@ -81,7 +153,10 @@
           : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
             : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
         const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
-        const matches = nodeId ? fas.filter(a => a && String(a.node_id ?? a.nodeId ?? '') === nodeId) : [];
+        const occurrences = sequenceOccurrencesForNode(node, flow);
+        const matches = occurrences.length
+          ? occurrences.map((item) => item.assignment).filter(Boolean)
+          : (nodeId ? fas.filter(a => a && String(a.node_id ?? a.nodeId ?? '') === nodeId) : []);
 
         const tbl = document.createElement('table');
         tbl.className = 'table table-sm table-borderless mb-0';
@@ -102,6 +177,26 @@
           tr.appendChild(tdL);
           tr.appendChild(tdV);
           tbody.appendChild(tr);
+        }
+
+        if (occurrences.length) {
+          const seqWrap = document.createElement('div');
+          if (occurrences.length > 1) {
+            const ol = document.createElement('ol');
+            ol.className = 'mb-0 ps-3';
+            occurrences.forEach((item) => {
+              const li = document.createElement('li');
+              const seqRoman = toRoman(item.index);
+              const assignment = item.assignment && typeof item.assignment === 'object' ? item.assignment : null;
+              const genId = assignment && assignment.id ? String(assignment.id) : '-';
+              li.textContent = genId !== '-' ? `${seqRoman}: ${genId}` : seqRoman;
+              ol.appendChild(li);
+            });
+            seqWrap.appendChild(ol);
+          } else {
+            seqWrap.textContent = toRoman(occurrences[0].index);
+          }
+          addRow('sequence', seqWrap);
         }
 
         // Flag generator(s) on this node.
@@ -307,6 +402,7 @@
       const tbody = document.createElement('tbody');
 
       const faByNodeId = new Map();
+      const faByIndex = Array.isArray(fas) ? fas : [];
       fas.forEach(a => {
         try {
           const nid = String(a?.node_id ?? a?.nodeId ?? '').trim();
@@ -337,7 +433,10 @@
         nodeTd.textContent = nodeName ? `${nodeName} (${nodeId || '-'})` : (nodeId || '-');
 
         const flagsTd = document.createElement('td');
-        const matches = nodeId ? (faByNodeId.get(nodeId) || []) : [];
+        const indexAssignment = (idx < faByIndex.length && faByIndex[idx] && typeof faByIndex[idx] === 'object')
+          ? faByIndex[idx]
+          : null;
+        const matches = indexAssignment ? [indexAssignment] : (nodeId ? (faByNodeId.get(nodeId) || []) : []);
         if (matches.length > 1) {
           const ol = document.createElement('ol');
           ol.className = 'mb-0 ps-3';
@@ -2033,7 +2132,11 @@
               const target = resolveNodeForChainEntry(entry);
               if (!target) return;
               target.isSequence = true;
-              target.sequence_index = idx + 1;
+              target.sequence_indices = Array.from(new Set([...
+                (Array.isArray(target.sequence_indices) ? target.sequence_indices : []),
+                idx + 1,
+              ].map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0))).sort((a, b) => a - b);
+              target.sequence_index = target.sequence_indices[0] || (idx + 1);
               target.sequence_chain_len = chainLen;
               const prev = idx > 0 ? normalizeChainMeta(chain[idx - 1]) : null;
               const next = idx < chainLen - 1 ? normalizeChainMeta(chain[idx + 1]) : null;
@@ -2374,8 +2477,8 @@
           const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
           const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
           const ip = primaryIp(d);
-          const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-          const seqPrefix = (seq && Number.isFinite(seq)) ? `${toRoman(seq)} ` : '';
+          const seqLabel = sequenceRomanLabel(d);
+          const seqPrefix = seqLabel ? `${seqLabel} ` : '';
           const line1 = id ? `${seqPrefix}${label} (${id})` : `${seqPrefix}${label}`;
           const maxLen = Math.max(String(line1 || '').length, String(ip || '').length);
           const textNeed = (maxLen * 6.4) + 26;
@@ -2402,13 +2505,11 @@
           .attr('ry', 6)
           .attr('fill', d => nodeFill(d))
           .attr('stroke', d => {
-            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-            if (seq && Number.isFinite(seq)) return sequenceColor;
+            if (sequenceIndices(d).length) return sequenceColor;
             return (d && (d.isBase || d.isBaseBridge)) ? '#6f42c1' : '#222';
           })
           .attr('stroke-width', d => {
-            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-            if (seq && Number.isFinite(seq)) return 3;
+            if (sequenceIndices(d).length) return 3;
             return (d && d.isBaseBridge) ? 3 : (d && d.isBase) ? 2 : 1.2;
           });
 
@@ -2431,14 +2532,19 @@
 
         function sequenceBadgeTitle(d) {
           try {
-            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-            if (!seq || !Number.isFinite(seq)) return '';
-            const roman = toRoman(seq);
+            const seqs = sequenceIndices(d);
+            if (!seqs.length) return '';
+            const roman = seqs.map((value) => toRoman(value)).filter(Boolean).join(', ');
             const chainLen = (d && (d.sequence_chain_len ?? d.sequenceChainLen)) ? Number(d.sequence_chain_len ?? d.sequenceChainLen) : null;
             const lines = [];
-            // Keep wording exactly as requested.
-            if (chainLen && Number.isFinite(chainLen)) lines.push(`Sequence ${roman} (${seq} of ${chainLen})`);
-            else lines.push(`Sequence ${roman} (${seq})`);
+            if (seqs.length === 1) {
+              const seq = seqs[0];
+              if (chainLen && Number.isFinite(chainLen)) lines.push(`Sequence ${roman} (${seq} of ${chainLen})`);
+              else lines.push(`Sequence ${roman} (${seq})`);
+            } else {
+              if (chainLen && Number.isFinite(chainLen)) lines.push(`Sequences ${roman} (${seqs.length} visits in ${chainLen} steps)`);
+              else lines.push(`Sequences ${roman}`);
+            }
 
             // Sequence name/description from flow metadata.
             const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
@@ -2448,18 +2554,19 @@
             lines.push(seqDesc);
 
             // requires/provides from flag assignments (if available)
-            const nodeId = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
-            let fa = null;
-            try {
-              const fas = flow && Array.isArray(flow.flag_assignments) ? flow.flag_assignments : null;
-              if (fas && nodeId) {
-                fa = fas.find(x => x && String(x.node_id ?? x.nodeId ?? x.id ?? '') === nodeId) || null;
-              }
-            } catch (e) { }
-            const req = (fa && Array.isArray(fa.inputs) && fa.inputs.length) ? fa.inputs.join(', ') : '-';
-            const prov = (fa && Array.isArray(fa.outputs) && fa.outputs.length) ? fa.outputs.join(', ') : '-';
-            lines.push(`requires: ${req}`);
-            lines.push(`provides: ${prov}`);
+            const occurrences = sequenceOccurrencesForNode(d, flow);
+            if (occurrences.length) {
+              occurrences.forEach((item) => {
+                const fa = item.assignment && typeof item.assignment === 'object' ? item.assignment : null;
+                const req = (fa && Array.isArray(fa.inputs) && fa.inputs.length) ? fa.inputs.join(', ') : '-';
+                const prov = (fa && Array.isArray(fa.outputs) && fa.outputs.length) ? fa.outputs.join(', ') : '-';
+                lines.push(`${toRoman(item.index)} requires: ${req}`);
+                lines.push(`${toRoman(item.index)} provides: ${prov}`);
+              });
+            } else {
+              lines.push('requires: -');
+              lines.push('provides: -');
+            }
             return lines.join('\n');
           } catch (e) {
             return '';
@@ -2470,8 +2577,7 @@
           .attr('class', 'node-seq-badge')
           .attr('pointer-events', 'all')
           .style('display', d => {
-            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-            return (seq && Number.isFinite(seq)) ? null : 'none';
+            return sequenceIndices(d).length ? null : 'none';
           })
           .style('cursor', 'pointer')
           .on('click', (event, d) => {
@@ -2483,10 +2589,9 @@
         seqBadge.insert('title', ':first-child').text(d => sequenceBadgeTitle(d));
 
         const seqBadgeWidth = (d) => {
-          const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-          const roman = toRoman(seq);
-          const w = 10 + Math.max(1, roman.length) * 7;
-          return Math.min(46, Math.max(18, w));
+          const label = sequenceRomanLabel(d);
+          const w = 10 + Math.max(1, label.length) * 6.6;
+          return Math.min(120, Math.max(18, w));
         };
 
         // Place the badge just outside the node's top-right corner.
@@ -2517,10 +2622,7 @@
           .attr('font-size', '11px')
           .attr('font-weight', '800')
           .attr('fill', sequenceColor)
-          .text(d => {
-            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-            return (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
-          });
+          .text(d => sequenceRomanLabel(d));
 
         // On-node text: name (id) + first IP (mirrors Details graph)
         const nodeLabel = node.append('text')
@@ -2534,8 +2636,8 @@
           .text(d => {
             const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
             const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
-            const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
-            const seqPrefix = (seq && Number.isFinite(seq)) ? `${toRoman(seq)} ` : '';
+            const seqLabel = sequenceRomanLabel(d);
+            const seqPrefix = seqLabel ? `${seqLabel} ` : '';
             return id ? `${seqPrefix}${label} (${id})` : `${seqPrefix}${label}`;
           });
 
