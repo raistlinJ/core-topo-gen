@@ -112,6 +112,8 @@ def test_layout_exposes_shared_navigation_loading_helper() -> None:
         'window.CORETG_NAVIGATE_PAGE_DETAILS = navigatePageDetails;',
         "const wantsLoading = target.hasAttribute('data-coretg-nav-loading') || target.id === 'navCoreLink';",
         "if (!shouldUseDefaultPageLoading(target)) return;",
+        "window.addEventListener('focus', hideNavLoading);",
+        "if (!document.hidden) hideNavLoading();",
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]

@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import ssl
 import socket
 import sys
 import threading
@@ -114,19 +115,32 @@ def _is_ollama_tool_parse_error(exc: BaseException) -> bool:
     return 'error parsing tool call' in message
 
 
+def _is_provider_tool_call_format_error(exc: BaseException) -> bool:
+    message = str(exc or '').lower()
+    return any(fragment in message for fragment in [
+        'error parsing tool call',
+        'plain text instead of mcp tool calls',
+        'malformed or unusable mcp tool calls',
+    ])
+
+
 def _build_mcp_bridge_tool_parse_retry_prompt(prompt: str, *, user_prompt: str | None = None) -> str:
     source_prompt = str(user_prompt or prompt or '')
     retry_lines = [
         '',
-        'Retry note: your previous response failed because Ollama could not parse a generated tool call.',
+        'Retry note: your previous response failed because the provider returned malformed or unusable tool calls.',
+        'Before you finish, use the available MCP tools first when the request requires scenario edits. Do not stop at plain text if tool calls are still needed.',
         'Every tool call arguments object must be strict valid JSON with no duplicate keys, no dangling text, and no partial numbers or strings.',
+        'Never emit placeholder tokens such as ?, ??, ???, TBD, ellipses, blank numeric values, or partially quoted values inside tool JSON.',
+        'Numeric fields such as count or v_count must be plain JSON numbers only, for example {"count": 8} and never {"count": 8?} or {"count": ?}.',
         'For vulnerabilities, do not pass factor.',
+        'For scenario.add_vulnerability_item, v_count must be a plain JSON number such as {"v_count": 1} and never {"v_count": "1"}, {"v_count": 1"}, or {"v_count": ?}.',
         'For traffic, if you provide count then do not also send factor or density for the same row.',
         'For vulnerabilities, use scenario.search_vulnerability_catalog first, then call scenario.add_vulnerability_item with only draft_id plus explicit v_name and v_path from the chosen concrete catalog match.',
         'For broad vulnerability requests, call scenario.search_vulnerability_catalog with only a free-text query from the user wording. Do not pass v_type or v_vector filters unless the user explicitly asked for those exact filters.',
         'If the user asks for multiple different vulnerabilities, make multiple separate add_vulnerability_item calls with v_count=1 instead of trying to encode them in one weighted row.',
         'For scenario.add_vulnerability_item, pass only strict JSON keys draft_id, v_name, v_path, and v_count unless the user explicitly requested exact type/vector filters.',
-        'When v_path contains dots or slashes, keep it as one quoted JSON string copied exactly from a catalog search result. Never emit bare path fragments, ellipses, comments, or truncated JSON.',
+        'When v_path contains dots or slashes, keep it as one quoted JSON string copied exactly from a catalog search result. Never emit bare path fragments, ellipses like "...", comments, or truncated JSON.',
     ]
     vulnerability_target_count = _extract_vulnerability_target_count(source_prompt)
     if vulnerability_target_count > 0:
@@ -1250,6 +1264,13 @@ def _build_prompt_repair_decision(
             status_message='Retrying after Ollama tool-call parse failure...',
             retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt),
         )
+    if exc is not None and _is_provider_tool_call_format_error(exc):
+        return _McpBridgeRepairDecision(
+            category='provider-tool-call-format-error',
+            retryable=True,
+            status_message='Retrying after provider tool-call formatting failure...',
+            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt),
+        )
     if isinstance(mismatch, dict):
         if isinstance(mismatch.get('missing'), list):
             return _McpBridgeRepairDecision(
@@ -1927,10 +1948,16 @@ def _build_request_headers(*, extra_headers: dict[str, str] | None = None) -> di
     return headers
 
 
-def _fetch_json(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> dict[str, Any]:
+def _fetch_json(
+    url: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    verify_ssl: bool = True,
+) -> dict[str, Any]:
     request_obj = Request(url, headers=_build_request_headers(extra_headers=headers))
     payload = _run_with_wall_clock_timeout(
-        lambda: _read_response_text(request_obj, timeout=timeout),
+        lambda: _read_response_text(request_obj, timeout=timeout, verify_ssl=verify_ssl),
         timeout_seconds=timeout,
     )
     data = json.loads(payload)
@@ -1939,7 +1966,14 @@ def _fetch_json(url: str, *, timeout: float, headers: dict[str, str] | None = No
     return data
 
 
-def _post_json(url: str, payload: dict[str, Any], *, timeout: float, headers: dict[str, str] | None = None) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    verify_ssl: bool = True,
+) -> dict[str, Any]:
     body = json.dumps(payload).encode('utf-8')
     request_obj = Request(
         url,
@@ -1948,7 +1982,7 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout: float, headers: di
         method='POST',
     )
     raw = _run_with_wall_clock_timeout(
-        lambda: _read_response_text(request_obj, timeout=timeout),
+        lambda: _read_response_text(request_obj, timeout=timeout, verify_ssl=verify_ssl),
         timeout_seconds=timeout,
     )
     data = json.loads(raw)
@@ -1957,8 +1991,17 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout: float, headers: di
     return data
 
 
-def _read_response_text(request_obj: Request, *, timeout: float) -> str:
-    with urlopen(request_obj, timeout=timeout) as response:
+def _urlopen_kwargs_for_request(request_obj: Request, *, verify_ssl: bool) -> dict[str, Any]:
+    if verify_ssl:
+        return {}
+    parsed = urlparse(str(getattr(request_obj, 'full_url', '') or ''))
+    if (parsed.scheme or '').lower() != 'https':
+        return {}
+    return {'context': ssl._create_unverified_context()}
+
+
+def _read_response_text(request_obj: Request, *, timeout: float, verify_ssl: bool = True) -> str:
+    with urlopen(request_obj, timeout=timeout, **_urlopen_kwargs_for_request(request_obj, verify_ssl=verify_ssl)) as response:
         return response.read().decode('utf-8')
 
 
@@ -1993,6 +2036,7 @@ def _stream_json_lines(
     *,
     timeout: float,
     headers: dict[str, str] | None = None,
+    verify_ssl: bool = True,
     cancellation_check: Callable[[], bool] | None = None,
     on_open: Callable[[Any], None] | None = None,
 ):
@@ -2008,7 +2052,7 @@ def _stream_json_lines(
 
     def _worker() -> None:
         try:
-            with urlopen(request_obj, timeout=timeout) as response:
+            with urlopen(request_obj, timeout=timeout, **_urlopen_kwargs_for_request(request_obj, verify_ssl=verify_ssl)) as response:
                 if callable(on_open):
                     on_open(response)
                 event_queue.put(('opened', None))
@@ -2240,7 +2284,7 @@ def _payload_bool(raw_value: Any, *, default: bool) -> bool:
     return default
 
 
-def _normalize_litellm_base_url(raw_value: Any, *, enforce_ssl: bool) -> str:
+def _normalize_openai_compatible_base_url(raw_value: Any, *, enforce_ssl: bool) -> str:
     base_url = _normalize_base_url(raw_value)
     parsed = urlparse(base_url)
     if enforce_ssl and (parsed.scheme or '').lower() != 'https':
@@ -2248,14 +2292,14 @@ def _normalize_litellm_base_url(raw_value: Any, *, enforce_ssl: bool) -> str:
     return base_url
 
 
-def _litellm_request_headers(api_key: Any) -> dict[str, str] | None:
+def _openai_compatible_request_headers(api_key: Any) -> dict[str, str] | None:
     key_text = str(api_key or '').strip()
     if not key_text:
         return None
     return {'Authorization': f'Bearer {key_text}'}
 
 
-def _litellm_models_url(base_url: str) -> str:
+def _openai_compatible_models_url(base_url: str) -> str:
     parsed = urlparse(base_url)
     path = (parsed.path or '').rstrip('/')
     if path.endswith('/v1'):
@@ -2263,7 +2307,7 @@ def _litellm_models_url(base_url: str) -> str:
     return f'{base_url}/v1/models'
 
 
-def _litellm_chat_completions_url(base_url: str) -> str:
+def _openai_compatible_chat_completions_url(base_url: str) -> str:
     parsed = urlparse(base_url)
     path = (parsed.path or '').rstrip('/')
     if path.endswith('/v1'):
@@ -2271,7 +2315,7 @@ def _litellm_chat_completions_url(base_url: str) -> str:
     return f'{base_url}/v1/chat/completions'
 
 
-def _extract_litellm_message_text(raw_payload: dict[str, Any]) -> str:
+def _extract_openai_compatible_message_text(raw_payload: dict[str, Any]) -> str:
     choices = raw_payload.get('choices') if isinstance(raw_payload.get('choices'), list) else []
     if not choices:
         return ''
@@ -3063,10 +3107,18 @@ def _normalize_mcp_bridge_tool_name(tool_name: Any, *, known_server_names: list[
     text = str(tool_name or '').strip()
     if not text:
         return ''
+    if '<|' in text or '|>' in text:
+        return ''
+    lowered = text.lower()
+    if lowered in {'assistant', 'user', 'tool', 'system'}:
+        return ''
     if isinstance(known_server_names, list):
         known = {str(name or '').strip() for name in known_server_names if str(name or '').strip()}
     else:
         known = set()
+
+    if known and text.startswith('scenario.') and len(known) == 1:
+        return f'{next(iter(known))}.{text}'
 
     if '.' in text:
         server_name, _rest = text.split('.', 1)
@@ -3079,6 +3131,71 @@ def _normalize_mcp_bridge_tool_name(tool_name: Any, *, known_server_names: list[
             if not known or candidate_server in known:
                 return candidate
     return text
+
+
+def _empty_bridge_tool_call_meta() -> dict[str, Any]:
+    return {
+        'raw_count': 0,
+        'accepted_count': 0,
+        'rejected_count': 0,
+        'rejected_tool_names': [],
+    }
+
+
+def _merge_bridge_tool_call_meta(current: dict[str, Any] | None, update: dict[str, Any] | None) -> dict[str, Any]:
+    merged = _empty_bridge_tool_call_meta()
+    for source in (current, update):
+        if not isinstance(source, dict):
+            continue
+        merged['raw_count'] += int(source.get('raw_count') or 0)
+        merged['accepted_count'] += int(source.get('accepted_count') or 0)
+        merged['rejected_count'] += int(source.get('rejected_count') or 0)
+        for name in source.get('rejected_tool_names') or []:
+            text = str(name or '').strip()
+            if text and text not in merged['rejected_tool_names']:
+                merged['rejected_tool_names'].append(text)
+    return merged
+
+
+def _normalize_bridge_chat_tool_calls(raw_tool_calls: Any, *, require_function_type: bool) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not isinstance(raw_tool_calls, list):
+        return [], _empty_bridge_tool_call_meta()
+    tool_calls: list[dict[str, Any]] = []
+    meta = _empty_bridge_tool_call_meta()
+    for entry in raw_tool_calls:
+        meta['raw_count'] += 1
+        if not isinstance(entry, dict):
+            meta['rejected_count'] += 1
+            continue
+        entry_type = str(entry.get('type') or '').strip().lower()
+        if require_function_type and entry_type and entry_type != 'function':
+            meta['rejected_count'] += 1
+            continue
+        function = entry.get('function') if isinstance(entry.get('function'), dict) else {}
+        raw_tool_name = str(function.get('name') or '').strip()
+        tool_name = _normalize_mcp_bridge_tool_name(function.get('name'))
+        if not tool_name:
+            meta['rejected_count'] += 1
+            if raw_tool_name:
+                meta['rejected_tool_names'].append(raw_tool_name)
+            continue
+        tool_args = function.get('arguments')
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except Exception:
+                tool_args = {'raw': tool_args}
+        if not isinstance(tool_args, dict):
+            tool_args = {'value': tool_args}
+        tool_calls.append({
+            'id': str(entry.get('id') or '').strip(),
+            'function': {
+                'name': tool_name,
+                'arguments': tool_args,
+            },
+        })
+    meta['accepted_count'] = len(tool_calls)
+    return tool_calls, meta
 
 
 _LLM_TOOL_PROPERTY_ALLOWLISTS: dict[str, set[str]] = {
@@ -3176,31 +3293,7 @@ def _sanitize_mcp_bridge_tool_arguments(
 
 
 def _normalize_ollama_chat_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_tool_calls, list):
-        return []
-    tool_calls: list[dict[str, Any]] = []
-    for entry in raw_tool_calls:
-        if not isinstance(entry, dict):
-            continue
-        function = entry.get('function') if isinstance(entry.get('function'), dict) else {}
-        tool_name = _normalize_mcp_bridge_tool_name(function.get('name'))
-        if not tool_name:
-            continue
-        tool_args = function.get('arguments')
-        if isinstance(tool_args, str):
-            try:
-                tool_args = json.loads(tool_args)
-            except Exception:
-                tool_args = {'raw': tool_args}
-        if not isinstance(tool_args, dict):
-            tool_args = {'value': tool_args}
-        tool_calls.append({
-            'id': str(entry.get('id') or '').strip(),
-            'function': {
-                'name': tool_name,
-                'arguments': tool_args,
-            },
-        })
+    tool_calls, _meta = _normalize_bridge_chat_tool_calls(raw_tool_calls, require_function_type=False)
     return tool_calls
 
 
@@ -3209,7 +3302,7 @@ def _extract_ollama_chat_message(raw_payload: dict[str, Any]) -> dict[str, Any]:
     role = str(message.get('role') or 'assistant').strip() or 'assistant'
     content = str(message.get('content') or '')
     thinking = str(message.get('thinking') or '')
-    tool_calls = _normalize_ollama_chat_tool_calls(message.get('tool_calls'))
+    tool_calls, tool_call_meta = _normalize_bridge_chat_tool_calls(message.get('tool_calls'), require_function_type=False)
     result = {
         'role': role,
         'content': content,
@@ -3218,35 +3311,13 @@ def _extract_ollama_chat_message(raw_payload: dict[str, Any]) -> dict[str, Any]:
         result['thinking'] = thinking
     if tool_calls:
         result['tool_calls'] = tool_calls
+    if tool_call_meta.get('raw_count'):
+        result['_tool_call_meta'] = tool_call_meta
     return result
 
 
 def _normalize_openai_chat_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_tool_calls, list):
-        return []
-    tool_calls: list[dict[str, Any]] = []
-    for entry in raw_tool_calls:
-        if not isinstance(entry, dict):
-            continue
-        function = entry.get('function') if isinstance(entry.get('function'), dict) else {}
-        tool_name = _normalize_mcp_bridge_tool_name(function.get('name'))
-        if not tool_name:
-            continue
-        tool_args = function.get('arguments')
-        if isinstance(tool_args, str):
-            try:
-                tool_args = json.loads(tool_args)
-            except Exception:
-                tool_args = {'raw': tool_args}
-        if not isinstance(tool_args, dict):
-            tool_args = {'value': tool_args}
-        tool_calls.append({
-            'id': str(entry.get('id') or '').strip(),
-            'function': {
-                'name': tool_name,
-                'arguments': tool_args,
-            },
-        })
+    tool_calls, _meta = _normalize_bridge_chat_tool_calls(raw_tool_calls, require_function_type=True)
     return tool_calls
 
 
@@ -3270,22 +3341,58 @@ def _extract_openai_chat_message(raw_payload: dict[str, Any]) -> dict[str, Any]:
         content_text = '\n'.join(text_parts).strip()
     else:
         content_text = str(content or '')
-    tool_calls = _normalize_openai_chat_tool_calls(message.get('tool_calls'))
+    tool_calls, tool_call_meta = _normalize_bridge_chat_tool_calls(message.get('tool_calls'), require_function_type=True)
     result = {
         'role': role,
         'content': content_text,
     }
     if tool_calls:
         result['tool_calls'] = tool_calls
+    if tool_call_meta.get('raw_count'):
+        result['_tool_call_meta'] = tool_call_meta
     return result
 
 
+def _validate_bridge_assistant_message(
+    assistant_message: dict[str, Any],
+    *,
+    requires_tool_calls: bool,
+    used_tool_calls: bool,
+) -> tuple[str, list[dict[str, Any]]]:
+    content = str(assistant_message.get('content') or '')
+    tool_calls = assistant_message.get('tool_calls') if isinstance(assistant_message.get('tool_calls'), list) else []
+    tool_call_meta = assistant_message.get('_tool_call_meta') if isinstance(assistant_message.get('_tool_call_meta'), dict) else {}
+    raw_count = int(tool_call_meta.get('raw_count') or 0)
+    rejected_count = int(tool_call_meta.get('rejected_count') or 0)
+
+    if requires_tool_calls and not tool_calls and not used_tool_calls:
+        provider_response = content.strip()
+        if raw_count > 0 and rejected_count >= raw_count:
+            raise ProviderAdapterError(
+                'Provider returned malformed or unusable MCP tool calls. Verify that MCP tools are enabled and that the selected model supports tool calling with valid function names and JSON arguments.',
+                status_code=502,
+                details={
+                    'provider_response': provider_response[:4000],
+                    'raw_tool_call_count': raw_count,
+                    'rejected_tool_names': list(tool_call_meta.get('rejected_tool_names') or [])[:10],
+                },
+            )
+        raise ProviderAdapterError(
+            'Provider returned plain text instead of MCP tool calls. Verify that MCP tools are enabled and that the selected model supports tool calling.',
+            status_code=502,
+            details={'provider_response': provider_response[:4000]},
+        )
+
+    return content, tool_calls
+
+
 class _RepoMcpBridgeClient:
-    def __init__(self, *, model: str, host: str, provider: str = 'ollama', api_key: str = ''):
+    def __init__(self, *, model: str, host: str, provider: str = 'ollama', api_key: str = '', verify_ssl: bool = True):
         self.model = model
         self.host = host
         self.provider = str(provider or 'ollama').strip().lower() or 'ollama'
         self.api_key = str(api_key or '').strip()
+        self.verify_ssl = bool(verify_ssl)
         self.sessions: dict[str, dict[str, Any]] = {}
         self.connection_errors: dict[str, str] = {}
         self.tool_manager = _BridgeToolManager()
@@ -3396,7 +3503,7 @@ class _RepoMcpBridgeClient:
 
     def _provider_label(self) -> str:
         if self.provider == 'litellm':
-            return 'LiteLLM'
+            return 'OpenAI-Compatible provider'
         if self.provider == 'openai':
             return 'OpenAI-compatible provider'
         return 'Ollama'
@@ -3468,10 +3575,11 @@ class _RepoMcpBridgeClient:
                     if tool_choice:
                         payload['tool_choice'] = tool_choice
                 return _post_json(
-                    _litellm_chat_completions_url(self.host),
+                    _openai_compatible_chat_completions_url(self.host),
                     payload,
                     timeout=self.timeout_seconds,
                     headers=self._chat_request_headers(),
+                    verify_ssl=self.verify_ssl,
                 )
             return _post_json(
                 f'{self.host}/api/chat',
@@ -3484,6 +3592,7 @@ class _RepoMcpBridgeClient:
                 },
                 timeout=self.timeout_seconds,
                 headers=self._chat_request_headers(),
+                verify_ssl=self.verify_ssl,
             )
         except HTTPError as exc:
             detail = ''
@@ -3514,6 +3623,7 @@ class _RepoMcpBridgeClient:
     ) -> dict[str, Any]:
         accumulated_text = ''
         tool_calls: list[dict[str, Any]] = []
+        tool_call_meta = _empty_bridge_tool_call_meta()
         if self._uses_openai_chat_completions():
             response = self._post_chat(messages=messages)
             assistant_message = _extract_openai_chat_message(response)
@@ -3559,7 +3669,12 @@ class _RepoMcpBridgeClient:
                 if content_delta:
                     accumulated_text += content_delta
                     emit('llm_delta', text=content_delta)
-                for tool_call in _normalize_ollama_chat_tool_calls(message.get('tool_calls')):
+                chunk_tool_calls, chunk_tool_call_meta = _normalize_bridge_chat_tool_calls(
+                    message.get('tool_calls'),
+                    require_function_type=False,
+                )
+                tool_call_meta = _merge_bridge_tool_call_meta(tool_call_meta, chunk_tool_call_meta)
+                for tool_call in chunk_tool_calls:
                     tool_calls.append(tool_call)
                     emit('tool_call', tool_name=str(((tool_call.get('function') or {}).get('name')) or ''))
         except HTTPError as exc:
@@ -3588,6 +3703,8 @@ class _RepoMcpBridgeClient:
             assistant_message['thinking'] = accumulated_thinking
         if tool_calls:
             assistant_message['tool_calls'] = tool_calls
+        if tool_call_meta.get('raw_count'):
+            assistant_message['_tool_call_meta'] = tool_call_meta
         return assistant_message
 
     async def _run_query(
@@ -3602,6 +3719,7 @@ class _RepoMcpBridgeClient:
         messages: list[dict[str, Any]] = [{'role': 'user', 'content': prompt}]
         final_text = ''
         current_draft_id = str(initial_draft_id or '').strip()
+        used_tool_calls = False
         self.query_debug_state = {
             'phase': 'starting_query',
             'phase_started_at': time.monotonic(),
@@ -3634,29 +3752,25 @@ class _RepoMcpBridgeClient:
                     else _extract_ollama_chat_message(raw_response)
                 )
 
-            content = str(assistant_message.get('content') or '')
+            content, tool_calls = _validate_bridge_assistant_message(
+                assistant_message,
+                requires_tool_calls=self._uses_openai_chat_completions() and self._has_enabled_chat_tools(),
+                used_tool_calls=used_tool_calls,
+            )
             if content:
                 final_text = content
             messages.append({
                 'role': 'assistant',
                 'content': content,
-                **({'tool_calls': assistant_message.get('tool_calls')} if assistant_message.get('tool_calls') else {}),
+                **({'tool_calls': tool_calls} if tool_calls else {}),
             })
 
-            tool_calls = assistant_message.get('tool_calls') if isinstance(assistant_message.get('tool_calls'), list) else []
             self._set_query_debug_state(
                 phase='assistant_response_received',
                 iteration=iteration + 1,
                 message_count=len(messages),
                 current_draft_id=current_draft_id,
             )
-            if self._uses_openai_chat_completions() and self._has_enabled_chat_tools() and not tool_calls:
-                provider_response = content.strip()
-                raise ProviderAdapterError(
-                    'Provider returned plain text instead of MCP tool calls. Verify that MCP tools are enabled and that the selected model supports tool calling.',
-                    status_code=502,
-                    details={'provider_response': provider_response[:4000]},
-                )
             if not tool_calls:
                 self._set_query_debug_state(
                     phase='completed_without_tool_calls',
@@ -3754,6 +3868,7 @@ class _RepoMcpBridgeClient:
                     'tool_call_id': str(tool_call.get('id') or '').strip(),
                     'content': tool_response,
                 })
+                used_tool_calls = True
 
         self._set_query_debug_state(
             phase='query_complete',
@@ -3808,6 +3923,9 @@ async def _mcp_bridge_process_query_server_side(
 ) -> str:
     process_query = None
     sanitized_initial_draft_id = str(initial_draft_id or '').strip()
+    current_prompt = prompt
+    tool_format_retry_count = 0
+    max_tool_format_retries = 2
 
     async def _invoke_process_query(callable_obj: Callable[..., Any], current_prompt: str, **kwargs: Any) -> str:
         if sanitized_initial_draft_id:
@@ -3831,15 +3949,20 @@ async def _mcp_bridge_process_query_server_side(
     if process_query is None:
         process_query = lambda current_prompt: _invoke_process_query(client.process_query, current_prompt)
 
-    try:
-        return await process_query(prompt)
-    except ProviderAdapterError as exc:
-        repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, exc=exc)
-        if not repair.retryable:
-            raise
-        if emit is not None and repair.status_message:
-            emit('status', message=repair.status_message)
-        return await process_query(repair.retry_prompt or prompt)
+    while True:
+        try:
+            return await process_query(current_prompt)
+        except ProviderAdapterError as exc:
+            repair = _build_prompt_repair_decision(prompt=current_prompt, user_prompt=user_prompt, exc=exc)
+            if not repair.retryable:
+                raise
+            if repair.category in {'ollama-tool-parse-error', 'provider-tool-call-format-error'}:
+                if tool_format_retry_count >= max_tool_format_retries:
+                    raise
+                tool_format_retry_count += 1
+            if emit is not None and repair.status_message:
+                emit('status', message=repair.status_message)
+            current_prompt = repair.retry_prompt or current_prompt
 
 
 def _compact_draft_payload_for_llm(draft: dict[str, Any]) -> dict[str, Any]:
@@ -3907,18 +4030,21 @@ def _configure_mcp_bridge_client_for_web(client: Any, *, hil_enabled: bool) -> N
 
 async def _mcp_bridge_connect(payload: dict[str, Any], *, model: str, host: str) -> tuple[Any, dict[str, Any]]:
     bridge_cfg = _normalize_mcp_bridge_payload(payload)
+    verify_ssl = _payload_bool(payload.get('enforce_ssl'), default=True)
     try:
         client = McpBridgeClient(
             model=model,
             host=host,
             provider=str(payload.get('provider') or 'ollama').strip().lower() or 'ollama',
             api_key=str(payload.get('api_key') or '').strip(),
+            verify_ssl=verify_ssl,
         )
     except TypeError:
         client = McpBridgeClient(model=model, host=host)
         try:
             setattr(client, 'provider', str(payload.get('provider') or 'ollama').strip().lower() or 'ollama')
             setattr(client, 'api_key', str(payload.get('api_key') or '').strip())
+            setattr(client, 'verify_ssl', verify_ssl)
         except Exception:
             pass
     _configure_mcp_bridge_client_for_web(client, hil_enabled=bridge_cfg['hil_enabled'])
@@ -5111,13 +5237,13 @@ class OllamaProviderAdapter(ProviderAdapter):
             ) from exc
 
 
-class LiteLlmProviderAdapter(ProviderAdapter):
+class OpenAiCompatibleProviderAdapter(ProviderAdapter):
     capability = ProviderCapability(
         provider='litellm',
-        label='LiteLLM',
+        label='OpenAI-Compatible',
         enabled=True,
         mode='remote',
-        description='OpenAI-compatible LiteLLM proxy for hosted or routed model access.',
+        description='OpenAI-compatible chat-completions endpoint for hosted or routed model access.',
         default_base_url='https://localhost:4000/v1',
         requires_model=True,
         requires_api_key=False,
@@ -5135,14 +5261,14 @@ class LiteLlmProviderAdapter(ProviderAdapter):
         enforce_ssl = _payload_bool(payload.get('enforce_ssl'), default=True)
 
         try:
-            base_url = _normalize_litellm_base_url(payload.get('base_url'), enforce_ssl=enforce_ssl)
+            base_url = _normalize_openai_compatible_base_url(payload.get('base_url'), enforce_ssl=enforce_ssl)
         except ValueError as exc:
             raise ProviderAdapterError(str(exc), details={'checked_at': _utc_timestamp()}) from exc
 
-        headers = _litellm_request_headers(payload.get('api_key'))
-        models_url = _litellm_models_url(base_url)
+        headers = _openai_compatible_request_headers(payload.get('api_key'))
+        models_url = _openai_compatible_models_url(base_url)
         try:
-            data = _fetch_json(models_url, timeout=timeout_seconds, headers=headers)
+            data = _fetch_json(models_url, timeout=timeout_seconds, headers=headers, verify_ssl=enforce_ssl)
             raw_models = data.get('data') if isinstance(data, dict) else []
             models: list[str] = []
             if isinstance(raw_models, list):
@@ -5154,9 +5280,9 @@ class LiteLlmProviderAdapter(ProviderAdapter):
                     if name:
                         models.append(name)
             model_found = (not model) or (model in models)
-            message = f'Reached LiteLLM at {base_url}.'
+            message = f'Reached OpenAI-compatible endpoint at {base_url}.'
             if model and not model_found:
-                message = f'Reached LiteLLM at {base_url}, but model {model!r} was not found.'
+                message = f'Reached OpenAI-compatible endpoint at {base_url}, but model {model!r} was not found.'
             return {
                 'success': True,
                 'provider': 'litellm',
@@ -5174,7 +5300,7 @@ class LiteLlmProviderAdapter(ProviderAdapter):
                 detail = exc.read().decode('utf-8').strip()
             except Exception:
                 detail = ''
-            message = f'LiteLLM returned HTTP {exc.code}.'
+            message = f'OpenAI-compatible endpoint returned HTTP {exc.code}.'
             if detail:
                 message = f'{message} {detail[:240]}'
             raise ProviderAdapterError(message, status_code=502, details={'checked_at': _utc_timestamp()}) from exc
@@ -5188,11 +5314,11 @@ class LiteLlmProviderAdapter(ProviderAdapter):
         except Exception as exc:  # pragma: no cover
             try:
                 if log is not None:
-                    log.exception('[ai-provider] litellm validation failed: %s', exc)
+                    log.exception('[ai-provider] openai-compatible validation failed: %s', exc)
             except Exception:
                 pass
             raise ProviderAdapterError(
-                'Unexpected validation failure while contacting LiteLLM.',
+                'Unexpected validation failure while contacting the OpenAI-compatible endpoint.',
                 status_code=500,
                 details={'checked_at': _utc_timestamp()},
             ) from exc
@@ -5211,15 +5337,25 @@ class LiteLlmProviderAdapter(ProviderAdapter):
             'stream': False,
         }
 
-    def _generate_once(self, *, base_url: str, api_key: str, model: str, prompt: str, timeout_seconds: float) -> tuple[str, dict[str, Any], str]:
+    def _generate_once(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        prompt: str,
+        timeout_seconds: float,
+        verify_ssl: bool,
+    ) -> tuple[str, dict[str, Any], str]:
         response_format = {'type': 'json_object'}
         response = _post_json(
-            _litellm_chat_completions_url(base_url),
+            _openai_compatible_chat_completions_url(base_url),
             self._build_generate_payload(model=model, prompt=prompt, response_format=response_format),
             timeout=timeout_seconds,
-            headers=_litellm_request_headers(api_key),
+            headers=_openai_compatible_request_headers(api_key),
+            verify_ssl=verify_ssl,
         )
-        raw_generation = _extract_litellm_message_text(response)
+        raw_generation = _extract_openai_compatible_message_text(response)
         parsed_generation = _extract_json_candidate(raw_generation)
         return raw_generation, parsed_generation or {}, 'json_object'
 
@@ -5230,7 +5366,7 @@ class LiteLlmProviderAdapter(ProviderAdapter):
 
         enforce_ssl = _payload_bool(payload.get('enforce_ssl'), default=True)
         try:
-            base_url = _normalize_litellm_base_url(payload.get('base_url'), enforce_ssl=enforce_ssl)
+            base_url = _normalize_openai_compatible_base_url(payload.get('base_url'), enforce_ssl=enforce_ssl)
         except ValueError as exc:
             raise ProviderAdapterError(str(exc)) from exc
 
@@ -5244,29 +5380,111 @@ class LiteLlmProviderAdapter(ProviderAdapter):
         api_key = str(payload.get('api_key') or '').strip()
         prompt = _build_ollama_prompt(current_scenario, user_prompt)
         provider_attempts: list[dict[str, Any]] = []
-        try:
-            raw_generation, parsed_generation, format_mode = self._generate_once(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
-                prompt=prompt,
-                timeout_seconds=timeout_seconds,
-            )
-            provider_attempts.append({'attempt': 'initial', 'format_mode': format_mode, 'response': raw_generation})
-            if not isinstance(parsed_generation, dict) or not parsed_generation:
-                repair_prompt = _build_ollama_repair_prompt(current_scenario, user_prompt, raw_generation)
-                raw_generation, parsed_generation, format_mode = self._generate_once(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=model,
-                    prompt=repair_prompt,
+        generation_started_at = time.monotonic()
+
+        def _run_attempt(*, attempt_name: str, prompt_text: str) -> tuple[str, dict[str, Any], str]:
+            attempt_started_at = time.monotonic()
+            try:
+                raw_generation, parsed_generation, format_mode = _run_with_wall_clock_timeout(
+                    lambda: self._generate_once(
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=model,
+                        prompt=prompt_text,
+                        timeout_seconds=timeout_seconds,
+                        verify_ssl=enforce_ssl,
+                    ),
                     timeout_seconds=timeout_seconds,
                 )
-                provider_attempts.append({'attempt': 'repair', 'format_mode': format_mode, 'response': raw_generation})
+            except HTTPError as exc:
+                detail = ''
+                try:
+                    detail = exc.read().decode('utf-8').strip()
+                except Exception:
+                    detail = ''
+                message = f'OpenAI-compatible endpoint returned HTTP {exc.code}.'
+                if detail:
+                    message = f'{message} {detail[:240]}'
+                _append_provider_attempt(
+                    provider_attempts,
+                    attempt=attempt_name,
+                    started_at=attempt_started_at,
+                    status='failed',
+                    error=message,
+                )
+                raise ProviderAdapterError(
+                    message,
+                    status_code=502,
+                    details=_build_provider_generation_error_details(
+                        provider='litellm',
+                        stage='direct_generate',
+                        started_at=generation_started_at,
+                        base_url=base_url,
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                        attempt=attempt_name,
+                        provider_attempts=provider_attempts,
+                        error_category='http_error',
+                    ),
+                ) from exc
+            except URLError as exc:
+                reason = getattr(exc, 'reason', exc)
+                reason_text = str(reason)
+                _append_provider_attempt(
+                    provider_attempts,
+                    attempt=attempt_name,
+                    started_at=attempt_started_at,
+                    status='failed',
+                    error=reason_text,
+                )
+                error_category = 'timeout' if 'timed out' in reason_text.lower() else 'connection_error'
+                raise ProviderAdapterError(
+                    f'Could not reach OpenAI-compatible endpoint at {base_url}: {reason}',
+                    status_code=502,
+                    details=_build_provider_generation_error_details(
+                        provider='litellm',
+                        stage='direct_generate',
+                        started_at=generation_started_at,
+                        base_url=base_url,
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                        attempt=attempt_name,
+                        provider_attempts=provider_attempts,
+                        error_category=error_category,
+                    ),
+                ) from exc
+            _append_provider_attempt(
+                provider_attempts,
+                attempt=attempt_name,
+                format_mode=format_mode,
+                started_at=attempt_started_at,
+                status='completed',
+                response=raw_generation,
+            )
+            return raw_generation, parsed_generation, format_mode
+
+        try:
+            raw_generation, parsed_generation, format_mode = _run_attempt(
+                attempt_name='initial',
+                prompt_text=prompt,
+            )
+            if not isinstance(parsed_generation, dict) or not parsed_generation:
+                repair_prompt = _build_ollama_repair_prompt(current_scenario, user_prompt, raw_generation)
+                raw_generation, parsed_generation, format_mode = _run_attempt(
+                    attempt_name='repair',
+                    prompt_text=repair_prompt,
+                )
                 prompt = repair_prompt
             if not isinstance(parsed_generation, dict) or not parsed_generation:
+                strict_prompt = _build_ollama_strict_json_repair_prompt(current_scenario, user_prompt, raw_generation)
+                raw_generation, parsed_generation, format_mode = _run_attempt(
+                    attempt_name='strict-rewrite',
+                    prompt_text=strict_prompt,
+                )
+                prompt = strict_prompt
+            if not isinstance(parsed_generation, dict) or not parsed_generation:
                 raise ProviderAdapterError(
-                    'LiteLLM did not return valid JSON for scenario generation.',
+                    'OpenAI-compatible endpoint did not return valid JSON for scenario generation.',
                     status_code=502,
                     details={
                         'provider_response': str((provider_attempts[-1].get('response') if provider_attempts else '') or '')[:4000],
@@ -5284,34 +5502,31 @@ class LiteLlmProviderAdapter(ProviderAdapter):
             }
         except ProviderAdapterError:
             raise
-        except HTTPError as exc:
-            detail = ''
-            try:
-                detail = exc.read().decode('utf-8').strip()
-            except Exception:
-                detail = ''
-            message = f'LiteLLM returned HTTP {exc.code}.'
-            if detail:
-                message = f'{message} {detail[:240]}'
-            raise ProviderAdapterError(message, status_code=502) from exc
-        except URLError as exc:
-            reason = getattr(exc, 'reason', exc)
-            raise ProviderAdapterError(f'Could not reach LiteLLM at {base_url}: {reason}', status_code=502) from exc
         except Exception as exc:  # pragma: no cover
             try:
                 if log is not None:
-                    log.exception('[ai-provider] litellm generation failed: %s', exc)
+                    log.exception('[ai-provider] openai-compatible generation failed: %s', exc)
             except Exception:
                 pass
             raise ProviderAdapterError(
-                'Unexpected generation failure while contacting LiteLLM.',
+                'Unexpected generation failure while contacting the OpenAI-compatible endpoint.',
                 status_code=500,
+                details=_build_provider_generation_error_details(
+                    provider='litellm',
+                    stage='direct_generate',
+                    started_at=generation_started_at,
+                    base_url=base_url,
+                    model=model,
+                    timeout_seconds=timeout_seconds,
+                    provider_attempts=provider_attempts,
+                    error_category='unexpected_error',
+                ),
             ) from exc
 
 
 _PROVIDER_REGISTRY: dict[str, ProviderAdapter] = {
     'ollama': OllamaProviderAdapter(),
-    'litellm': LiteLlmProviderAdapter(),
+    'litellm': OpenAiCompatibleProviderAdapter(),
     'openai': UnsupportedProviderAdapter(
         ProviderCapability(
             provider='openai',
@@ -5374,7 +5589,11 @@ def register(app, *, logger=None) -> None:
 
     @app.route('/api/ai/providers', methods=['GET'])
     def api_ai_provider_catalog():
-        providers = [adapter.capability.to_dict() for _, adapter in sorted(_PROVIDER_REGISTRY.items())]
+        providers = [
+            adapter.capability.to_dict()
+            for _, adapter in sorted(_PROVIDER_REGISTRY.items())
+            if getattr(adapter.capability, 'enabled', False)
+        ]
         return jsonify({
             'success': True,
             'providers': providers,

@@ -6,7 +6,7 @@
             const key = String(provider || 'ollama').trim().toLowerCase();
             if (key === 'litellm') {
                 return {
-                    label: 'LiteLLM',
+                    label: 'OpenAI-Compatible',
                     supportsBridge: true,
                 };
             }

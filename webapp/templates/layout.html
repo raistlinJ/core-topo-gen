@@ -633,6 +633,14 @@
 
             // If the page comes back from bfcache, ensure we don't keep the modal up.
             try { window.addEventListener('pageshow', hideNavLoading); } catch (e) { }
+            try { window.addEventListener('focus', hideNavLoading); } catch (e) { }
+            try {
+                document.addEventListener('visibilitychange', () => {
+                    try {
+                        if (!document.hidden) hideNavLoading();
+                    } catch (e) { }
+                });
+            } catch (e) { }
         })();
     </script>
     {% endif %}

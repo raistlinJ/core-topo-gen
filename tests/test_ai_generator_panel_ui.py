@@ -22,7 +22,7 @@ def test_ai_generator_panel_uses_provider_catalog_instead_of_hardcoded_dropdown(
 
 
 
-def test_ai_generator_panel_renders_litellm_controls_from_catalog_backed_ui() -> None:
+def test_ai_generator_panel_renders_openai_compatible_controls_from_catalog_backed_ui() -> None:
     text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
@@ -31,11 +31,11 @@ def test_ai_generator_panel_renders_litellm_controls_from_catalog_backed_ui() ->
         'id="aiGeneratorEnforceSslInput"',
         "supportsBridge: true",
         'reachable and MCP tools ready',
-        'the LiteLLM base URL must use <strong>https</strong>.',
+        'When on, the OpenAI-compatible base URL must use <strong>https</strong>',
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
-    assert not missing, "Missing LiteLLM UI control snippets in AI Generator panel: " + "; ".join(missing)
+    assert not missing, "Missing OpenAI-compatible UI control snippets in AI Generator panel: " + "; ".join(missing)
 
 
 def test_ai_generator_panel_no_longer_shows_bridge_field_copy() -> None:
@@ -51,7 +51,7 @@ def test_ai_generator_panel_no_longer_shows_bridge_field_copy() -> None:
     assert not present, "Bridge field copy should be removed from AI Generator panel: " + "; ".join(present)
 
 
-def test_ai_generator_panel_keeps_mcp_tooling_available_for_litellm() -> None:
+def test_ai_generator_panel_keeps_mcp_tooling_available_for_openai_compatible_provider() -> None:
     text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
@@ -62,7 +62,7 @@ def test_ai_generator_panel_keeps_mcp_tooling_available_for_litellm() -> None:
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
-    assert not missing, "Missing LiteLLM MCP tool UI snippets in AI Generator panel: " + "; ".join(missing)
+    assert not missing, "Missing OpenAI-compatible MCP tool UI snippets in AI Generator panel: " + "; ".join(missing)
 
 
 def test_ai_generator_workflow_blocks_bridge_generation_without_enabled_tools() -> None:

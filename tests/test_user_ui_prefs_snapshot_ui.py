@@ -13,10 +13,14 @@ def test_user_ui_prefs_are_hydrated_and_collected_via_server_snapshot() -> None:
         'hydrateBrowserUiPrefsFromServerSnapshot(initialEditorSnapshot);',
         'function collectUserScopedUiPrefs() {',
         'function persistUserScopedUiPrefsSoon() {',
+        'function getAiGeneratorScenarioKeys(scenario, idx = null) {',
+        'const candidateKeys = getAiGeneratorScenarioKeys(scenario, idx);',
+        'for (const key of getAiGeneratorScenarioKeys(scenario, idx)) {',
         'ui_prefs: collectUserScopedUiPrefs(),',
         'localStorage.setItem(USER_UI_PREFS_SECTION_COLLAPSE_KEY, JSON.stringify(prefs.section_collapse_state));',
         'localStorage.setItem(AI_GENERATOR_STATE_STORAGE_KEY, JSON.stringify(prefs.ai_generator_state));',
         'sessionStorage.setItem(USER_UI_PREFS_GRAPH_LABELS_STATE_KEY, graphLabelsState);',
+        'try { persistUserScopedUiPrefsSoon(); } catch (err) { }',
         'try { persistUserScopedUiPrefsSoon(); } catch (e) { }',
     ]
 

@@ -4883,12 +4883,25 @@
         return 'default';
     }
 
+    function getAiGeneratorScenarioKeys(scenario, idx = null) {
+        const keys = [];
+        if (scenario && typeof scenario === 'object') {
+            const sid = (scenario._sid || '').toString().trim();
+            if (sid) keys.push(sid);
+            const name = (scenario.name || '').toString().trim().toLowerCase();
+            if (name) keys.push(`name:${name}`);
+        }
+        if (Number.isInteger(idx)) keys.push(`idx:${idx}`);
+        if (!keys.length) keys.push('default');
+        return Array.from(new Set(keys.filter(Boolean)));
+    }
+
     function getAiProviderDefaults(provider = 'ollama') {
         const key = String(provider || 'ollama').trim().toLowerCase();
         if (key === 'litellm') {
             return {
                 provider: 'litellm',
-                label: 'LiteLLM',
+                label: 'OpenAI-Compatible',
                 defaultBaseUrl: 'https://localhost:4000/v1',
                 supportsBridge: false,
             };
@@ -4924,36 +4937,14 @@
                 },
                 {
                     provider: 'litellm',
-                    label: 'LiteLLM',
+                    label: 'OpenAI-Compatible',
                     enabled: true,
                     mode: 'remote',
-                    description: 'OpenAI-compatible LiteLLM proxy for hosted or routed model access.',
+                    description: 'OpenAI-compatible chat-completions endpoint for hosted or routed model access.',
                     default_base_url: 'https://localhost:4000/v1',
                     requires_model: true,
                     requires_api_key: false,
                     supports_mcp_bridge: true,
-                },
-                {
-                    provider: 'openai',
-                    label: 'OpenAI',
-                    enabled: false,
-                    mode: 'remote',
-                    description: 'Planned adapter for hosted OpenAI chat or responses APIs.',
-                    default_base_url: '',
-                    requires_model: true,
-                    requires_api_key: true,
-                    supports_mcp_bridge: false,
-                },
-                {
-                    provider: 'anthropic',
-                    label: 'Claude / Anthropic',
-                    enabled: false,
-                    mode: 'remote',
-                    description: 'Planned adapter for hosted Anthropic messages APIs.',
-                    default_base_url: '',
-                    requires_model: true,
-                    requires_api_key: true,
-                    supports_mcp_bridge: false,
                 },
             ],
         };
@@ -5069,8 +5060,19 @@
     function ensureAiGeneratorStateForScenario(scenario, idx = null) {
         const defaults = getDefaultAiGeneratorState();
         const localMap = loadAiGeneratorStateMap();
-        const key = getAiGeneratorScenarioKey(scenario, idx);
-        const localState = localMap && typeof localMap[key] === 'object' ? localMap[key] : {};
+        const candidateKeys = getAiGeneratorScenarioKeys(scenario, idx);
+        const localState = candidateKeys.reduce((acc, key) => {
+            const entry = localMap && typeof localMap[key] === 'object' ? localMap[key] : null;
+            if (!entry) return acc;
+            return {
+                ...acc,
+                ...entry,
+                validation: {
+                    ...(acc.validation && typeof acc.validation === 'object' ? acc.validation : {}),
+                    ...(entry.validation && typeof entry.validation === 'object' ? entry.validation : {}),
+                },
+            };
+        }, {});
         const scenarioState = (scenario && typeof scenario.ai_generator === 'object') ? scenario.ai_generator : {};
         const localValidation = localState.validation && typeof localState.validation === 'object' ? localState.validation : {};
         const scenarioValidation = scenarioState.validation && typeof scenarioState.validation === 'object' ? scenarioState.validation : {};
@@ -5159,8 +5161,11 @@
         if (typeof next.api_key !== 'string') next.api_key = '';
         scenario.ai_generator = stripSensitiveAiGeneratorState(next);
         const localMap = loadAiGeneratorStateMap();
-        localMap[getAiGeneratorScenarioKey(scenario, idx)] = next;
+        for (const key of getAiGeneratorScenarioKeys(scenario, idx)) {
+            localMap[key] = next;
+        }
         saveAiGeneratorStateMap(localMap);
+        try { persistUserScopedUiPrefsSoon(); } catch (err) { }
         return next;
     }
 

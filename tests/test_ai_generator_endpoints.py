@@ -1,5 +1,6 @@
 import json
 import asyncio
+import ssl
 import threading
 import time
 from copy import deepcopy
@@ -78,10 +79,10 @@ def _fake_ollama_urlopen_factory(*, generated_payload, models=None):
     return fake_urlopen
 
 
-def _fake_litellm_urlopen_factory(*, generated_payload, models=None, expected_api_key='test-litellm-key'):
+def _fake_openai_compatible_urlopen_factory(*, generated_payload, models=None, expected_api_key='test-litellm-key'):
     discovered_models = list(models or ['gpt-4o-mini'])
 
-    def fake_urlopen(request_obj, timeout=0):
+    def fake_urlopen(request_obj, timeout=0, context=None):
         url = request_obj.full_url
         auth_header = request_obj.headers.get('Authorization')
         if expected_api_key:
@@ -783,7 +784,7 @@ def test_ai_generate_scenario_preview_compiler_overrides_segmentation_rows(tmp_p
     ]
 
 
-def test_ai_provider_validate_litellm_uses_optional_api_key_and_ssl(tmp_path, monkeypatch):
+def test_ai_provider_validate_openai_compatible_uses_optional_api_key_and_ssl(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
 
@@ -792,7 +793,7 @@ def test_ai_provider_validate_litellm_uses_optional_api_key_and_ssl(tmp_path, mo
     monkeypatch.setattr(
         ai_provider,
         'urlopen',
-        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
+        _fake_openai_compatible_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
     )
     monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
 
@@ -822,7 +823,7 @@ def test_ai_provider_validate_litellm_uses_optional_api_key_and_ssl(tmp_path, mo
     assert 'gpt-4o-mini' in (payload.get('models') or [])
 
 
-def test_ai_provider_catalog_includes_litellm_and_bridge_capabilities() -> None:
+def test_ai_provider_catalog_includes_only_ollama_and_openai_compatible_bridge_capabilities() -> None:
     client = app.test_client()
     _login(client)
 
@@ -836,14 +837,16 @@ def test_ai_provider_catalog_includes_litellm_and_bridge_capabilities() -> None:
         for entry in providers
         if isinstance(entry, dict)
     }
+    assert set(provider_map.keys()) == {'ollama', 'litellm'}
     assert 'litellm' in provider_map
+    assert provider_map['litellm'].get('label') == 'OpenAI-Compatible'
     assert provider_map['litellm'].get('enabled') is True
     assert provider_map['litellm'].get('supports_mcp_bridge') is True
     assert provider_map['litellm'].get('default_base_url') == 'https://localhost:4000/v1'
     assert provider_map['ollama'].get('supports_mcp_bridge') is True
 
 
-def test_ai_provider_validate_skip_bridge_refreshes_litellm_models_without_mcp(tmp_path, monkeypatch):
+def test_ai_provider_validate_skip_bridge_refreshes_openai_compatible_models_without_mcp(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
 
@@ -852,7 +855,7 @@ def test_ai_provider_validate_skip_bridge_refreshes_litellm_models_without_mcp(t
     monkeypatch.setattr(
         ai_provider,
         'urlopen',
-        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini', 'gpt-4.1-mini']),
+        _fake_openai_compatible_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini', 'gpt-4.1-mini']),
     )
 
     def _unexpected_client(*args, **kwargs):
@@ -882,7 +885,7 @@ def test_ai_provider_validate_skip_bridge_refreshes_litellm_models_without_mcp(t
     assert 'gpt-4.1-mini' in (payload.get('models') or [])
 
 
-def test_ai_provider_validate_litellm_rejects_http_when_ssl_enforced(tmp_path):
+def test_ai_provider_validate_openai_compatible_rejects_http_when_ssl_enforced(tmp_path):
     client = app.test_client()
     _login(client)
 
@@ -900,7 +903,42 @@ def test_ai_provider_validate_litellm_rejects_http_when_ssl_enforced(tmp_path):
     assert 'https' in str(payload.get('error') or '').lower()
 
 
-def test_ai_generate_scenario_preview_uses_litellm_direct_provider(tmp_path, monkeypatch):
+def test_ai_provider_validate_openai_compatible_disables_certificate_verification_when_ssl_not_enforced(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    captured_contexts = []
+
+    def fake_urlopen(request_obj, timeout=0, context=None):
+        captured_contexts.append(context)
+        return _FakeResponse({'data': [{'id': 'gpt-4o-mini'}]})
+
+    monkeypatch.setattr(ai_provider, 'urlopen', fake_urlopen)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example.com/v1',
+            'enforce_ssl': False,
+            'model': 'gpt-4o-mini',
+            'skip_bridge': True,
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('enforce_ssl') is False
+    assert len(captured_contexts) == 1
+    assert captured_contexts[0] is not None
+    assert captured_contexts[0].check_hostname is False
+    assert captured_contexts[0].verify_mode == ssl.CERT_NONE
+
+
+def test_ai_generate_scenario_preview_uses_openai_compatible_direct_provider(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
 
@@ -936,7 +974,7 @@ def test_ai_generate_scenario_preview_uses_litellm_direct_provider(tmp_path, mon
     monkeypatch.setattr(
         ai_provider,
         'urlopen',
-        _fake_litellm_urlopen_factory(generated_payload=generated, models=['gpt-4o-mini']),
+        _fake_openai_compatible_urlopen_factory(generated_payload=generated, models=['gpt-4o-mini']),
     )
 
     scenario = _scenario_payload('LiteLlmPromptScenario')
@@ -976,7 +1014,78 @@ def test_ai_generate_scenario_preview_uses_litellm_direct_provider(tmp_path, mon
     assert attempts[0].get('format_mode') == 'json_object'
 
 
-def test_ai_generate_scenario_preview_uses_mcp_python_sdk_bridge_for_litellm(tmp_path, monkeypatch):
+def test_ai_generate_scenario_preview_uses_openai_compatible_strict_rewrite_pass(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    generated_scenario = {
+        'name': 'GeneratedOpenAiCompatibleScenario',
+        'density_count': 0,
+        'notes': 'Generated by strict rewrite.',
+        'sections': {
+            'Node Information': {
+                'density': 0,
+                'items': [
+                    {'selected': 'PC', 'v_metric': 'Count', 'v_count': 2, 'factor': 1.0},
+                ],
+            },
+            'Routing': {'density': 0.0, 'items': []},
+            'Services': {'density': 0.0, 'items': []},
+            'Traffic': {'density': 0.0, 'items': []},
+            'Vulnerabilities': {'density': 0.0, 'items': [], 'flag_type': 'text'},
+            'Segmentation': {'density': 0.0, 'items': []},
+        },
+    }
+
+    calls = {'count': 0}
+
+    def fake_generate_once(self, *, base_url, api_key, model, prompt, timeout_seconds, verify_ssl):
+        calls['count'] += 1
+        if calls['count'] == 1:
+            return 'not json', {}, 'json_object'
+        if calls['count'] == 2:
+            return 'still not json', {}, 'json_object'
+        return json.dumps(generated_scenario), generated_scenario, 'json_object'
+
+    monkeypatch.setattr(ai_provider.OpenAiCompatibleProviderAdapter, '_generate_once', fake_generate_once)
+
+    scenario = _scenario_payload('OpenAiCompatStrictRewriteScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example.com/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'bridge_mode': 'mcp-python-sdk',
+            'skip_bridge': True,
+            'prompt': 'Generate a small offline scenario with two PCs.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert payload.get('provider') == 'litellm'
+    assert payload.get('generated_scenario', {}).get('name') == 'OpenAiCompatStrictRewriteScenario'
+    assert payload.get('generated_scenario', {}).get('notes') == 'Generated by strict rewrite.'
+    attempts = payload.get('provider_attempts') or []
+    assert [entry.get('attempt') for entry in attempts] == ['initial', 'repair', 'strict-rewrite']
+
+
+def test_ai_generate_scenario_preview_uses_mcp_python_sdk_bridge_for_openai_compatible_provider(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
 
@@ -990,7 +1099,7 @@ def test_ai_generate_scenario_preview_uses_mcp_python_sdk_bridge_for_litellm(tmp
     monkeypatch.setattr(
         ai_provider,
         'urlopen',
-        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
+        _fake_openai_compatible_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
     )
     monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
 
@@ -1867,6 +1976,50 @@ def test_ai_generate_scenario_preview_reports_direct_timeout_details(monkeypatch
     assert 'timed out' in str(attempts[0].get('error') or '').lower()
 
 
+def test_ai_generate_scenario_preview_reports_openai_compatible_direct_timeout_details(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from urllib.error import URLError
+
+    from webapp.routes import ai_provider
+
+    def fake_generate_once(self, *, base_url, api_key, model, prompt, timeout_seconds, verify_ssl):
+        raise URLError(TimeoutError('timed out'))
+
+    monkeypatch.setattr(ai_provider.OpenAiCompatibleProviderAdapter, '_generate_once', fake_generate_once)
+
+    scenario = _scenario_payload('OpenAiCompatTimeoutDetailsScenario')
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example.com/v1',
+            'model': 'gpt-4o-mini',
+            'prompt': 'Generate a medium scenario with web traffic.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+            'timeout_seconds': 37,
+        },
+    )
+
+    assert resp.status_code == 502
+    payload = resp.get_json() or {}
+    assert payload.get('success') is False
+    assert 'Could not reach OpenAI-compatible endpoint' in str(payload.get('error') or '')
+    assert payload.get('provider_generation_stage') == 'direct_generate'
+    assert payload.get('provider_error_category') == 'timeout'
+    assert payload.get('provider_current_attempt') == 'initial'
+    assert payload.get('timeout_seconds') == 37.0
+    assert payload.get('model') == 'gpt-4o-mini'
+    attempts = payload.get('provider_attempts') or []
+    assert len(attempts) == 1
+    assert attempts[0].get('attempt') == 'initial'
+    assert attempts[0].get('status') == 'failed'
+    assert 'timed out' in str(attempts[0].get('error') or '').lower()
+
+
 def test_ai_provider_wall_clock_timeout_interrupts_hung_direct_call():
     from webapp.routes import ai_provider
 
@@ -2289,7 +2442,7 @@ def test_repo_mcp_bridge_client_recovers_from_router_replace_section_error(monke
     assert 'Router counts belong in Routing' in str(tool_result_events[0].get('message') or '')
 
 
-def test_repo_mcp_bridge_client_uses_openai_parser_for_litellm_nonstream(monkeypatch):
+def test_repo_mcp_bridge_client_uses_openai_parser_for_openai_compatible_nonstream(monkeypatch):
     from webapp.routes import ai_provider
 
     client = ai_provider._RepoMcpBridgeClient(
@@ -2342,7 +2495,7 @@ def test_repo_mcp_bridge_client_uses_openai_parser_for_litellm_nonstream(monkeyp
     assert responses == []
 
 
-def test_repo_mcp_bridge_client_requires_tools_for_litellm_requests(monkeypatch):
+def test_repo_mcp_bridge_client_requires_tools_for_openai_compatible_requests(monkeypatch):
     from webapp.routes import ai_provider
 
     client = ai_provider._RepoMcpBridgeClient(
@@ -2354,7 +2507,7 @@ def test_repo_mcp_bridge_client_requires_tools_for_litellm_requests(monkeypatch)
 
     captured = {}
 
-    def fake_post_json(url, payload, *, timeout, headers=None):
+    def fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True):
         captured['url'] = url
         captured['payload'] = payload
         captured['headers'] = headers
@@ -2376,7 +2529,36 @@ def test_repo_mcp_bridge_client_requires_tools_for_litellm_requests(monkeypatch)
     assert captured['headers'] == {'Authorization': 'Bearer test-litellm-key'}
 
 
-def test_repo_mcp_bridge_client_rejects_plain_text_litellm_bridge_reply(monkeypatch):
+def test_repo_mcp_bridge_client_uses_verify_ssl_flag_for_openai_compatible_requests(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+        verify_ssl=False,
+    )
+
+    captured = {}
+
+    def fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True):
+        captured['url'] = url
+        captured['payload'] = payload
+        captured['headers'] = headers
+        captured['verify_ssl'] = verify_ssl
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+    monkeypatch.setattr(ai_provider, '_post_json', fake_post_json)
+
+    client._post_chat(messages=[{'role': 'user', 'content': 'test prompt'}])
+
+    assert captured['url'].endswith('/chat/completions')
+    assert captured['headers'] == {'Authorization': 'Bearer test-litellm-key'}
+    assert captured['verify_ssl'] is False
+
+
+def test_repo_mcp_bridge_client_rejects_plain_text_openai_compatible_bridge_reply(monkeypatch):
     from webapp.routes import ai_provider
 
     client = ai_provider._RepoMcpBridgeClient(
@@ -2413,6 +2595,223 @@ def test_repo_mcp_bridge_client_rejects_plain_text_litellm_bridge_reply(monkeypa
         raise AssertionError('expected ProviderAdapterError')
 
 
+def test_repo_mcp_bridge_client_accepts_final_plain_text_summary_after_tool_calls(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+    client._draft = {
+        'draft_id': 'draft-bridge-1',
+        'scenario': _scenario_payload('BridgeScenario'),
+    }
+    client.sessions = {'server': {'session': _FakeSession(client)}}
+    client.tool_manager.set_available_tools([
+        _FakeTool('server.scenario.get_draft', 'Get draft', {'type': 'object', 'properties': {'draft_id': {'type': 'string'}}}),
+    ])
+    client.tool_manager.set_tool_status('server.scenario.get_draft', True)
+
+    responses = [
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'server.scenario.get_draft',
+                            'arguments': json.dumps({'draft_id': 'draft-bridge-1'}),
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': 'Added a TCP traffic row and left the seeded routing in place.',
+                },
+            }],
+        },
+    ]
+
+    def fake_post_chat(*, messages):
+        return responses.pop(0)
+
+    monkeypatch.setattr(client, '_post_chat', fake_post_chat)
+
+    result = asyncio.run(client._run_query('use MCP tools', initial_draft_id='draft-bridge-1'))
+
+    assert result == 'Added a TCP traffic row and left the seeded routing in place.'
+    assert responses == []
+
+
+def test_repo_mcp_bridge_client_rejects_unusable_openai_compatible_tool_calls_before_any_tool_use(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+    client.sessions = {'server': {'session': _FakeSession(client)}}
+    client.tool_manager.set_available_tools([
+        _FakeTool('server.scenario.get_draft', 'Get draft', {'type': 'object', 'properties': {'draft_id': {'type': 'string'}}}),
+    ])
+    client.tool_manager.set_tool_status('server.scenario.get_draft', True)
+
+    def fake_post_chat(*, messages):
+        return {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'assistant<|channel|>commentary',
+                            'arguments': json.dumps({}),
+                        },
+                    }],
+                },
+            }],
+        }
+
+    monkeypatch.setattr(client, '_post_chat', fake_post_chat)
+
+    try:
+        asyncio.run(client._run_query('use MCP tools'))
+    except ai_provider.ProviderAdapterError as exc:
+        assert exc.status_code == 502
+        assert 'malformed or unusable MCP tool calls' in exc.message
+        assert exc.details.get('raw_tool_call_count') == 1
+        assert exc.details.get('rejected_tool_names') == ['assistant<|channel|>commentary']
+    else:  # pragma: no cover
+        raise AssertionError('expected ProviderAdapterError')
+
+
+def test_repo_mcp_bridge_client_accepts_unqualified_openai_compatible_scenario_tool_name(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+    client._draft = {
+        'draft_id': 'draft-bridge-1',
+        'scenario': _scenario_payload('BridgeScenario'),
+    }
+    client.sessions = {'server': {'session': _FakeSession(client)}}
+
+    responses = [
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'scenario.get_draft',
+                            'arguments': json.dumps({'draft_id': 'draft-bridge-1'}),
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': 'done',
+                },
+            }],
+        },
+    ]
+
+    def fake_post_chat(*, messages):
+        return responses.pop(0)
+
+    monkeypatch.setattr(client, '_post_chat', fake_post_chat)
+
+    result = asyncio.run(client._run_query('use MCP tools', initial_draft_id='draft-bridge-1'))
+
+    assert result == 'done'
+    assert responses == []
+
+
+def test_repo_mcp_bridge_client_ignores_role_like_openai_compatible_tool_name_after_tool_use(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = ai_provider._RepoMcpBridgeClient(
+        model='gpt-4o-mini',
+        host='https://litellm.example.com/v1',
+        provider='litellm',
+        api_key='test-litellm-key',
+    )
+    client._draft = {
+        'draft_id': 'draft-bridge-1',
+        'scenario': _scenario_payload('BridgeScenario'),
+    }
+    client.sessions = {'server': {'session': _FakeSession(client)}}
+
+    responses = [
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'server.scenario.get_draft',
+                            'arguments': json.dumps({'draft_id': 'draft-bridge-1'}),
+                        },
+                    }],
+                },
+            }],
+        },
+        {
+            'choices': [{
+                'message': {
+                    'role': 'assistant',
+                    'content': 'Added a TCP traffic row.',
+                    'tool_calls': [{
+                        'id': 'call_2',
+                        'type': 'function',
+                        'function': {
+                            'name': 'assistant<|channel|>commentary',
+                            'arguments': json.dumps({}),
+                        },
+                    }],
+                },
+            }],
+        },
+    ]
+
+    def fake_post_chat(*, messages):
+        return responses.pop(0)
+
+    monkeypatch.setattr(client, '_post_chat', fake_post_chat)
+
+    result = asyncio.run(client._run_query('use MCP tools', initial_draft_id='draft-bridge-1'))
+
+    assert result == 'Added a TCP traffic row.'
+    assert responses == []
+
+
 def test_ai_generate_scenario_preview_rejects_bridge_generation_without_enabled_tools(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
@@ -2427,7 +2826,7 @@ def test_ai_generate_scenario_preview_rejects_bridge_generation_without_enabled_
     monkeypatch.setattr(
         ai_provider,
         'urlopen',
-        _fake_litellm_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
+        _fake_openai_compatible_urlopen_factory(generated_payload={'scenario': _scenario_payload('unused')}, models=['gpt-4o-mini']),
     )
     monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
 
@@ -2496,6 +2895,25 @@ def test_normalize_mcp_bridge_tool_name_repairs_server_prefix_separator():
     )
 
     assert normalized == 'server.scenario.replace_section'
+
+
+def test_normalize_mcp_bridge_tool_name_prefixes_single_known_server_for_unqualified_scenario_tool():
+    from webapp.routes import ai_provider
+
+    normalized = ai_provider._normalize_mcp_bridge_tool_name(
+        'scenario.get_draft',
+        known_server_names=['server'],
+    )
+
+    assert normalized == 'server.scenario.get_draft'
+
+
+def test_normalize_mcp_bridge_tool_name_rejects_role_like_invalid_tool_names():
+    from webapp.routes import ai_provider
+
+    assert ai_provider._normalize_mcp_bridge_tool_name('assistant', known_server_names=['server']) == ''
+    assert ai_provider._normalize_mcp_bridge_tool_name('tool', known_server_names=['server']) == ''
+    assert ai_provider._normalize_mcp_bridge_tool_name('assistant<|channel|>commentary', known_server_names=['server']) == ''
 
 
 def test_build_llm_chat_tool_schema_hides_draft_id_and_duplicate_aliases():
@@ -2640,6 +3058,24 @@ def test_build_prompt_repair_decision_recognizes_ollama_tool_parse_error():
     assert 'do not pass factor' in str(decision.retry_prompt or '').lower()
 
 
+def test_build_prompt_repair_decision_recognizes_provider_tool_call_format_error():
+    from webapp.routes import ai_provider
+
+    decision = ai_provider._build_prompt_repair_decision(
+        prompt='base prompt',
+        exc=ai_provider.ProviderAdapterError(
+            'Provider returned malformed or unusable MCP tool calls. Verify that MCP tools are enabled.',
+            status_code=502,
+        ),
+    )
+
+    assert decision.category == 'provider-tool-call-format-error'
+    assert decision.retryable is True
+    retry_prompt = str(decision.retry_prompt or '').lower()
+    assert 'malformed or unusable tool calls' in retry_prompt
+    assert 'do not stop at plain text' in retry_prompt
+
+
 def test_build_prompt_repair_decision_adds_vulnerability_grounding_for_tool_parse_error(monkeypatch):
     from webapp.routes import ai_provider
 
@@ -2666,7 +3102,10 @@ def test_build_prompt_repair_decision_adds_vulnerability_grounding_for_tool_pars
     retry_prompt = str(decision.retry_prompt or '')
     assert 'scenario.search_vulnerability_catalog' in retry_prompt
     assert 'pass only strict json keys draft_id, v_name, v_path, and v_count' in retry_prompt.lower()
+    assert 'v_count must be a plain json number' in retry_prompt.lower()
+    assert 'never {"v_count": "1"}, {"v_count": 1"}, or {"v_count": ?}' in retry_prompt
     assert 'quoted json string' in retry_prompt.lower()
+    assert 'ellipses like "..."' in retry_prompt
     assert 'Next JS Demo Vuln' in retry_prompt
     assert '/tmp/catalog/next-js/CVE-2025-1234/docker-compose.yml' in retry_prompt
 
@@ -2686,6 +3125,8 @@ def test_build_prompt_repair_decision_adds_traffic_grounding_for_tool_parse_erro
     retry_prompt = str(decision.retry_prompt or '')
     assert 'for scenario.add_traffic_item, pass only strict json keys' in retry_prompt.lower()
     assert 'when count is present, omit factor entirely' in retry_prompt.lower()
+    assert 'never emit placeholder tokens such as ?, ??, ???' in retry_prompt.lower()
+    assert 'never {"count": 8?} or {"count": ?}' in retry_prompt
     assert 'example valid traffic tool call json' in retry_prompt.lower()
     assert '"protocol":"TCP","count":3,"pattern":"periodic","content_type":"text"' in retry_prompt
 
@@ -4110,6 +4551,63 @@ def test_mcp_bridge_process_query_retries_once_on_ollama_tool_parse_error():
     assert 'do not pass factor' in observed_prompts[1].lower()
     assert 'multiple separate add_vulnerability_item calls' in observed_prompts[1].lower()
     assert 'pass only strict json keys draft_id, v_name, v_path, and v_count' in observed_prompts[1].lower()
+
+
+def test_mcp_bridge_process_query_retries_twice_on_repeated_ollama_tool_parse_error():
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+
+    class _FakeClient:
+        async def process_query(self, prompt):
+            observed_prompts.append(prompt)
+            if len(observed_prompts) <= 2:
+                raise ai_provider.ProviderAdapterError(
+                    'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=\'{\"v_count\":1\\n\\n\\n\\n\', err=unexpected end of JSON input"}',
+                    status_code=502,
+                )
+            return 'ok'
+
+    result = asyncio.run(ai_provider._mcp_bridge_process_query_server_side(
+        _FakeClient(),
+        prompt='create a scenario with 1 vulnerability',
+        model='gpt-oss:20b',
+        user_prompt='create a scenario with 1 vulnerability',
+    ))
+
+    assert result == 'ok'
+    assert len(observed_prompts) == 3
+    assert 'strict valid json' in observed_prompts[1].lower()
+    assert 'strict valid json' in observed_prompts[2].lower()
+
+
+def test_mcp_bridge_process_query_retries_once_on_provider_tool_call_format_error():
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+
+    class _FakeClient:
+        async def process_query(self, prompt):
+            observed_prompts.append(prompt)
+            if len(observed_prompts) == 1:
+                raise ai_provider.ProviderAdapterError(
+                    'Provider returned malformed or unusable MCP tool calls. Verify that MCP tools are enabled.',
+                    status_code=502,
+                )
+            return 'ok'
+
+    result = asyncio.run(ai_provider._mcp_bridge_process_query_server_side(
+        _FakeClient(),
+        prompt='create 3 tcp flows with periodic pattern',
+        model='gpt-4o-mini',
+        user_prompt='create 3 tcp flows with periodic pattern',
+    ))
+
+    assert result == 'ok'
+    assert len(observed_prompts) == 2
+    assert 'malformed or unusable tool calls' in observed_prompts[1].lower()
+    assert 'do not stop at plain text' in observed_prompts[1].lower()
+    assert 'when count is present, omit factor entirely' in observed_prompts[1].lower()
 
 
 def test_mcp_bridge_process_query_retry_prompt_mentions_traffic_factor_omission():

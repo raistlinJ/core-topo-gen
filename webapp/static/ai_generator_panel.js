@@ -11,29 +11,11 @@
                 reachabilityLabel: 'Provider Reachable',
             },
             litellm: {
-                label: 'LiteLLM',
-                baseUrlLabel: 'LiteLLM Base URL',
+                label: 'OpenAI-Compatible',
+                baseUrlLabel: 'OpenAI-Compatible Base URL',
                 baseUrlPlaceholder: 'https://localhost:4000/v1',
                 defaultBaseUrl: 'https://localhost:4000/v1',
                 supportsBridge: true,
-                connectionSuccessLabel: 'Connected',
-                reachabilityLabel: 'Provider Reachable',
-            },
-            openai: {
-                label: 'OpenAI',
-                baseUrlLabel: 'Provider Base URL',
-                baseUrlPlaceholder: '',
-                defaultBaseUrl: '',
-                supportsBridge: false,
-                connectionSuccessLabel: 'Connected',
-                reachabilityLabel: 'Provider Reachable',
-            },
-            anthropic: {
-                label: 'Claude / Anthropic',
-                baseUrlLabel: 'Provider Base URL',
-                baseUrlPlaceholder: '',
-                defaultBaseUrl: '',
-                supportsBridge: false,
                 connectionSuccessLabel: 'Connected',
                 reachabilityLabel: 'Provider Reachable',
             },
@@ -70,7 +52,7 @@
                 },
                 {
                     provider: 'litellm',
-                    label: 'LiteLLM',
+                    label: 'OpenAI-Compatible',
                     enabled: true,
                     default_base_url: 'https://localhost:4000/v1',
                     supports_mcp_bridge: true,
@@ -277,7 +259,7 @@
                     </span>
                 </label>`;
                 }).join('')
-                : `<div class="text-muted small">${supportsBridge ? 'Validate the bridge to discover MCP tools exposed through the MCP Python SDK bridge.' : 'LiteLLM currently uses direct scenario generation in this UI, so MCP tool discovery is not used for this provider.'}</div>`;
+                : `<div class="text-muted small">${supportsBridge ? 'Validate the bridge to discover MCP tools exposed through the MCP Python SDK bridge.' : 'This OpenAI-compatible provider currently uses direct scenario generation in this UI, so MCP tool discovery is not used for this provider.'}</div>`;
 
             const providerOptions = providerEntries.map((entry) => {
                 const key = String(entry && entry.provider || '').trim().toLowerCase();
@@ -336,7 +318,7 @@
                                 <div class="form-check form-switch mb-3">
                                     <input class="form-check-input" type="checkbox" role="switch" id="aiGeneratorEnforceSslInput" ${aiState.enforce_ssl === false ? '' : 'checked'}>
                                     <label class="form-check-label" for="aiGeneratorEnforceSslInput">Enforce SSL</label>
-                                    <div class="form-text">Enabled by default. When on, the LiteLLM base URL must use <strong>https</strong>.</div>
+                                    <div class="form-text">Enabled by default. When on, the OpenAI-compatible base URL must use <strong>https</strong> and certificates are verified. Turn it off to allow self-signed certificates or plain <strong>http</strong> endpoints.</div>
                                 </div>`
                 : '';
 
