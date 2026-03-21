@@ -447,6 +447,21 @@
 				"tests/test_core_connection_validation.py"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "pytest: targeted multi-vuln intent regression",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"-m",
+				"pytest",
+				"-q",
+				"tests/test_ai_topology_intent.py",
+				"tests/test_ai_generator_endpoints.py",
+				"-k",
+				"listed_vulnerability_requests or compiles_listed_vulnerability_requests_as_multiple_targets or mcp_bridge_generate_refreshes_preview_from_final_scenario or canonicalizes_specific_vuln_name_from_matching_path"
+			],
+			"isBackground": false
 		}
 	]
 }

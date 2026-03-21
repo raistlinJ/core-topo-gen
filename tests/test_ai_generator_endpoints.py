@@ -3345,6 +3345,21 @@ def test_prompt_coverage_mismatch_detects_missing_requested_sections():
     assert missing['Docker']['expected_min_items'] == 2
 
 
+def test_prompt_coverage_mismatch_counts_listed_vulnerability_requests():
+    from webapp.routes import ai_provider
+
+    scenario = _scenario_payload('ListedVulnerabilityCoverageScenario')
+    mismatch = ai_provider._get_prompt_coverage_mismatch(
+        'create a topology with 3 docker nodes and 20 total nodes. Use RIP for routing and include about 4 routers. Also, add sql injection, web, and another random vulnerability.',
+        scenario,
+    )
+
+    assert mismatch is not None
+    missing = {item['target']: item for item in mismatch.get('missing') or []}
+    assert missing['Vulnerabilities']['expected_min_items'] == 3
+    assert missing['Vulnerabilities']['actual_items'] == 0
+
+
 def test_prompt_coverage_mismatch_detects_missing_requested_values():
     from webapp.routes import ai_provider
 

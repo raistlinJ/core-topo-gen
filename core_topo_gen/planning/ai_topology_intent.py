@@ -125,15 +125,78 @@ def _extract_vulnerability_target_count(user_prompt: str) -> int:
         parsed = _parse_count_token(docker_target_match.group(1))
         return max(0, int(parsed or 0))
 
+    listed_hints = extract_vulnerability_query_hints(text)
+    if listed_hints:
+        return len(listed_hints)
+
     if re.search(r'\bvulnerabilit(?:y|ies)\b|\bvulns?\b', text):
         return 1
     return 0
+
+
+def extract_vulnerability_target_count(user_prompt: str) -> int:
+    return _extract_vulnerability_target_count(user_prompt)
+
+
+def extract_vulnerability_query_hints(user_prompt: str) -> list[str]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return []
+
+    has_vulnerability_context = re.search(r'\bvulnerabilit(?:y|ies)\b|\bvulns?\b', text)
+    has_explicit_vulnerability_signal = re.search(r'\bsql\s+injection\b|\bcve-\d{4}-\d+\b', text)
+    if not has_vulnerability_context and not has_explicit_vulnerability_signal:
+        return []
+
+    matches: list[tuple[int, str]] = []
+
+    def _add_matches(canonical: str, pattern: str) -> None:
+        for match in re.finditer(pattern, text):
+            matches.append((match.start(), canonical))
+
+    for keyword in (
+        'appweb',
+        'jboss',
+        'tomcat',
+        'nginx',
+        'apache',
+        'openssh',
+        'jwt',
+        'oauth',
+        'mysql',
+        'postgres',
+        'mongodb',
+        'redis',
+    ):
+        _add_matches(keyword, rf'\b{re.escape(keyword)}\b')
+
+    _add_matches('sql injection', r'\bsql\s+injection\b')
+    _add_matches('web', r'\bweb(?:-related)?\b|\bhttps?\b')
+    _add_matches('ssh', r'\bssh\b')
+    _add_matches('auth', r'\bauth(?:entication)?\b|\blogin\b|\btoken\b|\boauth\b')
+    _add_matches('database', r'\bdatabase\b|\bdb\b')
+    _add_matches('random', r'\b(?:another|one\s+more|extra)\s+random\s+vulnerabilit(?:y|ies)\b|\brandom\s+vulnerabilit(?:y|ies)\b')
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _position, canonical in sorted(matches, key=lambda item: item[0]):
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        ordered.append(canonical)
+
+    return ordered
 
 
 def extract_vulnerability_query_hint(user_prompt: str) -> str:
     text = str(user_prompt or '').strip().lower()
     if not text or _extract_vulnerability_target_count(text) <= 0:
         return ''
+
+    query_hints = extract_vulnerability_query_hints(text)
+    if query_hints:
+        first_hint = query_hints[0]
+        return 'vulnerability' if first_hint == 'random' else first_hint
 
     explicit_keywords = (
         'appweb',
@@ -286,6 +349,24 @@ def extract_node_role_count_intent(user_prompt: str) -> dict[str, int]:
         if total > 0:
             counts[role] = total
     return counts
+
+
+def extract_routing_protocols_requested(user_prompt: str) -> list[str]:
+    text = str(user_prompt or '').strip().lower()
+    if not text:
+        return []
+
+    matches: list[str] = []
+    for pattern, canonical in (
+        (r'\bospfv3\b', 'OSPFv3'),
+        (r'\bospf(?:v2)?\b', 'OSPFv2'),
+        (r'\bripng\b', 'RIPNG'),
+        (r'\brip\b', 'RIP'),
+        (r'\bbgp\b', 'BGP'),
+    ):
+        if re.search(pattern, text) and canonical not in matches:
+            matches.append(canonical)
+    return matches
 
 
 def explicit_host_role_count_total(user_prompt: str) -> int:
@@ -533,8 +614,10 @@ def compile_ai_topology_intent(
     locked_sections: list[str] = []
 
     if intent.router_count and intent.router_count > 0:
+        routing_protocols = extract_routing_protocols_requested(user_prompt)
+        selected_protocol = routing_protocols[0] if routing_protocols else 'OSPFv2'
         routing_item: dict[str, Any] = {
-            'selected': 'OSPFv2',
+            'selected': selected_protocol,
             'factor': 1.0,
             'v_metric': 'Count',
             'v_count': int(intent.router_count),
@@ -549,7 +632,7 @@ def compile_ai_topology_intent(
         }
         tool_seed_ops.append({
             'kind': 'routing',
-            'protocol': 'OSPFv2',
+            'protocol': selected_protocol,
             'count': int(intent.router_count),
             'r2r_mode': routing_item.get('r2r_mode'),
         })
@@ -673,16 +756,72 @@ def compile_ai_topology_intent(
             locked_sections.append('Segmentation')
 
     if intent.vulnerability_target_count > 0 and vuln_catalog:
-        query_hint = extract_vulnerability_query_hint(user_prompt)
-        candidates = search_vulnerability_catalog_for_prompt(
-            query_hint,
-            catalog=vuln_catalog,
-            limit=max(1, int(intent.vulnerability_target_count)),
-        )
+        query_hints = extract_vulnerability_query_hints(user_prompt)
+        requested_count = max(1, int(intent.vulnerability_target_count))
+        candidate_queries = [
+            'vulnerability' if str(hint or '').strip().lower() == 'random' else str(hint or '').strip()
+            for hint in query_hints
+            if str(hint or '').strip()
+        ]
+        if not candidate_queries:
+            query_hint = extract_vulnerability_query_hint(user_prompt)
+            if query_hint:
+                candidate_queries = [query_hint]
+
+        candidate_pool: list[dict[str, str]] = []
+        seen_candidates: set[tuple[str, str]] = set()
+
+        def _append_unique(entries: list[dict[str, str]], *, first_only: bool = False) -> None:
+            added = 0
+            for entry in entries:
+                name = str(entry.get('name') or '').strip()
+                path = str(entry.get('path') or '').strip()
+                if not name or not path:
+                    continue
+                key = (name, path)
+                if key in seen_candidates:
+                    continue
+                seen_candidates.add(key)
+                candidate_pool.append({'name': name, 'path': path})
+                added += 1
+                if first_only and added >= 1:
+                    break
+
+        hint_candidate_sets: list[list[dict[str, str]]] = []
+        for query in candidate_queries:
+            hint_candidate_sets.append(
+                search_vulnerability_catalog_for_prompt(
+                    query,
+                    catalog=vuln_catalog,
+                    limit=requested_count,
+                )
+            )
+
+        if len(hint_candidate_sets) > 1:
+            for entries in hint_candidate_sets:
+                _append_unique(entries, first_only=True)
+                if len(candidate_pool) >= requested_count:
+                    break
+
+        if len(candidate_pool) < requested_count:
+            for entries in hint_candidate_sets:
+                _append_unique(entries)
+                if len(candidate_pool) >= requested_count:
+                    break
+
+        if len(candidate_pool) < requested_count:
+            _append_unique(
+                search_vulnerability_catalog_for_prompt(
+                    'vulnerability',
+                    catalog=vuln_catalog,
+                    limit=requested_count,
+                )
+            )
+
         vuln_items: list[dict[str, Any]] = []
-        if candidates:
-            for index in range(max(1, int(intent.vulnerability_target_count))):
-                candidate = candidates[index % len(candidates)]
+        if candidate_pool:
+            for index in range(requested_count):
+                candidate = candidate_pool[index % len(candidate_pool)]
                 vuln_items.append({
                     'selected': 'Specific',
                     'v_metric': 'Count',

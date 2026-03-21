@@ -1,6 +1,7 @@
 # Feature Deep Dive
 
 ## AI Generator workflow
+- For a dedicated summary of the recent compiler, retry, validation, and preview-sync improvements, see [AI Generator Workflow](AI_GENERATOR_WORKFLOW.md).
 - The AI Generator tab sends the current in-browser scenario state, the user prompt, the selected Ollama model/base URL, and the enabled MCP tools to the Flask AI generation route.
 - Before model-authored rows are trusted, the backend runs a deterministic intent compiler in `core_topo_gen/planning/ai_topology_intent.py`.
 - That compiler currently owns explicit prompt intent for `Node Information`, `Routing`, `Services`, `Traffic`, `Vulnerabilities`, and `Segmentation`.

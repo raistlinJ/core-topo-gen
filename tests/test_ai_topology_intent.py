@@ -1,5 +1,6 @@
 from core_topo_gen.planning.ai_topology_intent import apply_compiled_sections_to_scenario
 from core_topo_gen.planning.ai_topology_intent import compile_ai_topology_intent
+from core_topo_gen.planning.ai_topology_intent import extract_vulnerability_target_count
 
 
 def _scenario_payload(name='IntentScenario'):
@@ -127,4 +128,32 @@ def test_compile_ai_topology_intent_compiles_segmentation_counts():
     assert compiled.section_payloads['Segmentation']['items'] == [
         {'selected': 'Firewall', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 2},
         {'selected': 'NAT', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 1},
+    ]
+
+
+def test_compile_ai_topology_intent_compiles_listed_vulnerability_requests_as_multiple_targets():
+    prompt = 'create a topology with 3 docker nodes and 20 total nodes. Use RIP for routing and include about 4 routers. Also, add sql injection, web, and another random vulnerability.'
+    compiled = compile_ai_topology_intent(
+        prompt,
+        vuln_catalog=[
+            {'Name': 'aaa/random-demo', 'Path': '/catalog/aaa/random-demo/docker-compose.yml', 'Description': 'Generic demo vulnerability'},
+            {'Name': 'appweb/CVE-2018-8715', 'Path': '/catalog/appweb/CVE-2018-8715/docker-compose.yml', 'Description': 'Web server vulnerability'},
+            {'Name': 'sqli-labs/demo', 'Path': '/catalog/sqli-labs/demo/docker-compose.yml', 'Description': 'SQL injection training app'},
+        ],
+    )
+
+    assert extract_vulnerability_target_count(prompt) == 3
+    assert compiled.intent.vulnerability_target_count == 3
+    assert compiled.locked_sections == ('Routing', 'Node Information', 'Vulnerabilities')
+    assert compiled.section_payloads['Routing']['items'] == [
+        {'selected': 'RIP', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 4},
+    ]
+    assert compiled.section_payloads['Node Information']['items'] == [
+        {'selected': 'PC', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 13},
+        {'selected': 'Docker', 'factor': 1.0, 'v_metric': 'Count', 'v_count': 3},
+    ]
+    assert compiled.section_payloads['Vulnerabilities']['items'] == [
+        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'sqli-labs/demo', 'v_path': '/catalog/sqli-labs/demo/docker-compose.yml'},
+        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'appweb/CVE-2018-8715', 'v_path': '/catalog/appweb/CVE-2018-8715/docker-compose.yml'},
+        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'aaa/random-demo', 'v_path': '/catalog/aaa/random-demo/docker-compose.yml'},
     ]

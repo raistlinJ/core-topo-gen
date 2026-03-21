@@ -31,7 +31,9 @@ from core_topo_gen.planning.ai_topology_intent import extract_segmentation_contr
 from core_topo_gen.planning.ai_topology_intent import extract_service_count_intent as _compiler_extract_service_count_intent
 from core_topo_gen.planning.ai_topology_intent import extract_traffic_pattern_count_intent as _compiler_extract_traffic_pattern_count_intent
 from core_topo_gen.planning.ai_topology_intent import extract_traffic_protocol_count_intent as _compiler_extract_traffic_protocol_count_intent
+from core_topo_gen.planning.ai_topology_intent import extract_vulnerability_query_hints as _compiler_extract_vulnerability_query_hints
 from core_topo_gen.planning.ai_topology_intent import extract_vulnerability_query_hint as _compiler_extract_vulnerability_query_hint
+from core_topo_gen.planning.ai_topology_intent import extract_vulnerability_target_count as _compiler_extract_vulnerability_target_count
 from core_topo_gen.planning.ai_topology_intent import has_low_r2r_intent as _compiler_has_low_r2r_intent
 from core_topo_gen.planning.ai_topology_intent import search_vulnerability_catalog_for_prompt as _compiler_search_vulnerability_catalog_for_prompt
 from webapp import app_backend
@@ -198,20 +200,11 @@ def _extract_count_intent(user_prompt: str) -> dict[str, int]:
 
 
 def _extract_vulnerability_target_count(user_prompt: str) -> int:
-    text = str(user_prompt or '').strip().lower()
-    if not text:
-        return 0
+    return _compiler_extract_vulnerability_target_count(user_prompt)
 
-    match = re.search(r'\b(\d+)\s+(?:[a-z][a-z0-9-]*\s+){0,3}vulnerabilit(?:y|ies)\b', text)
-    if match:
-        try:
-            return max(0, int(match.group(1)))
-        except Exception:
-            return 0
 
-    if re.search(r'\bvulnerabilit(?:y|ies)\b|\bvulns?\b', text):
-        return 1
-    return 0
+def _extract_vulnerability_query_hints(user_prompt: str) -> list[str]:
+    return _compiler_extract_vulnerability_query_hints(user_prompt)
 
 
 def _load_vulnerability_catalog_for_prompt() -> list[dict[str, str]]:
@@ -596,10 +589,8 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
             'reason': f'user requested exactly {count} {control} segmentation row{'s' if count != 1 else ''}',
         }
 
-    vuln_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'vulnerabilit(?:y|ies)\b')
-    if vuln_count is None and _has_any([r'\bvulnerabilit(?:y|ies)\b', r'\bvulns?\b']):
-        vuln_count = 1
-    if vuln_count is not None:
+    vuln_count = _extract_vulnerability_target_count(user_prompt)
+    if vuln_count and vuln_count > 0:
         coverage['Vulnerabilities'] = {
             'min_items': vuln_count,
             'reason': f'user requested at least {vuln_count} vulnerabilit{'y' if vuln_count == 1 else 'ies'}',
