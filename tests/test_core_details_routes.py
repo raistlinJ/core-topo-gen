@@ -75,3 +75,29 @@ def test_core_details_uses_session_export_when_only_session_id_provided(tmp_path
 
     assert resp.status_code == 200
     assert b'session-9.xml' in resp.data
+
+
+def test_core_details_falls_back_to_existing_scenario_path(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    scenario_file = tmp_path / 'alpha.xml'
+    scenario_file.write_text('<session><container /></session>', encoding='utf-8')
+
+    monkeypatch.setattr(backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(
+        backend,
+        '_scenario_catalog_for_user',
+        lambda history=None, user=None: (['Alpha'], {'alpha': {str(scenario_file)}}, {}),
+    )
+    monkeypatch.setattr(backend, '_core_config_for_request', lambda **kwargs: {'host': '127.0.0.1', 'port': 50051})
+    monkeypatch.setattr(backend, '_validate_core_xml', lambda path: (False, 'schema mismatch'))
+    monkeypatch.setattr(backend, '_analyze_core_xml', lambda path: {'nodes': [{'id': 'n1'}], 'switch_nodes': [], 'links_detail': []})
+    monkeypatch.setattr(backend, '_build_topology_graph_from_session_xml', lambda path: ([{'id': 'n1'}], [], {}))
+    monkeypatch.setattr(backend, '_list_active_core_sessions', lambda *args, **kwargs: [])
+    monkeypatch.setattr(backend, '_flow_state_from_latest_xml', lambda scenario_norm: None)
+
+    resp = client.get('/core/details?scenario_name=Alpha')
+
+    assert resp.status_code == 200
+    assert b'alpha.xml' in resp.data

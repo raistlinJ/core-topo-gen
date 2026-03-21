@@ -1175,17 +1175,24 @@ def _session_add_node(
             if extra_kwargs:
                 return _call(base_kwargs)
             raise
+    kwargs_without_start = dict(kwargs)
     # Try common kwarg spellings across wrapper versions.
     for key in ('start', 'start_node', '_start'):
         try:
             return _call({**kwargs, key: bool(start)})
         except TypeError:
-            if extra_kwargs:
-                try:
-                    return _call({**base_kwargs, key: bool(start)})
-                except TypeError:
-                    continue
-            continue
+            # Preserve docker compose/options metadata when the client rejects the
+            # start flag. Dropping extra kwargs here creates plain Docker nodes and
+            # later CORE startup hits /proc/0/environ against PID 0 containers.
+            try:
+                return _call(kwargs_without_start)
+            except TypeError:
+                if extra_kwargs:
+                    try:
+                        return _call(base_kwargs)
+                    except TypeError:
+                        continue
+                continue
     try:
         return _call(kwargs)
     except TypeError:

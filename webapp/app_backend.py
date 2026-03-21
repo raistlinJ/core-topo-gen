@@ -4941,50 +4941,98 @@ def _grpc_save_current_session_xml_with_config(
 
     cfg = _normalize_core_config(core_cfg, include_password=True)
     os.makedirs(out_dir, exist_ok=True)
+    try:
+        with _core_connection(cfg) as (conn_host, conn_port):
+            from core.api.grpc.client import CoreGrpcClient
 
-    with _core_connection(cfg) as (conn_host, conn_port):
-        from core.api.grpc.client import CoreGrpcClient
+            client = CoreGrpcClient(address=f'{conn_host}:{int(conn_port)}')
+            try:
+                connector = getattr(client, 'connect', None)
+                if callable(connector):
+                    connector()
 
-        client = CoreGrpcClient(address=f'{conn_host}:{int(conn_port)}')
-        try:
-            connector = getattr(client, 'connect', None)
-            if callable(connector):
-                connector()
+                target_id: Optional[int]
+                if session_id not in (None, ''):
+                    try:
+                        target_id = int(str(session_id).strip())
+                    except Exception as exc:
+                        raise RuntimeError(f'Invalid session id: {session_id}') from exc
+                else:
+                    sessions = client.get_sessions() or []
+                    if not sessions:
+                        raise RuntimeError('No CORE sessions available')
+                    first = sessions[0]
+                    raw_id = getattr(first, 'id', None) or getattr(first, 'session_id', None)
+                    if raw_id in (None, ''):
+                        raise RuntimeError('Unable to determine session id to save')
+                    target_id = int(raw_id)
 
-            target_id: Optional[int]
-            if session_id not in (None, ''):
                 try:
-                    target_id = int(str(session_id).strip())
-                except Exception as exc:
-                    raise RuntimeError(f'Invalid session id: {session_id}') from exc
-            else:
-                sessions = client.get_sessions() or []
-                if not sessions:
-                    raise RuntimeError('No CORE sessions available')
-                first = sessions[0]
-                raw_id = getattr(first, 'id', None) or getattr(first, 'session_id', None)
-                if raw_id in (None, ''):
-                    raise RuntimeError('Unable to determine session id to save')
-                target_id = int(raw_id)
+                    opener = getattr(client, 'open_session', None)
+                    if callable(opener):
+                        opener(target_id)
+                except Exception:
+                    pass
 
-            try:
-                opener = getattr(client, 'open_session', None)
-                if callable(opener):
-                    opener(target_id)
-            except Exception:
-                pass
+                filename = f'session-{target_id}.xml' if target_id is not None else f'core-session-{_local_timestamp_safe()}.xml'
+                out_path = os.path.join(out_dir, filename)
+                client.save_xml(session_id=target_id, file_path=Path(out_path))
+                return out_path
+            finally:
+                try:
+                    closer = getattr(client, 'close', None)
+                    if callable(closer):
+                        closer()
+                except Exception:
+                    pass
+    except Exception as exc:
+        original_exc = exc
 
-            filename = f'session-{target_id}.xml' if target_id is not None else f'core-session-{_local_timestamp_safe()}.xml'
-            out_path = os.path.join(out_dir, filename)
-            client.save_xml(session_id=target_id, file_path=Path(out_path))
-            return out_path
-        finally:
-            try:
-                closer = getattr(client, 'close', None)
-                if callable(closer):
-                    closer()
-            except Exception:
-                pass
+    try:
+        ssh_cfg = _require_core_ssh_credentials(cfg)
+    except Exception:
+        raise original_exc
+
+    try:
+        ssh_user = (ssh_cfg.get('ssh_username') or '').strip() or '<unknown>'
+        ssh_host = str(ssh_cfg.get('ssh_host') or ssh_cfg.get('host') or 'localhost').strip() or 'localhost'
+        remote_target_host = str(ssh_cfg.get('host') or CORE_HOST or 'localhost').strip() or 'localhost'
+        if remote_target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
+            remote_target_host = '127.0.0.1'
+        remote_target_port = int(ssh_cfg.get('port') or CORE_PORT)
+        address = f'{remote_target_host}:{remote_target_port}'
+        remote_filename = (
+            f'session-{str(session_id).strip()}.xml'
+            if session_id not in (None, '')
+            else f'core-session-{_local_timestamp_safe()}.xml'
+        )
+        remote_path = posixpath.join('/tmp/core-topo-gen/core-post', remote_filename)
+        script = _remote_core_save_xml_script(address, str(session_id).strip() if session_id not in (None, '') else None, remote_path)
+        payload = _run_remote_python_json(
+            ssh_cfg,
+            script,
+            logger=app.logger,
+            label='core.save_xml',
+            command_desc=f'remote ssh {ssh_user}@{ssh_host} -> CoreGrpcClient.save_xml {address}',
+            timeout=120.0,
+        )
+        error_text = str((payload or {}).get('error') or '').strip()
+        if error_text:
+            raise RuntimeError(error_text)
+        resolved_remote_path = str((payload or {}).get('output_path') or '').strip()
+        if not resolved_remote_path:
+            raise RuntimeError('Remote CORE save_xml did not return an output path')
+        resolved_session_id = str((payload or {}).get('session_id') or '').strip()
+        local_filename = f'session-{resolved_session_id}.xml' if resolved_session_id else os.path.basename(resolved_remote_path)
+        out_path = os.path.join(out_dir, local_filename)
+        _download_remote_file(ssh_cfg, resolved_remote_path, out_path)
+        try:
+            _remove_remote_file(ssh_cfg, resolved_remote_path)
+        except Exception:
+            pass
+        return out_path
+    except Exception:
+        raise original_exc
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -20435,6 +20483,42 @@ def _prune_stale_scenario_entries(
     return cleaned_names, cleaned_paths, cleaned_hints
 
 
+def _select_existing_path(candidates: Any) -> str | None:
+    if candidates in (None, ''):
+        return None
+
+    if isinstance(candidates, (str, os.PathLike)):
+        raw_candidates = [candidates]
+    else:
+        try:
+            raw_candidates = list(candidates)
+        except Exception:
+            raw_candidates = [candidates]
+
+    best_path: str | None = None
+    best_mtime = float('-inf')
+    for candidate in raw_candidates:
+        if candidate in (None, ''):
+            continue
+        try:
+            abs_candidate = os.path.abspath(os.fspath(candidate))
+        except Exception:
+            try:
+                abs_candidate = os.path.abspath(str(candidate))
+            except Exception:
+                continue
+        try:
+            if not os.path.exists(abs_candidate):
+                continue
+            mtime = os.path.getmtime(abs_candidate)
+        except Exception:
+            continue
+        if best_path is None or mtime > best_mtime:
+            best_path = abs_candidate
+            best_mtime = mtime
+    return best_path
+
+
 def _merge_editor_scenarios_into_catalog(
     scenario_names: list[str],
     scenario_paths: dict[str, set[str]],
@@ -24816,25 +24900,22 @@ def main():
         except Exception:
             pass
 
-        # Find container targets: prefer compose project containers (actual services),
-        # and optionally include the node-name alias when present.
+        # Find container targets: prefer the node-name container alias that CORE
+        # actually manages. Only fall back to compose project containers when the
+        # alias is absent. This avoids treating sidecars or transient helper
+        # services as the node's runtime container during postrun verification.
         targets = []
         last_err = ''
         project = f"{node_name}conf" if node_name else 'coretg'
         for _ in range(6):
             names, err = _docker_names()
             last_err = err or last_err
+            if node_name in names:
+                targets = [node_name]
+                break
             ids = _compose_container_ids(project, yml)
             if ids:
                 targets = list(ids)
-                try:
-                    if node_name in names and node_name not in targets:
-                        targets.append(node_name)
-                except Exception:
-                    pass
-                break
-            if node_name in names:
-                targets = [node_name]
                 break
             time.sleep(2)
 
@@ -32705,6 +32786,7 @@ try:
         load_run_history=lambda: _load_run_history(),
         select_core_config_for_page=lambda *args, **kwargs: _select_core_config_for_page(*args, **kwargs),
         merge_core_configs=lambda *args, **kwargs: _merge_core_configs(*args, **kwargs),
+        apply_core_secret_to_config=lambda *args, **kwargs: _apply_core_secret_to_config(*args, **kwargs),
         grpc_save_current_session_xml_with_config=lambda *args, **kwargs: _grpc_save_current_session_xml_with_config(*args, **kwargs),
         append_async_run_log_line=lambda meta, line: _append_async_run_log_line(meta, line),
         append_session_scenario_discrepancies=lambda *args, **kwargs: _append_session_scenario_discrepancies(*args, **kwargs),

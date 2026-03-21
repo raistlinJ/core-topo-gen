@@ -591,7 +591,20 @@ def register(app, *, backend_module: Any) -> None:
                 flash('CLI finished with errors. See logs.')
             try:
                 post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
-                post_saved = backend._grpc_save_current_session_xml_with_config(core_cfg, post_dir, session_id=session_id)
+                core_cfg_for_post = core_cfg
+                try:
+                    scenario_for_post = str(active_scenario_name or scenario_name_hint or '').strip()
+                except Exception:
+                    scenario_for_post = ''
+                if scenario_for_post and isinstance(core_cfg_for_post, dict):
+                    try:
+                        core_cfg_for_post = backend._apply_core_secret_to_config(
+                            core_cfg_for_post,
+                            scenario_for_post.lower().replace(' ', '-'),
+                        )
+                    except Exception:
+                        pass
+                post_saved = backend._grpc_save_current_session_xml_with_config(core_cfg_for_post, post_dir, session_id=session_id)
                 if post_saved:
                     flash(f'Captured post-run CORE session XML: {os.path.basename(post_saved)}')
                     app.logger.debug('[sync] Post-run session XML saved to %s', post_saved)

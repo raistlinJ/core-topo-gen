@@ -95,6 +95,14 @@ def test_listener_snapshot_script_includes_tcp_udp_and_ss_checks():
     assert 'docker-40' in script
 
 
+def test_remote_copy_flow_artifacts_script_prefers_node_alias_over_compose_sidecars():
+    script = backend._remote_copy_flow_artifacts_into_containers_script(sudo_password='pw')
+
+    assert "if node_name in names:" in script
+    assert "targets = [node_name]" in script
+    assert script.index("if node_name in names:") < script.index("ids = _compose_container_ids(project, yml)")
+
+
 def test_remote_validator_prefers_resolved_inject_sources_and_skips_legacy_tmp_flag_txt(tmp_path):
     run_dir = tmp_path / 'flow-run'
     run_dir.mkdir(parents=True, exist_ok=True)

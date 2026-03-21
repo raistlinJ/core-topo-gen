@@ -31,6 +31,7 @@ def register(
     load_run_history: Callable[[], list[dict]],
     select_core_config_for_page: Callable[..., dict[str, Any]],
     merge_core_configs: Callable[..., dict[str, Any]],
+    apply_core_secret_to_config: Callable[[dict[str, Any], str], dict[str, Any]],
     grpc_save_current_session_xml_with_config: Callable[..., str | None],
     append_async_run_log_line: Callable[[dict[str, Any], str], None],
     append_session_scenario_discrepancies: Callable[..., None],
@@ -194,6 +195,15 @@ def register(
                                             '[async] recovered core ssh_username from saved scenario config for post-run save_xml (scenario=%s)',
                                             scenario_for_post,
                                         )
+                        except Exception:
+                            pass
+                    try:
+                        scenario_for_post = str(scenario_label or meta.get('scenario_name') or '').strip()
+                    except Exception:
+                        scenario_for_post = ''
+                    if scenario_for_post and isinstance(cfg_for_post, dict):
+                        try:
+                            cfg_for_post = apply_core_secret_to_config(cfg_for_post, scenario_for_post.lower().replace(' ', '-'))
                         except Exception:
                             pass
                     post_saved = grpc_save_current_session_xml_with_config(cfg_for_post, post_dir, session_id=sid)

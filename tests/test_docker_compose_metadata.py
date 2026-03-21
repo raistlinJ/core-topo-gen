@@ -83,6 +83,7 @@ services:
             or "yum install" in txt
             or "dnf install" in txt
         )
+        assert "WORKDIR /" not in txt
         assert "ln -sfn /defaultroute.sh" in txt
         assert "ln -sfn /runtraffic.sh" in txt
 
@@ -140,6 +141,7 @@ services:
     assert os.path.exists(dockerfile)
     txt = open(dockerfile, encoding="utf-8").read()
 
+    assert "WORKDIR /" not in txt
     assert "ln -sfn /defaultroute.sh" in txt
     assert "ln -sfn /runtraffic.sh" in txt
 

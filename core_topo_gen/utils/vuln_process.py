@@ -2990,7 +2990,8 @@ def _write_iproute2_wrapper(
 			]
 		lines += [
 			"USER root",
-			"WORKDIR /",
+			"",
+			"# Preserve the base image WORKDIR; some upstream services rely on it.",
 			"",
 			"# CORE may chmod relative service script paths (e.g., defaultroute.sh, runtraffic.sh).",
 			"# Ensure those relative names resolve from common runtime working directories.",
@@ -3077,7 +3078,8 @@ def _write_iproute2_wrapper(
 		f"FROM {base_image}",
 		"",
 		"USER root",
-		"WORKDIR /",
+		"",
+		"# Preserve the base image WORKDIR; some upstream services rely on it.",
 		"",
 		"# CORE may chmod relative service script paths (e.g., defaultroute.sh, runtraffic.sh).",
 		"# Ensure those relative names resolve from common runtime working directories.",
