@@ -111,6 +111,24 @@
             return deps && typeof deps.getPreviewState === 'function' ? deps.getPreviewState() : null;
         }
 
+        function getScenarioSectionItemCounts(scenario) {
+            const sections = (scenario && typeof scenario === 'object' && scenario.sections && typeof scenario.sections === 'object')
+                ? scenario.sections
+                : {};
+            const readCount = (sectionName) => {
+                const section = sections[sectionName];
+                return Array.isArray(section && section.items) ? section.items.length : 0;
+            };
+            return {
+                node_information: readCount('Node Information'),
+                routing: readCount('Routing'),
+                services: readCount('Services'),
+                traffic: readCount('Traffic'),
+                vulnerabilities: readCount('Vulnerabilities'),
+                segmentation: readCount('Segmentation'),
+            };
+        }
+
         async function applyPreviewSuccess({ idx, scenario, aiState, promptValue, data }) {
             const state = getState();
             const previewState = getPreviewState();
@@ -142,6 +160,7 @@
                 routers: Array.isArray(preview.routers) ? preview.routers.length : 0,
                 hosts: Array.isArray(preview.hosts) ? preview.hosts.length : 0,
                 switches: Array.isArray(preview.switches) ? preview.switches.length : 0,
+                section_item_counts: getScenarioSectionItemCounts(generatedScenario),
                 seed: preview.seed || null,
                 generated_at: data.checked_at || new Date().toISOString(),
             };

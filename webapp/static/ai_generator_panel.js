@@ -109,6 +109,33 @@
             };
         }
 
+        function formatGenerationSummary(summary) {
+            if (!summary || typeof summary !== 'object') return '';
+            const parts = [
+                `Preview ready: routers=${Number(summary.routers) || 0}`,
+                `hosts=${Number(summary.hosts) || 0}`,
+                `switches=${Number(summary.switches) || 0}`,
+            ];
+            const sectionCounts = (summary.section_item_counts && typeof summary.section_item_counts === 'object')
+                ? summary.section_item_counts
+                : null;
+            if (sectionCounts) {
+                const sectionParts = [
+                    ['node info', sectionCounts.node_information],
+                    ['routing', sectionCounts.routing],
+                    ['services', sectionCounts.services],
+                    ['traffic', sectionCounts.traffic],
+                    ['vulnerabilities', sectionCounts.vulnerabilities],
+                    ['segmentation', sectionCounts.segmentation],
+                ].map(([label, value]) => `${label}=${Number(value) || 0}`);
+                parts.push(`sections: ${sectionParts.join(', ')}`);
+            }
+            if (summary.seed) {
+                parts.push(`seed=${summary.seed}`);
+            }
+            return parts.join(', ');
+        }
+
         function renderAiGeneratorPanel() {
             const root = document.getElementById('aiGeneratorRoot');
             if (!root) return;
@@ -390,7 +417,7 @@
                                         <div class="alert alert-danger mb-0 small" id="aiGeneratorGenerationError">${escapeHtml(generationError)}</div>
                                     </div>
                                     <div class="mb-3 ${generationSummary ? '' : 'd-none'}" id="aiGeneratorGenerationSummaryWrap">
-                                        <div class="alert alert-success mb-0 small" id="aiGeneratorGenerationSummary">${generationSummary ? escapeHtml(`Preview ready: routers=${generationSummary.routers}, hosts=${generationSummary.hosts}, switches=${generationSummary.switches}${generationSummary.seed ? `, seed=${generationSummary.seed}` : ''}`) : ''}</div>
+                                        <div class="alert alert-success mb-0 small" id="aiGeneratorGenerationSummary">${generationSummary ? escapeHtml(formatGenerationSummary(generationSummary)) : ''}</div>
                                     </div>
                                     <div class="mb-3 ${(promptCoverageMismatch || promptCoverageRetryUsed) ? '' : 'd-none'}" id="aiGeneratorCoverageWrap">
                                         <div class="alert ${promptCoverageMismatch ? 'alert-warning' : 'alert-info'} mb-0 small" id="aiGeneratorCoverageMessage">

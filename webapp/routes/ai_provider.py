@@ -294,7 +294,8 @@ def _build_vulnerability_grounding_guidance(user_prompt: str) -> list[str]:
     if not query_hint:
         return []
 
-    candidates = _search_vulnerability_catalog_for_prompt(query_hint, limit=3)
+    requested_count = max(1, _extract_vulnerability_target_count(user_prompt))
+    candidates = _search_vulnerability_catalog_for_prompt(query_hint, limit=requested_count)
     guidance = [
         f'For this request, keep the vulnerability catalog query narrow: query="{query_hint}".',
         'Do one focused vulnerability search, choose concrete matches, and stop. Do not wander through multiple broad catalog searches once you already have viable results.',
@@ -309,6 +310,14 @@ def _build_vulnerability_grounding_guidance(user_prompt: str) -> list[str]:
             guidance.append(
                 f'Likely concrete matches for that query include: {candidate_names}. Prefer these before exploring unrelated catalog entries.'
             )
+    if requested_count == 1:
+        guidance.append(
+            'The request only needs one vulnerability target. Choose one concrete catalog match and stop after adding that single vulnerability item.'
+        )
+    else:
+        guidance.append(
+            f'The request needs {requested_count} vulnerability target(s). Add only that many concrete vulnerability items unless the user explicitly asks for more.'
+        )
     return guidance
 
 
@@ -4318,7 +4327,6 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
         if not isinstance(execution_result, dict):
             raise ProviderAdapterError('MCP bridge generation failed to produce a preview result.', status_code=502)
         draft_payload = execution_result.get('draft_payload') if isinstance(execution_result.get('draft_payload'), dict) else {}
-        previewed = execution_result.get('previewed') if isinstance(execution_result.get('previewed'), dict) else {}
         scenario_payload = draft_payload.get('scenario') if isinstance(draft_payload.get('scenario'), dict) else deepcopy(current_scenario)
         scenario_payload = _restore_preserved_scenario_metadata(current_scenario, scenario_payload)
         scenario_payload = _overlay_compiled_intent_sections(scenario_payload, user_prompt)
@@ -4327,6 +4335,7 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
             scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
             _ensure_explicit_vulnerability_query_matches_or_raise(user_prompt, scenario_payload)
             scenario_payload = _canonicalize_generated_routing_modes(scenario_payload)
+            scenario_payload = app_backend._concretize_preview_placeholders(scenario_payload, seed=payload.get('seed'))
         except BaseException as exc:
             raise _augment_provider_error_for_bridge_stage(
                 exc,
@@ -4336,6 +4345,10 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
                 fallback='MCP bridge generation failed while canonicalizing vulnerabilities.',
                 client=client,
             ) from exc
+        refreshed_preview, refreshed_plan, refreshed_flow_meta = _refresh_preview_for_final_bridge_scenario(
+            payload,
+            scenario_payload=scenario_payload,
+        )
         return {
             'provider': str(payload.get('provider') or 'ollama').strip().lower() or 'ollama',
             'bridge_mode': bridge_cfg['bridge_mode'],
@@ -4344,9 +4357,9 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
             'prompt_used': execution_result.get('prompt_used') or prompt,
             'provider_response': execution_result.get('provider_response') or '',
             'generated_scenario': scenario_payload,
-            'preview': previewed.get('preview') if isinstance(previewed.get('preview'), dict) else {},
-            'plan': previewed.get('plan') if isinstance(previewed.get('plan'), dict) else {},
-            'flow_meta': previewed.get('flow_meta') if isinstance(previewed.get('flow_meta'), dict) else {},
+            'preview': refreshed_preview,
+            'plan': refreshed_plan,
+            'flow_meta': refreshed_flow_meta,
             'breakdowns': None,
             'count_intent_mismatch': execution_result.get('count_intent_mismatch'),
             'count_intent_retry_used': bool(execution_result.get('count_intent_retry_used')),
@@ -4512,6 +4525,11 @@ async def _mcp_bridge_generate_with_events(
         canonicalize_started_at = time.monotonic()
         try:
             scenario_payload = _canonicalize_generated_vulnerabilities_or_raise(scenario_payload)
+            scenario_payload = _restore_preserved_scenario_metadata(current_scenario, scenario_payload)
+            scenario_payload = _overlay_compiled_intent_sections(scenario_payload, user_prompt)
+            _ensure_explicit_vulnerability_query_matches_or_raise(user_prompt, scenario_payload)
+            scenario_payload = _canonicalize_generated_routing_modes(scenario_payload)
+            scenario_payload = app_backend._concretize_preview_placeholders(scenario_payload, seed=payload.get('seed'))
         except BaseException as exc:
             raise _augment_provider_error_for_bridge_stage(
                 exc,
@@ -4521,6 +4539,10 @@ async def _mcp_bridge_generate_with_events(
                 fallback='MCP bridge generation failed while canonicalizing vulnerabilities.',
                 client=client,
             ) from exc
+        refreshed_preview, refreshed_plan, refreshed_flow_meta = _refresh_preview_for_final_bridge_scenario(
+            payload,
+            scenario_payload=scenario_payload,
+        )
         return {
             'provider': str(payload.get('provider') or 'ollama').strip().lower() or 'ollama',
             'bridge_mode': bridge_cfg['bridge_mode'],
@@ -4529,9 +4551,9 @@ async def _mcp_bridge_generate_with_events(
             'prompt_used': execution_result.get('prompt_used') or prompt,
             'provider_response': execution_result.get('provider_response') or '',
             'generated_scenario': scenario_payload,
-            'preview': previewed.get('preview') if isinstance(previewed.get('preview'), dict) else {},
-            'plan': previewed.get('plan') if isinstance(previewed.get('plan'), dict) else {},
-            'flow_meta': previewed.get('flow_meta') if isinstance(previewed.get('flow_meta'), dict) else {},
+            'preview': refreshed_preview,
+            'plan': refreshed_plan,
+            'flow_meta': refreshed_flow_meta,
             'breakdowns': None,
             'count_intent_mismatch': execution_result.get('count_intent_mismatch'),
             'count_intent_retry_used': bool(execution_result.get('count_intent_retry_used')),
@@ -4655,6 +4677,34 @@ def _dispatch_preview_full(preview_body: dict[str, Any]) -> tuple[Any, dict[str,
     return preview_resp, preview_json
 
 
+def _refresh_preview_for_final_bridge_scenario(
+    payload: dict[str, Any],
+    *,
+    scenario_payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    preview_body = {
+        'scenarios': [scenario_payload],
+        'core': payload.get('core') if isinstance(payload.get('core'), dict) else None,
+        'scenario': scenario_payload.get('name') or None,
+    }
+    if payload.get('seed') is not None:
+        preview_body['seed'] = payload.get('seed')
+
+    preview_resp, preview_json = _dispatch_preview_full(preview_body)
+    if not preview_resp.status_code or preview_resp.status_code >= 400 or preview_json.get('ok') is False:
+        raise ProviderAdapterError(
+            preview_json.get('error') or f'Preview failed (HTTP {preview_resp.status_code}).',
+            status_code=400,
+            details={'generated_scenario': scenario_payload},
+        )
+
+    return (
+        preview_json.get('full_preview') if isinstance(preview_json.get('full_preview'), dict) else {},
+        preview_json.get('plan') if isinstance(preview_json.get('plan'), dict) else {},
+        preview_json.get('flow_meta') if isinstance(preview_json.get('flow_meta'), dict) else {},
+    )
+
+
 def _generate_ollama_streaming_result(
     payload: dict[str, Any],
     *,
@@ -4730,10 +4780,10 @@ def _generate_ollama_streaming_result(
         parsed_generation = _extract_json_candidate(raw_generation)
         return raw_generation, parsed_generation or {}, ('schema' if format_mode != 'json' else 'json')
 
-    prompt = _build_ollama_prompt(current_scenario, user_prompt)
-    provider_attempts: list[dict[str, Any]] = []
-    emit('status', message='Sending prompt to Ollama…')
     try:
+        prompt = _build_ollama_prompt(current_scenario, user_prompt)
+        provider_attempts: list[dict[str, Any]] = []
+        emit('status', message='Sending prompt to Ollama…')
         raw_generation, parsed_generation, format_mode = _generate_once_streaming(prompt=prompt)
         provider_attempts.append({'attempt': 'initial', 'format_mode': format_mode, 'response': raw_generation})
         if not isinstance(parsed_generation, dict) or not parsed_generation:

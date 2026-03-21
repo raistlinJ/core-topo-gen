@@ -337,7 +337,20 @@ def test_save_xml_api_roundtrip_preserves_ai_generator_state(tmp_path, monkeypat
         'draft_prompt': 'Build an offline lab with two hosts.',
         'prompt_packet': '{"prompt":"Build an offline lab with two hosts."}',
         'last_packet_at': '2026-03-07T22:05:00Z',
-        'last_generation_summary': {'routers': 1, 'hosts': 2, 'switches': 1, 'seed': 1234},
+        'last_generation_summary': {
+            'routers': 1,
+            'hosts': 2,
+            'switches': 1,
+            'section_item_counts': {
+                'node_information': 1,
+                'routing': 1,
+                'services': 2,
+                'traffic': 1,
+                'vulnerabilities': 1,
+                'segmentation': 0,
+            },
+            'seed': 1234,
+        },
         'last_generation_error': '',
         'prompt_coverage_mismatch': {
             'reasons': ['Traffic missing requested selected_values: UDP'],
@@ -394,6 +407,7 @@ def test_save_xml_api_roundtrip_preserves_ai_generator_state(tmp_path, monkeypat
     assert restored.get('enabled_tools') == ['server.scenario.create_draft', 'server.scenario.preview_draft']
     assert len(restored.get('available_tools') or []) == 2
     assert (restored.get('last_generation_summary') or {}).get('hosts') == 2
+    assert ((restored.get('last_generation_summary') or {}).get('section_item_counts') or {}).get('vulnerabilities') == 1
     assert restored.get('prompt_coverage_retry_used') is True
     assert (restored.get('prompt_coverage_mismatch') or {}).get('reasons') == ['Traffic missing requested selected_values: UDP']
     validation = restored.get('validation') or {}
@@ -1197,6 +1211,106 @@ def test_ai_generate_scenario_preview_canonicalizes_specific_vuln_name_from_matc
     assert len(vuln_items) == 1
     assert vuln_items[0].get('v_name') == 'jboss/CVE-2017-12149'
     assert vuln_items[0].get('v_path') == 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149'
+
+
+def test_mcp_bridge_generate_refreshes_preview_from_final_scenario(monkeypatch):
+    from webapp.routes import ai_provider
+
+    client = _FakeMcpBridgeClient()
+    payload = {
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'llama3.1',
+        'core': {},
+    }
+    current_scenario = _scenario_payload('BridgeRefreshScenario')
+
+    async def fake_connect(_payload, *, model, host):
+        return client, {
+            'bridge_mode': 'mcp-python-sdk',
+            'enabled_tools': [],
+            'enabled_tools_specified': False,
+        }
+
+    async def fake_call_tool(_client, qualified_tool_name, arguments):
+        if qualified_tool_name == 'server.scenario.create_draft':
+            return {'draft': {'draft_id': 'draft-bridge-refresh-1'}}
+        raise AssertionError(f'unexpected tool call: {qualified_tool_name}')
+
+    async def fake_seed(*args, **kwargs):
+        return []
+
+    async def fake_execute(*args, **kwargs):
+        return {
+            'draft_payload': {
+                'scenario': {
+                    'name': 'BridgeGeneratedScenario',
+                    'notes': 'Generated through MCP bridge.',
+                    'sections': {
+                        'Node Information': {
+                            'density': 0,
+                            'items': [
+                                {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0},
+                            ],
+                        },
+                        'Routing': {'density': 0.0, 'items': []},
+                        'Services': {'density': 0.0, 'items': []},
+                        'Traffic': {'density': 0.0, 'items': []},
+                        'Vulnerabilities': {
+                            'density': 0.0,
+                            'items': [
+                                {
+                                    'selected': 'Specific',
+                                    'v_metric': 'Count',
+                                    'v_count': 1,
+                                    'v_name': 'jboss/CVE-2017-12149',
+                                    'v_path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+                                },
+                            ],
+                            'flag_type': 'text',
+                        },
+                        'Segmentation': {'density': 0.0, 'items': []},
+                    },
+                },
+            },
+            'previewed': {
+                'preview': {
+                    'hosts': [
+                        {'node_id': 1, 'name': 'docker-1', 'role': 'Docker', 'vulnerabilities': ['jboss/CVE-2017-12149']},
+                        {'node_id': 2, 'name': 'docker-2', 'role': 'Docker', 'vulnerabilities': ['jboss/CVE-2017-12149']},
+                    ],
+                    'vulnerabilities_plan': {'jboss/CVE-2017-12149': 2},
+                    'vulnerabilities_by_node': {'1': ['jboss/CVE-2017-12149'], '2': ['jboss/CVE-2017-12149']},
+                },
+                'plan': {'vulnerability_plan': {'jboss/CVE-2017-12149': 2}},
+                'flow_meta': {},
+            },
+            'prompt_used': 'bridge prompt',
+            'provider_response': 'bridge response',
+            'count_intent_mismatch': None,
+            'count_intent_retry_used': False,
+            'prompt_coverage_mismatch': None,
+            'prompt_coverage_retry_used': False,
+        }
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_connect', fake_connect)
+    monkeypatch.setattr(ai_provider, '_apply_mcp_bridge_tool_selection', lambda *_args, **_kwargs: {tool.name: True for tool in client.tool_manager.get_available_tools()})
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+    monkeypatch.setattr(ai_provider, '_apply_deterministic_mcp_bridge_seed', fake_seed)
+    monkeypatch.setattr(ai_provider, '_execute_mcp_bridge_prompt_with_preview_retry', fake_execute)
+
+    result = asyncio.run(ai_provider._mcp_bridge_generate(
+        payload,
+        current_scenario=current_scenario,
+        user_prompt='add 1 jboss vulnerability',
+        model='llama3.1',
+        host='http://127.0.0.1:11434',
+    ))
+
+    vuln_items = (((result.get('generated_scenario') or {}).get('sections') or {}).get('Vulnerabilities') or {}).get('items') or []
+    assert len(vuln_items) == 1
+    assert (result.get('preview') or {}).get('vulnerabilities_plan') == {'jboss/CVE-2017-12149': 1}
+    assert (result.get('preview') or {}).get('vulnerabilities_by_node') == {'1': ['jboss/CVE-2017-12149']}
 
 
 def test_ai_generate_scenario_preview_rejects_specific_vuln_outside_enabled_catalog(tmp_path, monkeypatch):
@@ -2891,6 +3005,31 @@ def test_mcp_bridge_goal_prompt_mentions_routing_ratio_fields():
     assert 'explicit v_name and v_path' in prompt
     assert 'Do not pass factor' in prompt
     assert 'make separate add_vulnerability_item calls with v_count=1' in prompt
+
+
+def test_build_vulnerability_grounding_guidance_limits_singular_vulnerability_prompt(monkeypatch):
+    from webapp.routes import ai_provider
+
+    observed_limits = []
+
+    def fake_search(query, limit=3):
+        observed_limits.append(limit)
+        return [
+            {'name': 'Vuln 1', 'path': '/tmp/v1'},
+            {'name': 'Vuln 2', 'path': '/tmp/v2'},
+            {'name': 'Vuln 3', 'path': '/tmp/v3'},
+        ][:limit]
+
+    monkeypatch.setattr(ai_provider, '_search_vulnerability_catalog_for_prompt', fake_search)
+
+    guidance = ai_provider._build_vulnerability_grounding_guidance('Add a jboss vulnerability.')
+
+    assert observed_limits == [1]
+    combined = ' '.join(guidance)
+    assert 'Vuln 1' in combined
+    assert 'Vuln 2' not in combined
+    assert 'Vuln 3' not in combined
+    assert 'only needs one vulnerability target' in combined
 
 
 def test_build_recoverable_traffic_pattern_error_uses_add_traffic_item_retry():
