@@ -3101,6 +3101,7 @@ def test_build_prompt_repair_decision_adds_vulnerability_grounding_for_tool_pars
 
     retry_prompt = str(decision.retry_prompt or '')
     assert 'scenario.search_vulnerability_catalog' in retry_prompt
+    assert 'emit exactly one tool call' in retry_prompt.lower()
     assert 'pass only strict json keys draft_id, v_name, v_path, and v_count' in retry_prompt.lower()
     assert 'v_count must be a plain json number' in retry_prompt.lower()
     assert 'never {"v_count": "1"}, {"v_count": 1"}, or {"v_count": ?}' in retry_prompt
@@ -3124,6 +3125,7 @@ def test_build_prompt_repair_decision_adds_traffic_grounding_for_tool_parse_erro
 
     retry_prompt = str(decision.retry_prompt or '')
     assert 'for scenario.add_traffic_item, pass only strict json keys' in retry_prompt.lower()
+    assert 'call only one scenario.add_traffic_item row' in retry_prompt.lower()
     assert 'when count is present, omit factor entirely' in retry_prompt.lower()
     assert 'never emit placeholder tokens such as ?, ??, ???' in retry_prompt.lower()
     assert 'never {"count": 8?} or {"count": ?}' in retry_prompt
@@ -4058,7 +4060,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_prompt_va
         'items': [{'selected': 'BGP', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0}],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', auto_heal_prompt=True, auto_heal_leniency='medium', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -4118,7 +4120,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_prompt_co
         'items': [{'selected': 'TCP', 'pattern': 'continuous', 'v_metric': 'Count', 'v_count': 1, 'factor': 1.0, 'content_type': 'text'}],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', auto_heal_prompt=True, auto_heal_leniency='medium', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -4207,7 +4209,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_can_apply_count_then_cover
         ],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', auto_heal_prompt=True, auto_heal_leniency='medium', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -4325,7 +4327,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_can_retry_prompt_coverage_
         ],
     }
 
-    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', auto_heal_prompt=True, auto_heal_leniency='medium', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -4381,7 +4383,7 @@ def test_execute_mcp_bridge_prompt_with_preview_retry_retries_once_for_count_mis
     observed_prompts = []
     preview_attempt = {'index': 0}
 
-    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', emit=None, cancel_check=None, on_response_open=None):
+    async def fake_process_query_server_side(client, *, prompt, model, user_prompt=None, initial_draft_id='', auto_heal_prompt=True, auto_heal_leniency='medium', emit=None, cancel_check=None, on_response_open=None):
         observed_prompts.append(prompt)
         preview_attempt['index'] = len(observed_prompts) - 1
         return f'response-{len(observed_prompts)}'
@@ -4608,6 +4610,112 @@ def test_mcp_bridge_process_query_retries_once_on_provider_tool_call_format_erro
     assert 'malformed or unusable tool calls' in observed_prompts[1].lower()
     assert 'do not stop at plain text' in observed_prompts[1].lower()
     assert 'when count is present, omit factor entirely' in observed_prompts[1].lower()
+
+
+def test_mcp_bridge_process_query_does_not_retry_when_auto_heal_prompt_disabled():
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+
+    class _FakeClient:
+        async def process_query(self, prompt):
+            observed_prompts.append(prompt)
+            raise ai_provider.ProviderAdapterError(
+                'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=..."}',
+                status_code=502,
+            )
+
+    try:
+        asyncio.run(ai_provider._mcp_bridge_process_query_server_side(
+            _FakeClient(),
+            prompt='create a scenario with 1 vulnerability',
+            model='gpt-oss:20b',
+            user_prompt='create a scenario with 1 vulnerability',
+            auto_heal_prompt=False,
+        ))
+    except ai_provider.ProviderAdapterError as exc:
+        assert 'error parsing tool call' in exc.message.lower()
+    else:  # pragma: no cover
+        raise AssertionError('expected ProviderAdapterError')
+
+    assert len(observed_prompts) == 1
+
+
+def test_mcp_bridge_process_query_high_leniency_allows_more_tool_parse_retries():
+    from webapp.routes import ai_provider
+
+    observed_prompts = []
+
+    class _FakeClient:
+        async def process_query(self, prompt):
+            observed_prompts.append(prompt)
+            if len(observed_prompts) <= 4:
+                raise ai_provider.ProviderAdapterError(
+                    'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=..."}',
+                    status_code=502,
+                )
+            return 'ok'
+
+    result = asyncio.run(ai_provider._mcp_bridge_process_query_server_side(
+        _FakeClient(),
+        prompt='create 3 tcp flows with periodic pattern',
+        model='gpt-oss:20b',
+        user_prompt='create 3 tcp flows with periodic pattern',
+        auto_heal_prompt=True,
+        auto_heal_leniency='high',
+    ))
+
+    assert result == 'ok'
+    assert len(observed_prompts) == 5
+
+
+def test_execute_mcp_bridge_prompt_with_preview_retry_returns_best_effort_on_high_leniency(monkeypatch):
+    from webapp.routes import ai_provider
+
+    class _FakeClient:
+        pass
+
+    async def fake_process_query_server_side(*args, **kwargs):
+        raise ai_provider.ProviderAdapterError(
+            'Ollama returned HTTP 500. {"error":"error parsing tool call: raw=..."}',
+            status_code=502,
+        )
+
+    async def fake_call_tool(client, tool_name, tool_args):
+        if tool_name.endswith('get_draft'):
+            return {
+                'draft': {
+                    'draft_id': 'draft-1',
+                    'scenario': _scenario_payload('BestEffortScenario'),
+                }
+            }
+        if tool_name.endswith('preview_draft'):
+            return {
+                'preview': {
+                    'routers': [],
+                    'hosts': [],
+                    'switches': [],
+                }
+            }
+        raise AssertionError(f'unexpected tool {tool_name}')
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_process_query_server_side', fake_process_query_server_side)
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
+
+    result = asyncio.run(ai_provider._execute_mcp_bridge_prompt_with_preview_retry(
+        _FakeClient(),
+        draft_id='draft-1',
+        prompt='base prompt',
+        user_prompt='create a scenario with 1 vulnerability',
+        model='gpt-oss:20b',
+        get_tool='server.scenario.get_draft',
+        preview_tool='server.scenario.preview_draft',
+        auto_heal_prompt=True,
+        auto_heal_leniency='high',
+    ))
+
+    assert result.get('best_effort_used') is True
+    assert 'best-effort draft preview' in str(result.get('best_effort_reason') or '').lower()
 
 
 def test_mcp_bridge_process_query_retry_prompt_mentions_traffic_factor_omission():

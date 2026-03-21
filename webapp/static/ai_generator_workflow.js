@@ -53,10 +53,15 @@
             const coverageMismatch = (data && data.prompt_coverage_mismatch && typeof data.prompt_coverage_mismatch === 'object')
                 ? data.prompt_coverage_mismatch
                 : null;
+            const bestEffortUsed = !!(data && data.best_effort_used);
+            const bestEffortReason = (data && data.best_effort_reason ? String(data.best_effort_reason) : '').trim();
             const parts = [];
             if (success) {
                 parts.push('No textual model summary was returned. The request completed through tool calls.');
                 parts.push(`Preview summary: routers=${routers}, hosts=${hosts}, switches=${switches}.`);
+                if (bestEffortUsed) {
+                    parts.push(bestEffortReason || 'A best-effort draft preview was returned after repeated tool-call formatting failures.');
+                }
                 if (retryUsed) {
                     parts.push('An automatic retry was attempted because the first preview did not match the requested counts.');
                 }
@@ -175,6 +180,8 @@
                 last_generation_error: '',
                 prompt_coverage_mismatch: (data.prompt_coverage_mismatch && typeof data.prompt_coverage_mismatch === 'object') ? data.prompt_coverage_mismatch : null,
                 prompt_coverage_retry_used: !!data.prompt_coverage_retry_used,
+                last_best_effort_used: !!data.best_effort_used,
+                last_best_effort_reason: String(data.best_effort_reason || ''),
             });
 
             try { deps.persistEditorState(); } catch (e) { }
@@ -193,6 +200,8 @@
                 last_generation_error: message,
                 prompt_coverage_mismatch: null,
                 prompt_coverage_retry_used: false,
+                last_best_effort_used: false,
+                last_best_effort_reason: '',
             });
             renderPanel();
         }
@@ -214,6 +223,8 @@
                     servers_json_path: aiState.servers_json_path || '',
                     auto_discovery: !!aiState.auto_discovery,
                     hil_enabled: !!aiState.hil_enabled,
+                    auto_heal_prompt: aiState.auto_heal_prompt === false ? false : true,
+                    auto_heal_leniency: ['low', 'medium', 'high'].includes(String(aiState.auto_heal_leniency || '').toLowerCase()) ? String(aiState.auto_heal_leniency || '').toLowerCase() : 'medium',
                     enabled_tools: Array.isArray(aiState.enabled_tools) ? aiState.enabled_tools : [],
                 } : {}),
                 scenario_name: scenarioName,

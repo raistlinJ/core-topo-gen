@@ -261,6 +261,13 @@
                 }).join('')
                 : `<div class="text-muted small">${supportsBridge ? 'Validate the bridge to discover MCP tools exposed through the MCP Python SDK bridge.' : 'This OpenAI-compatible provider currently uses direct scenario generation in this UI, so MCP tool discovery is not used for this provider.'}</div>`;
 
+            const autoHealPrompt = aiState.auto_heal_prompt === false ? false : true;
+            const autoHealLeniency = ['low', 'medium', 'high'].includes(String(aiState.auto_heal_leniency || '').toLowerCase())
+                ? String(aiState.auto_heal_leniency || '').toLowerCase()
+                : 'medium';
+            const bestEffortUsed = !!aiState.last_best_effort_used;
+            const bestEffortReason = String(aiState.last_best_effort_reason || '').trim();
+
             const providerOptions = providerEntries.map((entry) => {
                 const key = String(entry && entry.provider || '').trim().toLowerCase();
                 if (!key) return '';
@@ -320,6 +327,30 @@
                                     <label class="form-check-label" for="aiGeneratorEnforceSslInput">Enforce SSL</label>
                                     <div class="form-text">Enabled by default. When on, the OpenAI-compatible base URL must use <strong>https</strong> and certificates are verified. Turn it off to allow self-signed certificates or plain <strong>http</strong> endpoints.</div>
                                 </div>`
+                : '';
+
+            const autoHealMarkup = supportsBridge
+                ? `
+                                    <div class="border rounded p-3 bg-light mb-3">
+                                        <div class="d-flex justify-content-between align-items-start gap-3 flex-wrap">
+                                            <div>
+                                                <div class="fw-semibold">Auto-heal Prompt</div>
+                                                <div class="small text-muted">Controls automatic prompt repair retries when MCP/tool-call generation fails. High leniency may return a best-effort draft preview if partial progress exists.</div>
+                                            </div>
+                                            <div class="form-check form-switch m-0">
+                                                <input class="form-check-input" type="checkbox" role="switch" id="aiGeneratorAutoHealPromptInput" ${autoHealPrompt ? 'checked' : ''}>
+                                                <label class="form-check-label" for="aiGeneratorAutoHealPromptInput">Enable</label>
+                                            </div>
+                                        </div>
+                                        <div class="mt-3">
+                                            <label class="form-label mb-1" for="aiGeneratorAutoHealLeniencyInput">Leniency</label>
+                                            <select class="form-select" id="aiGeneratorAutoHealLeniencyInput" ${autoHealPrompt ? '' : 'disabled'}>
+                                                <option value="low" ${autoHealLeniency === 'low' ? 'selected' : ''}>Low: fail faster, minimal retries</option>
+                                                <option value="medium" ${autoHealLeniency === 'medium' ? 'selected' : ''}>Medium: standard bounded retries</option>
+                                                <option value="high" ${autoHealLeniency === 'high' ? 'selected' : ''}>High: more retries, best-effort fallback</option>
+                                            </select>
+                                        </div>
+                                    </div>`
                 : '';
 
             root.innerHTML = `
@@ -390,6 +421,7 @@
                                         <label class="form-label">Prompt / Command Intent</label>
                                         <textarea class="form-control" id="aiGeneratorPromptInput" rows="6" placeholder="Describe the topology, services, vulnerabilities, and flag-sequencing goals you want generated." ${isValidated ? '' : 'disabled'}>${escapeHtml(aiState.draft_prompt || '')}</textarea>
                                     </div>
+                                    ${autoHealMarkup}
                                     <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
                                         <button type="button" class="btn btn-success" id="aiGeneratorGenerateBtn" ${isValidated ? '' : 'disabled'}>Construct Scenario Elements</button>
                                         <button type="button" class="btn btn-outline-secondary" id="aiGeneratorBuildPacketBtn" ${isValidated ? '' : 'disabled'}>Refresh Prompt / Command</button>
@@ -407,6 +439,9 @@
                                                 ? `<div class="fw-semibold mb-1">Some prompt requirements were still ignored.</div><ul class="mb-0">${promptCoverageReasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul>`
                                                 : `${promptCoverageRetryUsed ? 'The backend auto-retried once because the first draft missed requested prompt items or values.' : ''}`}
                                         </div>
+                                    </div>
+                                    <div class="mb-3 ${bestEffortUsed ? '' : 'd-none'}" id="aiGeneratorBestEffortWrap">
+                                        <div class="alert alert-info mb-0 small" id="aiGeneratorBestEffortMessage">${escapeHtml(bestEffortReason || 'A best-effort draft preview was returned after repeated tool-call formatting failures.')}</div>
                                     </div>
                                     <details class="mb-0">
                                         <summary class="small text-muted fw-semibold">Prompt packet preview</summary>
@@ -429,6 +464,8 @@
             const enforceSslInput = document.getElementById('aiGeneratorEnforceSslInput');
             const autoDiscoveryInput = document.getElementById('aiGeneratorAutoDiscoveryInput');
             const hilEnabledInput = document.getElementById('aiGeneratorHilEnabledInput');
+            const autoHealPromptInput = document.getElementById('aiGeneratorAutoHealPromptInput');
+            const autoHealLeniencyInput = document.getElementById('aiGeneratorAutoHealLeniencyInput');
             const fetchModelsBtn = document.getElementById('aiGeneratorFetchModelsBtn');
             const promptInput = document.getElementById('aiGeneratorPromptInput');
             const validateBtn = document.getElementById('aiGeneratorValidateBtn');
@@ -509,6 +546,23 @@
             if (hilEnabledInput) {
                 hilEnabledInput.addEventListener('change', () => {
                     deps.persistAiGeneratorStateForScenario(scenario, idx, { hil_enabled: !!hilEnabledInput.checked, validation: resetValidation() });
+                    renderAiGeneratorPanel();
+                });
+            }
+            if (autoHealPromptInput) {
+                autoHealPromptInput.addEventListener('change', () => {
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        auto_heal_prompt: !!autoHealPromptInput.checked,
+                        auto_heal_leniency: autoHealLeniency,
+                    });
+                    renderAiGeneratorPanel();
+                });
+            }
+            if (autoHealLeniencyInput) {
+                autoHealLeniencyInput.addEventListener('change', () => {
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        auto_heal_leniency: autoHealLeniencyInput.value,
+                    });
                     renderAiGeneratorPanel();
                 });
             }

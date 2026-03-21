@@ -5009,6 +5009,8 @@
             provider: 'ollama',
             bridge_mode: 'mcp-python-sdk',
             hil_enabled: false,
+            auto_heal_prompt: true,
+            auto_heal_leniency: 'medium',
             base_url: 'http://127.0.0.1:11434',
             api_key: '',
             enforce_ssl: true,
@@ -5038,6 +5040,8 @@
             last_generation_error: '',
             prompt_coverage_mismatch: null,
             prompt_coverage_retry_used: false,
+            last_best_effort_used: false,
+            last_best_effort_reason: '',
         };
     }
 
@@ -5055,6 +5059,12 @@
             return 'mcp-python-sdk';
         }
         return text;
+    }
+
+    function normalizeAiAutoHealLeniency(rawValue) {
+        const text = String(rawValue || 'medium').trim().toLowerCase();
+        if (text === 'low' || text === 'medium' || text === 'high') return text;
+        return 'medium';
     }
 
     function ensureAiGeneratorStateForScenario(scenario, idx = null) {
@@ -5107,6 +5117,8 @@
         if (!String(merged.mcp_server_url || '').trim()) merged.mcp_server_url = defaults.mcp_server_url;
         if (!String(merged.servers_json_path || '').trim()) merged.servers_json_path = defaults.servers_json_path;
         merged.bridge_mode = normalizeAiBridgeMode(merged.bridge_mode || defaults.bridge_mode);
+        merged.auto_heal_prompt = merged.auto_heal_prompt === false ? false : true;
+        merged.auto_heal_leniency = normalizeAiAutoHealLeniency(merged.auto_heal_leniency || defaults.auto_heal_leniency);
         if (typeof merged.api_key !== 'string') merged.api_key = '';
         merged.enforce_ssl = merged.enforce_ssl === false ? false : true;
         if (scenario && typeof scenario === 'object') {
@@ -5124,6 +5136,8 @@
             bridge_mode: normalizeAiBridgeMode(aiState.bridge_mode || 'mcp-python-sdk'),
             auto_discovery: !!aiState.auto_discovery,
             hil_enabled: !!aiState.hil_enabled,
+            auto_heal_prompt: aiState.auto_heal_prompt === false ? false : true,
+            auto_heal_leniency: normalizeAiAutoHealLeniency(aiState.auto_heal_leniency || 'medium'),
             mcp_server_path: '',
             mcp_server_url: '',
             servers_json_path: '',
@@ -5157,6 +5171,8 @@
                 ...(partialState && partialState.validation && typeof partialState.validation === 'object' ? partialState.validation : {}),
             },
         };
+        next.auto_heal_prompt = next.auto_heal_prompt === false ? false : true;
+        next.auto_heal_leniency = normalizeAiAutoHealLeniency(next.auto_heal_leniency || 'medium');
         next.enforce_ssl = next.enforce_ssl === false ? false : true;
         if (typeof next.api_key !== 'string') next.api_key = '';
         scenario.ai_generator = stripSensitiveAiGeneratorState(next);

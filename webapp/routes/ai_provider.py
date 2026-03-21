@@ -124,8 +124,119 @@ def _is_provider_tool_call_format_error(exc: BaseException) -> bool:
     ])
 
 
-def _build_mcp_bridge_tool_parse_retry_prompt(prompt: str, *, user_prompt: str | None = None) -> str:
+def _normalize_auto_heal_leniency(raw_value: Any, *, default: str = 'medium') -> str:
+    text = str(raw_value or default).strip().lower()
+    if text in {'low', 'medium', 'high'}:
+        return text
+    return default
+
+
+def _tool_parse_retry_budget(leniency: str) -> int:
+    normalized = _normalize_auto_heal_leniency(leniency)
+    if normalized == 'low':
+        return 1
+    if normalized == 'high':
+        return 4
+    return 2
+
+
+def _count_mismatch_retry_budget(leniency: str) -> int:
+    normalized = _normalize_auto_heal_leniency(leniency)
+    if normalized == 'low':
+        return 0
+    if normalized == 'high':
+        return 2
+    return 1
+
+
+def _coverage_retry_budget(leniency: str) -> int:
+    normalized = _normalize_auto_heal_leniency(leniency)
+    if normalized == 'low':
+        return 1
+    if normalized == 'high':
+        return 3
+    return 2
+
+
+def _preview_retry_iteration_budget(leniency: str) -> int:
+    normalized = _normalize_auto_heal_leniency(leniency)
+    if normalized == 'low':
+        return 2
+    if normalized == 'high':
+        return 6
+    return 4
+
+
+def _allow_best_effort_prompt_heal(leniency: str) -> bool:
+    return _normalize_auto_heal_leniency(leniency) == 'high'
+
+
+def _extract_tool_call_parse_error_text(exc_or_message: Any) -> str:
+    text = str(exc_or_message or '')
+    match = re.search(r"raw='([^']+)'", text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _classify_tool_call_parse_error(exc_or_message: Any) -> list[str]:
+    text = _extract_tool_call_parse_error_text(exc_or_message).lower()
+    hints: list[str] = []
+    if '?' in text:
+        hints.append('numeric-placeholder')
+    if re.search(r'"(?:v_)?count"\s*:\s*\d+"', text):
+        hints.append('quoted-number')
+    if '"v_path"' in text and ('...' in text or '…' in text):
+        hints.append('truncated-path')
+    if not hints:
+        hints.append('generic')
+    return hints
+
+
+def _infer_tool_parse_domain(source_prompt: str, *, exc: BaseException | None = None) -> str:
+    text = str(source_prompt or '').lower()
+    error_text = str(exc or '').lower()
+    if _extract_vulnerability_target_count(source_prompt) > 0 or any(token in error_text for token in ['v_count', 'v_name', 'v_path', 'vulnerability', 'magento']):
+        return 'vulnerability'
+    if _build_seeded_traffic_rows(source_prompt) or _extract_requested_traffic_patterns(source_prompt) or re.search(r'\b(?:tcp|udp|traffic\s+flows?|flows?|traffic\s+streams?|streams?)\b', text):
+        return 'traffic'
+    if re.search(r'\b(?:ospf|bgp|rip|routing|router|routers)\b', text):
+        return 'routing'
+    if re.search(r'\b(?:service|services|ssh|http|https|dns|dhcp)\b', text):
+        return 'services'
+    return 'generic'
+
+
+def _build_one_tool_only_retry_lines(source_prompt: str, *, exc: BaseException | None = None) -> list[str]:
+    domain = _infer_tool_parse_domain(source_prompt, exc=exc)
+    lines = [
+        'On the next assistant turn, emit exactly one tool call and no surrounding commentary, prose, markdown, or extra JSON.',
+        'If more than one change is needed, wait for the tool result and continue on the following turn instead of emitting multiple tool calls now.',
+    ]
+    if domain == 'vulnerability':
+        query_hint = _extract_vulnerability_query_hint(source_prompt)
+        if query_hint:
+            lines.append(f'Next turn: call only scenario.search_vulnerability_catalog with query="{query_hint}" and no other tool call.')
+        else:
+            lines.append('Next turn: call only scenario.search_vulnerability_catalog with a free-text vulnerability query from the user wording and no other tool call.')
+    elif domain == 'traffic':
+        lines.append('Next turn: call only one scenario.add_traffic_item row. Do not emit multiple traffic rows in one message.')
+    elif domain == 'routing':
+        lines.append('Next turn: call only one routing tool and no other tool call.')
+    elif domain == 'services':
+        lines.append('Next turn: call only one service tool and no other tool call.')
+    return lines
+
+
+def _build_mcp_bridge_tool_parse_retry_prompt(
+    prompt: str,
+    *,
+    user_prompt: str | None = None,
+    exc: BaseException | None = None,
+    leniency: str = 'medium',
+) -> str:
     source_prompt = str(user_prompt or prompt or '')
+    error_hints = _classify_tool_call_parse_error(exc)
     retry_lines = [
         '',
         'Retry note: your previous response failed because the provider returned malformed or unusable tool calls.',
@@ -142,6 +253,15 @@ def _build_mcp_bridge_tool_parse_retry_prompt(prompt: str, *, user_prompt: str |
         'For scenario.add_vulnerability_item, pass only strict JSON keys draft_id, v_name, v_path, and v_count unless the user explicitly requested exact type/vector filters.',
         'When v_path contains dots or slashes, keep it as one quoted JSON string copied exactly from a catalog search result. Never emit bare path fragments, ellipses like "...", comments, or truncated JSON.',
     ]
+    if 'numeric-placeholder' in error_hints:
+        retry_lines.append('The previous tool JSON included placeholder-style numeric corruption. Do not emit ?, duplicate placeholder count fields, or mixed number-plus-symbol values like 8? anywhere in tool arguments.')
+    if 'quoted-number' in error_hints:
+        retry_lines.append('The previous tool JSON incorrectly treated a numeric field as partially quoted text. Keep count and v_count as plain JSON numbers with no trailing quote characters.')
+    if 'truncated-path' in error_hints:
+        retry_lines.append('The previous tool JSON used a truncated path placeholder. Never send v_path as "..." or any shortened stand-in; copy the full exact path from catalog search results.')
+    retry_lines.extend(_build_one_tool_only_retry_lines(source_prompt, exc=exc))
+    if _allow_best_effort_prompt_heal(leniency):
+        retry_lines.append('High auto-heal leniency is enabled. If later turns still struggle, prioritize one valid tool call that improves the draft rather than attempting multiple fragile edits at once.')
     vulnerability_target_count = _extract_vulnerability_target_count(source_prompt)
     if vulnerability_target_count > 0:
         retry_lines.extend(_build_vulnerability_grounding_guidance(source_prompt))
@@ -1256,20 +1376,21 @@ def _build_prompt_repair_decision(
     user_prompt: str | None = None,
     exc: ProviderAdapterError | None = None,
     mismatch: dict[str, Any] | None = None,
+    leniency: str = 'medium',
 ) -> _McpBridgeRepairDecision:
     if exc is not None and _is_ollama_tool_parse_error(exc):
         return _McpBridgeRepairDecision(
             category='ollama-tool-parse-error',
             retryable=True,
             status_message='Retrying after Ollama tool-call parse failure...',
-            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt),
+            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt, exc=exc, leniency=leniency),
         )
     if exc is not None and _is_provider_tool_call_format_error(exc):
         return _McpBridgeRepairDecision(
             category='provider-tool-call-format-error',
             retryable=True,
             status_message='Retrying after provider tool-call formatting failure...',
-            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt),
+            retry_prompt=_build_mcp_bridge_tool_parse_retry_prompt(prompt, user_prompt=user_prompt, exc=exc, leniency=leniency),
         )
     if isinstance(mismatch, dict):
         if isinstance(mismatch.get('missing'), list):
@@ -1357,29 +1478,66 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
     model: str,
     get_tool: str,
     preview_tool: str,
+    auto_heal_prompt: bool = True,
+    auto_heal_leniency: str = 'medium',
     emit: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     on_response_open: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     current_prompt = prompt
-    count_retry_used = False
+    count_retry_count = 0
     coverage_retry_count = 0
     final_mismatch: dict[str, Any] | None = None
     final_coverage_mismatch: dict[str, Any] | None = None
+    count_retry_budget = _count_mismatch_retry_budget(auto_heal_leniency)
+    coverage_retry_budget = _coverage_retry_budget(auto_heal_leniency)
+    max_iterations = _preview_retry_iteration_budget(auto_heal_leniency)
 
-    for _ in range(4):
+    for _ in range(max_iterations):
         if cancel_check and cancel_check():
             raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
-        model_response = await _mcp_bridge_process_query_server_side(
-            client,
-            prompt=current_prompt,
-            model=model,
-            user_prompt=user_prompt,
-            initial_draft_id=draft_id,
-            emit=emit,
-            cancel_check=cancel_check,
-            on_response_open=on_response_open,
-        )
+        try:
+            model_response = await _mcp_bridge_process_query_server_side(
+                client,
+                prompt=current_prompt,
+                model=model,
+                user_prompt=user_prompt,
+                initial_draft_id=draft_id,
+                auto_heal_prompt=auto_heal_prompt,
+                auto_heal_leniency=auto_heal_leniency,
+                emit=emit,
+                cancel_check=cancel_check,
+                on_response_open=on_response_open,
+            )
+        except ProviderAdapterError as exc:
+            if not auto_heal_prompt or not _allow_best_effort_prompt_heal(auto_heal_leniency) or not _is_provider_tool_call_format_error(exc):
+                raise
+            try:
+                if emit is not None:
+                    emit('status', message='Using best-effort draft after repeated tool-call formatting failures...')
+                fetched = await _mcp_bridge_call_tool(client, get_tool, {'draft_id': draft_id})
+                previewed = await _mcp_bridge_call_tool(client, preview_tool, {'draft_id': draft_id})
+                draft_payload = fetched.get('draft') if isinstance(fetched.get('draft'), dict) else {}
+                scenario_payload = draft_payload.get('scenario') if isinstance(draft_payload.get('scenario'), dict) else {}
+                final_mismatch = _get_count_intent_mismatch(
+                    user_prompt,
+                    previewed.get('preview') if isinstance(previewed.get('preview'), dict) else {},
+                )
+                final_coverage_mismatch = _get_prompt_coverage_mismatch(user_prompt, scenario_payload)
+                return {
+                    'prompt_used': current_prompt,
+                    'provider_response': str(getattr(exc, 'message', '') or str(exc) or '').strip(),
+                    'draft_payload': draft_payload,
+                    'previewed': previewed,
+                    'count_intent_mismatch': final_mismatch,
+                    'count_intent_retry_used': count_retry_count > 0,
+                    'prompt_coverage_mismatch': final_coverage_mismatch,
+                    'prompt_coverage_retry_used': coverage_retry_count > 0,
+                    'best_effort_used': True,
+                    'best_effort_reason': 'Repeated malformed tool-call output prevented a clean completion, so the backend returned a best-effort draft preview from the current draft.',
+                }
+            except Exception:
+                raise exc
         if cancel_check and cancel_check():
             raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
         fetched = await _mcp_bridge_call_tool(client, get_tool, {'draft_id': draft_id})
@@ -1393,17 +1551,17 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
             previewed.get('preview') if isinstance(previewed.get('preview'), dict) else {},
         )
         final_coverage_mismatch = _get_prompt_coverage_mismatch(user_prompt, scenario_payload)
-        if final_mismatch and not count_retry_used:
-            count_retry_used = True
-            repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, mismatch=final_mismatch)
+        if auto_heal_prompt and final_mismatch and count_retry_count < count_retry_budget:
+            count_retry_count += 1
+            repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, mismatch=final_mismatch, leniency=auto_heal_leniency)
             if emit is not None and repair.status_message:
                 emit('status', message=repair.status_message)
             current_prompt = repair.retry_prompt or prompt
             draft_id = effective_draft_id
             continue
-        if final_coverage_mismatch and coverage_retry_count < 2:
+        if auto_heal_prompt and final_coverage_mismatch and coverage_retry_count < coverage_retry_budget:
             coverage_retry_count += 1
-            repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, mismatch=final_coverage_mismatch)
+            repair = _build_prompt_repair_decision(prompt=prompt, user_prompt=user_prompt, mismatch=final_coverage_mismatch, leniency=auto_heal_leniency)
             if emit is not None and repair.status_message:
                 emit('status', message=repair.status_message)
             current_prompt = repair.retry_prompt or current_prompt
@@ -1415,9 +1573,11 @@ async def _execute_mcp_bridge_prompt_with_preview_retry(
             'draft_payload': draft_payload,
             'previewed': previewed,
             'count_intent_mismatch': final_mismatch,
-            'count_intent_retry_used': count_retry_used,
+            'count_intent_retry_used': count_retry_count > 0,
             'prompt_coverage_mismatch': final_coverage_mismatch,
             'prompt_coverage_retry_used': coverage_retry_count > 0,
+            'best_effort_used': False,
+            'best_effort_reason': '',
         }
 
     raise ProviderAdapterError('MCP bridge generation failed to produce a preview result.', status_code=502)
@@ -3917,6 +4077,8 @@ async def _mcp_bridge_process_query_server_side(
     model: str,
     user_prompt: str | None = None,
     initial_draft_id: str = '',
+    auto_heal_prompt: bool = True,
+    auto_heal_leniency: str = 'medium',
     emit: Callable[..., None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     on_response_open: Callable[[Any], None] | None = None,
@@ -3925,7 +4087,7 @@ async def _mcp_bridge_process_query_server_side(
     sanitized_initial_draft_id = str(initial_draft_id or '').strip()
     current_prompt = prompt
     tool_format_retry_count = 0
-    max_tool_format_retries = 2
+    max_tool_format_retries = _tool_parse_retry_budget(auto_heal_leniency)
 
     async def _invoke_process_query(callable_obj: Callable[..., Any], current_prompt: str, **kwargs: Any) -> str:
         if sanitized_initial_draft_id:
@@ -3953,7 +4115,9 @@ async def _mcp_bridge_process_query_server_side(
         try:
             return await process_query(current_prompt)
         except ProviderAdapterError as exc:
-            repair = _build_prompt_repair_decision(prompt=current_prompt, user_prompt=user_prompt, exc=exc)
+            if not auto_heal_prompt:
+                raise
+            repair = _build_prompt_repair_decision(prompt=current_prompt, user_prompt=user_prompt, exc=exc, leniency=auto_heal_leniency)
             if not repair.retryable:
                 raise
             if repair.category in {'ollama-tool-parse-error', 'provider-tool-call-format-error'}:
@@ -4418,6 +4582,8 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
                     model=model,
                     get_tool=get_tool,
                     preview_tool=preview_tool,
+                    auto_heal_prompt=_payload_bool(payload.get('auto_heal_prompt'), default=True),
+                    auto_heal_leniency=_normalize_auto_heal_leniency(payload.get('auto_heal_leniency')),
                 )
                 break
             except ProviderAdapterError as exc:
@@ -4482,6 +4648,8 @@ async def _mcp_bridge_generate(payload: dict[str, Any], *, current_scenario: dic
             'count_intent_retry_used': bool(execution_result.get('count_intent_retry_used')),
             'prompt_coverage_mismatch': execution_result.get('prompt_coverage_mismatch'),
             'prompt_coverage_retry_used': bool(execution_result.get('prompt_coverage_retry_used')),
+            'best_effort_used': bool(execution_result.get('best_effort_used')),
+            'best_effort_reason': str(execution_result.get('best_effort_reason') or ''),
             'bridge_tools': [
                 _mcp_bridge_tool_payload(tool, enabled_map)
                 for tool in client.tool_manager.get_available_tools()
@@ -4602,6 +4770,8 @@ async def _mcp_bridge_generate_with_events(
                     model=model,
                     get_tool=get_tool,
                     preview_tool=preview_tool,
+                    auto_heal_prompt=_payload_bool(payload.get('auto_heal_prompt'), default=True),
+                    auto_heal_leniency=_normalize_auto_heal_leniency(payload.get('auto_heal_leniency')),
                     emit=emit,
                     cancel_check=cancel_check,
                     on_response_open=on_response_open,
@@ -4676,6 +4846,8 @@ async def _mcp_bridge_generate_with_events(
             'count_intent_retry_used': bool(execution_result.get('count_intent_retry_used')),
             'prompt_coverage_mismatch': execution_result.get('prompt_coverage_mismatch'),
             'prompt_coverage_retry_used': bool(execution_result.get('prompt_coverage_retry_used')),
+            'best_effort_used': bool(execution_result.get('best_effort_used')),
+            'best_effort_reason': str(execution_result.get('best_effort_reason') or ''),
             'bridge_tools': [
                 _mcp_bridge_tool_payload(tool, enabled_map)
                 for tool in client.tool_manager.get_available_tools()
@@ -4719,6 +4891,8 @@ def _build_stream_success_payload(
             'count_intent_retry_used': bool(generation_result.get('count_intent_retry_used')),
             'prompt_coverage_mismatch': generation_result.get('prompt_coverage_mismatch'),
             'prompt_coverage_retry_used': bool(generation_result.get('prompt_coverage_retry_used')),
+            'best_effort_used': bool(generation_result.get('best_effort_used')),
+            'best_effort_reason': str(generation_result.get('best_effort_reason') or ''),
             'generated_scenario': generated_scenario,
             'generated_scenarios': next_scenarios,
             'preview': generation_result.get('preview') or {},

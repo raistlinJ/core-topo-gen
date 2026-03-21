@@ -65,6 +65,21 @@ def test_ai_generator_panel_keeps_mcp_tooling_available_for_openai_compatible_pr
     assert not missing, "Missing OpenAI-compatible MCP tool UI snippets in AI Generator panel: " + "; ".join(missing)
 
 
+def test_ai_generator_panel_renders_auto_heal_prompt_controls() -> None:
+    text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'Auto-heal Prompt',
+        'aiGeneratorAutoHealPromptInput',
+        'aiGeneratorAutoHealLeniencyInput',
+        'High: more retries, best-effort fallback',
+        'last_best_effort_reason',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing auto-heal prompt UI snippets in AI Generator panel: " + "; ".join(missing)
+
+
 def test_ai_generator_workflow_blocks_bridge_generation_without_enabled_tools() -> None:
     text = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_workflow.js").read_text(encoding="utf-8", errors="ignore")
 
