@@ -254,10 +254,10 @@ current_user.is_authenticated) else '' %}
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">Loading…</h5>
+        <h5 class="modal-title">Retrieving Page Details</h5>
       </div>
       <div class="modal-body">
-        <div class="small text-muted mb-2">Loading scenario details…</div>
+        <div class="small text-muted mb-2">Retrieving page details…</div>
         <div class="progress" role="progressbar" aria-label="Loading" aria-valuemin="0" aria-valuemax="100">
           <div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 100%">Loading</div>
         </div>
@@ -1315,9 +1315,15 @@ current_user.is_authenticated) else '' %}
         if (href.indexOf('{{ url_for('core_details') }}') === -1 && href.indexOf('/core/details') === -1) return;
         if (!shouldInterceptClick(ev)) return;
         ev.preventDefault();
-        showLoadingModal();
-        // Give the browser a moment to paint the modal before navigating.
-        requestAnimationFrame(() => { setTimeout(() => { window.location.assign(href); }, 50); });
+        if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+          window.CORETG_NAVIGATE_WITH_LOADING(href, {
+            title: 'Retrieving Page Details',
+            message: 'Retrieving page details…',
+          });
+        } else {
+          showLoadingModal();
+          requestAnimationFrame(() => { setTimeout(() => { window.location.assign(href); }, 50); });
+        }
       } catch (e) { }
     }, true);
   })();

@@ -5278,12 +5278,17 @@
         const delay = Number(options.delay) || 0;
         const scenarioName = typeof options.scenarioName === 'string' ? options.scenarioName : null;
         const targetUrl = buildScenarioAwareUrl(baseUrl, scenarioName) || baseUrl;
-        const navigate = () => { window.location.href = targetUrl; };
+        const navigate = () => {
+            if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                window.CORETG_NAVIGATE_PAGE_DETAILS(targetUrl);
+            } else {
+                window.location.href = targetUrl;
+            }
+        };
         if (delay > 0) { setTimeout(navigate, delay); } else { navigate(); }
     }
 
     function cloneScenarioCoreFromScenario(scenario, includePassword = true) {
-        if (!scenario) return null;
         const hitlState = ensureHitlStateForScenario(scenario);
         if (!hitlState || typeof hitlState !== 'object' || !hitlState.core || typeof hitlState.core !== 'object') {
             return null;
@@ -6302,7 +6307,11 @@
             }
         } catch (e) { }
         _unsavedNavAllowOnce = true;
-        window.location.href = href;
+        if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+            window.CORETG_NAVIGATE_PAGE_DETAILS(href);
+        } else {
+            window.location.href = href;
+        }
     }
 
     document.addEventListener('DOMContentLoaded', () => {
@@ -6358,7 +6367,11 @@
                 if (navHref !== href) {
                     event.preventDefault();
                     _unsavedNavAllowOnce = true;
-                    window.location.href = navHref;
+                        if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                            window.CORETG_NAVIGATE_PAGE_DETAILS(navHref);
+                        } else {
+                            window.location.href = navHref;
+                        }
                 }
                 return;
             }
@@ -6788,7 +6801,11 @@
                         window.coretgAllowUnsavedNavOnce();
                     }
                 } catch (e) { }
-                window.location.href = href;
+                if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                    window.CORETG_NAVIGATE_PAGE_DETAILS(href);
+                } else {
+                    window.location.href = href;
+                }
             } catch (e) {
                 try { ev.preventDefault(); } catch (_e) { }
             }
@@ -6810,7 +6827,11 @@
                             window.coretgAllowUnsavedNavOnce();
                         }
                     } catch (e) { }
-                    window.location.href = url;
+                    if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                        window.CORETG_NAVIGATE_PAGE_DETAILS(url);
+                    } else {
+                        window.location.href = url;
+                    }
                     return;
                 }
                 if (action === 'continue-topology') {
@@ -6821,7 +6842,11 @@
                             window.coretgAllowUnsavedNavOnce();
                         }
                     } catch (e) { }
-                    window.location.href = url;
+                    if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                        window.CORETG_NAVIGATE_PAGE_DETAILS(url);
+                    } else {
+                        window.location.href = url;
+                    }
                     return;
                 }
                 if (action === 'ai-generator') {
@@ -6832,7 +6857,11 @@
                             window.coretgAllowUnsavedNavOnce();
                         }
                     } catch (e) { }
-                    window.location.href = url;
+                    if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                        window.CORETG_NAVIGATE_PAGE_DETAILS(url);
+                    } else {
+                        window.location.href = url;
+                    }
                     return;
                 }
                 document.getElementById('scenariosPreviewTabLink')?.click();
@@ -15669,7 +15698,11 @@
                                 window.coretgAllowUnsavedNavOnce();
                             }
                         } catch (e) { }
-                        window.location.href = target;
+                        if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                            window.CORETG_NAVIGATE_PAGE_DETAILS(target);
+                        } else {
+                            window.location.href = target;
+                        }
                     }
                     return result;
                 };

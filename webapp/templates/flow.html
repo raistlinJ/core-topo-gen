@@ -9239,7 +9239,14 @@
       // Navigate to Preview tab.
       const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
       const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + '&scenario=' + encodeURIComponent(scenario);
-      window.location.href = url;
+      if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+        window.CORETG_NAVIGATE_WITH_LOADING(url, {
+          title: 'Retrieving Page Details',
+          message: 'Retrieving page details…',
+        });
+      } else {
+        window.location.href = url;
+      }
     } catch (e) {
       setStatus('Preview failed: ' + String(e && e.message || e), true);
     } finally {
@@ -9920,7 +9927,14 @@
         } catch (e) { }
         const baseUrl = String(link.dataset?.previewBaseUrl || '/scenarios/preview');
         const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
-        window.location.href = url;
+        if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+          window.CORETG_NAVIGATE_WITH_LOADING(url, {
+            title: 'Retrieving Page Details',
+            message: 'Retrieving page details…',
+          });
+        } else {
+          window.location.href = url;
+        }
       } catch (e) { }
     });
   });

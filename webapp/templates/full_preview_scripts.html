@@ -3350,7 +3350,11 @@
             + '?auto_execute=1'
             + '&xml_path=' + encodeURIComponent('{{ xml_path }}')
             + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
-          (window.top || window).location.href = url;
+          if (typeof (window.top || window).CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+            (window.top || window).CORETG_NAVIGATE_PAGE_DETAILS(url);
+          } else {
+            (window.top || window).location.href = url;
+          }
           return;
         } catch (e) { }
 
@@ -3465,7 +3469,11 @@
                   setTimeout(() => {
                     try {
                       // Use assign so the browser treats it as a navigation.
-                      window.location.assign(reportsHref);
+                      if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                        window.CORETG_NAVIGATE_PAGE_DETAILS(reportsHref);
+                      } else {
+                        window.location.assign(reportsHref);
+                      }
                     } catch (navErr) {
                       try { appendExecuteProgressLog('Redirect to Reports failed: ' + navErr); } catch (_) { }
                     }
@@ -3576,7 +3584,13 @@
                         setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
                         try {
                           const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
-                          setTimeout(() => { window.location.assign(reportsHref); }, 700);
+                          setTimeout(() => {
+                            if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                              window.CORETG_NAVIGATE_PAGE_DETAILS(reportsHref);
+                            } else {
+                              window.location.assign(reportsHref);
+                            }
+                          }, 700);
                         } catch (_) { }
                         return;
                       }

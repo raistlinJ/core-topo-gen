@@ -338,7 +338,14 @@
             const url = base + '?xml_path=' + encodeURIComponent(xmlPath)
               + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '')
               + '&auto_execute=1';
-            window.location.href = url;
+            if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+              window.CORETG_NAVIGATE_WITH_LOADING(url, {
+                title: 'Retrieving Page Details',
+                message: 'Retrieving page details…',
+              });
+            } else {
+              window.location.href = url;
+            }
           } catch (e) { }
         });
       } catch (e) { }
@@ -369,7 +376,14 @@
       alert('No saved XML found for that scenario.');
       return;
     }
-    window.location.href = baseUrl + '?xml_path=' + encodeURIComponent(xml) + '&scenario=' + encodeURIComponent(scen);
+    if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+      window.CORETG_NAVIGATE_WITH_LOADING(baseUrl + '?xml_path=' + encodeURIComponent(xml) + '&scenario=' + encodeURIComponent(scen), {
+        title: 'Retrieving Page Details',
+        message: 'Retrieving page details…',
+      });
+    } else {
+      window.location.href = baseUrl + '?xml_path=' + encodeURIComponent(xml) + '&scenario=' + encodeURIComponent(scen);
+    }
   }
   if (listEl) {
     listEl.addEventListener('click', (ev) => {
@@ -384,7 +398,14 @@
       if (Array.isArray(scenarios) && scenarios.length) {
         goScenario(String(scenarios[0] || ''));
       } else {
-        window.location.href = baseUrl;
+        if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+          window.CORETG_NAVIGATE_WITH_LOADING(baseUrl, {
+            title: 'Retrieving Page Details',
+            message: 'Retrieving page details…',
+          });
+        } else {
+          window.location.href = baseUrl;
+        }
       }
     });
   }

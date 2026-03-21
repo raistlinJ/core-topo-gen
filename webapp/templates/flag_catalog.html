@@ -2101,7 +2101,13 @@
               showResult((payload && (payload.message || payload.detail)) ? (payload.message || payload.detail) : 'Upload succeeded.');
               enterTerminalState();
               // Reload the catalog to show the updated pack table.
-              window.setTimeout(() => { window.location.href = '{{ url_for('flag_catalog_page') }}'; }, 1200);
+              window.setTimeout(() => {
+                if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+                  window.CORETG_NAVIGATE_PAGE_DETAILS('{{ url_for('flag_catalog_page') }}');
+                } else {
+                  window.location.href = '{{ url_for('flag_catalog_page') }}';
+                }
+              }, 1200);
               return;
             }
 

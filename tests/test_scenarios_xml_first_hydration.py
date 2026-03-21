@@ -4,6 +4,11 @@ from webapp.app_backend import app
 
 
 TABS_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "partials" / "scenarios_tabs.html"
+LAYOUT_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "layout.html"
+CORE_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "core.html"
+INDEX_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "index.html"
+FULL_PREVIEW_SCRIPTS_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "full_preview_scripts.html"
+FLAG_CATALOG_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "flag_catalog.html"
 
 
 def _login(client):
@@ -82,6 +87,85 @@ def test_scenarios_tabs_refreshes_latest_state_from_xml_on_load():
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing XML-first scenarios tab hydration snippets: " + "; ".join(missing)
+
+
+def test_scenarios_tabs_exposes_retrieving_page_details_loading_attributes() -> None:
+    text = TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'data-coretg-nav-loading="1"',
+        'data-coretg-nav-loading-title="Retrieving Page Details"',
+        'data-coretg-nav-loading-message="Retrieving page details…"',
+        "window.CORETG_NAVIGATE_WITH_LOADING(url, {",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing scenarios tab retrieving-page-details loading snippets: " + "; ".join(missing)
+
+
+def test_layout_exposes_shared_navigation_loading_helper() -> None:
+    text = LAYOUT_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'id="navLoadingTitle"',
+        'window.CORETG_NAVIGATE_WITH_LOADING = navigateWithLoading;',
+        'window.CORETG_NAVIGATE_PAGE_DETAILS = navigatePageDetails;',
+        "const wantsLoading = target.hasAttribute('data-coretg-nav-loading') || target.id === 'navCoreLink';",
+        "if (!shouldUseDefaultPageLoading(target)) return;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing shared navigation loading helper snippets: " + "; ".join(missing)
+
+
+def test_core_template_uses_retrieving_page_details_text() -> None:
+    text = CORE_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'Retrieving Page Details',
+        'Retrieving page details…',
+        "window.CORETG_NAVIGATE_WITH_LOADING(href, {",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing core details loading snippets: " + "; ".join(missing)
+
+
+def test_index_template_uses_page_details_navigation_helper() -> None:
+    text = INDEX_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'window.CORETG_NAVIGATE_PAGE_DETAILS(targetUrl);',
+        'window.CORETG_NAVIGATE_PAGE_DETAILS(href);',
+        'window.CORETG_NAVIGATE_PAGE_DETAILS(url);',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing index page-details navigation snippets: " + "; ".join(missing)
+    assert "window.CORETG_NAVIGATE_PAGE_DETAILS(href);\n        const hitlState = ensureHitlStateForScenario(scenario);" not in text
+
+
+def test_full_preview_scripts_uses_page_details_navigation_helper() -> None:
+    text = FULL_PREVIEW_SCRIPTS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        '(window.top || window).CORETG_NAVIGATE_PAGE_DETAILS(url);',
+        'window.CORETG_NAVIGATE_PAGE_DETAILS(reportsHref);',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing full preview page-details navigation snippets: " + "; ".join(missing)
+
+
+def test_flag_catalog_success_redirect_uses_page_details_navigation_helper() -> None:
+    text = FLAG_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "window.CORETG_NAVIGATE_PAGE_DETAILS('{{ url_for('flag_catalog_page') }}');",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing flag catalog page-details navigation snippet: " + "; ".join(missing)
 
 
 def test_scenarios_tabs_xml_refresh_does_not_clobber_hitl_with_empty_payload() -> None:
