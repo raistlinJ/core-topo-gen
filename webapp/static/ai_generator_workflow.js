@@ -608,6 +608,7 @@
                     api_key: aiState.api_key || '',
                     enforce_ssl: aiState.enforce_ssl === false ? false : true,
                     model: aiState.model,
+                    skip_bridge: aiState.skip_bridge === true,
                     ...deps.buildAiGeneratorBridgePayload(aiState),
                     prompt: promptValue,
                     scenarios: state.scenarios,

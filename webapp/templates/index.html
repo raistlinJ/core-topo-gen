@@ -5161,6 +5161,7 @@
         return {
             provider: 'ollama',
             bridge_mode: 'mcp-python-sdk',
+            skip_bridge: false,
             hil_enabled: false,
             auto_heal_prompt: true,
             auto_heal_leniency: 'medium',
@@ -5288,6 +5289,7 @@
         if (!String(merged.mcp_server_url || '').trim()) merged.mcp_server_url = defaults.mcp_server_url;
         if (!String(merged.servers_json_path || '').trim()) merged.servers_json_path = defaults.servers_json_path;
         merged.bridge_mode = normalizeAiBridgeMode(merged.bridge_mode || defaults.bridge_mode);
+        merged.skip_bridge = merged.skip_bridge === true;
         merged.auto_heal_prompt = merged.auto_heal_prompt === false ? false : true;
         merged.auto_heal_leniency = normalizeAiAutoHealLeniency(merged.auto_heal_leniency || defaults.auto_heal_leniency);
         if (typeof merged.api_key !== 'string') merged.api_key = '';
@@ -5344,6 +5346,7 @@
         };
         next.auto_heal_prompt = next.auto_heal_prompt === false ? false : true;
         next.auto_heal_leniency = normalizeAiAutoHealLeniency(next.auto_heal_leniency || 'medium');
+        next.skip_bridge = next.skip_bridge === true;
         next.enforce_ssl = next.enforce_ssl === false ? false : true;
         if (typeof next.api_key !== 'string') next.api_key = '';
         const providerKey = String(next.provider || current.provider || 'ollama').trim().toLowerCase() || 'ollama';

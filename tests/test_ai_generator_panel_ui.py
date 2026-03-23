@@ -71,16 +71,33 @@ def test_ai_generator_panel_keeps_mcp_tooling_available_for_openai_compatible_pr
     assert not missing, "Missing OpenAI-compatible MCP tool UI snippets in AI Generator panel: " + "; ".join(missing)
 
 
-def test_ai_generator_panel_no_longer_shows_fetch_models_button() -> None:
+def test_ai_generator_panel_exposes_bridge_bypass_toggle() -> None:
     text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
 
-    removed_snippets = [
-        'id="aiGeneratorFetchModelsBtn"',
-        'Fetch Models',
+    expected_snippets = [
+        'id="aiGeneratorUseBridgeInput"',
+        'Use MCP Bridge',
+        'bypass the MCP bridge and test direct',
+        "skip_bridge: !useBridgeInput.checked",
+        'const useBridge = supportsBridge && aiState.skip_bridge !== true;',
     ]
 
-    present = [snippet for snippet in removed_snippets if snippet in text]
-    assert not present, "Fetch-models button should be removed from AI Generator Provider Config: " + "; ".join(present)
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator bridge bypass toggle snippets: " + "; ".join(missing)
+
+
+def test_ai_generator_panel_shows_fetch_models_button_and_hook() -> None:
+    text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'id="aiGeneratorFetchModelsBtn"',
+        'Fetch Models',
+        "const fetchModelsBtn = document.getElementById('aiGeneratorFetchModelsBtn');",
+        "deps.fetchAiGeneratorModels()",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing Fetch-models button wiring in AI Generator Provider Config: " + "; ".join(missing)
 
 
 def test_ai_generator_workflow_blocks_bridge_generation_without_enabled_tools() -> None:
@@ -162,6 +179,9 @@ def test_index_bootstrap_tracks_ai_generator_warning_state() -> None:
     text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
+        "skip_bridge: false,",
+        "merged.skip_bridge = merged.skip_bridge === true;",
+        "next.skip_bridge = next.skip_bridge === true;",
         "last_generation_error: '',",
         "last_generation_warning: '',",
     ]
@@ -250,3 +270,8 @@ def test_ai_generator_client_normalizes_legacy_ollmcp_bridge_mode() -> None:
     workflow_missing = [snippet for snippet in workflow_expected if snippet not in workflow_text]
     assert not index_missing, "Missing legacy bridge_mode normalization snippets in index template: " + "; ".join(index_missing)
     assert not workflow_missing, "Missing legacy bridge_mode normalization snippets in AI Generator workflow: " + "; ".join(workflow_missing)
+
+
+def test_ai_generator_workflow_sends_skip_bridge_when_bridge_bypass_enabled() -> None:
+    workflow_text = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_workflow.js").read_text(encoding="utf-8", errors="ignore")
+    assert "skip_bridge: aiState.skip_bridge === true," in workflow_text

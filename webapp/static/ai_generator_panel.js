@@ -217,6 +217,7 @@
             const provider = (aiState.provider || 'ollama').toString();
             const providerMeta = resolveProviderMeta(provider, providerEntries);
             const supportsBridge = !!providerMeta.supportsBridge;
+            const useBridge = supportsBridge && aiState.skip_bridge !== true;
             const providerLabel = providerMeta.label;
             const usesSecureApiKeyStorage = provider === 'litellm';
             const hasStoredApiKey = !!aiState.has_stored_api_key;
@@ -267,8 +268,8 @@
                 if (isValidated || hasBridgeConnection) {
                     return {
                         badgeClass: 'text-bg-success',
-                        badgeLabel: supportsBridge ? providerMeta.connectionSuccessLabel : 'Connected',
-                        summary: supportsBridge
+                        badgeLabel: useBridge ? providerMeta.connectionSuccessLabel : 'Connected',
+                        summary: useBridge
                             ? `${providerLabel} reachable and MCP tools ready`
                             : `${providerLabel} reachable and ready for direct generation`,
                     };
@@ -284,7 +285,7 @@
                     return {
                         badgeClass: 'text-bg-primary',
                         badgeLabel: providerMeta.reachabilityLabel,
-                        summary: supportsBridge
+                        summary: useBridge
                             ? `${providerLabel} reachable, MCP tools not validated yet`
                             : `${providerLabel} reachable`,
                     };
@@ -345,7 +346,7 @@
                     </span>
                 </label>`;
                 }).join('')
-                : `<div class="text-muted small">${supportsBridge ? 'Validate the bridge to discover MCP tools exposed through the MCP Python SDK bridge.' : 'This OpenAI-compatible provider currently uses direct scenario generation in this UI, so MCP tool discovery is not used for this provider.'}</div>`;
+                : `<div class="text-muted small">${useBridge ? 'Validate the bridge to discover MCP tools exposed through the MCP Python SDK bridge.' : 'Bridge tooling is currently bypassed for direct generation diagnostics.'}</div>`;
 
             const bestEffortUsed = !!aiState.last_best_effort_used;
             const bestEffortReason = String(aiState.last_best_effort_reason || '').trim();
@@ -363,6 +364,11 @@
 
             const bridgeMarkup = supportsBridge
                 ? `
+                                <div class="form-check form-switch mb-3">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="aiGeneratorUseBridgeInput" ${useBridge ? 'checked' : ''}>
+                                    <label class="form-check-label" for="aiGeneratorUseBridgeInput">Use MCP Bridge</label>
+                                    <div class="form-text">Leave this on for normal tool-assisted generation. Turn it off to bypass the MCP bridge and test direct ${escapeHtml(providerLabel)} generation.</div>
+                                </div>
                                 <details class="mb-3">
                                     <summary class="fw-semibold mb-2">Advanced MCP Bridge</summary>
                                     <div class="pt-3">
@@ -422,7 +428,7 @@
                     <div>
                         <div class="text-uppercase small text-muted">AI Scenario Authoring</div>
                         <h4 class="mb-1">AI Generator for ${escapeHtml(scenario.name || `Scenario ${idx + 1}`)}</h4>
-                        <div class="text-muted small">${supportsBridge ? `Connect ${escapeHtml(providerLabel)} to the repo MCP server through the MCP Python SDK bridge, choose the allowed tools, then let the model operate the draft through backend-safe tool calls.` : `Connect ${escapeHtml(providerLabel)}, validate the model endpoint, then generate a scenario draft directly through the provider.`}</div>
+                        <div class="text-muted small">${useBridge ? `Connect ${escapeHtml(providerLabel)} to the repo MCP server through the MCP Python SDK bridge, choose the allowed tools, then let the model operate the draft through backend-safe tool calls.` : `Connect ${escapeHtml(providerLabel)}, validate the model endpoint, then generate a scenario draft directly through the provider.`}</div>
                     </div>
                     <div class="d-inline-flex align-items-center gap-2 small text-muted">
                         <span class="badge ${connectionStatus.badgeClass}">${escapeHtml(connectionStatus.badgeLabel)}</span>
@@ -445,13 +451,16 @@
                                 ${directProviderFields}
                                 <div class="mb-3">
                                     <label class="form-label">LLM Model</label>
-                                    <div class="small text-muted mb-2">${supportsBridge ? `Connect fetches models from ${escapeHtml(providerLabel)} and then validates MCP bridge discovery.` : `Connect fetches models from ${escapeHtml(providerLabel)} using the configured base URL and optional API key.`}</div>
+                                    <div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="aiGeneratorFetchModelsBtn" ${isCheckingValidation ? 'disabled' : ''}>Fetch Models</button>
+                                        <div class="small text-muted">${useBridge ? `Connect fetches models from ${escapeHtml(providerLabel)} and then validates MCP bridge discovery. Use Fetch Models when you only want the available LLM list first.` : `Connect fetches models from ${escapeHtml(providerLabel)} using the configured base URL and optional API key. Use Fetch Models when you only want the available LLM list first.`}</div>
+                                    </div>
                                     <select class="form-select" id="aiGeneratorModelSelect">${modelOptions}</select>
                                 </div>
-                                ${bridgeMarkup}
+                                ${useBridge ? bridgeMarkup : ''}
                                 <div class="d-flex gap-2 align-items-center">
                                     <button type="button" class="btn btn-primary" id="aiGeneratorValidateBtn" ${isCheckingValidation ? 'disabled' : ''}>${escapeHtml(connectionActionLabel)}</button>
-                                    <div class="small text-muted">${supportsBridge ? `Connect validates ${escapeHtml(providerLabel)} reachability, available LLMs, and MCP tool discovery through the MCP Python SDK bridge.` : `Connect validates ${escapeHtml(providerLabel)} reachability, available LLMs, and the current SSL/API-key settings.`}</div>
+                                    <div class="small text-muted">${useBridge ? `Connect validates ${escapeHtml(providerLabel)} reachability, available LLMs, and MCP tool discovery through the MCP Python SDK bridge.` : `Connect validates ${escapeHtml(providerLabel)} reachability, available LLMs, and the current SSL/API-key settings.`}</div>
                                 </div>
                                 <div class="mt-3 small ${validationMessageClass}" id="aiGeneratorValidationMessage">${escapeHtml(validation.message || 'No validation has been run yet.')}${checkedAt ? ` • ${escapeHtml(checkedAt)}` : ''}</div>
                             </div>
@@ -459,7 +468,7 @@
                     </div>
                     <div class="col-12 col-xl-7">
                         <div class="d-flex flex-column gap-3 h-100">
-                            <div class="card border-0 shadow-sm ${isValidated ? '' : 'border border-warning-subtle'} ${supportsBridge ? '' : 'd-none'}">
+                            <div class="card border-0 shadow-sm ${isValidated ? '' : 'border border-warning-subtle'} ${useBridge ? '' : 'd-none'}">
                                 <div class="card-header bg-white border-0 pb-0 d-flex justify-content-between align-items-center">
                                     <strong>Enabled MCP Tools</strong>
                                     <span class="badge text-bg-light border">${availableTools.length} discovered</span>
@@ -484,7 +493,7 @@
                                     <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
                                         <button type="button" class="btn btn-success" id="aiGeneratorGenerateBtn" ${isValidated ? '' : 'disabled'}>Construct Scenario Elements</button>
                                         <button type="button" class="btn btn-outline-secondary" id="aiGeneratorBuildPacketBtn" ${isValidated ? '' : 'disabled'}>Refresh Prompt / Command</button>
-                                        <div class="small text-muted">${supportsBridge ? 'Runs the MCP Python SDK bridge with the selected LLM and enabled tools, then returns the updated draft and preview.' : `Runs direct ${escapeHtml(providerLabel)} generation, then previews the resulting draft through the existing backend planner.`}</div>
+                                        <div class="small text-muted">${useBridge ? 'Runs the MCP Python SDK bridge with the selected LLM and enabled tools, then returns the updated draft and preview.' : `Runs direct ${escapeHtml(providerLabel)} generation, then previews the resulting draft through the existing backend planner.`}</div>
                                     </div>
                                     <div class="mb-3 ${generationError ? '' : 'd-none'}" id="aiGeneratorGenerationErrorWrap">
                                         <div class="alert alert-danger mb-0 small" id="aiGeneratorGenerationError">${escapeHtml(generationError)}</div>
@@ -522,6 +531,7 @@
             const providerSelect = document.getElementById('aiGeneratorProviderSelect');
             const baseUrlInput = document.getElementById('aiGeneratorBaseUrlInput');
             const modelSelect = document.getElementById('aiGeneratorModelSelect');
+            const useBridgeInput = document.getElementById('aiGeneratorUseBridgeInput');
             const mcpServerPathInput = document.getElementById('aiGeneratorMcpServerPathInput');
             const mcpServerUrlInput = document.getElementById('aiGeneratorMcpServerUrlInput');
             const serversJsonInput = document.getElementById('aiGeneratorServersJsonInput');
@@ -535,6 +545,7 @@
             const autoHealLeniencyInput = document.getElementById('aiGeneratorAutoHealLeniencyInput');
             const promptInput = document.getElementById('aiGeneratorPromptInput');
             const validateBtn = document.getElementById('aiGeneratorValidateBtn');
+            const fetchModelsBtn = document.getElementById('aiGeneratorFetchModelsBtn');
             const buildPacketBtn = document.getElementById('aiGeneratorBuildPacketBtn');
             const resetValidation = () => ({ ok: false, in_progress: false, ollama_ok: false, bridge_ok: false, checked_at: null, message: '', models: [], model_found: false, provider: providerSelect ? providerSelect.value : provider });
 
@@ -670,6 +681,15 @@
                     renderAiGeneratorPanel();
                 });
             }
+            if (useBridgeInput) {
+                useBridgeInput.addEventListener('change', () => {
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        skip_bridge: !useBridgeInput.checked,
+                        validation: resetValidation(),
+                    });
+                    renderAiGeneratorPanel();
+                });
+            }
             if (mcpServerPathInput) {
                 mcpServerPathInput.addEventListener('input', () => {
                     deps.persistAiGeneratorStateForScenario(scenario, idx, { mcp_server_path: mcpServerPathInput.value, validation: resetValidation() });
@@ -740,6 +760,13 @@
             if (validateBtn) {
                 validateBtn.addEventListener('click', () => {
                     deps.validateAiGeneratorConfig();
+                });
+            }
+            if (fetchModelsBtn) {
+                fetchModelsBtn.addEventListener('click', () => {
+                    if (deps && typeof deps.fetchAiGeneratorModels === 'function') {
+                        deps.fetchAiGeneratorModels();
+                    }
                 });
             }
             if (buildPacketBtn) {
