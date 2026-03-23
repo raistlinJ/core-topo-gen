@@ -1,22 +1,654 @@
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+import uuid
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
 
 from flask import jsonify, render_template, request, send_file
+from werkzeug.utils import secure_filename
 
 from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
+
+_GROUNDING_CACHE: dict[str, str] = {}
+
+
+def _derive_plugin_id(name_hint: str, *, fallback: str = 'generated_generator') -> str:
+    text = re.sub(r'[^a-zA-Z0-9_.\-]+', '_', str(name_hint or '').strip())
+    text = re.sub(r'_+', '_', text).strip('_')
+    return text or fallback
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        items = value
+    elif value is None:
+        items = []
+    else:
+        items = str(value).splitlines()
+    result: list[str] = []
+    for item in items:
+        text = str(item or '').strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _coerce_requires(value: Any, optional_value: Any = None) -> tuple[list[dict[str, Any]], list[str]]:
+    normalized: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                artifact = str(item.get('artifact') or '').strip()
+                if not artifact:
+                    continue
+                normalized.append({'artifact': artifact, 'optional': bool(item.get('optional'))})
+            else:
+                artifact = str(item or '').strip()
+                if artifact:
+                    normalized.append({'artifact': artifact, 'optional': False})
+    elif value is not None:
+        for artifact in _coerce_string_list(value):
+            normalized.append({'artifact': artifact, 'optional': False})
+
+    optional_list = _coerce_string_list(optional_value)
+    optional_set = {artifact for artifact in optional_list if artifact}
+    next_normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in normalized:
+        artifact = str(item.get('artifact') or '').strip()
+        if not artifact or artifact in seen:
+            continue
+        seen.add(artifact)
+        next_normalized.append({'artifact': artifact, 'optional': bool(item.get('optional')) or artifact in optional_set})
+    for artifact in optional_list:
+        if artifact and artifact not in seen:
+            next_normalized.append({'artifact': artifact, 'optional': True})
+            seen.add(artifact)
+    return next_normalized, optional_list
+
+
+def _coerce_runtime_inputs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or '').strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        record: dict[str, Any] = {
+            'name': name,
+            'type': str(item.get('type') or 'string').strip() or 'string',
+            'required': bool(item.get('required', True)),
+        }
+        if item.get('sensitive') is True:
+            record['sensitive'] = True
+        normalized.append(record)
+    return normalized
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    candidates = [str(text or '').strip()]
+    fenced = re.findall(r'```(?:json)?\s*(.*?)```', str(text or ''), flags=re.IGNORECASE | re.DOTALL)
+    candidates.extend(fragment.strip() for fragment in fenced if fragment and fragment.strip())
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        start = candidate.find('{')
+        if start < 0:
+            continue
+        try:
+            parsed, _offset = decoder.raw_decode(candidate[start:])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    raise ValueError('AI response did not contain a valid JSON object.')
+
+
+def _build_direct_generation_prompt(messages: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        role = str(message.get('role') or '').strip().lower()
+        content = str(message.get('content') or '').strip()
+        if not content:
+            continue
+        if role == 'system':
+            parts.append(content)
+        elif role == 'user':
+            parts.append(f'User request:\n{content}')
+        else:
+            parts.append(f'{role.title()}:\n{content}')
+    return '\n\n'.join(parts).strip()
+
+
+def _generate_builder_ollama_response(
+    ai_provider_routes: Any,
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    base_url: str,
+    verify_ssl: bool,
+    timeout_seconds: float,
+) -> str:
+    prompt = _build_direct_generation_prompt(messages)
+    try:
+        raw_response = ai_provider_routes._post_json(
+            f'{base_url}/api/generate',
+            {
+                'model': model,
+                'prompt': prompt,
+                'stream': False,
+                'format': 'json',
+                'options': {'temperature': 0.1},
+            },
+            timeout=timeout_seconds,
+            verify_ssl=verify_ssl,
+        )
+    except HTTPError as exc:
+        raise ai_provider_routes.ProviderAdapterError(
+            f'Ollama request failed with HTTP {exc.code}.',
+            status_code=502,
+        ) from exc
+    except URLError as exc:
+        reason = getattr(exc, 'reason', exc)
+        raise ai_provider_routes.ProviderAdapterError(
+            f'Could not reach Ollama at {base_url}: {reason}',
+            status_code=502,
+        ) from exc
+    assistant_text = str(raw_response.get('response') or '').strip()
+    if not assistant_text:
+        assistant_text = str(raw_response.get('thinking') or '').strip()
+    if not assistant_text:
+        raise ai_provider_routes.ProviderAdapterError('Ollama returned an empty response.', status_code=502)
+    return assistant_text
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _read_grounding_file(rel_path: str) -> str:
+    cached = _GROUNDING_CACHE.get(rel_path)
+    if cached is not None:
+        return cached
+    abs_path = os.path.join(_repo_root(), rel_path)
+    try:
+        with open(abs_path, 'r', encoding='utf-8') as handle:
+            text = handle.read().strip()
+    except Exception:
+        text = ''
+    _GROUNDING_CACHE[rel_path] = text
+    return text
+
+
+def _render_grounding_section(title: str, rel_path: str) -> list[str]:
+    text = _read_grounding_file(rel_path)
+    if not text:
+        return []
+    return [
+        f'{title} ({rel_path}):',
+        '```text',
+        text,
+        '```',
+        '',
+    ]
+
+
+def _extract_markdown_section(rel_path: str, heading: str) -> str:
+    text = _read_grounding_file(rel_path)
+    if not text:
+        return ''
+    lines = text.splitlines()
+    start_index = -1
+    for index, line in enumerate(lines):
+        if line.strip() == heading.strip():
+            start_index = index
+            break
+    if start_index < 0:
+        return ''
+    collected: list[str] = []
+    for index in range(start_index, len(lines)):
+        line = lines[index]
+        if index > start_index and line.startswith('## '):
+            break
+        collected.append(line)
+    return '\n'.join(collected).strip()
+
+
+def _render_grounding_excerpt(title: str, rel_path: str, heading: str) -> list[str]:
+    text = _extract_markdown_section(rel_path, heading)
+    if not text:
+        return []
+    return [
+        f'{title} ({rel_path} :: {heading}):',
+        '```text',
+        text,
+        '```',
+        '',
+    ]
+
+
+def _build_generator_grounding_lines(plugin_type: str) -> list[str]:
+    if plugin_type == 'flag-node-generator':
+        template_base = 'generator_templates/flag-node-generator-python-compose'
+        sample_base = 'flag_node_generators/py_sample_nfs_sensitive_file'
+    else:
+        template_base = 'generator_templates/flag-generator-python-compose'
+        sample_base = 'flag_generators/py_sample_textfile_username_password'
+
+    lines = [
+        'Repo authoring guidance:',
+        '- Start from the provided template scaffold for this generator family.',
+        '- Keep manifest artifacts and outputs.json keys aligned exactly.',
+        '- Preserve test-vs-execute parity; do not rely on incidental environment state.',
+        '- Keep the implementation deterministic for the same inputs.',
+        '',
+    ]
+    lines.extend(_render_grounding_excerpt(
+        'Reference docs excerpt: AI scaffolding quickstart',
+        'docs/GENERATOR_AUTHORING.md',
+        '## 0) AI scaffolding quickstart',
+    ))
+    lines.extend(_render_grounding_section('Reference template: generator.py', f'{template_base}/generator.py'))
+    lines.extend(_render_grounding_section('Reference template: docker-compose.yml', f'{template_base}/docker-compose.yml'))
+    lines.extend(_render_grounding_section('Reference sample: manifest.yaml', f'{sample_base}/manifest.yaml'))
+    lines.extend(_render_grounding_section('Reference sample: generator.py', f'{sample_base}/generator.py'))
+    return lines
+
+
+def _extract_builder_failure_text(last_test_result: dict[str, Any] | None) -> str:
+    if not isinstance(last_test_result, dict):
+        return ''
+    parts = [
+        str(last_test_result.get('failure_summary') or '').strip(),
+        str(last_test_result.get('stderr') or '').strip(),
+        str(last_test_result.get('stdout') or '').strip(),
+        str(last_test_result.get('log_tail') or '').strip(),
+    ]
+    return '\n'.join(part for part in parts if part).strip()
+
+
+def _build_targeted_failure_guidance(last_test_result: dict[str, Any] | None) -> list[str]:
+    text = _extract_builder_failure_text(last_test_result)
+    lowered = text.lower()
+    if not text:
+        return []
+    lines: list[str] = []
+    if 'inject_files validation failed' in lowered or 'inject_files staging failed' in lowered:
+        lines.extend([
+            'Observed failure to fix first: inject_files referenced file paths that were never created.',
+            '- inject_files entries are validated as real files under /outputs or /outputs/artifacts before success exit.',
+            '- If you keep inject_files: ["File(path)"], then outputs.json.outputs["File(path)"] must point to a file that the generator actually writes, for example artifacts/challenge.bin.',
+            '- Do not list inject_files unless the corresponding file artifact is produced every successful run.',
+            '- If no injected file is needed, remove inject_files and remove File(path) from produces.',
+            '',
+        ])
+    if 'failed to generate base image' in lowered:
+        lines.extend([
+            'Observed failure to fix first: the generator attempted to build or synthesize a base image and failed at runtime.',
+            '- Ensure all required dependencies are installed explicitly in the runtime image.',
+            '- Do not hide the concrete exception behind a generic failure message.',
+            '- Create required parent directories before writing generated assets.',
+            '',
+        ])
+    return lines
+
+
+def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+    plugin_type = str(payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+    source_id_hint = str(payload.get('source_id_hint') or '').strip()
+    name_hint = str(payload.get('name_hint') or '').strip()
+    prompt = str(payload.get('prompt') or '').strip()
+    if not prompt:
+        raise ValueError('prompt is required')
+
+    kind_requirements = [
+        '- For all generators: read /inputs/config.json and write /outputs/outputs.json.',
+        '- outputs.json must include generator_id and Flag(flag_id).',
+        '- Keep outputs deterministic for the same inputs.',
+        '- Use Python standard library only unless the prompt explicitly requires otherwise.',
+        '- Return JSON only. Do not wrap in markdown fences.',
+        '- outputs.json.outputs keys must exactly match produces and must reference artifacts that actually exist by the time the generator exits successfully.',
+        '- If you declare inject_files, every inject entry must resolve to a real generated file path, not just an ontology key name.',
+    ]
+    if plugin_type == 'flag-node-generator':
+        kind_requirements.extend([
+            '- Also write /outputs/docker-compose.yml.',
+            '- Include File(path): docker-compose.yml in outputs.',
+            '- Do not emit ${...} placeholders in docker-compose.yml.',
+            '- Prefer explicit working_dir or absolute script paths in compose startup commands.',
+        ])
+    else:
+        kind_requirements.extend([
+            '- Do not write hint.txt unless explicitly required by the prompt.',
+            '- If you emit files, write them under /outputs/artifacts/... and reference them from outputs.',
+            '- If produces includes File(path), write the file under /outputs or /outputs/artifacts and set outputs.json.outputs["File(path)"] to that created path.',
+            '- If inject_files includes File(path), the File(path) output must exist on disk before exit or the test will fail validation.',
+        ])
+
+    schema_lines = [
+        '{',
+        '  "plugin_id": "source_identifier",',
+        '  "folder_name": "py_source_identifier",',
+        '  "name": "Human-readable name",',
+        '  "description": "One sentence summary",',
+        '  "requires": [{"artifact": "Knowledge(ip)", "optional": false}],',
+        '  "optional_requires": ["Knowledge(hostname)"],',
+        '  "produces": ["Flag(flag_id)", "Credential(user,password)"],',
+        '  "runtime_inputs": [{"name": "seed", "type": "string", "required": true}],',
+        '  "hint_templates": ["Next: use {{OUTPUT.Credential(user,password)}}"],',
+        '  "inject_files": ["File(path)"],',
+        '  "env": {"EXAMPLE": "value"},',
+        '  "compose_text": "full docker-compose.yml text",',
+        '  "readme_text": "full README.md text",',
+        '  "generator_py_text": "full generator.py text"',
+        '}',
+    ]
+
+    current_scaffold = payload.get('current_scaffold_request') if isinstance(payload.get('current_scaffold_request'), dict) else None
+    current_files = payload.get('current_files') if isinstance(payload.get('current_files'), dict) else None
+    last_test_result = payload.get('last_test_result') if isinstance(payload.get('last_test_result'), dict) else None
+    mode = 'refine' if current_scaffold else 'create'
+
+    context_lines = [
+        f'Mode: {mode}',
+        f'Target kind: {plugin_type}',
+        f'Source id hint: {source_id_hint or "(derive one)"}',
+        f'Name hint: {name_hint or "(derive one)"}',
+        '',
+        'Compatibility requirements:',
+        *kind_requirements,
+        '',
+        'Response contract:',
+        '- Reply with exactly one JSON object.',
+        '- Use requires as a list of {artifact, optional}.',
+        '- Use runtime_inputs as a list of {name, type, required, sensitive?}.',
+        '- Include full generator_py_text.',
+        '- Include compose_text when the default scaffold would be insufficient.',
+        '- Keep manifest-facing artifact keys and outputs.json keys aligned.',
+        '- Treat inject_files as runtime file paths that must be created, not as abstract artifact declarations.',
+        '- If inject_files references File(path), then produces must include File(path) and outputs.json.outputs["File(path)"] must point to a created file.',
+        '',
+        'JSON schema shape:',
+        *schema_lines,
+        '',
+    ]
+    context_lines.extend(_build_generator_grounding_lines(plugin_type))
+    if current_scaffold:
+        context_lines.extend([
+            'Current scaffold request (treat this as the existing generator state and preserve compatible parts unless the user asked to change them):',
+            json.dumps(current_scaffold, indent=2, ensure_ascii=False),
+            '',
+        ])
+    if current_files:
+        selected_files: dict[str, str] = {}
+        for key in sorted(current_files.keys()):
+            text = str(current_files.get(key) or '')
+            if key.endswith('/manifest.yaml') or key.endswith('/generator.py') or key.endswith('/README.md') or key.endswith('/docker-compose.yml'):
+                selected_files[key] = text
+        if selected_files:
+            context_lines.extend([
+                'Current scaffold files:',
+                json.dumps(selected_files, indent=2, ensure_ascii=False),
+                '',
+            ])
+    if last_test_result:
+        test_summary = {
+            'ok': bool(last_test_result.get('ok')),
+            'returncode': last_test_result.get('returncode'),
+            'stdout': str(last_test_result.get('stdout') or '')[-4000:],
+            'stderr': str(last_test_result.get('stderr') or '')[-4000:],
+            'failure_summary': str(last_test_result.get('failure_summary') or '')[-2000:],
+            'files': last_test_result.get('files') if isinstance(last_test_result.get('files'), list) else [],
+        }
+        context_lines.extend([
+            'Latest local test result:',
+            json.dumps(test_summary, indent=2, ensure_ascii=False),
+            '',
+            'When refining, fix concrete test failures first before adding unrelated behavior.',
+            '',
+        ])
+        context_lines.extend(_build_targeted_failure_guidance(last_test_result))
+    context_lines.extend([
+        'User request:',
+        prompt,
+    ])
+    return [
+        {
+            'role': 'system',
+            'content': 'You author CORE TopoGen generator scaffolds. Produce strict JSON only and optimize for runtime compatibility.',
+        },
+        {
+            'role': 'user',
+            'content': '\n'.join(context_lines),
+        },
+    ]
+
+
+def _normalize_ai_scaffold_payload(ai_payload: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
+    plugin_type = str(request_payload.get('plugin_type') or ai_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+    plugin_id = str(ai_payload.get('plugin_id') or request_payload.get('source_id_hint') or '').strip()
+    if not plugin_id:
+        plugin_id = _derive_plugin_id(ai_payload.get('name') or request_payload.get('name_hint') or '')
+    folder_name = str(ai_payload.get('folder_name') or '').strip() or f'py_{plugin_id}'
+    requires, _optional_requires = _coerce_requires(ai_payload.get('requires'), ai_payload.get('optional_requires'))
+    runtime_inputs = _coerce_runtime_inputs(ai_payload.get('runtime_inputs') or ai_payload.get('inputs'))
+    hint_templates = _coerce_string_list(ai_payload.get('hint_templates'))
+    inject_files = _coerce_string_list(ai_payload.get('inject_files'))
+    produces = _coerce_string_list(ai_payload.get('produces'))
+    compose_text = str(ai_payload.get('compose_text') or '').strip('\n')
+    readme_text = str(ai_payload.get('readme_text') or '').strip('\n')
+    generator_py_text = str(ai_payload.get('generator_py_text') or ai_payload.get('generator_text') or '').strip('\n')
+    env_value = ai_payload.get('env') if isinstance(ai_payload.get('env'), dict) else {}
+    env = {str(key): str(value) for key, value in env_value.items() if str(key or '').strip()}
+    return {
+        'plugin_type': plugin_type,
+        'plugin_id': plugin_id,
+        'folder_name': folder_name,
+        'name': str(ai_payload.get('name') or request_payload.get('name_hint') or plugin_id).strip() or plugin_id,
+        'description': str(ai_payload.get('description') or request_payload.get('prompt') or f'Generator {plugin_id}').strip(),
+        'requires': requires,
+        'produces': produces,
+        'runtime_inputs': runtime_inputs,
+        'hint_templates': hint_templates,
+        'inject_files': inject_files,
+        'env': env,
+        'compose_text': compose_text,
+        'readme_text': readme_text,
+        'generator_py_text': generator_py_text,
+    }
+
+
+def _default_test_value(input_name: str, input_type: str) -> Any:
+    normalized_name = str(input_name or '').strip().lower()
+    normalized_type = str(input_type or 'string').strip().lower()
+    if normalized_name == 'seed':
+        return 'demo-seed'
+    if normalized_name == 'secret':
+        return 'demo-secret'
+    if normalized_name == 'node_name':
+        return 'node1'
+    if normalized_name == 'flag_prefix':
+        return 'FLAG'
+    if normalized_type in {'int', 'number'}:
+        return 1
+    if normalized_type == 'float':
+        return 1.0
+    if normalized_type == 'boolean':
+        return True
+    if normalized_type == 'json':
+        return {'demo': True}
+    if normalized_type in {'string_list', 'file_list'}:
+        return []
+    return f'demo-{normalized_name or "value"}'
+
+
+def _build_default_test_config(scaffold_payload: dict[str, Any]) -> dict[str, Any]:
+    runtime_inputs = scaffold_payload.get('runtime_inputs') if isinstance(scaffold_payload.get('runtime_inputs'), list) else []
+    config: dict[str, Any] = {}
+    for item in runtime_inputs:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or '').strip()
+        if not name:
+            continue
+        config[name] = _default_test_value(name, str(item.get('type') or 'string'))
+    return config
+
+
+def _collect_run_output_files(run_dir: str) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    if not os.path.isdir(run_dir):
+        return files
+    for root, _dirs, filenames in os.walk(run_dir):
+        for filename in filenames:
+            abs_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(abs_path, run_dir).replace('\\', '/')
+            try:
+                size = os.path.getsize(abs_path)
+            except Exception:
+                size = None
+            text_content = None
+            if size is not None and size <= 65536:
+                try:
+                    with open(abs_path, 'r', encoding='utf-8') as handle:
+                        text_content = handle.read()
+                except Exception:
+                    text_content = None
+            files.append({
+                'path': rel_path,
+                'name': filename,
+                'size': size,
+                'text': text_content,
+            })
+    files.sort(key=lambda entry: str(entry.get('path') or ''))
+    return files
+
+
+def _builder_test_workspace_root() -> str:
+    return _repo_root()
+
+
+def _builder_test_runs_dir(outputs_dir_getter: Callable[[], str]) -> str:
+    return os.path.join(os.path.abspath(outputs_dir_getter()), 'generator_builder_runs')
+
+
+def _builder_test_run_dir_for_id(outputs_dir_getter: Callable[[], str], run_id: str) -> str:
+    return os.path.join(_builder_test_runs_dir(outputs_dir_getter), str(run_id or '').strip())
+
+
+def _is_file_input_type(input_type: Any) -> bool:
+    normalized = str(input_type or '').strip().lower()
+    return normalized in {'file', 'path', 'artifact', 'binary'}
+
+
+def _build_scaffold_zip_bytes(scaffold_files: dict[str, str], *, zipfile_module: Any, io_module: Any) -> bytes:
+    mem = io_module.BytesIO()
+    with zipfile_module.ZipFile(mem, 'w', zipfile_module.ZIP_DEFLATED) as zf:
+        for path, content in scaffold_files.items():
+            zf.writestr(path, content)
+    mem.seek(0)
+    return mem.getvalue()
+
+
+def _persist_scaffold_files(run_dir: str, scaffold_files: dict[str, str], scaffold_payload: dict[str, Any]) -> None:
+    scaffold_root = os.path.join(run_dir, 'scaffold')
+    os.makedirs(scaffold_root, exist_ok=True)
+    for rel_path, content in (scaffold_files or {}).items():
+        safe_rel = str(rel_path or '').lstrip('/').replace('\\', '/')
+        if not safe_rel:
+            continue
+        abs_path = os.path.abspath(os.path.join(scaffold_root, safe_rel))
+        if not (abs_path == scaffold_root or abs_path.startswith(scaffold_root + os.sep)):
+            continue
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, 'w', encoding='utf-8') as handle:
+            handle.write(str(content or ''))
+    request_path = os.path.join(scaffold_root, '_scaffold_request.json')
+    with open(request_path, 'w', encoding='utf-8') as handle:
+        json.dump(scaffold_payload or {}, handle, indent=2, ensure_ascii=False)
+        handle.write('\n')
+
+
+def _tail_text_file(path: str, limit_chars: int = 12000) -> str:
+    if not path or not os.path.isfile(path):
+        return ''
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            text = handle.read()
+    except Exception:
+        return ''
+    if limit_chars > 0 and len(text) > limit_chars:
+        return text[-limit_chars:]
+    return text
+
+
+def _summarize_run_log(log_tail: str) -> str:
+    text = str(log_tail or '').replace('\r', '\n')
+    lines = [line.strip() for line in text.splitlines() if line and line.strip()]
+    if not lines:
+        return ''
+    ignored_prefixes = ('__SSE_EVENT__', '[remote] synced outputs:')
+    interesting: list[str] = []
+    for line in lines:
+        if any(line.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        interesting.append(line)
+    candidates = interesting or lines
+    selected: list[str] = []
+    for line in reversed(candidates):
+        selected.append(line)
+        lowered = line.lower()
+        if 'traceback' in lowered or 'calledprocesserror' in lowered or 'failed' in lowered or 'error' in lowered:
+            if len(selected) >= 6:
+                break
+        if len(selected) >= 12:
+            break
+    selected.reverse()
+    return '\n'.join(selected[-12:]).strip()
 
 
 def register(
     app,
     *,
     require_builder_or_admin: Callable[[], None],
+    runs: dict[str, dict[str, Any]],
+    outputs_dir: Callable[[], str],
     flag_generators_from_enabled_sources: Callable[[], tuple[list[dict], list[dict]]],
     flag_node_generators_from_enabled_sources: Callable[[], tuple[list[dict], list[dict]]],
     reserved_artifacts: dict[str, dict[str, Any]],
     load_custom_artifacts: Callable[[], dict[str, dict[str, Any]]],
     upsert_custom_artifact: Callable[..., dict[str, Any]],
     build_generator_scaffold: Callable[[dict[str, Any]], tuple[dict[str, str], str, str]],
+    install_generator_pack_or_bundle: Callable[..., tuple[bool, str]],
+    run_remote_builder_test: Callable[..., dict[str, Any]],
+    start_remote_builder_test_process: Callable[..., dict[str, Any]],
+    sync_remote_flag_test_outputs: Callable[[dict[str, Any]], None],
+    purge_remote_flag_test_dir: Callable[[dict[str, Any]], None],
+    parse_flag_test_core_cfg_from_form: Callable[[Any], dict[str, Any] | None],
+    ensure_core_vm_idle_for_test: Callable[[dict[str, Any]], None],
+    cleanup_remote_test_runtime: Callable[[dict[str, Any]], None],
+    write_sse_marker: Callable[[Any, str, Any], None],
+    local_timestamp_safe: Callable[[], str],
     sanitize_id: Callable[[Any], str],
     io_module: Any,
     zipfile_module: Any,
@@ -133,6 +765,545 @@ def register(
             'manifest_yaml': manifest_yaml,
             'scaffold_paths': sorted(scaffold_files.keys()),
         })
+
+    @app.route('/api/generators/ai_scaffold', methods=['POST'])
+    def api_generators_ai_scaffold():
+        require_builder_or_admin()
+        payload = request.get_json(silent=True) or {}
+        from webapp.routes import ai_provider as ai_provider_routes
+
+        try:
+            messages = _build_generator_builder_ai_messages(payload)
+
+            provider = str(payload.get('provider') or 'ollama').strip().lower() or 'ollama'
+            adapter = ai_provider_routes._get_provider_adapter(provider)
+            model = str(payload.get('model') or '').strip()
+            if not model:
+                raise ValueError('model is required')
+            base_url = str(payload.get('base_url') or '').strip() or str(adapter.capability.default_base_url or '').strip()
+            if not base_url:
+                raise ValueError('base_url is required')
+            enforce_ssl = ai_provider_routes._payload_bool(payload.get('enforce_ssl'), default=True)
+            if provider in {'litellm', 'openai'}:
+                base_url = ai_provider_routes._normalize_openai_compatible_base_url(base_url, enforce_ssl=enforce_ssl)
+            else:
+                base_url = ai_provider_routes._normalize_base_url(base_url)
+            timeout_seconds = ai_provider_routes._normalize_bridge_timeout_seconds(
+                payload.get('timeout_seconds'),
+                default=240.0,
+                low=5.0,
+                high=240.0,
+            )
+            if provider == 'ollama':
+                assistant_text = _generate_builder_ollama_response(
+                    ai_provider_routes,
+                    messages=messages,
+                    model=model,
+                    base_url=base_url,
+                    verify_ssl=enforce_ssl,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                client = ai_provider_routes._RepoMcpBridgeClient(
+                    model=model,
+                    host=base_url,
+                    provider=provider,
+                    api_key=str(payload.get('api_key') or '').strip(),
+                    verify_ssl=enforce_ssl,
+                )
+                client.timeout_seconds = timeout_seconds
+                raw_response = client._post_chat(messages=messages)
+                if client._uses_openai_chat_completions():
+                    assistant_message = ai_provider_routes._extract_openai_chat_message(raw_response)
+                else:
+                    assistant_message = ai_provider_routes._extract_ollama_chat_message(raw_response)
+                assistant_text = str(assistant_message.get('content') or '').strip()
+            ai_payload = _extract_json_object(assistant_text)
+            scaffold_payload = _normalize_ai_scaffold_payload(ai_payload, payload)
+            scaffold_files, manifest_yaml, folder_path = build_generator_scaffold(scaffold_payload)
+        except ai_provider_routes.ProviderAdapterError as exc:
+            return jsonify({'ok': False, 'error': exc.message, **(exc.details or {})}), exc.status_code
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+
+        return jsonify({
+            'ok': True,
+            'provider': provider,
+            'base_url': base_url,
+            'model': model,
+            'assistant_json': ai_payload,
+            'assistant_text': assistant_text,
+            'scaffold_request': scaffold_payload,
+            'folder_path': folder_path,
+            'manifest_yaml': manifest_yaml,
+            'scaffold_paths': sorted(scaffold_files.keys()),
+            'files': scaffold_files,
+        })
+
+    @app.route('/api/generators/builder_test', methods=['POST'])
+    def api_generators_builder_test():
+        require_builder_or_admin()
+        payload = request.get_json(silent=True) or {}
+        scaffold_payload = payload.get('scaffold_request') if isinstance(payload.get('scaffold_request'), dict) else {}
+        if not scaffold_payload:
+            return jsonify({'ok': False, 'error': 'scaffold_request is required.'}), 400
+        try:
+            scaffold_files, manifest_yaml, folder_path = build_generator_scaffold(scaffold_payload)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+
+        plugin_kind = str(scaffold_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+        plugin_id = sanitize_id(scaffold_payload.get('plugin_id')) or 'generator'
+        config = _build_default_test_config(scaffold_payload)
+
+        try:
+            result = run_remote_builder_test(
+                scaffold_files=scaffold_files,
+                plugin_kind=plugin_kind,
+                plugin_id=plugin_id,
+                config=config,
+            )
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed running builder test: {exc}'}), 500
+
+        return jsonify({
+            'ok': bool(result.get('ok')),
+            'plugin_id': plugin_id,
+            'plugin_type': plugin_kind,
+            'folder_path': folder_path,
+            'manifest_yaml': manifest_yaml,
+            'returncode': result.get('returncode'),
+            'stdout': str(result.get('stdout') or ''),
+            'stderr': str(result.get('stderr') or ''),
+            'files': result.get('files') if isinstance(result.get('files'), list) else [],
+            'test_mode': 'remote_core_vm',
+        }), (200 if result.get('ok') else 400)
+
+    @app.route('/api/generators/builder_test/run', methods=['POST'])
+    def api_generators_builder_test_run():
+        require_builder_or_admin()
+        scaffold_raw = (request.form.get('scaffold_request') or '').strip()
+        if not scaffold_raw:
+            return jsonify({'ok': False, 'error': 'scaffold_request is required.'}), 400
+        try:
+            scaffold_payload = json.loads(scaffold_raw)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Invalid scaffold_request JSON: {exc}'}), 400
+        if not isinstance(scaffold_payload, dict):
+            return jsonify({'ok': False, 'error': 'scaffold_request must be an object.'}), 400
+
+        try:
+            scaffold_files, _manifest_yaml, _folder_path = build_generator_scaffold(scaffold_payload)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+
+        plugin_kind = str(scaffold_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+        plugin_id = sanitize_id(scaffold_payload.get('plugin_id')) or 'generator'
+        run_id = local_timestamp_safe() + '-' + uuid.uuid4().hex[:10]
+        run_dir = _builder_test_run_dir_for_id(outputs_dir, run_id)
+        inputs_dir = os.path.join(run_dir, 'inputs')
+        os.makedirs(inputs_dir, exist_ok=True)
+        log_path = os.path.join(run_dir, 'run.log')
+
+        try:
+            _persist_scaffold_files(run_dir, scaffold_files, scaffold_payload)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed preparing scaffold snapshot: {exc}'}), 500
+
+        cfg = _build_default_test_config(scaffold_payload)
+        saved_uploads: dict[str, dict[str, Any]] = {}
+        runtime_inputs = scaffold_payload.get('runtime_inputs') if isinstance(scaffold_payload.get('runtime_inputs'), list) else []
+
+        for item in runtime_inputs:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '').strip()
+            if not name:
+                continue
+            raw_val = request.form.get(name)
+            if raw_val is not None:
+                cfg[name] = raw_val
+
+        def _unique_dest_filename(dir_path: str, filename: str) -> str:
+            base = secure_filename(filename) or 'upload'
+            candidate = base
+            root, ext = os.path.splitext(base)
+            idx = 1
+            while os.path.exists(os.path.join(dir_path, candidate)):
+                candidate = f'{root}_{idx}{ext}'
+                idx += 1
+                if idx > 5000:
+                    break
+            return candidate
+
+        for item in runtime_inputs:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '').strip()
+            if not name or not _is_file_input_type(item.get('type')):
+                continue
+            uploaded = request.files.get(name)
+            if not (uploaded and getattr(uploaded, 'filename', '')):
+                continue
+            original_filename = str(getattr(uploaded, 'filename', '') or '')
+            stored = _unique_dest_filename(inputs_dir, f'{name}__{original_filename}')
+            dest = os.path.join(inputs_dir, stored)
+            try:
+                uploaded.save(dest)
+            except Exception:
+                return jsonify({'ok': False, 'error': f'Failed saving file input: {name}'}), 400
+            cfg[name] = f'/inputs/{stored}'
+            saved_uploads[name] = {
+                'original_filename': original_filename,
+                'stored_filename': stored,
+                'stored_path': f'inputs/{stored}',
+                'container_path': f'/inputs/{stored}',
+            }
+
+        missing: list[str] = []
+        for item in runtime_inputs:
+            if not isinstance(item, dict):
+                continue
+            if item.get('required') is False:
+                continue
+            name = str(item.get('name') or '').strip()
+            if not name:
+                continue
+            val = cfg.get(name)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(name)
+        if missing:
+            return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+        try:
+            core_cfg = parse_flag_test_core_cfg_from_form(request.form)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'CORE VM SSH config required: {exc}'}), 400
+        if not isinstance(core_cfg, dict):
+            return jsonify({'ok': False, 'error': 'CORE VM SSH config required for builder tests.'}), 400
+
+        try:
+            ensure_core_vm_idle_for_test(core_cfg)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 409
+
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f'[builder-test] starting {plugin_id} (remote CORE VM)\n')
+                write_sse_marker(log_f, 'phase', {
+                    'phase': 'starting',
+                    'generator_id': plugin_id,
+                    'run_id': run_id,
+                    'remote': True,
+                })
+        except Exception:
+            pass
+
+        try:
+            log_handle = open(log_path, 'a', encoding='utf-8')
+            remote_meta = start_remote_builder_test_process(
+                run_id=run_id,
+                run_dir=run_dir,
+                log_handle=log_handle,
+                scaffold_files=scaffold_files,
+                plugin_kind=plugin_kind,
+                plugin_id=plugin_id,
+                cfg=cfg,
+                core_cfg=core_cfg,
+            )
+        except Exception as exc:
+            try:
+                with open(log_path, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f'[builder-test] failed to start remote run: {exc}\n')
+                    write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+            except Exception:
+                pass
+            return jsonify({'ok': False, 'error': f'Failed launching remote builder test: {exc}'}), 500
+
+        runs[run_id] = {
+            'proc': None,
+            'log_path': log_path,
+            'done': False,
+            'returncode': None,
+            'status': 'generator_running',
+            'run_dir': run_dir,
+            'kind': 'generator_builder_test',
+            'generator_id': plugin_id,
+            'generator_name': str(scaffold_payload.get('name') or plugin_id),
+            'plugin_type': plugin_kind,
+            'remote': True,
+            'core_cfg': core_cfg,
+            'remote_run_dir': remote_meta.get('remote_run_dir'),
+            'remote_repo_dir': remote_meta.get('remote_repo_dir'),
+            'remote_env_path': remote_meta.get('remote_env_path'),
+            'ssh_client': remote_meta.get('ssh_client'),
+            'ssh_channel': remote_meta.get('ssh_channel'),
+            'ssh_log_thread': remote_meta.get('ssh_log_thread'),
+            'ssh_log_handle': log_handle,
+            'cleanup_requested': False,
+        }
+
+        def _finalize_builder_run(run_id_local: str) -> None:
+            meta = runs.get(run_id_local)
+            if not isinstance(meta, dict):
+                return
+            rc = -1
+            try:
+                channel = meta.get('ssh_channel')
+                if channel is not None:
+                    while True:
+                        try:
+                            if channel.exit_status_ready():
+                                rc = int(channel.recv_exit_status())
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.5)
+            finally:
+                try:
+                    with open(str(meta.get('log_path') or ''), 'a', encoding='utf-8') as log_f:
+                        write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
+                except Exception:
+                    pass
+                try:
+                    if not meta.get('cleanup_requested'):
+                        sync_remote_flag_test_outputs(meta)
+                except Exception:
+                    pass
+                try:
+                    purge_remote_flag_test_dir(meta)
+                except Exception:
+                    pass
+                try:
+                    thread_obj = meta.get('ssh_log_thread')
+                    if thread_obj and hasattr(thread_obj, 'join'):
+                        thread_obj.join(timeout=3)
+                except Exception:
+                    pass
+                try:
+                    client_obj = meta.get('ssh_client')
+                    if client_obj:
+                        client_obj.close()
+                except Exception:
+                    pass
+                try:
+                    handle = meta.get('ssh_log_handle')
+                    if handle:
+                        handle.flush()
+                        handle.close()
+                except Exception:
+                    pass
+                meta['done'] = True
+                meta['returncode'] = rc
+                meta['status'] = 'completed' if rc == 0 else 'failed'
+                try:
+                    with open(str(meta.get('log_path') or ''), 'a', encoding='utf-8') as log_f:
+                        write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_finalize_builder_run,
+            args=(run_id,),
+            name=f'builder-test-{run_id[:8]}',
+            daemon=True,
+        ).start()
+
+        return jsonify({
+            'ok': True,
+            'run_id': run_id,
+            'saved_uploads': saved_uploads,
+        })
+
+    @app.route('/api/generators/builder_test/outputs/<run_id>', methods=['GET'])
+    def api_generators_builder_test_outputs(run_id: str):
+        require_builder_or_admin()
+        meta = runs.get(run_id)
+        if meta and meta.get('kind') != 'generator_builder_test':
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+
+        run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+        if not isinstance(run_dir, str) or not run_dir:
+            run_dir = _builder_test_run_dir_for_id(outputs_dir, run_id)
+        abs_run_dir = os.path.abspath(run_dir)
+        outputs_root = os.path.abspath(outputs_dir())
+        if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+            return jsonify({'ok': False, 'error': 'refusing'}), 400
+        if not os.path.isdir(abs_run_dir):
+            done = bool(meta.get('done')) if isinstance(meta, dict) else False
+            returncode = meta.get('returncode') if isinstance(meta, dict) else None
+            return jsonify({'ok': True, 'files': [], 'done': done, 'returncode': returncode}), 200
+
+        input_files: list[dict[str, Any]] = []
+        output_files: list[dict[str, Any]] = []
+        scaffold_files: list[dict[str, Any]] = []
+        misc_files: list[dict[str, Any]] = []
+        for root, _dirs, filenames in os.walk(abs_run_dir):
+            rel_root = os.path.relpath(root, abs_run_dir).replace('\\', '/')
+            for filename in filenames:
+                abs_path = os.path.join(root, filename)
+                try:
+                    st = os.stat(abs_path)
+                    rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                    entry = {'path': rel, 'name': filename, 'size': st.st_size}
+                except Exception:
+                    continue
+                if rel_root == 'inputs' or rel_root.startswith('inputs/'):
+                    input_files.append(entry)
+                elif rel_root == 'scaffold' or rel_root.startswith('scaffold/'):
+                    scaffold_files.append(entry)
+                elif rel == 'run.log':
+                    misc_files.append(entry)
+                else:
+                    output_files.append(entry)
+        input_files.sort(key=lambda item: str(item.get('path') or ''))
+        output_files.sort(key=lambda item: str(item.get('path') or ''))
+        scaffold_files.sort(key=lambda item: str(item.get('path') or ''))
+        misc_files.sort(key=lambda item: str(item.get('path') or ''))
+        done = bool(meta.get('done')) if isinstance(meta, dict) else True
+        returncode = meta.get('returncode') if isinstance(meta, dict) else None
+        log_path = meta.get('log_path') if isinstance(meta, dict) else os.path.join(abs_run_dir, 'run.log')
+        log_tail = _tail_text_file(str(log_path or ''))
+        failure_summary = _summarize_run_log(log_tail)
+        return jsonify({
+            'ok': True,
+            'inputs': input_files,
+            'outputs': output_files,
+            'scaffold': scaffold_files,
+            'misc': misc_files,
+            'done': done,
+            'returncode': returncode,
+            'log_tail': log_tail,
+            'failure_summary': failure_summary,
+        }), 200
+
+    @app.route('/api/generators/builder_test/download/<run_id>', methods=['GET'])
+    def api_generators_builder_test_download(run_id: str):
+        require_builder_or_admin()
+        meta = runs.get(run_id)
+        if meta and meta.get('kind') != 'generator_builder_test':
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+        run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+        if not isinstance(run_dir, str) or not run_dir:
+            run_dir = _builder_test_run_dir_for_id(outputs_dir, run_id)
+        rel = (request.args.get('p') or '').strip().lstrip('/').replace('\\', '/')
+        if not rel:
+            return jsonify({'ok': False, 'error': 'invalid path'}), 400
+        abs_run_dir = os.path.abspath(run_dir)
+        outputs_root = os.path.abspath(outputs_dir())
+        if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+            return jsonify({'ok': False, 'error': 'refusing'}), 400
+        abs_path = os.path.abspath(os.path.join(abs_run_dir, rel))
+        if not (abs_path == abs_run_dir or abs_path.startswith(abs_run_dir + os.sep)):
+            return jsonify({'ok': False, 'error': 'refusing'}), 400
+        if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+            return jsonify({'ok': False, 'error': 'missing file'}), 404
+        return send_file(abs_path, as_attachment=True, download_name=os.path.basename(abs_path))
+
+    @app.route('/api/generators/builder_test/cleanup/<run_id>', methods=['POST'])
+    def api_generators_builder_test_cleanup(run_id: str):
+        require_builder_or_admin()
+        meta = runs.get(run_id)
+        if meta and meta.get('kind') != 'generator_builder_test':
+            return jsonify({'ok': False, 'error': 'not found'}), 404
+        run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+        if not isinstance(run_dir, str) or not run_dir:
+            run_dir = _builder_test_run_dir_for_id(outputs_dir, run_id)
+        abs_run_dir = os.path.abspath(run_dir)
+        outputs_root = os.path.abspath(outputs_dir())
+        if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+            return jsonify({'ok': False, 'error': 'refusing'}), 400
+
+        try:
+            if isinstance(meta, dict):
+                meta['cleanup_requested'] = True
+                try:
+                    cleanup_remote_test_runtime(meta)
+                except Exception:
+                    pass
+                try:
+                    channel = meta.get('ssh_channel')
+                    if channel is not None and hasattr(channel, 'close'):
+                        channel.close()
+                except Exception:
+                    pass
+                try:
+                    client_obj = meta.get('ssh_client')
+                    if client_obj is not None:
+                        client_obj.close()
+                except Exception:
+                    pass
+                try:
+                    purge_remote_flag_test_dir(meta)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            lp = meta.get('log_path') if isinstance(meta, dict) else os.path.join(abs_run_dir, 'run.log')
+            if isinstance(lp, str) and lp:
+                with open(lp, 'a', encoding='utf-8') as log_f:
+                    write_sse_marker(log_f, 'phase', {'phase': 'cleanup_start', 'run_id': run_id})
+        except Exception:
+            pass
+
+        removed = False
+        try:
+            if os.path.isdir(abs_run_dir):
+                shutil.rmtree(abs_run_dir, ignore_errors=True)
+            removed = True
+        except Exception:
+            removed = False
+
+        try:
+            if isinstance(meta, dict):
+                meta['done'] = True
+        except Exception:
+            pass
+        try:
+            if isinstance(meta, dict):
+                lp = meta.get('log_path')
+            else:
+                lp = os.path.join(abs_run_dir, 'run.log')
+            if isinstance(lp, str) and lp and os.path.exists(lp):
+                with open(lp, 'a', encoding='utf-8') as log_f2:
+                    write_sse_marker(log_f2, 'phase', {'phase': 'cleanup_done', 'run_id': run_id, 'removed': removed})
+        except Exception:
+            pass
+        try:
+            runs.pop(run_id, None)
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'removed': removed}), 200
+
+    @app.route('/api/generators/install_generated', methods=['POST'])
+    def api_generators_install_generated():
+        require_builder_or_admin()
+        payload = request.get_json(silent=True) or {}
+        scaffold_payload = payload.get('scaffold_request') if isinstance(payload.get('scaffold_request'), dict) else {}
+        if not scaffold_payload:
+            return jsonify({'ok': False, 'error': 'scaffold_request is required.'}), 400
+        try:
+            scaffold_files, _manifest_yaml, _folder_path = build_generator_scaffold(scaffold_payload)
+            zip_bytes = _build_scaffold_zip_bytes(scaffold_files, zipfile_module=zipfile_module, io_module=io_module)
+            pack_label = str(payload.get('pack_label') or scaffold_payload.get('name') or scaffold_payload.get('plugin_id') or 'generated-builder-pack').strip()
+            fd, tmp_path = tempfile.mkstemp(prefix='coretg_builder_pack_', suffix='.zip')
+            os.close(fd)
+            try:
+                with open(tmp_path, 'wb') as handle:
+                    handle.write(zip_bytes)
+                ok, note = install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=pack_label, pack_origin='generator_builder')
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+        if not ok:
+            return jsonify({'ok': False, 'error': note}), 400
+        return jsonify({'ok': True, 'message': note, 'pack_label': pack_label})
 
     @app.route('/api/generators/scaffold_zip', methods=['POST'])
     def api_generators_scaffold_zip():

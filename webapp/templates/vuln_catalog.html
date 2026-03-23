@@ -16,6 +16,9 @@
         <li class="nav-item" role="presentation">
           <button class="nav-link" id="vulnCatalogTab" data-bs-toggle="tab" data-bs-target="#vulnCatalog" type="button" role="tab">Vulnerability Catalog</button>
         </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="vulnBatchTab" data-bs-toggle="tab" data-bs-target="#vulnBatch" type="button" role="tab">Batch Test</button>
+        </li>
       </ul>
 
       <div class="tab-content mt-3">
@@ -148,6 +151,138 @@
             </div>
           </div>
         </div>
+
+        <div class="tab-pane fade" id="vulnBatch" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-end">
+                <div class="col-md-4">
+                  <label class="form-label">Filter</label>
+                  <input id="vulnBatchFilter" class="form-control" placeholder="Name, id, source, or path…" />
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">Scope</label>
+                  <select id="vulnBatchScope" class="form-select">
+                    <option value="unvalidated" selected>Unvalidated / Incomplete</option>
+                    <option value="failed">Previously Failed</option>
+                    <option value="all_enabled">All Enabled</option>
+                  </select>
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">Max Items</label>
+                  <input id="vulnBatchLimit" class="form-control" type="number" min="1" max="500" placeholder="All" />
+                </div>
+                <div class="col-md-3 d-flex justify-content-md-end gap-2">
+                  <button class="btn btn-primary" type="button" id="vulnBatchStartBtn">Start Batch</button>
+                  <button class="btn btn-outline-danger" type="button" id="vulnBatchStopBtn" style="display:none;">Stop Batch</button>
+                </div>
+                <div class="col-12 d-flex flex-wrap gap-2 justify-content-md-end">
+                  <button class="btn btn-sm btn-outline-secondary" type="button" id="vulnBatchCopySummaryBtn">Copy Summary</button>
+                  <a class="btn btn-sm btn-outline-secondary disabled" href="#" id="vulnBatchExportJsonBtn" aria-disabled="true">Export JSON</a>
+                  <a class="btn btn-sm btn-outline-secondary disabled" href="#" id="vulnBatchExportMdBtn" aria-disabled="true">Export Markdown</a>
+                </div>
+                <div class="col-12 d-flex flex-wrap gap-3 align-items-center small text-muted">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="vulnBatchIncludeDisabled">
+                    <label class="form-check-label" for="vulnBatchIncludeDisabled">Include disabled items</label>
+                  </div>
+                  <div id="vulnBatchSelectionPreview">Selection preview will appear after the catalog loads.</div>
+                </div>
+                <div class="col-12 small text-muted" id="vulnBatchMeta">No batch run active.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row g-3">
+            <div class="col-lg-4">
+              <div class="card h-100">
+                <div class="card-body">
+                  <h6 class="mb-3">Progress</h6>
+                  <div class="small mb-2">Queued: <strong id="vulnBatchCountTotal">0</strong></div>
+                  <div class="small mb-2">Completed: <strong id="vulnBatchCountCompleted">0</strong></div>
+                  <div class="small mb-2 text-success">Passed: <strong id="vulnBatchCountPassed">0</strong></div>
+                  <div class="small mb-2 text-danger">Failed: <strong id="vulnBatchCountFailed">0</strong></div>
+                  <div class="small mb-2 text-secondary">Incomplete: <strong id="vulnBatchCountIncomplete">0</strong></div>
+                  <div class="small mb-2 text-muted">Skipped: <strong id="vulnBatchCountSkipped">0</strong></div>
+                  <div class="small mb-3">Pending: <strong id="vulnBatchCountPending">0</strong></div>
+                  <hr>
+                  <div class="small text-muted mb-1">Active Item</div>
+                  <div id="vulnBatchActiveItem" class="small">Idle</div>
+                  <div class="small text-muted mt-3 mb-1">Catalog</div>
+                  <div id="vulnBatchCatalogLabel" class="small">—</div>
+                  <div class="small text-muted mt-3 mb-1">Category Counts</div>
+                  <div id="vulnBatchCategoryCounts" class="small text-muted">—</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-lg-8">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="d-flex align-items-center justify-content-between mb-2">
+                    <h6 class="mb-0">Results</h6>
+                    <div class="small text-muted">Auto-classified from execute return code and validation summary</div>
+                  </div>
+                  <div class="row g-2 align-items-end mb-2">
+                    <div class="col-md-5">
+                      <label class="form-label small text-muted mb-1">Filter Results By Category</label>
+                      <select id="vulnBatchResultsCategoryFilter" class="form-select form-select-sm">
+                        <option value="">All categories</option>
+                      </select>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label small text-muted mb-1">Filter Results By Status</label>
+                      <select id="vulnBatchResultsStatusFilter" class="form-select form-select-sm">
+                        <option value="">All statuses</option>
+                        <option value="passed">Passed</option>
+                        <option value="failed">Failed</option>
+                        <option value="incomplete">Incomplete</option>
+                        <option value="skipped">Skipped</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label small text-muted mb-1">Sort Results</label>
+                      <select id="vulnBatchResultsSortKey" class="form-select form-select-sm">
+                        <option value="item_id">Item ID</option>
+                        <option value="status">Status</option>
+                        <option value="category_count">Category Count</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2 d-flex gap-2 align-items-end">
+                      <button class="btn btn-sm btn-outline-secondary w-100" type="button" id="vulnBatchResultsSortDirBtn">Asc</button>
+                      <button class="btn btn-sm btn-outline-secondary w-100" type="button" id="vulnBatchResultsClearFiltersBtn">Clear</button>
+                    </div>
+                    <div class="col-md-12 small text-muted" id="vulnBatchResultsMeta">All batch results are shown.</div>
+                  </div>
+                  <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                      <thead>
+                        <tr>
+                          <th style="width: 70px;">#</th>
+                          <th>Item</th>
+                          <th style="width: 130px;">Status</th>
+                          <th style="width: 220px;">Categories</th>
+                          <th>Reason</th>
+                          <th style="width: 120px;">Log</th>
+                        </tr>
+                      </thead>
+                      <tbody id="vulnBatchResultsBody">
+                        <tr><td colspan="6" class="text-muted">No batch results yet.</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card mt-3">
+            <div class="card-body">
+              <div class="small text-muted mb-1">Batch Log</div>
+              <pre class="small bg-light p-2 mb-0" id="vulnBatchLog" style="max-height: 260px; overflow: auto;"></pre>
+            </div>
+          </div>
+        </div>
       </div>
 
     </div>
@@ -269,6 +404,12 @@
     activeTestRunId: null,
     activeTestItemId: null,
     cleanupItemId: null,
+    activeBatchRunId: null,
+    activeBatchItemId: null,
+    activeBatchDone: true,
+    latestBatchPayload: null,
+    batchResultsSortKey: 'item_id',
+    batchResultsSortDir: 'asc',
     sortKey: 'name',
     sortDir: 'asc',
   };
@@ -578,9 +719,13 @@
       const itemId = String(it && it.id != null ? it.id : '');
       const activeItemId = String(_vulnCatalogState.activeTestItemId != null ? _vulnCatalogState.activeTestItemId : '');
       const cleanupItemId = String(_vulnCatalogState.cleanupItemId != null ? _vulnCatalogState.cleanupItemId : '');
+      const batchItemId = String(_vulnCatalogState.activeBatchItemId != null ? _vulnCatalogState.activeBatchItemId : '');
+      const batchActive = !!_vulnCatalogState.activeBatchRunId && !_vulnCatalogState.activeBatchDone;
       const isRunning = !!_vulnCatalogState.activeTestRunId && itemId && itemId === activeItemId;
       const isCleaning = itemId && itemId === cleanupItemId;
-      const isBusy = isRunning || isCleaning;
+      const isBatchRunning = batchActive && itemId && itemId === batchItemId;
+      const isBusy = isRunning || isCleaning || batchActive;
+      const mutationsLocked = isRunning || isCleaning || batchActive;
       const tr = document.createElement('tr');
       if (it.disabled) tr.classList.add('table-secondary');
       tr.innerHTML = `
@@ -591,6 +736,7 @@
             ${it.disabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
             ${isRunning ? `<span class="badge text-bg-info ms-2">Running</span>` : ''}
             ${isCleaning ? `<span class="badge text-bg-secondary ms-2">Cleaning up</span>` : ''}
+            ${isBatchRunning ? `<span class="badge text-bg-primary ms-2">Batch Active</span>` : ''}
           </div>
           <div class="small text-muted">ID: ${escapeHtml(it.id ?? '')}</div>
         </td>
@@ -609,9 +755,9 @@
         <td class="small">${escapeHtml(it.from_source || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
-            <button class="btn btn-sm btn-outline-primary" data-action="test" type="button" ${(it.disabled || isBusy) ? 'disabled' : ''} title="${it.disabled ? 'Disabled' : (isBusy ? 'Test already active/cleaning up' : 'Test vulnerability')}">Test</button>
-            <button class="btn btn-sm btn-outline-warning" data-action="toggle" type="button" title="${it.disabled ? 'Enable vulnerability' : 'Disable vulnerability'}">${it.disabled ? 'Enable' : 'Disable'}</button>
-            <button class="btn btn-sm btn-outline-danger" data-action="delete" type="button" title="Delete vulnerability">Delete</button>
+            <button class="btn btn-sm btn-outline-primary" data-action="test" type="button" ${(it.disabled || isBusy) ? 'disabled' : ''} title="${it.disabled ? 'Disabled' : (isBusy ? 'Another test or batch is active' : 'Test vulnerability')}">Test</button>
+            <button class="btn btn-sm btn-outline-warning" data-action="toggle" type="button" ${mutationsLocked ? 'disabled' : ''} title="${mutationsLocked ? 'Catalog is locked while a test or batch is active' : (it.disabled ? 'Enable vulnerability' : 'Disable vulnerability')}">${it.disabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger" data-action="delete" type="button" ${mutationsLocked ? 'disabled' : ''} title="${mutationsLocked ? 'Catalog is locked while a test or batch is active' : 'Delete vulnerability'}">Delete</button>
           </div>
         </td>
       `;
@@ -667,6 +813,457 @@
     const activeLabel = _vulnCatalogState.active && _vulnCatalogState.active.label ? String(_vulnCatalogState.active.label) : 'repo default';
     if (metaEl) metaEl.textContent = `${_vulnCatalogState.items.length} items • Active: ${activeLabel}${src ? ' • From: ' + src : ''}`;
     _renderVulnCatalogTable();
+    try { renderVulnBatchSelectionPreview(); } catch (e) {}
+  }
+
+  const _vulnBatchStorageKey = 'coretg_vuln_batch_run_id';
+  let _vulnBatchPollTimer = null;
+
+  function _loadSavedVulnBatchRunId() {
+    try {
+      return localStorage.getItem(_vulnBatchStorageKey) || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function _saveVulnBatchRunId(runId) {
+    try {
+      if (runId) {
+        localStorage.setItem(_vulnBatchStorageKey, String(runId));
+      } else {
+        localStorage.removeItem(_vulnBatchStorageKey);
+      }
+    } catch (e) {}
+  }
+
+  function _scheduleVulnBatchPoll(delayMs) {
+    if (_vulnBatchPollTimer) {
+      clearTimeout(_vulnBatchPollTimer);
+      _vulnBatchPollTimer = null;
+    }
+    _vulnBatchPollTimer = setTimeout(() => {
+      refreshVulnBatchStatus().catch(() => {});
+    }, Math.max(250, Number(delayMs || 1500)));
+  }
+
+  function _collectVulnBatchFilters() {
+    const scopeEl = _qs('vulnBatchScope');
+    const queryEl = _qs('vulnBatchFilter');
+    const limitEl = _qs('vulnBatchLimit');
+    const includeDisabledEl = _qs('vulnBatchIncludeDisabled');
+    const limitRaw = String((limitEl && limitEl.value) || '').trim();
+    let limit = null;
+    if (limitRaw) {
+      const parsed = parseInt(limitRaw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        limit = Math.min(parsed, 500);
+      }
+    }
+    return {
+      scope: String((scopeEl && scopeEl.value) || 'unvalidated'),
+      query: String((queryEl && queryEl.value) || '').trim(),
+      include_disabled: !!(includeDisabledEl && includeDisabledEl.checked),
+      limit,
+    };
+  }
+
+  function renderVulnBatchSelectionPreview() {
+    const previewEl = _qs('vulnBatchSelectionPreview');
+    if (!previewEl) return;
+    const items = Array.isArray(_vulnCatalogState.items) ? _vulnCatalogState.items : [];
+    if (!items.length) {
+      previewEl.textContent = 'Selection preview will appear after the catalog loads.';
+      return;
+    }
+    const filters = _collectVulnBatchFilters();
+    let selected = items.filter((item) => {
+      if (!filters.include_disabled && item && item.disabled) return false;
+      if (filters.scope === 'failed' && item.validated_ok !== false) return false;
+      if (filters.scope === 'unvalidated' && !(item.validated_ok == null || item.validated_incomplete === true)) return false;
+      if (!filters.query) return true;
+      const needle = filters.query.toLowerCase();
+      return [item.id, item.name, item.from_source].some((value) => String(value || '').toLowerCase().includes(needle));
+    });
+    if (filters.limit != null) {
+      selected = selected.slice(0, filters.limit);
+    }
+    const scopeLabel = filters.scope === 'failed'
+      ? 'previously failed'
+      : (filters.scope === 'all_enabled' ? 'all enabled' : 'unvalidated / incomplete');
+    previewEl.textContent = `${selected.length} item(s) currently match ${scopeLabel}${filters.include_disabled ? ', including disabled items' : ''}.`;
+  }
+
+  function _vulnBatchCategoryBadge(category) {
+    const key = String(category || '').trim();
+    if (!key) return '';
+    const label = key.replace(/_/g, ' ');
+    return `<span class="badge rounded-pill text-bg-light border me-1 mb-1">${escapeHtml(label)}</span>`;
+  }
+
+  function _setVulnBatchCategoryFilter(category) {
+    const el = _qs('vulnBatchResultsCategoryFilter');
+    if (!el) return;
+    el.value = String(category || '').trim();
+  }
+
+  function _selectedVulnBatchStatusFilter() {
+    const el = _qs('vulnBatchResultsStatusFilter');
+    return String((el && el.value) || '').trim().toLowerCase();
+  }
+
+  function _selectedVulnBatchSortKey() {
+    return String(_vulnCatalogState.batchResultsSortKey || 'item_id').trim();
+  }
+
+  function _selectedVulnBatchSortDir() {
+    const value = String(_vulnCatalogState.batchResultsSortDir || 'asc').trim().toLowerCase();
+    return value === 'desc' ? 'desc' : 'asc';
+  }
+
+  function _normalizeVulnBatchResults(rows) {
+    return Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : [];
+  }
+
+  function _selectedVulnBatchCategoryFilter() {
+    const el = _qs('vulnBatchResultsCategoryFilter');
+    return String((el && el.value) || '').trim();
+  }
+
+  function _filteredVulnBatchResults(rows) {
+    const selected = _selectedVulnBatchCategoryFilter();
+    const selectedStatus = _selectedVulnBatchStatusFilter();
+    const normalized = _normalizeVulnBatchResults(rows);
+    return normalized.filter((result) => {
+      const status = String(result && result.status || '').trim().toLowerCase();
+      const categories = Array.isArray(result && result.categories) ? result.categories : [];
+      const categoryMatch = !selected || categories.some((category) => String(category || '').trim() === selected);
+      const statusMatch = !selectedStatus || status === selectedStatus;
+      return categoryMatch && statusMatch;
+    });
+  }
+
+  function _sortedVulnBatchResults(rows) {
+    const normalized = _normalizeVulnBatchResults(rows);
+    const key = _selectedVulnBatchSortKey();
+    const dir = _selectedVulnBatchSortDir() === 'desc' ? -1 : 1;
+    const decorated = normalized.map((result, index) => ({ result, index }));
+    const statusRank = { failed: 0, incomplete: 1, skipped: 2, passed: 3 };
+    decorated.sort((left, right) => {
+      const a = left.result || {};
+      const b = right.result || {};
+      let cmp = 0;
+      if (key === 'status') {
+        cmp = (statusRank[String(a.status || '').toLowerCase()] ?? 99) - (statusRank[String(b.status || '').toLowerCase()] ?? 99);
+      } else if (key === 'category_count') {
+        cmp = (Array.isArray(a.categories) ? a.categories.length : 0) - (Array.isArray(b.categories) ? b.categories.length : 0);
+      } else {
+        cmp = (Number(a.item_id || 0) || 0) - (Number(b.item_id || 0) || 0);
+      }
+      if (cmp !== 0) return cmp * dir;
+      return left.index - right.index;
+    });
+    return decorated.map((entry) => entry.result);
+  }
+
+  function _resetVulnBatchResultsFilters() {
+    const categoryEl = _qs('vulnBatchResultsCategoryFilter');
+    const statusEl = _qs('vulnBatchResultsStatusFilter');
+    const sortKeyEl = _qs('vulnBatchResultsSortKey');
+    if (categoryEl) categoryEl.value = '';
+    if (statusEl) statusEl.value = '';
+    _vulnCatalogState.batchResultsSortKey = 'item_id';
+    _vulnCatalogState.batchResultsSortDir = 'asc';
+    if (sortKeyEl) sortKeyEl.value = 'item_id';
+    const sortDirBtn = _qs('vulnBatchResultsSortDirBtn');
+    if (sortDirBtn) sortDirBtn.textContent = 'Asc';
+  }
+
+  function _renderVulnBatchCategoryFilterOptions(counts) {
+    const el = _qs('vulnBatchResultsCategoryFilter');
+    if (!el) return;
+    const current = String(el.value || '').trim();
+    const entries = (counts && typeof counts === 'object') ? Object.entries(counts) : [];
+    el.innerHTML = '<option value="">All categories</option>';
+    entries.forEach(([key, value]) => {
+      const opt = document.createElement('option');
+      opt.value = String(key || '');
+      opt.textContent = `${String(key || '').replace(/_/g, ' ')} (${value})`;
+      el.appendChild(opt);
+    });
+    if (current && entries.some(([key]) => key === current)) {
+      el.value = current;
+    } else {
+      el.value = '';
+    }
+  }
+
+  function _renderVulnBatchResultsMeta(totalCount, shownCount) {
+    const el = _qs('vulnBatchResultsMeta');
+    if (!el) return;
+    if (!totalCount) {
+      el.textContent = 'All batch results are shown.';
+      return;
+    }
+    const selected = _selectedVulnBatchCategoryFilter();
+    const selectedStatus = _selectedVulnBatchStatusFilter();
+    const selectedSort = _selectedVulnBatchSortKey();
+    const selectedDir = _selectedVulnBatchSortDir();
+    if (!selected && !selectedStatus) {
+      el.textContent = `Showing all ${shownCount} result(s), sorted by ${selectedSort.replace(/_/g, ' ')} ${selectedDir}.`;
+      return;
+    }
+    const parts = [];
+    if (selected) parts.push(`category ${selected.replace(/_/g, ' ')}`);
+    if (selectedStatus) parts.push(`status ${selectedStatus}`);
+    el.textContent = `Showing ${shownCount} of ${totalCount} result(s) for ${parts.join(' and ')}, sorted by ${selectedSort.replace(/_/g, ' ')} ${selectedDir}.`;
+  }
+
+  function _vulnBatchSummaryText(payload) {
+    const data = payload && typeof payload === 'object' ? payload : null;
+    if (!data) return 'No batch run active.';
+    const progress = data.progress || {};
+    const lines = [
+      `Run ID: ${data.run_id || '—'}`,
+      `Status: ${data.status || '—'}`,
+      `Catalog: ${(data.catalog && (data.catalog.label || data.catalog.id)) || '—'}`,
+      `Started: ${data.started_at || '—'}`,
+      `Finished: ${data.finished_at || '—'}`,
+      `Progress: total=${progress.total || 0}, completed=${progress.completed || 0}, passed=${progress.passed || 0}, failed=${progress.failed || 0}, incomplete=${progress.incomplete || 0}, skipped=${progress.skipped || 0}, pending=${progress.pending || 0}`,
+    ];
+    const categoryCounts = data.category_counts && typeof data.category_counts === 'object' ? Object.entries(data.category_counts) : [];
+    if (categoryCounts.length) {
+      lines.push(`Categories: ${categoryCounts.map(([key, value]) => `${key}=${value}`).join(', ')}`);
+    }
+    const failures = _normalizeVulnBatchResults(data.results).filter((result) => {
+      const status = String(result.status || '').toLowerCase();
+      return status === 'failed' || status === 'incomplete';
+    }).slice(0, 10);
+    if (failures.length) {
+      lines.push('Top failures:');
+      failures.forEach((result) => {
+        const categories = Array.isArray(result.categories) ? result.categories.join(', ') : '';
+        lines.push(`- #${result.item_id || ''} ${result.item_name || ''} [${result.status || 'unknown'}]${categories ? ` (${categories})` : ''}: ${result.reason || ''}`);
+      });
+    }
+    return lines.join('\n');
+  }
+
+  async function _copyVulnBatchSummary() {
+    const text = _vulnBatchSummaryText(_vulnCatalogState.latestBatchPayload);
+    if (!text) return;
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.setAttribute('readonly', 'readonly');
+    helper.style.position = 'absolute';
+    helper.style.left = '-9999px';
+    document.body.appendChild(helper);
+    helper.select();
+    document.execCommand('copy');
+    document.body.removeChild(helper);
+  }
+
+  function _renderVulnBatchCategoryCounts(counts) {
+    const el = _qs('vulnBatchCategoryCounts');
+    if (!el) return;
+    const entries = (counts && typeof counts === 'object') ? Object.entries(counts) : [];
+    if (!entries.length) {
+      el.innerHTML = '<span class="text-muted">—</span>';
+      return;
+    }
+    el.innerHTML = entries.map(([key, value]) => `<button type="button" class="btn btn-link btn-sm p-0 me-2 mb-1 text-decoration-none align-baseline vuln-batch-category-chip" data-category="${escapeHtml(key)}">${_vulnBatchCategoryBadge(key)} <span class="ms-1">${escapeHtml(value)}</span></button>`).join(' ');
+    el.querySelectorAll('.vuln-batch-category-chip').forEach((button) => {
+      button.addEventListener('click', () => {
+        const category = button.getAttribute('data-category') || '';
+        _setVulnBatchCategoryFilter(category);
+        const payload = _vulnCatalogState.latestBatchPayload;
+        _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+      });
+    });
+  }
+
+  function _renderVulnBatchResults(results) {
+    const body = _qs('vulnBatchResultsBody');
+    if (!body) return;
+    const allRows = _normalizeVulnBatchResults(results);
+    const rows = _sortedVulnBatchResults(_filteredVulnBatchResults(allRows));
+    body.innerHTML = '';
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="6" class="text-muted">No batch results yet.</td></tr>';
+      _renderVulnBatchResultsMeta(allRows.length, rows.length);
+      return;
+    }
+    rows.forEach((result, idx) => {
+      const status = String(result && result.status || '').toLowerCase();
+      const categories = Array.isArray(result && result.categories) ? result.categories : [];
+      let badge = '<span class="badge text-bg-secondary">Unknown</span>';
+      if (status === 'passed') badge = '<span class="badge text-bg-success">Passed</span>';
+      else if (status === 'failed') badge = '<span class="badge text-bg-danger">Failed</span>';
+      else if (status === 'skipped') badge = '<span class="badge text-bg-dark">Skipped</span>';
+      else if (status === 'incomplete') badge = '<span class="badge text-bg-secondary">Incomplete</span>';
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="text-muted">${idx + 1}</td>
+        <td>
+          <div><strong>${escapeHtml(result.item_name || '')}</strong></div>
+          <div class="small text-muted">ID: ${escapeHtml(result.item_id ?? '')}</div>
+        </td>
+        <td>${badge}</td>
+        <td class="small">${categories.length ? categories.map((category) => `<button type="button" class="btn btn-link btn-sm p-0 me-1 mb-1 text-decoration-none align-baseline vuln-batch-result-category" data-category="${escapeHtml(category)}">${_vulnBatchCategoryBadge(category)}</button>`).join('') : '<span class="text-muted">—</span>'}</td>
+        <td class="small">${escapeHtml(result.reason || '')}</td>
+        <td class="small">${result && result.log_download_url ? `<a class="btn btn-sm btn-outline-secondary" href="${escapeHtml(result.log_download_url)}">Download</a>` : '<span class="text-muted">—</span>'}</td>
+      `;
+      tr.querySelectorAll('.vuln-batch-result-category').forEach((button) => {
+        button.addEventListener('click', () => {
+          const category = button.getAttribute('data-category') || '';
+          _setVulnBatchCategoryFilter(category);
+          _renderVulnBatchResults(allRows);
+        });
+      });
+      body.appendChild(tr);
+    });
+    _renderVulnBatchResultsMeta(allRows.length, rows.length);
+  }
+
+  function _renderVulnBatchStatus(data) {
+    const payload = (data && typeof data === 'object') ? data : null;
+    const progress = payload && payload.progress ? payload.progress : {
+      total: 0,
+      completed: 0,
+      passed: 0,
+      failed: 0,
+      incomplete: 0,
+      skipped: 0,
+      pending: 0,
+    };
+    _setText('vulnBatchCountTotal', progress.total || 0);
+    _setText('vulnBatchCountCompleted', progress.completed || 0);
+    _setText('vulnBatchCountPassed', progress.passed || 0);
+    _setText('vulnBatchCountFailed', progress.failed || 0);
+    _setText('vulnBatchCountIncomplete', progress.incomplete || 0);
+    _setText('vulnBatchCountSkipped', progress.skipped || 0);
+    _setText('vulnBatchCountPending', progress.pending || 0);
+
+    const activeItem = payload && payload.active_item ? payload.active_item : null;
+    const activeChild = payload && payload.active_child ? payload.active_child : null;
+    _setText('vulnBatchActiveItem', activeItem ? `#${activeItem.id} ${activeItem.name || ''}` : 'Idle');
+    _setText('vulnBatchCatalogLabel', payload && payload.catalog ? (payload.catalog.label || payload.catalog.id || '—') : '—');
+    _renderVulnBatchCategoryCounts(payload && payload.category_counts ? payload.category_counts : null);
+
+    const metaEl = _qs('vulnBatchMeta');
+    if (metaEl) {
+      if (!payload) {
+        metaEl.textContent = 'No batch run active.';
+      } else {
+        const status = String(payload.status || '').trim() || 'idle';
+        const startedAt = payload.started_at ? ` • started ${payload.started_at}` : '';
+        const finishedAt = payload.finished_at ? ` • finished ${payload.finished_at}` : '';
+        const childStatus = activeChild && activeChild.status ? ` • child ${activeChild.status}` : '';
+        const childLast = activeChild && Array.isArray(activeChild.log_tail) && activeChild.log_tail.length
+          ? ` • ${String(activeChild.log_tail[activeChild.log_tail.length - 1] || '').slice(0, 180)}`
+          : '';
+        metaEl.textContent = `Run ${payload.run_id || '—'} • ${status}${childStatus}${startedAt}${finishedAt}${childLast}`;
+      }
+    }
+
+    const startBtn = _qs('vulnBatchStartBtn');
+    const stopBtn = _qs('vulnBatchStopBtn');
+    const exportJsonBtn = _qs('vulnBatchExportJsonBtn');
+    const exportMdBtn = _qs('vulnBatchExportMdBtn');
+    const copySummaryBtn = _qs('vulnBatchCopySummaryBtn');
+    const isActive = !!(payload && payload.run_id && !payload.done);
+    if (startBtn) startBtn.disabled = isActive;
+    if (stopBtn) stopBtn.style.display = isActive ? '' : 'none';
+    const hasRun = !!(payload && payload.run_id);
+    if (copySummaryBtn) copySummaryBtn.disabled = !hasRun;
+    if (exportJsonBtn) {
+      exportJsonBtn.classList.toggle('disabled', !hasRun);
+      exportJsonBtn.setAttribute('aria-disabled', hasRun ? 'false' : 'true');
+      exportJsonBtn.href = hasRun ? `/vuln_catalog_items/batch/export.json?run_id=${encodeURIComponent(payload.run_id)}` : '#';
+    }
+    if (exportMdBtn) {
+      exportMdBtn.classList.toggle('disabled', !hasRun);
+      exportMdBtn.setAttribute('aria-disabled', hasRun ? 'false' : 'true');
+      exportMdBtn.href = hasRun ? `/vuln_catalog_items/batch/export.md?run_id=${encodeURIComponent(payload.run_id)}` : '#';
+    }
+
+    _vulnCatalogState.activeBatchRunId = payload && payload.run_id ? String(payload.run_id) : null;
+    _vulnCatalogState.activeBatchItemId = activeItem && activeItem.id != null ? activeItem.id : null;
+    _vulnCatalogState.activeBatchDone = payload ? !!payload.done : true;
+    _vulnCatalogState.latestBatchPayload = payload;
+    _renderVulnBatchCategoryFilterOptions(payload && payload.category_counts ? payload.category_counts : null);
+    _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+
+    const logEl = _qs('vulnBatchLog');
+    if (logEl) {
+      const lines = payload && Array.isArray(payload.log_lines) ? payload.log_lines : [];
+      logEl.textContent = lines.join('\n');
+      try { logEl.scrollTop = logEl.scrollHeight; } catch (e) {}
+    }
+
+    if (payload && payload.run_id) {
+      _saveVulnBatchRunId(payload.run_id);
+    } else if (!isActive) {
+      _saveVulnBatchRunId('');
+    }
+    _renderVulnCatalogTable();
+  }
+
+  async function refreshVulnBatchStatus(runId) {
+    const targetRunId = String(runId || _vulnCatalogState.activeBatchRunId || _loadSavedVulnBatchRunId() || '').trim();
+    const url = targetRunId
+      ? `/vuln_catalog_items/batch/status?run_id=${encodeURIComponent(targetRunId)}`
+      : '/vuln_catalog_items/batch/status';
+    try {
+      const payload = await _fetchJson(url, { method: 'GET' });
+      _renderVulnBatchStatus(payload);
+      if (payload && payload.done !== true) {
+        _scheduleVulnBatchPoll(1500);
+      } else if (_vulnBatchPollTimer) {
+        clearTimeout(_vulnBatchPollTimer);
+        _vulnBatchPollTimer = null;
+      }
+    } catch (e) {
+      const msg = String(e || '');
+      if (msg.toLowerCase().includes('not found')) {
+        _renderVulnBatchStatus(null);
+      } else {
+        _setText('vulnBatchMeta', `Batch status error: ${msg}`);
+      }
+    }
+  }
+
+  async function startVulnBatch() {
+    if (_vulnCatalogState.activeBatchRunId && !_vulnCatalogState.activeBatchDone) {
+      return;
+    }
+    const creds = await promptVulnTestCreds();
+    if (!creds) return;
+    _vulnCatalogState.testCoreCfg = creds;
+    const payload = _collectVulnBatchFilters();
+    _setText('vulnBatchMeta', 'Starting batch run…');
+    const result = await _postJson('/vuln_catalog_items/batch/start', {
+      scope: payload.scope,
+      query: payload.query,
+      include_disabled: payload.include_disabled,
+      limit: payload.limit,
+      core: creds,
+    });
+    if (!result || result.ok !== true || !result.run_id) {
+      throw new Error((result && result.error) ? result.error : 'Failed to start batch run');
+    }
+    await refreshVulnBatchStatus(result.run_id);
+  }
+
+  async function stopVulnBatch() {
+    const runId = String(_vulnCatalogState.activeBatchRunId || _loadSavedVulnBatchRunId() || '').trim();
+    if (!runId) return;
+    await _postJson('/vuln_catalog_items/batch/stop', { run_id: runId });
+    await refreshVulnBatchStatus(runId);
   }
 
   function openVulnTestModal(item) {
@@ -1148,6 +1745,14 @@
 
     const filter = _qs('vulnCatalogFilter');
     if (filter) filter.addEventListener('input', _renderVulnCatalogTable);
+    const batchFilter = _qs('vulnBatchFilter');
+    if (batchFilter) batchFilter.addEventListener('input', renderVulnBatchSelectionPreview);
+    const batchScope = _qs('vulnBatchScope');
+    if (batchScope) batchScope.addEventListener('change', renderVulnBatchSelectionPreview);
+    const batchLimit = _qs('vulnBatchLimit');
+    if (batchLimit) batchLimit.addEventListener('input', renderVulnBatchSelectionPreview);
+    const batchIncludeDisabled = _qs('vulnBatchIncludeDisabled');
+    if (batchIncludeDisabled) batchIncludeDisabled.addEventListener('change', renderVulnBatchSelectionPreview);
 
     // Mirror Flag-Generators: click header to sort + arrows
     enableTableSorting('vulnCatalogTable', _vulnCatalogState, [
@@ -1161,6 +1766,11 @@
     if (tab) tab.addEventListener('shown.bs.tab', async () => {
       try { await loadVulnCatalogItems(); } catch (e) { _setText('vulnCatalogMeta', String(e)); }
     });
+    const batchTab = _qs('vulnBatchTab');
+    if (batchTab) batchTab.addEventListener('shown.bs.tab', async () => {
+      try { await loadVulnCatalogItems(); } catch (e) { _setText('vulnBatchMeta', String(e)); }
+      try { await refreshVulnBatchStatus(); } catch (e) {}
+    });
     const runBtn = _qs('vulnTestRunBtn');
     if (runBtn) runBtn.addEventListener('click', async () => {
       const creds = await promptVulnTestCreds();
@@ -1172,6 +1782,63 @@
     if (stopOkBtn) stopOkBtn.addEventListener('click', () => stopVulnTest(true));
     const stopFailBtn = _qs('vulnTestStopFailBtn');
     if (stopFailBtn) stopFailBtn.addEventListener('click', () => stopVulnTest(false));
+    const batchStartBtn = _qs('vulnBatchStartBtn');
+    if (batchStartBtn) batchStartBtn.addEventListener('click', async () => {
+      try {
+        await loadVulnCatalogItems();
+        await startVulnBatch();
+      } catch (e) {
+        _setText('vulnBatchMeta', `Batch start failed: ${String(e)}`);
+      }
+    });
+    const batchStopBtn = _qs('vulnBatchStopBtn');
+    if (batchStopBtn) batchStopBtn.addEventListener('click', async () => {
+      try {
+        await stopVulnBatch();
+      } catch (e) {
+        _setText('vulnBatchMeta', `Batch stop failed: ${String(e)}`);
+      }
+    });
+    const batchCategoryFilter = _qs('vulnBatchResultsCategoryFilter');
+    if (batchCategoryFilter) batchCategoryFilter.addEventListener('change', () => {
+      const payload = _vulnCatalogState.latestBatchPayload;
+      _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+    });
+    const batchStatusFilter = _qs('vulnBatchResultsStatusFilter');
+    if (batchStatusFilter) batchStatusFilter.addEventListener('change', () => {
+      const payload = _vulnCatalogState.latestBatchPayload;
+      _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+    });
+    const batchSortKey = _qs('vulnBatchResultsSortKey');
+    if (batchSortKey) batchSortKey.addEventListener('change', () => {
+      _vulnCatalogState.batchResultsSortKey = String(batchSortKey.value || 'item_id');
+      const payload = _vulnCatalogState.latestBatchPayload;
+      _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+    });
+    const batchSortDirBtn = _qs('vulnBatchResultsSortDirBtn');
+    if (batchSortDirBtn) batchSortDirBtn.addEventListener('click', () => {
+      _vulnCatalogState.batchResultsSortDir = _selectedVulnBatchSortDir() === 'asc' ? 'desc' : 'asc';
+      batchSortDirBtn.textContent = _selectedVulnBatchSortDir() === 'asc' ? 'Asc' : 'Desc';
+      const payload = _vulnCatalogState.latestBatchPayload;
+      _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+    });
+    const batchClearFiltersBtn = _qs('vulnBatchResultsClearFiltersBtn');
+    if (batchClearFiltersBtn) batchClearFiltersBtn.addEventListener('click', () => {
+      _resetVulnBatchResultsFilters();
+      const payload = _vulnCatalogState.latestBatchPayload;
+      _renderVulnBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+    });
+    const batchCopySummaryBtn = _qs('vulnBatchCopySummaryBtn');
+    if (batchCopySummaryBtn) batchCopySummaryBtn.addEventListener('click', async () => {
+      try {
+        await _copyVulnBatchSummary();
+        _setText('vulnBatchMeta', 'Batch summary copied to clipboard.');
+      } catch (e) {
+        _setText('vulnBatchMeta', `Copy summary failed: ${String(e)}`);
+      }
+    });
+    renderVulnBatchSelectionPreview();
+    refreshVulnBatchStatus().catch(() => {});
 
     // Intentionally do not auto-stop on dialog close.
     // Container/session remain active until explicit Stop is pressed.

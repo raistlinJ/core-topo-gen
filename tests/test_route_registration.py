@@ -26,6 +26,7 @@ from webapp.routes import diagnostics_health
 from webapp.routes import docker_routes
 from webapp.routes import editor_snapshot
 from webapp.routes import flag_compose
+from webapp.routes import flag_catalog_batch
 from webapp.routes import flag_catalog_pages
 from webapp.routes import generator_catalog_data
 from webapp.routes import generator_catalog_mutations
@@ -66,6 +67,7 @@ from webapp.routes import vuln_catalog_api
 from webapp.routes import vuln_catalog_overview
 from webapp.routes import vuln_catalog_pack_ingest
 from webapp.routes import vuln_catalog_pack_files
+from webapp.routes import vuln_catalog_batch
 from webapp.routes import vuln_catalog_test_control
 from webapp.routes import vuln_catalog_test_start
 from webapp.routes import vuln_compose
@@ -1290,12 +1292,24 @@ def test_generator_builder_routes_register_is_idempotent():
     generator_builder_routes.register(
         app,
         require_builder_or_admin=lambda: None,
+        runs={},
+        outputs_dir=lambda: '/tmp/outputs',
         flag_generators_from_enabled_sources=lambda: ([], []),
         flag_node_generators_from_enabled_sources=lambda: ([], []),
         reserved_artifacts={},
         load_custom_artifacts=lambda: {},
         upsert_custom_artifact=lambda *args, **kwargs: {'artifact': 'demo'},
         build_generator_scaffold=lambda payload: ({'demo/manifest.yaml': 'x'}, 'manifest', 'demo'),
+        install_generator_pack_or_bundle=lambda *args, **kwargs: (True, 'ok'),
+        run_remote_builder_test=lambda *args, **kwargs: {'ok': True, 'returncode': 0, 'stdout': '', 'stderr': '', 'files': []},
+        start_remote_builder_test_process=lambda **kwargs: {},
+        sync_remote_flag_test_outputs=lambda meta: None,
+        purge_remote_flag_test_dir=lambda meta: None,
+        parse_flag_test_core_cfg_from_form=lambda form: None,
+        ensure_core_vm_idle_for_test=lambda core_cfg: None,
+        cleanup_remote_test_runtime=lambda meta: None,
+        write_sse_marker=lambda *args, **kwargs: None,
+        local_timestamp_safe=lambda: '20260322-000000',
         sanitize_id=lambda value: 'demo',
         io_module=__import__('io'),
         zipfile_module=__import__('zipfile'),
@@ -1303,12 +1317,24 @@ def test_generator_builder_routes_register_is_idempotent():
     generator_builder_routes.register(
         app,
         require_builder_or_admin=lambda: None,
+        runs={},
+        outputs_dir=lambda: '/tmp/outputs',
         flag_generators_from_enabled_sources=lambda: ([], []),
         flag_node_generators_from_enabled_sources=lambda: ([], []),
         reserved_artifacts={},
         load_custom_artifacts=lambda: {},
         upsert_custom_artifact=lambda *args, **kwargs: {'artifact': 'demo'},
         build_generator_scaffold=lambda payload: ({'demo/manifest.yaml': 'x'}, 'manifest', 'demo'),
+        install_generator_pack_or_bundle=lambda *args, **kwargs: (True, 'ok'),
+        run_remote_builder_test=lambda *args, **kwargs: {'ok': True, 'returncode': 0, 'stdout': '', 'stderr': '', 'files': []},
+        start_remote_builder_test_process=lambda **kwargs: {},
+        sync_remote_flag_test_outputs=lambda meta: None,
+        purge_remote_flag_test_dir=lambda meta: None,
+        parse_flag_test_core_cfg_from_form=lambda form: None,
+        ensure_core_vm_idle_for_test=lambda core_cfg: None,
+        cleanup_remote_test_runtime=lambda meta: None,
+        write_sse_marker=lambda *args, **kwargs: None,
+        local_timestamp_safe=lambda: '20260322-000000',
         sanitize_id=lambda value: 'demo',
         io_module=__import__('io'),
         zipfile_module=__import__('zipfile'),
@@ -1319,6 +1345,13 @@ def test_generator_builder_routes_register_is_idempotent():
     assert '/api/generators/artifacts_index' in rules
     assert '/api/generators/artifacts_index/custom' in rules
     assert '/api/generators/scaffold_meta' in rules
+    assert '/api/generators/ai_scaffold' in rules
+    assert '/api/generators/builder_test' in rules
+    assert '/api/generators/builder_test/run' in rules
+    assert '/api/generators/builder_test/outputs/<run_id>' in rules
+    assert '/api/generators/builder_test/download/<run_id>' in rules
+    assert '/api/generators/builder_test/cleanup/<run_id>' in rules
+    assert '/api/generators/install_generated' in rules
     assert '/api/generators/scaffold_zip' in rules
 
 
@@ -1556,6 +1589,46 @@ def test_vuln_catalog_test_control_register_is_idempotent():
     assert '/vuln_catalog_items/test/stop' in rules
     assert '/vuln_catalog_items/test/stop_active' in rules
     assert '/vuln_catalog_items/test/status' in rules
+
+
+def test_vuln_catalog_batch_register_is_idempotent():
+    app = Flask(__name__)
+
+    vuln_catalog_batch.register(
+        app,
+        backend_module=type('BackendModule', (), {})(),
+    )
+    vuln_catalog_batch.register(
+        app,
+        backend_module=type('BackendModule', (), {})(),
+    )
+
+    rules = {rule.rule for rule in app.url_map.iter_rules()}
+    assert '/vuln_catalog_items/batch/start' in rules
+    assert '/vuln_catalog_items/batch/status' in rules
+    assert '/vuln_catalog_items/batch/stop' in rules
+    assert '/vuln_catalog_items/batch/export.json' in rules
+    assert '/vuln_catalog_items/batch/export.md' in rules
+
+
+def test_flag_catalog_batch_register_is_idempotent():
+    app = Flask(__name__)
+
+    flag_catalog_batch.register(
+        app,
+        backend_module=type('BackendModule', (), {})(),
+    )
+    flag_catalog_batch.register(
+        app,
+        backend_module=type('BackendModule', (), {})(),
+    )
+
+    rules = {rule.rule for rule in app.url_map.iter_rules()}
+    assert '/flag_catalog_items/batch/start' in rules
+    assert '/flag_catalog_items/batch/status' in rules
+    assert '/flag_catalog_items/batch/stop' in rules
+    assert '/flag_catalog_items/batch/export.json' in rules
+    assert '/flag_catalog_items/batch/export.md' in rules
 
 
 def test_vuln_catalog_test_start_register_is_idempotent():

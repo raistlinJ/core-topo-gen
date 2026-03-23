@@ -38,6 +38,7 @@ def test_flag_catalog_page_groups_installed_ids_by_kind(monkeypatch):
     assert 'pack-1' in page
     assert 'flag-generator' in page
     assert 'flag-node-generator' in page
+    assert 'Batch Test' in page
 
 
 def test_data_sources_page_is_still_renderable(monkeypatch):

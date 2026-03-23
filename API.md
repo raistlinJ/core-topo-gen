@@ -316,7 +316,115 @@ What is still missing for a clean LLM integration:
 These endpoints power the **Generator-Builder** page in the Web UI.
 
 `GET /generator_builder`
-: HTML page that helps scaffold new generators.
+: HTML page for prompt-driven generator authoring with provider/model selection, scaffold file previews, local test execution, and direct README/docker-compose downloads.
+
+Intended workflow:
+- create a scaffold from an initial prompt
+- run a local builder test
+- refine the current scaffold with a follow-up prompt and the last test result as context
+- test again
+- add the current scaffold directly to the Flag Catalog when ready
+
+`POST /api/generators/ai_scaffold`
+: Prompt-driven authoring endpoint used by the Generator Builder page. It calls the selected AI provider, expects strict JSON scaffold output, normalizes that payload, and returns previewable scaffold files.
+
+This endpoint supports both:
+- initial scaffold creation
+- iterative refinement by passing the current scaffold/files and latest test result back into the prompt context
+
+Example request:
+
+```json
+{
+	"plugin_type": "flag-generator",
+	"source_id_hint": "ssh_creds_drop",
+	"name_hint": "SSH Credentials Drop",
+	"prompt": "Build a deterministic SSH credential generator with Knowledge(ip) as required input.",
+	"provider": "ollama",
+	"base_url": "http://127.0.0.1:11434",
+	"model": "qwen2.5:7b",
+	"api_key": "",
+	"enforce_ssl": true
+}
+```
+
+Response shape:
+- `ok`
+- `provider`, `base_url`, `model`
+- `assistant_json`: parsed JSON object returned by the model
+- `assistant_text`: raw assistant text used for parsing/debugging
+- `scaffold_request`: normalized request body compatible with `/api/generators/scaffold_meta` and `/api/generators/scaffold_zip`
+- `folder_path`, `manifest_yaml`, `scaffold_paths`, `files`
+
+Optional iterative request fields:
+- `current_scaffold_request`: the current normalized scaffold request
+- `current_files`: current scaffold files keyed by relative path
+- `last_test_result`: latest `/api/generators/builder_test` response payload (or a subset)
+
+`POST /api/generators/builder_test`
+: Runs a newly generated scaffold locally without first installing it as a generator pack.
+
+Request JSON:
+
+```json
+{
+	"scaffold_request": {
+		"plugin_type": "flag-node-generator",
+		"plugin_id": "demo_nodegen",
+		"folder_name": "py_demo_nodegen",
+		"name": "Demo NodeGen",
+		"description": "demo",
+		"requires": [],
+		"produces": ["Flag(flag_id)"],
+		"runtime_inputs": [
+			{"name": "seed", "type": "string", "required": true},
+			{"name": "node_name", "type": "string", "required": true}
+		],
+		"generator_py_text": "..."
+	},
+	"config": {
+		"seed": "demo-seed",
+		"node_name": "node1"
+	}
+}
+```
+
+Behavior:
+- Stages the scaffold into a temporary repo-like directory under `outputs/`
+- Runs `scripts/run_flag_generator.py` with `--repo-root <tempdir>`
+- Returns stdout/stderr and the produced output files as JSON
+
+Response fields:
+- `ok`, `returncode`
+- `plugin_id`, `plugin_type`, `folder_path`
+- `config`
+- `stdout`, `stderr`
+- `files`: generated files from the test output directory, including small text file contents when available
+
+`POST /api/generators/install_generated`
+: Installs the current scaffold directly into the installed Generator Packs catalog without requiring the user to manually download and re-upload a ZIP.
+
+Request JSON:
+
+```json
+{
+	"pack_label": "My Generated Pack",
+	"scaffold_request": {
+		"plugin_type": "flag-generator",
+		"plugin_id": "demo",
+		"folder_name": "py_demo",
+		"name": "My Generated Pack",
+		"description": "demo",
+		"requires": [],
+		"produces": ["Flag(flag_id)"]
+	}
+}
+```
+
+Response JSON:
+- `ok`
+- `message`
+- `pack_label`
 
 `POST /api/generators/scaffold_meta`
 : JSON request describing the generator you want. Returns `{ ok, manifest_yaml, scaffold_paths }`.
@@ -340,18 +448,25 @@ Example request:
 	],
 	"optional_requires": [],
 	"produces": ["Flag(flag_id)", "Credential(user)", "Credential(user, password)"],
-	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
+	"runtime_inputs": [
+		{"name": "seed", "type": "string", "required": true},
+		{"name": "secret", "type": "string", "required": true, "sensitive": true},
+		{"name": "flag_prefix", "type": "string", "required": false}
+	],
 	"hint_templates": ["Next: SSH using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}"],
 	"inject_files": ["File(path)"],
 	"compose_text": "(optional full docker-compose.yml override)",
-	"readme_text": "(optional full README.md override)"
+	"readme_text": "(optional full README.md override)",
+	"generator_py_text": "(optional full generator.py override)"
 }
 ```
 
 Notes:
-- `requires` must be a list of objects `{ artifact, optional }`; items with `optional: true` are written into `artifacts.optional_requires` in the manifest.
-- `inputs` is a boolean flag map for standard runtime fields (e.g., `seed`, `secret`, `node_name`, `flag_prefix`). The scaffold converts these into `manifest.yaml` inputs with required defaults (`seed`/`secret`/`node_name` required, `flag_prefix` optional).
+- `requires` accepts either a list of strings or a list of objects `{ artifact, optional }`; items with `optional: true` are written into `artifacts.optional_requires` in the manifest.
+- `runtime_inputs` is the preferred way to define manifest runtime inputs. The older `inputs` boolean flag map still works for standard fields such as `seed`, `secret`, `node_name`, and `flag_prefix`.
 - `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
+- `generator_py_text` lets callers override the default scaffolded `generator.py` body while still using the builder's manifest and ZIP conventions.
+- For `flag-node-generator`, the scaffold automatically ensures `File(path)` appears in `artifacts.produces` so the generated pack remains compatible with the node-generator runtime contract.
 - Optional destination directory syntax: `inject_files: ["File(path) -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
 
 `POST /api/generators/scaffold_zip`

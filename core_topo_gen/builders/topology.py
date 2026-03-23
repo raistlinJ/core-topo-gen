@@ -1328,6 +1328,8 @@ def _docker_node_add_node_kwargs(node_name: str, rec: Optional[Dict[str, str]]) 
         return {}
     compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
     compose_name = _docker_compose_service_for_record(compose_path, rec)
+    if not compose_name:
+        compose_name = n
 
     options_obj = SimpleNamespace()
     try:
@@ -1965,13 +1967,12 @@ def _apply_docker_compose_meta(node, rec, session=None):
                 if vname and not service_names:
                     try:
                         logger.warning(
-                            "[vuln-node] compose services unavailable node=%s requested=%s; omitting compose_name",
+                            "[vuln-node] compose services unavailable node=%s requested=%s; keeping requested compose_name",
                             n,
                             vname,
                         )
                     except Exception:
                         pass
-                    vname = None
                 if vname and service_names and vname not in service_names:
                     try:
                         logger.warning(
@@ -1991,6 +1992,8 @@ def _apply_docker_compose_meta(node, rec, session=None):
             vname = _first_compose_service_name(compose_path) or _first_compose_service_name(source_compose_hint or '')
         if vname and service_names and vname not in service_names:
             vname = None
+        if not vname:
+            vname = str(n or '').strip() or None
         try:
             logger.debug("[vuln-node] node=%s existing compose attr=%s", n, getattr(node, 'compose', None))
         except Exception:

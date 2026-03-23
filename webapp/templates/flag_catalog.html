@@ -4,20 +4,8 @@
 <div class="container-fluid">
   <div class="row">
     <div class="col-12">
-      <ul class="nav nav-tabs" id="flagTabs" role="tablist">
-        <li class="nav-item" role="presentation">
-          <button class="nav-link active" id="flagGenSourcesTab" data-bs-toggle="tab" data-bs-target="#flagGenSources" type="button" role="tab">Generator Packs</button>
-        </li>
-        <li class="nav-item" role="presentation">
-          <button class="nav-link" id="flagGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagGenerators" type="button" role="tab">Flag-Generators</button>
-        </li>
-        <li class="nav-item" role="presentation">
-          <button class="nav-link" id="flagNodeGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagNodeGenerators" type="button" role="tab">Flag-Node-Generators</button>
-        </li>
-        <li class="nav-item" role="presentation">
-          <a class="nav-link" id="flagGeneratorBuilderTab" href="{{ url_for('generator_builder_page') }}"><i class="bi bi-wrench-adjustable me-1"></i>Generator Builder</a>
-        </li>
-      </ul>
+      {% set active_generator_catalog_tab = 'packs' %}
+      {% include 'partials/generator_catalog_tabs.html' %}
 
       <div class="tab-content mt-3">
         <div class="tab-pane fade show active" id="flagGenSources" role="tabpanel">
@@ -191,6 +179,137 @@
             </div>
           </div>
         </div>
+
+        <div class="tab-pane fade" id="flagBatch" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-end">
+                <div class="col-md-3">
+                  <label class="form-label">Kind</label>
+                  <select id="flagBatchKind" class="form-select">
+                    <option value="flag-generator" selected>Flag-Generators</option>
+                    <option value="flag-node-generator">Flag-Node-Generators</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Filter</label>
+                  <input id="flagBatchFilter" class="form-control" placeholder="Name, id, or source…" />
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">Max Items</label>
+                  <input id="flagBatchLimit" class="form-control" type="number" min="1" max="500" placeholder="All" />
+                </div>
+                <div class="col-md-3 d-flex justify-content-md-end gap-2">
+                  <button class="btn btn-primary" type="button" id="flagBatchStartBtn">Start Batch</button>
+                  <button class="btn btn-outline-danger" type="button" id="flagBatchStopBtn" style="display:none;">Stop Batch</button>
+                </div>
+                <div class="col-12 d-flex flex-wrap gap-2 justify-content-md-end">
+                  <button class="btn btn-sm btn-outline-secondary" type="button" id="flagBatchCopySummaryBtn">Copy Summary</button>
+                  <a class="btn btn-sm btn-outline-secondary disabled" href="#" id="flagBatchExportJsonBtn" aria-disabled="true">Export JSON</a>
+                  <a class="btn btn-sm btn-outline-secondary disabled" href="#" id="flagBatchExportMdBtn" aria-disabled="true">Export Markdown</a>
+                </div>
+                <div class="col-12 d-flex flex-wrap gap-3 align-items-center small text-muted">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="flagBatchIncludeDisabled">
+                    <label class="form-check-label" for="flagBatchIncludeDisabled">Include disabled items</label>
+                  </div>
+                  <div id="flagBatchSelectionPreview">Selection preview will appear after the generator list loads.</div>
+                </div>
+                <div class="col-12 small text-muted" id="flagBatchMeta">No batch run active.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row g-3">
+            <div class="col-lg-4">
+              <div class="card h-100">
+                <div class="card-body">
+                  <h6 class="mb-3">Progress</h6>
+                  <div class="small mb-2">Queued: <strong id="flagBatchCountTotal">0</strong></div>
+                  <div class="small mb-2">Completed: <strong id="flagBatchCountCompleted">0</strong></div>
+                  <div class="small mb-2 text-success">Passed: <strong id="flagBatchCountPassed">0</strong></div>
+                  <div class="small mb-2 text-danger">Failed: <strong id="flagBatchCountFailed">0</strong></div>
+                  <div class="small mb-2 text-secondary">Incomplete: <strong id="flagBatchCountIncomplete">0</strong></div>
+                  <div class="small mb-2 text-muted">Skipped: <strong id="flagBatchCountSkipped">0</strong></div>
+                  <div class="small mb-3">Pending: <strong id="flagBatchCountPending">0</strong></div>
+                  <hr>
+                  <div class="small text-muted mb-1">Active Item</div>
+                  <div id="flagBatchActiveItem" class="small">Idle</div>
+                  <div class="small text-muted mt-3 mb-1">Kind</div>
+                  <div id="flagBatchKindLabel" class="small">—</div>
+                  <div class="small text-muted mt-3 mb-1">Category Counts</div>
+                  <div id="flagBatchCategoryCounts" class="small text-muted">—</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-lg-8">
+              <div class="card h-100">
+                <div class="card-body">
+                  <div class="d-flex align-items-center justify-content-between mb-2">
+                    <h6 class="mb-0">Results</h6>
+                    <div class="small text-muted">Batch mode skips generators that require manual inputs.</div>
+                  </div>
+                  <div class="row g-2 align-items-end mb-2">
+                    <div class="col-md-5">
+                      <label class="form-label small text-muted mb-1">Filter Results By Category</label>
+                      <select id="flagBatchResultsCategoryFilter" class="form-select form-select-sm">
+                        <option value="">All categories</option>
+                      </select>
+                    </div>
+                    <div class="col-md-3">
+                      <label class="form-label small text-muted mb-1">Filter Results By Status</label>
+                      <select id="flagBatchResultsStatusFilter" class="form-select form-select-sm">
+                        <option value="">All statuses</option>
+                        <option value="passed">Passed</option>
+                        <option value="failed">Failed</option>
+                        <option value="incomplete">Incomplete</option>
+                        <option value="skipped">Skipped</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label small text-muted mb-1">Sort Results</label>
+                      <select id="flagBatchResultsSortKey" class="form-select form-select-sm">
+                        <option value="item_name">Item</option>
+                        <option value="status">Status</option>
+                        <option value="category_count">Category Count</option>
+                      </select>
+                    </div>
+                    <div class="col-md-2 d-flex gap-2 align-items-end">
+                      <button class="btn btn-sm btn-outline-secondary w-100" type="button" id="flagBatchResultsSortDirBtn">Asc</button>
+                      <button class="btn btn-sm btn-outline-secondary w-100" type="button" id="flagBatchResultsClearFiltersBtn">Clear</button>
+                    </div>
+                    <div class="col-md-12 small text-muted" id="flagBatchResultsMeta">All batch results are shown.</div>
+                  </div>
+                  <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                      <thead>
+                        <tr>
+                          <th style="width: 70px;">#</th>
+                          <th>Item</th>
+                          <th style="width: 130px;">Status</th>
+                          <th style="width: 220px;">Categories</th>
+                          <th>Reason</th>
+                          <th style="width: 120px;">Log</th>
+                        </tr>
+                      </thead>
+                      <tbody id="flagBatchResultsBody">
+                        <tr><td colspan="6" class="text-muted">No batch results yet.</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card mt-3">
+            <div class="card-body">
+              <div class="small text-muted mb-1">Batch Log</div>
+              <pre class="small bg-light p-2 mb-0" id="flagBatchLog" style="max-height: 260px; overflow: auto;"></pre>
+            </div>
+          </div>
+        </div>
       </div>
 
     </div>
@@ -359,6 +478,16 @@
     stageLabel: '',
     lastStageLabel: '',
   };
+
+  const flagBatchState = {
+    activeRunId: null,
+    activeDone: true,
+    latestPayload: null,
+    resultsSortKey: 'item_name',
+    resultsSortDir: 'asc',
+  };
+
+  let flagBatchPollTimer = null;
 
   let pendingCleanupRunId = null;
   let pendingCleanupTestBase = null;
@@ -1824,6 +1953,500 @@
     if (logPreId) appendPreLine(logPreId, `[ok] ${resp && resp.message ? resp.message : 'Updated.'}`);
   }
 
+  function flagBatchEl(id) {
+    return document.getElementById(id);
+  }
+
+  function selectedFlagBatchKind() {
+    const el = flagBatchEl('flagBatchKind');
+    const value = String((el && el.value) || 'flag-generator').trim().toLowerCase();
+    return value === 'flag-node-generator' ? 'flag-node-generator' : 'flag-generator';
+  }
+
+  function selectedFlagBatchStatusFilter() {
+    const el = flagBatchEl('flagBatchResultsStatusFilter');
+    return String((el && el.value) || '').trim().toLowerCase();
+  }
+
+  function selectedFlagBatchCategoryFilter() {
+    const el = flagBatchEl('flagBatchResultsCategoryFilter');
+    return String((el && el.value) || '').trim();
+  }
+
+  function selectedFlagBatchSortKey() {
+    return String(flagBatchState.resultsSortKey || 'item_name').trim();
+  }
+
+  function selectedFlagBatchSortDir() {
+    const value = String(flagBatchState.resultsSortDir || 'asc').trim().toLowerCase();
+    return value === 'desc' ? 'desc' : 'asc';
+  }
+
+  async function ensureFlagBatchCatalogLoaded(kind) {
+    const selectedKind = String(kind || selectedFlagBatchKind()).trim().toLowerCase();
+    if (selectedKind === 'flag-node-generator') {
+      if (!(Array.isArray(nodeGenState.generators) && nodeGenState.generators.length)) {
+        await loadNodeGenerators();
+      }
+      return;
+    }
+    if (!(Array.isArray(genState.generators) && genState.generators.length)) {
+      await loadGenerators();
+    }
+  }
+
+  function currentFlagBatchItems() {
+    return selectedFlagBatchKind() === 'flag-node-generator'
+      ? (Array.isArray(nodeGenState.generators) ? nodeGenState.generators : [])
+      : (Array.isArray(genState.generators) ? genState.generators : []);
+  }
+
+  function flagBatchInputNeedsManual(inp) {
+    if (!inp || typeof inp !== 'object') return false;
+    const hasDefault = Object.prototype.hasOwnProperty.call(inp, 'default') && inp.default !== null && inp.default !== '';
+    const required = inp.required === true;
+    const type = String(inp.type || '').trim().toLowerCase();
+    if (isFileInputType(type)) {
+      return required || hasDefault;
+    }
+    return required && !hasDefault;
+  }
+
+  function flagBatchItemEligibility(item) {
+    const inputs = Array.isArray(item && item.inputs) ? item.inputs : [];
+    const manualInputs = inputs
+      .filter((inp) => flagBatchInputNeedsManual(inp))
+      .map((inp) => String((inp && inp.name) || '').trim())
+      .filter(Boolean);
+    return {
+      eligible: manualInputs.length === 0,
+      manualInputs,
+    };
+  }
+
+  function collectFlagBatchFilters() {
+    const query = String((flagBatchEl('flagBatchFilter') && flagBatchEl('flagBatchFilter').value) || '').trim();
+    const includeDisabled = !!(flagBatchEl('flagBatchIncludeDisabled') && flagBatchEl('flagBatchIncludeDisabled').checked);
+    let limit = null;
+    try {
+      const raw = String((flagBatchEl('flagBatchLimit') && flagBatchEl('flagBatchLimit').value) || '').trim();
+      if (raw) {
+        limit = Math.max(1, Math.min(parseInt(raw, 10) || 0, 500));
+        if (!limit) limit = null;
+      }
+    } catch (e) {
+      limit = null;
+    }
+    return {
+      kind: selectedFlagBatchKind(),
+      query,
+      include_disabled: includeDisabled,
+      limit,
+    };
+  }
+
+  function renderFlagBatchSelectionPreview() {
+    const previewEl = flagBatchEl('flagBatchSelectionPreview');
+    if (!previewEl) return;
+    const items = currentFlagBatchItems();
+    if (!items.length) {
+      previewEl.textContent = 'Selection preview will appear after the generator list loads.';
+      return;
+    }
+    const filters = collectFlagBatchFilters();
+    let selected = items.filter((item) => {
+      if (!filters.include_disabled && item && item._disabled) return false;
+      if (!filters.query) return true;
+      const needle = filters.query.toLowerCase();
+      return [item.id, item.name, item.from_source, item._source_path].some((value) => String(value || '').toLowerCase().includes(needle));
+    });
+    if (filters.limit != null) {
+      selected = selected.slice(0, filters.limit);
+    }
+    let eligible = 0;
+    let manual = 0;
+    selected.forEach((item) => {
+      const info = flagBatchItemEligibility(item);
+      if (info.eligible) eligible += 1;
+      else manual += 1;
+    });
+    const kindLabel = filters.kind === 'flag-node-generator' ? 'node-generator' : 'generator';
+    previewEl.textContent = `${selected.length} ${kindLabel}(s) currently match. ${eligible} batch-eligible, ${manual} require manual inputs.${filters.include_disabled ? ' Disabled items included.' : ''}`;
+  }
+
+  function flagBatchCategoryBadge(category) {
+    const key = String(category || '').trim();
+    if (!key) return '';
+    const label = key.replace(/_/g, ' ');
+    return `<span class="badge rounded-pill text-bg-light border me-1 mb-1">${escapeHtml(label)}</span>`;
+  }
+
+  function normalizeFlagBatchResults(rows) {
+    return Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : [];
+  }
+
+  function filteredFlagBatchResults(rows) {
+    const selectedCategory = selectedFlagBatchCategoryFilter();
+    const selectedStatus = selectedFlagBatchStatusFilter();
+    const normalized = normalizeFlagBatchResults(rows);
+    return normalized.filter((result) => {
+      const status = String(result && result.status || '').trim().toLowerCase();
+      const categories = Array.isArray(result && result.categories) ? result.categories : [];
+      const categoryMatch = !selectedCategory || categories.some((category) => String(category || '').trim() === selectedCategory);
+      const statusMatch = !selectedStatus || status === selectedStatus;
+      return categoryMatch && statusMatch;
+    });
+  }
+
+  function sortedFlagBatchResults(rows) {
+    const normalized = normalizeFlagBatchResults(rows);
+    const key = selectedFlagBatchSortKey();
+    const dir = selectedFlagBatchSortDir() === 'desc' ? -1 : 1;
+    const decorated = normalized.map((result, index) => ({ result, index }));
+    const statusRank = { failed: 0, incomplete: 1, skipped: 2, passed: 3 };
+    decorated.sort((left, right) => {
+      const a = left.result || {};
+      const b = right.result || {};
+      let cmp = 0;
+      if (key === 'status') {
+        cmp = (statusRank[String(a.status || '').toLowerCase()] ?? 99) - (statusRank[String(b.status || '').toLowerCase()] ?? 99);
+      } else if (key === 'category_count') {
+        cmp = (Array.isArray(a.categories) ? a.categories.length : 0) - (Array.isArray(b.categories) ? b.categories.length : 0);
+      } else {
+        cmp = compareForSort(a.item_name || a.item_id || '', b.item_name || b.item_id || '');
+      }
+      if (cmp !== 0) return cmp * dir;
+      return left.index - right.index;
+    });
+    return decorated.map((entry) => entry.result);
+  }
+
+  function resetFlagBatchResultsFilters() {
+    const categoryEl = flagBatchEl('flagBatchResultsCategoryFilter');
+    const statusEl = flagBatchEl('flagBatchResultsStatusFilter');
+    const sortKeyEl = flagBatchEl('flagBatchResultsSortKey');
+    if (categoryEl) categoryEl.value = '';
+    if (statusEl) statusEl.value = '';
+    flagBatchState.resultsSortKey = 'item_name';
+    flagBatchState.resultsSortDir = 'asc';
+    if (sortKeyEl) sortKeyEl.value = 'item_name';
+    const sortDirBtn = flagBatchEl('flagBatchResultsSortDirBtn');
+    if (sortDirBtn) sortDirBtn.textContent = 'Asc';
+  }
+
+  function renderFlagBatchCategoryFilterOptions(counts) {
+    const el = flagBatchEl('flagBatchResultsCategoryFilter');
+    if (!el) return;
+    const current = String(el.value || '').trim();
+    const entries = (counts && typeof counts === 'object') ? Object.entries(counts) : [];
+    el.innerHTML = '<option value="">All categories</option>';
+    entries.forEach(([key, value]) => {
+      const opt = document.createElement('option');
+      opt.value = String(key || '');
+      opt.textContent = `${String(key || '').replace(/_/g, ' ')} (${value})`;
+      el.appendChild(opt);
+    });
+    if (current && entries.some(([key]) => key === current)) {
+      el.value = current;
+    } else {
+      el.value = '';
+    }
+  }
+
+  function renderFlagBatchResultsMeta(totalCount, shownCount) {
+    const el = flagBatchEl('flagBatchResultsMeta');
+    if (!el) return;
+    if (!totalCount) {
+      el.textContent = 'All batch results are shown.';
+      return;
+    }
+    const selectedCategory = selectedFlagBatchCategoryFilter();
+    const selectedStatus = selectedFlagBatchStatusFilter();
+    const selectedSort = selectedFlagBatchSortKey();
+    const selectedDir = selectedFlagBatchSortDir();
+    if (!selectedCategory && !selectedStatus) {
+      el.textContent = `Showing all ${shownCount} result(s), sorted by ${selectedSort.replace(/_/g, ' ')} ${selectedDir}.`;
+      return;
+    }
+    const parts = [];
+    if (selectedCategory) parts.push(`category ${selectedCategory.replace(/_/g, ' ')}`);
+    if (selectedStatus) parts.push(`status ${selectedStatus}`);
+    el.textContent = `Showing ${shownCount} of ${totalCount} result(s) for ${parts.join(' and ')}, sorted by ${selectedSort.replace(/_/g, ' ')} ${selectedDir}.`;
+  }
+
+  function renderFlagBatchCategoryCounts(counts) {
+    const el = flagBatchEl('flagBatchCategoryCounts');
+    if (!el) return;
+    const entries = (counts && typeof counts === 'object') ? Object.entries(counts) : [];
+    if (!entries.length) {
+      el.innerHTML = '<span class="text-muted">—</span>';
+      return;
+    }
+    el.innerHTML = entries.map(([key, value]) => `<button type="button" class="btn btn-link btn-sm p-0 me-2 mb-1 text-decoration-none align-baseline flag-batch-category-chip" data-category="${escapeHtml(key)}">${flagBatchCategoryBadge(key)} <span class="ms-1">${escapeHtml(value)}</span></button>`).join(' ');
+    el.querySelectorAll('.flag-batch-category-chip').forEach((button) => {
+      button.addEventListener('click', () => {
+        const category = button.getAttribute('data-category') || '';
+        const filterEl = flagBatchEl('flagBatchResultsCategoryFilter');
+        if (filterEl) filterEl.value = category;
+        renderFlagBatchResults(flagBatchState.latestPayload && Array.isArray(flagBatchState.latestPayload.results) ? flagBatchState.latestPayload.results : []);
+      });
+    });
+  }
+
+  function renderFlagBatchResults(results) {
+    const body = flagBatchEl('flagBatchResultsBody');
+    if (!body) return;
+    const allRows = normalizeFlagBatchResults(results);
+    const rows = sortedFlagBatchResults(filteredFlagBatchResults(allRows));
+    body.innerHTML = '';
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="6" class="text-muted">No batch results yet.</td></tr>';
+      renderFlagBatchResultsMeta(allRows.length, rows.length);
+      return;
+    }
+    rows.forEach((result, idx) => {
+      const status = String(result && result.status || '').toLowerCase();
+      const categories = Array.isArray(result && result.categories) ? result.categories : [];
+      let badge = '<span class="badge text-bg-secondary">Unknown</span>';
+      if (status === 'passed') badge = '<span class="badge text-bg-success">Passed</span>';
+      else if (status === 'failed') badge = '<span class="badge text-bg-danger">Failed</span>';
+      else if (status === 'skipped') badge = '<span class="badge text-bg-dark">Skipped</span>';
+      else if (status === 'incomplete') badge = '<span class="badge text-bg-secondary">Incomplete</span>';
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="text-muted">${idx + 1}</td>
+        <td>
+          <div><strong>${escapeHtml(result.item_name || result.item_id || '')}</strong></div>
+          <div class="small text-muted">ID: ${escapeHtml(result.item_id || '')}</div>
+        </td>
+        <td>${badge}</td>
+        <td class="small">${categories.length ? categories.map((category) => `<button type="button" class="btn btn-link btn-sm p-0 me-1 mb-1 text-decoration-none align-baseline flag-batch-result-category" data-category="${escapeHtml(category)}">${flagBatchCategoryBadge(category)}</button>`).join('') : '<span class="text-muted">—</span>'}</td>
+        <td class="small">${escapeHtml(result.reason || '')}</td>
+        <td class="small">${result && result.log_download_url ? `<a class="btn btn-sm btn-outline-secondary" href="${escapeHtml(result.log_download_url)}">Download</a>` : '<span class="text-muted">—</span>'}</td>
+      `;
+      tr.querySelectorAll('.flag-batch-result-category').forEach((button) => {
+        button.addEventListener('click', () => {
+          const category = button.getAttribute('data-category') || '';
+          const filterEl = flagBatchEl('flagBatchResultsCategoryFilter');
+          if (filterEl) filterEl.value = category;
+          renderFlagBatchResults(allRows);
+        });
+      });
+      body.appendChild(tr);
+    });
+    renderFlagBatchResultsMeta(allRows.length, rows.length);
+  }
+
+  function flagBatchSummaryText(payload) {
+    const data = payload && typeof payload === 'object' ? payload : null;
+    if (!data) return 'No batch run active.';
+    const progress = data.progress || {};
+    const selection = data.selection || {};
+    const lines = [
+      `Run ID: ${data.run_id || '—'}`,
+      `Status: ${data.status || '—'}`,
+      `Kind: ${selection.kind_label || selection.kind || '—'}`,
+      `Started: ${data.started_at || '—'}`,
+      `Finished: ${data.finished_at || '—'}`,
+      `Progress: total=${progress.total || 0}, completed=${progress.completed || 0}, passed=${progress.passed || 0}, failed=${progress.failed || 0}, incomplete=${progress.incomplete || 0}, skipped=${progress.skipped || 0}, pending=${progress.pending || 0}`,
+    ];
+    const categoryCounts = data.category_counts && typeof data.category_counts === 'object' ? Object.entries(data.category_counts) : [];
+    if (categoryCounts.length) {
+      lines.push(`Categories: ${categoryCounts.map(([key, value]) => `${key}=${value}`).join(', ')}`);
+    }
+    const failures = normalizeFlagBatchResults(data.results).filter((result) => {
+      const status = String(result.status || '').toLowerCase();
+      return status === 'failed' || status === 'incomplete' || status === 'skipped';
+    }).slice(0, 10);
+    if (failures.length) {
+      lines.push('Top issues:');
+      failures.forEach((result) => {
+        const categories = Array.isArray(result.categories) ? result.categories.join(', ') : '';
+        lines.push(`- ${result.item_name || result.item_id || ''} [${result.status || 'unknown'}]${categories ? ` (${categories})` : ''}: ${result.reason || ''}`);
+      });
+    }
+    return lines.join('\n');
+  }
+
+  async function copyFlagBatchSummary() {
+    const text = flagBatchSummaryText(flagBatchState.latestPayload);
+    if (!text) return;
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.setAttribute('readonly', 'readonly');
+    helper.style.position = 'absolute';
+    helper.style.left = '-9999px';
+    document.body.appendChild(helper);
+    helper.select();
+    document.execCommand('copy');
+    document.body.removeChild(helper);
+  }
+
+  function scheduleFlagBatchPoll(delayMs) {
+    if (flagBatchPollTimer) {
+      clearTimeout(flagBatchPollTimer);
+      flagBatchPollTimer = null;
+    }
+    flagBatchPollTimer = window.setTimeout(() => {
+      refreshFlagBatchStatus().catch(() => {});
+    }, Math.max(250, Number(delayMs || 1500)));
+  }
+
+  function renderFlagBatchStatus(data) {
+    const payload = (data && typeof data === 'object') ? data : null;
+    const progress = payload && payload.progress ? payload.progress : {
+      total: 0,
+      completed: 0,
+      passed: 0,
+      failed: 0,
+      incomplete: 0,
+      skipped: 0,
+      pending: 0,
+    };
+    const setCount = (id, value) => {
+      const el = flagBatchEl(id);
+      if (el) el.textContent = String(value || 0);
+    };
+    setCount('flagBatchCountTotal', progress.total || 0);
+    setCount('flagBatchCountCompleted', progress.completed || 0);
+    setCount('flagBatchCountPassed', progress.passed || 0);
+    setCount('flagBatchCountFailed', progress.failed || 0);
+    setCount('flagBatchCountIncomplete', progress.incomplete || 0);
+    setCount('flagBatchCountSkipped', progress.skipped || 0);
+    setCount('flagBatchCountPending', progress.pending || 0);
+
+    const activeItem = payload && payload.active_item ? payload.active_item : null;
+    const activeChild = payload && payload.active_child ? payload.active_child : null;
+    const activeItemEl = flagBatchEl('flagBatchActiveItem');
+    if (activeItemEl) activeItemEl.textContent = activeItem ? `${activeItem.id || ''} ${activeItem.name || ''}`.trim() : 'Idle';
+    const kindLabelEl = flagBatchEl('flagBatchKindLabel');
+    if (kindLabelEl) kindLabelEl.textContent = payload && payload.selection ? (payload.selection.kind_label || payload.selection.kind || '—') : '—';
+    renderFlagBatchCategoryCounts(payload && payload.category_counts ? payload.category_counts : null);
+
+    const metaEl = flagBatchEl('flagBatchMeta');
+    if (metaEl) {
+      if (!payload) {
+        metaEl.textContent = 'No batch run active.';
+      } else {
+        const status = String(payload.status || '').trim() || 'idle';
+        const startedAt = payload.started_at ? ` • started ${payload.started_at}` : '';
+        const finishedAt = payload.finished_at ? ` • finished ${payload.finished_at}` : '';
+        const childStatus = activeChild && activeChild.status ? ` • child ${activeChild.status}` : '';
+        const childLast = activeChild && Array.isArray(activeChild.log_tail) && activeChild.log_tail.length
+          ? ` • ${String(activeChild.log_tail[activeChild.log_tail.length - 1] || '').slice(0, 180)}`
+          : '';
+        metaEl.textContent = `Run ${payload.run_id || '—'} • ${status}${childStatus}${startedAt}${finishedAt}${childLast}`;
+      }
+    }
+
+    const startBtn = flagBatchEl('flagBatchStartBtn');
+    const stopBtn = flagBatchEl('flagBatchStopBtn');
+    const exportJsonBtn = flagBatchEl('flagBatchExportJsonBtn');
+    const exportMdBtn = flagBatchEl('flagBatchExportMdBtn');
+    const copySummaryBtn = flagBatchEl('flagBatchCopySummaryBtn');
+    const isActive = !!(payload && payload.run_id && !payload.done);
+    if (startBtn) startBtn.disabled = isActive;
+    if (stopBtn) stopBtn.style.display = isActive ? '' : 'none';
+    const hasRun = !!(payload && payload.run_id);
+    if (copySummaryBtn) copySummaryBtn.disabled = !hasRun;
+    if (exportJsonBtn) {
+      exportJsonBtn.classList.toggle('disabled', !hasRun);
+      exportJsonBtn.setAttribute('aria-disabled', hasRun ? 'false' : 'true');
+      exportJsonBtn.href = hasRun ? `/flag_catalog_items/batch/export.json?run_id=${encodeURIComponent(payload.run_id)}` : '#';
+    }
+    if (exportMdBtn) {
+      exportMdBtn.classList.toggle('disabled', !hasRun);
+      exportMdBtn.setAttribute('aria-disabled', hasRun ? 'false' : 'true');
+      exportMdBtn.href = hasRun ? `/flag_catalog_items/batch/export.md?run_id=${encodeURIComponent(payload.run_id)}` : '#';
+    }
+
+    flagBatchState.activeRunId = payload && payload.run_id ? String(payload.run_id) : null;
+    flagBatchState.activeDone = payload ? !!payload.done : true;
+    flagBatchState.latestPayload = payload;
+    renderFlagBatchCategoryFilterOptions(payload && payload.category_counts ? payload.category_counts : null);
+    renderFlagBatchResults(payload && Array.isArray(payload.results) ? payload.results : []);
+
+    const logEl = flagBatchEl('flagBatchLog');
+    if (logEl) {
+      const lines = payload && Array.isArray(payload.log_lines) ? payload.log_lines : [];
+      logEl.textContent = lines.join('\n');
+      try { logEl.scrollTop = logEl.scrollHeight; } catch (e) {}
+    }
+  }
+
+  async function refreshFlagBatchStatus(runId) {
+    const targetRunId = String(runId || flagBatchState.activeRunId || '').trim();
+    const url = targetRunId
+      ? `/flag_catalog_items/batch/status?run_id=${encodeURIComponent(targetRunId)}`
+      : '/flag_catalog_items/batch/status';
+    const payload = await fetchJson(url, { method: 'GET' });
+    if (!payload || payload.ok === false) {
+      const msg = String((payload && payload.error) || '');
+      if (msg.toLowerCase().includes('not found')) {
+        renderFlagBatchStatus(null);
+        return;
+      }
+      throw new Error(msg || 'Failed loading batch status');
+    }
+    renderFlagBatchStatus(payload);
+    if (payload.done !== true) {
+      scheduleFlagBatchPoll(1500);
+    } else if (flagBatchPollTimer) {
+      clearTimeout(flagBatchPollTimer);
+      flagBatchPollTimer = null;
+    }
+  }
+
+  async function startFlagBatch() {
+    if (flagBatchState.activeRunId && !flagBatchState.activeDone) return;
+    const kind = selectedFlagBatchKind();
+    await ensureFlagBatchCatalogLoaded(kind);
+    const creds = await promptGenTestCreds();
+    if (!creds) return;
+    const payload = collectFlagBatchFilters();
+    const metaEl = flagBatchEl('flagBatchMeta');
+    if (metaEl) metaEl.textContent = 'Starting batch run…';
+    const result = await fetchJson('/flag_catalog_items/batch/start', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        kind: payload.kind,
+        query: payload.query,
+        include_disabled: payload.include_disabled,
+        limit: payload.limit,
+        core: creds,
+      }),
+    });
+    if (!result || result.ok !== true || !result.run_id) {
+      throw new Error((result && result.error) ? result.error : 'Failed to start batch run');
+    }
+    await refreshFlagBatchStatus(result.run_id);
+  }
+
+  async function stopFlagBatch() {
+    const runId = String(flagBatchState.activeRunId || '').trim();
+    if (!runId) return;
+    const result = await fetchJson('/flag_catalog_items/batch/stop', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ run_id: runId }),
+    });
+    if (!result || result.ok !== true) {
+      throw new Error((result && result.error) ? result.error : 'Failed to stop batch run');
+    }
+    await refreshFlagBatchStatus(runId);
+  }
+
   async function loadGenerators() {
     const metaEl = document.getElementById('genMeta');
     metaEl.textContent = 'Loading…';
@@ -1840,11 +2463,13 @@
     (genState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
     setGenLog(lines);
     renderGenerators();
+    renderFlagBatchSelectionPreview();
   }
 
   document.getElementById('genFilter').addEventListener('input', (e) => {
     genState.filter = e.target.value || '';
     renderGenerators();
+    renderFlagBatchSelectionPreview();
   });
 
   // Load generator list when the tab is shown
@@ -1911,11 +2536,13 @@
     (nodeGenState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
     setNodeGenLog(lines);
     renderNodeGenerators();
+    renderFlagBatchSelectionPreview();
   }
 
   document.getElementById('nodeGenFilter').addEventListener('input', (e) => {
     nodeGenState.filter = e.target.value || '';
     renderNodeGenerators();
+    renderFlagBatchSelectionPreview();
   });
 
   // Load node-generator list when the tab is shown
@@ -1945,6 +2572,162 @@
     { key: 'source', label: 'From Source' },
     { key: null, label: 'Actions' },
   ], renderNodeGenerators);
+
+  const flagBatchKindEl = flagBatchEl('flagBatchKind');
+  if (flagBatchKindEl) {
+    flagBatchKindEl.addEventListener('change', async () => {
+      try {
+        await ensureFlagBatchCatalogLoaded(selectedFlagBatchKind());
+      } catch (e) {}
+      renderFlagBatchSelectionPreview();
+    });
+  }
+
+  const flagBatchFilterEl = flagBatchEl('flagBatchFilter');
+  if (flagBatchFilterEl) {
+    flagBatchFilterEl.addEventListener('input', () => {
+      renderFlagBatchSelectionPreview();
+    });
+  }
+
+  const flagBatchIncludeDisabledEl = flagBatchEl('flagBatchIncludeDisabled');
+  if (flagBatchIncludeDisabledEl) {
+    flagBatchIncludeDisabledEl.addEventListener('change', () => {
+      renderFlagBatchSelectionPreview();
+    });
+  }
+
+  const flagBatchLimitEl = flagBatchEl('flagBatchLimit');
+  if (flagBatchLimitEl) {
+    flagBatchLimitEl.addEventListener('input', () => {
+      renderFlagBatchSelectionPreview();
+    });
+  }
+
+  const flagBatchTabEl = flagBatchEl('flagBatchTab');
+  if (flagBatchTabEl) {
+    flagBatchTabEl.addEventListener('shown.bs.tab', async () => {
+      try {
+        await ensureFlagBatchCatalogLoaded(selectedFlagBatchKind());
+      } catch (e) {
+        const metaEl = flagBatchEl('flagBatchMeta');
+        if (metaEl) metaEl.textContent = String(e || 'Failed loading generator catalog.');
+      }
+      renderFlagBatchSelectionPreview();
+      try { await refreshFlagBatchStatus(); } catch (e) {}
+    });
+  }
+
+  const flagBatchStartBtn = flagBatchEl('flagBatchStartBtn');
+  if (flagBatchStartBtn) {
+    flagBatchStartBtn.addEventListener('click', async () => {
+      try {
+        await startFlagBatch();
+      } catch (e) {
+        const metaEl = flagBatchEl('flagBatchMeta');
+        if (metaEl) metaEl.textContent = `Batch start failed: ${String(e)}`;
+      }
+    });
+  }
+
+  const flagBatchStopBtn = flagBatchEl('flagBatchStopBtn');
+  if (flagBatchStopBtn) {
+    flagBatchStopBtn.addEventListener('click', async () => {
+      try {
+        await stopFlagBatch();
+      } catch (e) {
+        const metaEl = flagBatchEl('flagBatchMeta');
+        if (metaEl) metaEl.textContent = `Batch stop failed: ${String(e)}`;
+      }
+    });
+  }
+
+  const flagBatchCategoryFilterEl = flagBatchEl('flagBatchResultsCategoryFilter');
+  if (flagBatchCategoryFilterEl) {
+    flagBatchCategoryFilterEl.addEventListener('change', () => {
+      renderFlagBatchResults(flagBatchState.latestPayload && Array.isArray(flagBatchState.latestPayload.results) ? flagBatchState.latestPayload.results : []);
+    });
+  }
+
+  const flagBatchStatusFilterEl = flagBatchEl('flagBatchResultsStatusFilter');
+  if (flagBatchStatusFilterEl) {
+    flagBatchStatusFilterEl.addEventListener('change', () => {
+      renderFlagBatchResults(flagBatchState.latestPayload && Array.isArray(flagBatchState.latestPayload.results) ? flagBatchState.latestPayload.results : []);
+    });
+  }
+
+  const flagBatchSortKeyEl = flagBatchEl('flagBatchResultsSortKey');
+  if (flagBatchSortKeyEl) {
+    flagBatchSortKeyEl.addEventListener('change', () => {
+      flagBatchState.resultsSortKey = String(flagBatchSortKeyEl.value || 'item_name');
+      renderFlagBatchResults(flagBatchState.latestPayload && Array.isArray(flagBatchState.latestPayload.results) ? flagBatchState.latestPayload.results : []);
+    });
+  }
+
+  const flagBatchSortDirBtn = flagBatchEl('flagBatchResultsSortDirBtn');
+  if (flagBatchSortDirBtn) {
+    flagBatchSortDirBtn.addEventListener('click', () => {
+      flagBatchState.resultsSortDir = selectedFlagBatchSortDir() === 'asc' ? 'desc' : 'asc';
+      flagBatchSortDirBtn.textContent = selectedFlagBatchSortDir() === 'asc' ? 'Asc' : 'Desc';
+      renderFlagBatchResults(flagBatchState.latestPayload && Array.isArray(flagBatchState.latestPayload.results) ? flagBatchState.latestPayload.results : []);
+    });
+  }
+
+  const flagBatchClearFiltersBtn = flagBatchEl('flagBatchResultsClearFiltersBtn');
+  if (flagBatchClearFiltersBtn) {
+    flagBatchClearFiltersBtn.addEventListener('click', () => {
+      resetFlagBatchResultsFilters();
+      renderFlagBatchResults(flagBatchState.latestPayload && Array.isArray(flagBatchState.latestPayload.results) ? flagBatchState.latestPayload.results : []);
+    });
+  }
+
+  const flagBatchCopySummaryBtn = flagBatchEl('flagBatchCopySummaryBtn');
+  if (flagBatchCopySummaryBtn) {
+    flagBatchCopySummaryBtn.addEventListener('click', async () => {
+      try {
+        await copyFlagBatchSummary();
+        const metaEl = flagBatchEl('flagBatchMeta');
+        if (metaEl) metaEl.textContent = 'Batch summary copied to clipboard.';
+      } catch (e) {
+        const metaEl = flagBatchEl('flagBatchMeta');
+        if (metaEl) metaEl.textContent = `Copy summary failed: ${String(e)}`;
+      }
+    });
+  }
+
+  renderFlagBatchSelectionPreview();
+
+  (function initGeneratorCatalogHashTabs() {
+    const tabMap = {
+      '#flagGenSources': 'flagGenSourcesTab',
+      '#flagGenerators': 'flagGeneratorsTab',
+      '#flagNodeGenerators': 'flagNodeGeneratorsTab',
+      '#flagBatch': 'flagBatchTab',
+    };
+
+    function activateFromHash() {
+      const hash = String(window.location.hash || '').trim();
+      const tabId = tabMap[hash];
+      if (!tabId || !window.bootstrap || !bootstrap.Tab) return;
+      const trigger = document.getElementById(tabId);
+      if (!trigger) return;
+      bootstrap.Tab.getOrCreateInstance(trigger).show();
+    }
+
+    Object.entries(tabMap).forEach(([hash, tabId]) => {
+      const trigger = document.getElementById(tabId);
+      if (!trigger) return;
+      trigger.addEventListener('shown.bs.tab', () => {
+        if (window.location.hash !== hash) {
+          history.replaceState(null, '', hash);
+        }
+      });
+    });
+
+    window.addEventListener('hashchange', activateFromHash);
+    activateFromHash();
+  })();
+  refreshFlagBatchStatus().catch(() => {});
 
   (function attachCleanupModalHandlers() {
     const el = document.getElementById('genTestCleanupModal');

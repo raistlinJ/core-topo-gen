@@ -4498,6 +4498,125 @@ def _prepare_remote_cli_context(
 ) -> Dict[str, Any]:
     """Upload required artifacts before starting the remote CLI."""
 
+    def _upload_xml_with_remote_vuln_paths(
+        source_xml_path: str,
+        remote_target_path: str,
+        *,
+        uploaded_paths: set[str],
+        uploaded_dirs: set[str],
+    ) -> None:
+        def _upload_wrapper_dir(local_dir: str, remote_dir: str) -> None:
+            for root_dir, _dirs, files in os.walk(local_dir):
+                rel_dir = os.path.relpath(root_dir, local_dir)
+                remote_root = remote_dir if rel_dir in ('.', '') else _remote_path_join(remote_dir, rel_dir.replace('\\', '/'))
+                _remote_mkdirs(client, remote_root)
+                for file_name in files:
+                    local_file = os.path.join(root_dir, file_name)
+                    remote_file = _remote_path_join(remote_root, file_name)
+                    sftp.put(local_file, remote_file)
+
+        def _upload_compose_with_remote_wrapper_paths(local_compose_path: str, remote_compose_path: str) -> None:
+            compose_upload_path = local_compose_path
+            temp_compose_upload_path: str | None = None
+            wrapper_rewrites = 0
+            try:
+                import yaml  # type: ignore
+
+                compose_obj = yaml.safe_load(Path(local_compose_path).read_text('utf-8', errors='ignore'))
+                services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
+                if isinstance(services, dict):
+                    for svc in services.values():
+                        if not isinstance(svc, dict):
+                            continue
+                        labels = svc.get('labels')
+                        if not isinstance(labels, dict):
+                            continue
+                        wrapper_ctx_raw = str(labels.get('coretg.wrapper_build_context') or '').strip()
+                        if not wrapper_ctx_raw:
+                            continue
+                        local_wrapper_dir = os.path.abspath(wrapper_ctx_raw)
+                        if not os.path.isdir(local_wrapper_dir):
+                            continue
+                        remote_wrapper_dir = _remote_path_join(run_dir, os.path.basename(local_wrapper_dir))
+                        if local_wrapper_dir not in uploaded_dirs:
+                            _upload_wrapper_dir(local_wrapper_dir, remote_wrapper_dir)
+                            uploaded_dirs.add(local_wrapper_dir)
+                        labels['coretg.wrapper_build_context'] = remote_wrapper_dir
+                        wrapper_rewrites += 1
+                if wrapper_rewrites > 0:
+                    import tempfile as _tempfile
+
+                    fd, tmp_path = _tempfile.mkstemp(prefix='coretg-remote-compose-', suffix='.yml')
+                    os.close(fd)
+                    Path(tmp_path).write_text(yaml.safe_dump(compose_obj, sort_keys=False), encoding='utf-8')
+                    temp_compose_upload_path = tmp_path
+                    compose_upload_path = temp_compose_upload_path
+                    try:
+                        log_handle.write(
+                            f"[remote] uploaded/relinked {wrapper_rewrites} wrapper build context(s) into run dir\n"
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                compose_upload_path = local_compose_path
+
+            try:
+                sftp.put(compose_upload_path, remote_compose_path)
+            finally:
+                try:
+                    if temp_compose_upload_path and os.path.exists(temp_compose_upload_path):
+                        os.remove(temp_compose_upload_path)
+                except Exception:
+                    pass
+
+        upload_path = source_xml_path
+        temp_upload_path: str | None = None
+        try:
+            tree = ET.parse(source_xml_path)
+            root = tree.getroot()
+            rewrites = 0
+            for item_el in root.findall('.//item'):
+                try:
+                    v_path_raw = str(item_el.get('v_path') or '').strip()
+                except Exception:
+                    v_path_raw = ''
+                if not v_path_raw:
+                    continue
+                local_compose_path = os.path.abspath(v_path_raw)
+                if not os.path.isfile(local_compose_path):
+                    continue
+                remote_compose_path = _remote_path_join(run_dir, os.path.basename(local_compose_path))
+                if local_compose_path not in uploaded_paths:
+                    _upload_compose_with_remote_wrapper_paths(local_compose_path, remote_compose_path)
+                    uploaded_paths.add(local_compose_path)
+                item_el.set('v_path', remote_compose_path)
+                rewrites += 1
+            if rewrites > 0:
+                import tempfile as _tempfile
+
+                fd, tmp_path = _tempfile.mkstemp(prefix='coretg-remote-xml-', suffix='.xml')
+                os.close(fd)
+                tree.write(tmp_path, encoding='utf-8', xml_declaration=True)
+                temp_upload_path = tmp_path
+                upload_path = temp_upload_path
+                try:
+                    log_handle.write(
+                        f"[remote] uploaded/relinked {rewrites} vulnerability compose path(s) into run dir\n"
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            upload_path = source_xml_path
+
+        try:
+            sftp.put(upload_path, remote_target_path)
+        finally:
+            try:
+                if temp_upload_path and os.path.exists(temp_upload_path):
+                    os.remove(temp_upload_path)
+            except Exception:
+                pass
+
     def _sync_runtime_subset_to_remote_repo(repo_dir: str, sftp: Any, log_handle_local: Any) -> None:
         repo_root = _get_repo_root()
 
@@ -4581,56 +4700,32 @@ def _prepare_remote_cli_context(
         for subdir in ('reports', 'outputs', 'uploads'):
             _remote_mkdirs(client, _remote_path_join(repo_dir, subdir))
         remote_xml_path = _remote_path_join(run_dir, os.path.basename(xml_path))
-        xml_upload_path = xml_path
-        temp_xml_upload_path: str | None = None
-        try:
-            tree = ET.parse(xml_path)
-            root = tree.getroot()
-            rewrites = 0
-            uploaded_paths: set[str] = set()
-            for item_el in root.findall('.//item'):
-                try:
-                    v_path_raw = str(item_el.get('v_path') or '').strip()
-                except Exception:
-                    v_path_raw = ''
-                if not v_path_raw:
-                    continue
-                local_compose_path = os.path.abspath(v_path_raw)
-                if not os.path.isfile(local_compose_path):
-                    continue
-                remote_compose_path = _remote_path_join(run_dir, os.path.basename(local_compose_path))
-                if local_compose_path not in uploaded_paths:
-                    sftp.put(local_compose_path, remote_compose_path)
-                    uploaded_paths.add(local_compose_path)
-                item_el.set('v_path', remote_compose_path)
-                rewrites += 1
-            if rewrites > 0:
-                import tempfile as _tempfile
-
-                fd, tmp_path = _tempfile.mkstemp(prefix='coretg-remote-xml-', suffix='.xml')
-                os.close(fd)
-                tree.write(tmp_path, encoding='utf-8', xml_declaration=True)
-                temp_xml_upload_path = tmp_path
-                xml_upload_path = temp_xml_upload_path
-                try:
-                    log_handle.write(
-                        f"[remote] uploaded/relinked {rewrites} vulnerability compose path(s) into run dir\n"
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            xml_upload_path = xml_path
-
-        sftp.put(xml_upload_path, remote_xml_path)
-        try:
-            if temp_xml_upload_path and os.path.exists(temp_xml_upload_path):
-                os.remove(temp_xml_upload_path)
-        except Exception:
-            pass
+        uploaded_paths: set[str] = set()
+        uploaded_dirs: set[str] = set()
+        _upload_xml_with_remote_vuln_paths(
+            xml_path,
+            remote_xml_path,
+            uploaded_paths=uploaded_paths,
+            uploaded_dirs=uploaded_dirs,
+        )
         remote_preview_plan = None
         if preview_plan_path:
             remote_preview_plan = _remote_path_join(run_dir, os.path.basename(preview_plan_path))
-            sftp.put(preview_plan_path, remote_preview_plan)
+            try:
+                same_source = os.path.abspath(str(preview_plan_path)) == os.path.abspath(str(xml_path))
+            except Exception:
+                same_source = str(preview_plan_path) == str(xml_path)
+            if same_source and remote_preview_plan == remote_xml_path:
+                pass
+            elif str(preview_plan_path).lower().endswith('.xml'):
+                _upload_xml_with_remote_vuln_paths(
+                    str(preview_plan_path),
+                    remote_preview_plan,
+                    uploaded_paths=uploaded_paths,
+                    uploaded_dirs=uploaded_dirs,
+                )
+            else:
+                sftp.put(preview_plan_path, remote_preview_plan)
             # If the preview/flow plan references local /tmp/vulns artifact directories,
             # upload them to the CORE VM so the remote run can use them.
             _upload_flow_artifacts_for_plan_to_remote(
@@ -24357,6 +24452,20 @@ except Exception:
         pass
 
 
+try:
+    from webapp.routes import flag_catalog_batch as _flag_catalog_batch_routes
+
+    _flag_catalog_batch_routes.register(
+        app,
+        backend_module=sys.modules[__name__],
+    )
+except Exception:
+    try:
+        app.logger.exception('Failed to register flag_catalog_batch routes.')
+    except Exception:
+        pass
+
+
 def _remote_docker_status_script(sudo_password: str | None = None) -> str:
     """Remote script to read compose assignments + docker state on the CORE VM.
 
@@ -34041,10 +34150,14 @@ def _normalize_requires_with_optional(payload: dict[str, Any]) -> tuple[list[str
     """Return (required_requires, optional_requires)."""
     # Generator Builder UI shape: requires = [{artifact, optional}, ...]
     req_items = payload.get('requires')
-    if not (isinstance(req_items, list) and all(isinstance(x, dict) for x in req_items)):
-        raise ValueError('requires must be a list of {artifact, optional} objects')
+    if req_items is None:
+        legacy_required = _split_artifact_list(payload.get('requires'))
+        legacy_optional = _split_artifact_list(payload.get('optional_requires'))
+        required_set = {x for x in legacy_required if x}
+        optional_set = {x for x in legacy_optional if x and x not in required_set}
+        return sorted(required_set), sorted(optional_set)
 
-    if isinstance(req_items, list):
+    if isinstance(req_items, list) and all(isinstance(x, dict) for x in req_items):
         required: list[str] = []
         optional: list[str] = []
         for item in req_items:
@@ -34056,10 +34169,18 @@ def _normalize_requires_with_optional(payload: dict[str, Any]) -> tuple[list[str
                 optional.append(art)
             else:
                 required.append(art)
-        # De-dupe, prefer required if both appear.
         required_set = {x for x in required if x}
         optional_set = {x for x in optional if x and x not in required_set}
         return sorted(required_set), sorted(optional_set)
+
+    if isinstance(req_items, list):
+        legacy_required = _split_artifact_list(req_items)
+        legacy_optional = _split_artifact_list(payload.get('optional_requires'))
+        required_set = {x for x in legacy_required if x}
+        optional_set = {x for x in legacy_optional if x and x not in required_set}
+        return sorted(required_set), sorted(optional_set)
+
+    raise ValueError('requires must be a list of strings or {artifact, optional} objects')
 
 
 def _normalize_plugin_type(raw: Any) -> str:
@@ -34105,6 +34226,45 @@ def _inputs_schema_from_flags(flags: dict[str, Any], *, plugin_type: str) -> dic
     return inputs
 
 
+def _normalize_runtime_inputs(raw_inputs: Any, *, plugin_type: str) -> list[dict[str, Any]]:
+    if isinstance(raw_inputs, list):
+        normalized: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        for item in raw_inputs:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '').strip()
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            record: dict[str, Any] = {
+                'name': name,
+                'type': str(item.get('type') or 'string').strip() or 'string',
+                'required': bool(item.get('required', True)),
+            }
+            if item.get('sensitive') is True:
+                record['sensitive'] = True
+            normalized.append(record)
+        return normalized
+
+    flags = raw_inputs if isinstance(raw_inputs, dict) else {}
+    inputs_schema = _inputs_schema_from_flags(flags, plugin_type=plugin_type)
+    normalized = []
+    for name, meta in (inputs_schema or {}).items():
+        nm = str(name or '').strip()
+        if not nm:
+            continue
+        record: dict[str, Any] = {
+            'name': nm,
+            'type': str((meta or {}).get('type') or 'string').strip() or 'string',
+            'required': bool((meta or {}).get('required', True)),
+        }
+        if (meta or {}).get('sensitive') is True:
+            record['sensitive'] = True
+        normalized.append(record)
+    return normalized
+
+
 def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], str, str]:
     plugin_type = _normalize_plugin_type(payload.get('plugin_type'))
     plugin_id = _sanitize_id(payload.get('plugin_id'))
@@ -34135,26 +34295,13 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
 
     if 'Flag(flag_id)' not in produces and 'flag' not in produces:
         produces = ['Flag(flag_id)'] + produces
+    if plugin_type == 'flag-node-generator' and 'File(path)' not in produces:
+        produces.append('File(path)')
 
-    inputs_flags = payload.get('inputs') if isinstance(payload.get('inputs'), dict) else {}
-    inputs_schema = _inputs_schema_from_flags(inputs_flags, plugin_type=plugin_type)
-
-    # Manifest v1: preferred workflow for installed Generator Packs.
-    inputs_manifest: list[dict[str, Any]] = []
-    try:
-        for name, meta in (inputs_schema or {}).items():
-            nm = str(name or '').strip()
-            if not nm:
-                continue
-            rec: dict[str, Any] = {'name': nm, 'type': str((meta or {}).get('type') or 'string')}
-            if isinstance(meta, dict):
-                if 'required' in meta:
-                    rec['required'] = bool(meta.get('required'))
-                if meta.get('sensitive') is True:
-                    rec['sensitive'] = True
-            inputs_manifest.append(rec)
-    except Exception:
-        inputs_manifest = []
+    runtime_inputs_raw = payload.get('runtime_inputs')
+    if runtime_inputs_raw is None:
+        runtime_inputs_raw = payload.get('inputs')
+    inputs_manifest = _normalize_runtime_inputs(runtime_inputs_raw, plugin_type=plugin_type)
 
     manifest_yaml = (
         "manifest_version: 1\n"
@@ -34369,6 +34516,10 @@ if __name__ == '__main__':
     main()
 """
 
+    generator_override = str(payload.get('generator_py_text') or payload.get('generator_text') or '').strip('\n')
+    if generator_override.strip():
+        generator_py = generator_override + ("\n" if not generator_override.endswith("\n") else "")
+
     readme_override = str(payload.get('readme_text') or '')
     if readme_override and not readme_override.endswith('\n'):
         readme_override = readme_override + '\n'
@@ -34389,12 +34540,24 @@ try:
     _generator_builder_routes.register(
         app,
         require_builder_or_admin=lambda: _require_builder_or_admin(),
+        runs=RUNS,
+        outputs_dir=lambda: _outputs_dir(),
         flag_generators_from_enabled_sources=lambda: _flag_generators_from_enabled_sources(),
         flag_node_generators_from_enabled_sources=lambda: _flag_node_generators_from_enabled_sources(),
         reserved_artifacts=_RESERVED_ARTIFACTS,
         load_custom_artifacts=lambda: _load_custom_artifacts(),
         upsert_custom_artifact=lambda *args, **kwargs: _upsert_custom_artifact(*args, **kwargs),
         build_generator_scaffold=lambda payload: _build_generator_scaffold(payload),
+        install_generator_pack_or_bundle=lambda *args, **kwargs: _install_generator_pack_or_bundle(*args, **kwargs),
+        run_remote_builder_test=lambda *args, **kwargs: _run_remote_builder_scaffold_test(*args, **kwargs),
+        start_remote_builder_test_process=lambda **kwargs: _start_remote_builder_scaffold_test_process(**kwargs),
+        sync_remote_flag_test_outputs=lambda meta: _sync_remote_flag_test_outputs(meta),
+        purge_remote_flag_test_dir=lambda meta: _purge_remote_flag_test_dir(meta),
+        parse_flag_test_core_cfg_from_form=lambda form: _parse_flag_test_core_cfg_from_form(form),
+        ensure_core_vm_idle_for_test=lambda core_cfg: _ensure_core_vm_idle_for_test(core_cfg),
+        cleanup_remote_test_runtime=lambda meta: _cleanup_remote_test_runtime(meta),
+        write_sse_marker=lambda *args, **kwargs: _write_sse_marker(*args, **kwargs),
+        local_timestamp_safe=lambda: _local_timestamp_safe(),
         sanitize_id=lambda value: _sanitize_id(value),
         io_module=io,
         zipfile_module=zipfile,
@@ -35640,6 +35803,20 @@ except Exception:
         pass
 
 
+try:
+    from webapp.routes import vuln_catalog_batch as _vuln_catalog_batch_routes
+
+    _vuln_catalog_batch_routes.register(
+        app,
+        backend_module=sys.modules[__name__],
+    )
+except Exception:
+    try:
+        app.logger.exception('Failed to register vuln_catalog_batch routes.')
+    except Exception:
+        pass
+
+
 def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
     execute_like_real = bool(meta.get('execute_like_real'))
     compose_path = meta.get('remote_compose_path')
@@ -35654,8 +35831,21 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
     project_name = meta.get('project_name')
     log_path = meta.get('log_path')
     core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+
+    def _response(payload: dict, status_code: int = 200):
+        try:
+            from flask import has_app_context
+
+            if has_app_context():
+                return jsonify(payload), status_code
+        except Exception:
+            pass
+        if status_code == 200:
+            return payload
+        return payload, status_code
+
     if not core_cfg and not execute_like_real:
-        return jsonify({'ok': False, 'error': 'Missing CORE VM credentials'}), 400
+        return _response({'ok': False, 'error': 'Missing CORE VM credentials'}, 400)
 
     try:
         if log_path:
@@ -35788,7 +35978,7 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
             meta['returncode'] = meta.get('returncode') or 0
     except Exception:
         pass
-    return jsonify({'ok': True})
+    return _response({'ok': True})
 
 
 
@@ -36692,6 +36882,39 @@ def _parse_flag_test_core_cfg_from_form(form: Any) -> Dict[str, Any] | None:
         core_cfg['port'] = CORE_PORT
     return _require_core_ssh_credentials(core_cfg)
 
+def _load_saved_flag_generators_test_core_cfg() -> Dict[str, Any] | None:
+    hint_path = os.path.join(_outputs_dir(), 'flag_generators_test_core_hint.json')
+    try:
+        if not os.path.exists(hint_path):
+            return None
+        with open(hint_path, 'r', encoding='utf-8') as fh:
+            hint = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(hint, dict):
+        return None
+    secret_id = str(hint.get('core_secret_id') or '').strip()
+    if not secret_id:
+        return None
+    record = _load_core_credentials(secret_id)
+    if not isinstance(record, dict):
+        return None
+    core_cfg = {
+        'host': record.get('grpc_host') or record.get('host') or record.get('ssh_host') or '127.0.0.1',
+        'port': int(record.get('grpc_port') or record.get('port') or CORE_PORT),
+        'ssh_host': record.get('ssh_host') or record.get('host') or '127.0.0.1',
+        'ssh_port': int(record.get('ssh_port') or 22),
+        'ssh_username': record.get('ssh_username') or '',
+        'ssh_password': record.get('ssh_password_plain') or record.get('password_plain') or '',
+        'ssh_enabled': True,
+        'venv_bin': record.get('venv_bin') or DEFAULT_CORE_VENV_BIN,
+        'core_secret_id': record.get('identifier') or secret_id,
+    }
+    try:
+        return _require_core_ssh_credentials(core_cfg)
+    except Exception:
+        return None
+
 
 def _ensure_core_vm_idle_for_test(core_cfg: Dict[str, Any]) -> None:
     errors: list[str] = []
@@ -36703,7 +36926,314 @@ def _ensure_core_vm_idle_for_test(core_cfg: Dict[str, Any]) -> None:
     if sessions:
         raise RuntimeError('CORE VM has active session(s). Stop running scenario before testing.')
 
+def _run_remote_builder_scaffold_test(
+    *,
+    scaffold_files: Dict[str, str],
+    plugin_kind: str,
+    plugin_id: str,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    core_cfg = _load_saved_flag_generators_test_core_cfg()
+    if not isinstance(core_cfg, dict):
+        raise RuntimeError('Saved CORE VM generator-test credentials not found. Save generator test CORE credentials first.')
+    _ensure_core_vm_idle_for_test(core_cfg)
 
+    run_id = _local_timestamp_safe() + '-' + uuid.uuid4().hex[:10]
+    temp_root = tempfile.mkdtemp(prefix='generator-builder-remote-', dir=_outputs_dir())
+    staged_repo = os.path.join(temp_root, 'repo')
+    local_run_dir = os.path.join(temp_root, 'run')
+    os.makedirs(staged_repo, exist_ok=True)
+    os.makedirs(local_run_dir, exist_ok=True)
+
+    def _collect_local_output_files(run_dir: str) -> List[Dict[str, Any]]:
+        files: List[Dict[str, Any]] = []
+        if not os.path.isdir(run_dir):
+            return files
+        for root, _dirs, filenames in os.walk(run_dir):
+            for filename in filenames:
+                abs_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(abs_path, run_dir).replace('\\', '/')
+                try:
+                    size = os.path.getsize(abs_path)
+                except Exception:
+                    size = None
+                text_content = None
+                if size is not None and size <= 65536:
+                    try:
+                        with open(abs_path, 'r', encoding='utf-8') as handle:
+                            text_content = handle.read()
+                    except Exception:
+                        text_content = None
+                files.append({'path': rel_path, 'name': filename, 'size': size, 'text': text_content})
+        files.sort(key=lambda entry: str(entry.get('path') or ''))
+        return files
+
+    for rel_path, content in scaffold_files.items():
+        abs_path = os.path.join(staged_repo, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, 'w', encoding='utf-8') as handle:
+            handle.write(content)
+
+    ssh_client = None
+    sftp = None
+    remote_env_path = ''
+    remote_repo_dir = ''
+    remote_run_dir = ''
+    try:
+        _push_repo_to_remote(
+            core_cfg,
+            logger=app.logger,
+            include_repo_paths=[
+                'scripts/run_flag_generator.py',
+                'core_topo_gen',
+                'flag_generators',
+                'flag_node_generators',
+                'outputs/installed_generators/flag_generators',
+                'outputs/installed_generators/flag_node_generators',
+            ],
+        )
+        ssh_client = _open_ssh_client(core_cfg)
+        sftp = ssh_client.open_sftp()
+        remote_static_repo = _remote_static_repo_dir(sftp)
+        remote_repo_dir = _remote_path_join('/tmp/tests', f'flag-builder-repo-{run_id}')
+        remote_run_dir = _remote_path_join('/tmp/tests', f'flag-builder-run-{run_id}')
+        _remote_remove_path(ssh_client, remote_repo_dir)
+        _remote_remove_path(ssh_client, remote_run_dir)
+        _exec_ssh_command(
+            ssh_client,
+            f"mkdir -p {shlex.quote(posixpath.dirname(remote_repo_dir) or '/tmp/tests')} && cp -R {shlex.quote(remote_static_repo)} {shlex.quote(remote_repo_dir)}",
+            timeout=300.0,
+            check=True,
+        )
+        _remote_mkdirs(ssh_client, remote_run_dir)
+        _remote_mkdirs(ssh_client, _remote_path_join(remote_run_dir, 'inputs'))
+
+        for rel_path in scaffold_files.keys():
+            local_path = os.path.join(staged_repo, rel_path)
+            remote_path = _remote_path_join(remote_repo_dir, rel_path.replace('\\', '/'))
+            _remote_mkdirs(ssh_client, posixpath.dirname(remote_path) or remote_repo_dir)
+            sftp.put(local_path, remote_path)
+
+        sudo_pw = str(core_cfg.get('ssh_password') or '')
+
+        def _sh_single_quote(val: str) -> str:
+            return "'" + (val or '').replace("'", "'\\''") + "'"
+
+        remote_env_path = _remote_path_join(remote_run_dir, '.coretg_env.sh')
+        env_lines = [
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            'export CORETG_DOCKER_USE_SUDO=1',
+            'export CORETG_DOCKER_HOST_NETWORK=1',
+            f"export CORETG_DOCKER_SUDO_PASSWORD={_sh_single_quote(sudo_pw)}",
+        ]
+        with sftp.open(remote_env_path, 'w') as fh:
+            fh.write('\n'.join(env_lines) + '\n')
+        _exec_ssh_command(ssh_client, f"chmod 600 {shlex.quote(remote_env_path)}")
+
+        python_exec = _select_remote_python_interpreter(ssh_client, core_cfg)
+        config_payload = json.dumps(config, ensure_ascii=False)
+        remote_runner_path = _remote_path_join(remote_repo_dir, 'scripts', 'run_flag_generator.py')
+        prefix = f"set -a && source {shlex.quote(remote_env_path)} && set +a && " if remote_env_path else ''
+        cmd_inner = (
+            f"{prefix}cd {shlex.quote(remote_repo_dir)} && "
+            f"{shlex.quote(python_exec)} {shlex.quote(remote_runner_path)} "
+            f"--kind {shlex.quote(plugin_kind)} "
+            f"--generator-id {shlex.quote(plugin_id)} "
+            f"--out-dir {shlex.quote(remote_run_dir)} "
+            f"--config {shlex.quote(config_payload)} "
+            f"--repo-root {shlex.quote(remote_repo_dir)}"
+        )
+        returncode, stdout, stderr = _exec_ssh_command(
+            ssh_client,
+            f"bash -lc {shlex.quote(cmd_inner)}",
+            timeout=300.0,
+            check=False,
+        )
+        _download_remote_tree(sftp, remote_run_dir, local_run_dir)
+        return {
+            'ok': returncode == 0,
+            'returncode': returncode,
+            'stdout': stdout,
+            'stderr': stderr,
+            'files': _collect_local_output_files(local_run_dir),
+        }
+    finally:
+        try:
+            if ssh_client and remote_env_path:
+                _remote_remove_path(ssh_client, remote_env_path)
+        except Exception:
+            pass
+        try:
+            if ssh_client and remote_run_dir:
+                _remote_remove_path(ssh_client, remote_run_dir)
+        except Exception:
+            pass
+        try:
+            if ssh_client and remote_repo_dir:
+                _remote_remove_path(ssh_client, remote_repo_dir)
+        except Exception:
+            pass
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if ssh_client:
+                ssh_client.close()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception:
+            pass
+
+def _start_remote_builder_scaffold_test_process(
+    *,
+    run_id: str,
+    run_dir: str,
+    log_handle: Any,
+    scaffold_files: Dict[str, str],
+    plugin_kind: str,
+    plugin_id: str,
+    cfg: Dict[str, Any],
+    core_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    ssh_client = _open_ssh_client(core_cfg)
+    sftp = ssh_client.open_sftp()
+    remote_static_repo = _remote_static_repo_dir(sftp)
+    remote_repo_dir = _remote_path_join('/tmp/tests', f'flag-builder-repo-{run_id}')
+    remote_run_dir = _remote_path_join('/tmp/tests', f'flag-builder-run-{run_id}')
+
+    try:
+        _push_repo_to_remote(
+            core_cfg,
+            logger=app.logger,
+            include_repo_paths=[
+                'scripts/run_flag_generator.py',
+                'core_topo_gen',
+                'flag_generators',
+                'flag_node_generators',
+                'outputs/installed_generators/flag_generators',
+                'outputs/installed_generators/flag_node_generators',
+            ],
+            log_handle=log_handle,
+        )
+    except Exception:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+        sftp = ssh_client.open_sftp()
+        remote_static_repo = _remote_static_repo_dir(sftp)
+
+    _remote_remove_path(ssh_client, remote_repo_dir)
+    _remote_remove_path(ssh_client, remote_run_dir)
+    _exec_ssh_command(
+        ssh_client,
+        f"mkdir -p {shlex.quote(posixpath.dirname(remote_repo_dir) or '/tmp/tests')} && cp -R {shlex.quote(remote_static_repo)} {shlex.quote(remote_repo_dir)}",
+        timeout=300.0,
+        check=True,
+    )
+    _remote_mkdirs(ssh_client, remote_run_dir)
+    _remote_mkdirs(ssh_client, _remote_path_join(remote_run_dir, 'inputs'))
+
+    local_staging_dir = tempfile.mkdtemp(prefix='generator-builder-stage-', dir=_outputs_dir())
+    try:
+        for rel_path, content in scaffold_files.items():
+            local_path = os.path.join(local_staging_dir, rel_path)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, 'w', encoding='utf-8') as handle:
+                handle.write(content)
+            remote_path = _remote_path_join(remote_repo_dir, rel_path.replace('\\', '/'))
+            _remote_mkdirs(ssh_client, posixpath.dirname(remote_path) or remote_repo_dir)
+            sftp.put(local_path, remote_path)
+
+        local_inputs_dir = os.path.join(run_dir, 'inputs')
+        if os.path.isdir(local_inputs_dir):
+            for root, dirs, files in os.walk(local_inputs_dir):
+                rel = os.path.relpath(root, local_inputs_dir)
+                rel = '' if rel == '.' else rel
+                remote_root = _remote_path_join(remote_run_dir, 'inputs', rel) if rel else _remote_path_join(remote_run_dir, 'inputs')
+                _remote_mkdirs(ssh_client, remote_root)
+                for directory_name in dirs:
+                    _remote_mkdirs(ssh_client, _remote_path_join(remote_root, directory_name))
+                for filename in files:
+                    local_file = os.path.join(root, filename)
+                    remote_file = _remote_path_join(remote_root, filename)
+                    if os.path.isfile(local_file):
+                        sftp.put(local_file, remote_file)
+    finally:
+        try:
+            shutil.rmtree(local_staging_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    try:
+        sudo_pw = str(core_cfg.get('ssh_password') or '')
+    except Exception:
+        sudo_pw = ''
+    remote_env_path = _remote_path_join(remote_run_dir, '.coretg_env.sh')
+    try:
+        def _sh_single_quote(val: str) -> str:
+            return "'" + (val or '').replace("'", "'\\''") + "'"
+
+        env_lines = [
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            'export CORETG_DOCKER_USE_SUDO=1',
+            'export CORETG_DOCKER_HOST_NETWORK=1',
+            f"export CORETG_DOCKER_SUDO_PASSWORD={_sh_single_quote(sudo_pw)}",
+        ]
+        with sftp.open(remote_env_path, 'w') as fh:
+            fh.write('\n'.join(env_lines) + '\n')
+        _exec_ssh_command(ssh_client, f"chmod 600 {shlex.quote(remote_env_path)}")
+    except Exception:
+        remote_env_path = ''
+
+    python_exec = _select_remote_python_interpreter(ssh_client, core_cfg)
+    config_payload = json.dumps(cfg, ensure_ascii=False)
+    remote_runner_path = _remote_path_join(remote_repo_dir, 'scripts', 'run_flag_generator.py')
+    prefix = f"set -a && source {shlex.quote(remote_env_path)} && set +a && " if remote_env_path else ''
+    cmd_inner = (
+        f"{prefix}cd {shlex.quote(remote_repo_dir)} && "
+        f"{shlex.quote(python_exec)} {shlex.quote(remote_runner_path)} "
+        f"--kind {shlex.quote(plugin_kind)} "
+        f"--generator-id {shlex.quote(plugin_id)} "
+        f"--out-dir {shlex.quote(remote_run_dir)} "
+        f"--config {shlex.quote(config_payload)} "
+        f"--repo-root {shlex.quote(remote_repo_dir)}"
+    )
+    cmd = f"bash -lc {shlex.quote(cmd_inner)}"
+
+    channel = ssh_client.get_transport().open_session() if ssh_client.get_transport() else None
+    if channel is None:
+        raise RuntimeError('SSH channel unavailable')
+    try:
+        channel.get_pty()
+    except Exception:
+        pass
+    channel.exec_command(cmd)
+    relay_thread = threading.Thread(
+        target=_relay_remote_channel_to_log,
+        args=(channel, log_handle),
+        kwargs={'redact_tokens': [sudo_pw] if sudo_pw else []},
+        daemon=True,
+    )
+    relay_thread.start()
+    try:
+        sftp.close()
+    except Exception:
+        pass
+    return {
+        'ssh_client': ssh_client,
+        'ssh_channel': channel,
+        'ssh_log_thread': relay_thread,
+        'remote_run_dir': remote_run_dir,
+        'remote_repo_dir': remote_repo_dir,
+        'remote_env_path': remote_env_path,
+    }
 try:
     from webapp.routes import core_test_prepare as _core_test_prepare_routes
 
@@ -36788,6 +37318,7 @@ def _start_remote_flag_test_process(
     kind: str,
     generator_id: str,
     cfg: Dict[str, Any],
+    run_remote_builder_test=lambda *args, **kwargs: _run_remote_builder_scaffold_test(*args, **kwargs),
     core_cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
     ssh_client = _open_ssh_client(core_cfg)

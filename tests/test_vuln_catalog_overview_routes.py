@@ -30,6 +30,14 @@ def test_vuln_catalog_page_renders_active_catalog(monkeypatch):
     assert resp.status_code == 200
     page = resp.get_data(as_text=True)
     assert 'Catalog One' in page
+    assert 'Batch Test' in page
+    assert 'Export JSON' in page
+    assert 'Export Markdown' in page
+    assert 'Copy Summary' in page
+    assert 'Filter Results By Category' in page
+    assert 'Filter Results By Status' in page
+    assert 'Sort Results' in page
+    assert 'Clear' in page
 
 
 def test_vuln_catalog_items_data_returns_active_items(monkeypatch, tmp_path):

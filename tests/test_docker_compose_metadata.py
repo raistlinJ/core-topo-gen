@@ -3,7 +3,7 @@ import os
 import re
 from types import SimpleNamespace
 
-from core_topo_gen.builders.topology import _apply_docker_compose_meta, NodeType
+from core_topo_gen.builders.topology import _apply_docker_compose_meta, _docker_node_add_node_kwargs, NodeType
 from core_topo_gen.utils.vuln_process import prepare_compose_for_assignments
 
 
@@ -239,7 +239,7 @@ services:
     assert getattr(options, "compose_name") == "web"
 
 
-def test_apply_docker_compose_meta_unsets_invalid_service_when_unreadable_compose(tmp_path):
+def test_apply_docker_compose_meta_keeps_requested_service_when_compose_unreadable(tmp_path):
     compose_path = tmp_path / "docker-compose-host-1.yml"
     compose_path.write_text("services:\n  web: [\n", encoding="utf-8")
 
@@ -253,10 +253,48 @@ def test_apply_docker_compose_meta_unsets_invalid_service_when_unreadable_compos
 
     _apply_docker_compose_meta(node, record, session=session)
 
-    assert getattr(node, "compose_name", None) is None
+    assert getattr(node, "compose_name", None) == "standard-ubuntu-docker-core"
     assert session.calls, "session.edit_node should be called"
     _node_id, options, _ = session.calls[0]
-    assert getattr(options, "compose_name", None) is None
+    assert getattr(options, "compose_name", None) == "standard-ubuntu-docker-core"
+
+
+def test_apply_docker_compose_meta_falls_back_to_node_name_without_requested_service(tmp_path):
+    compose_path = tmp_path / "docker-compose-host-1.yml"
+    compose_path.write_text("services:\n  web: [\n", encoding="utf-8")
+
+    record = {
+        "Name": "standard-ubuntu-docker-core",
+        "compose_path": str(compose_path),
+    }
+    node = SimpleNamespace(id=9, name="host-1", options=None, type=NodeType.DOCKER, image="")
+    session = DummySession()
+
+    _apply_docker_compose_meta(node, record, session=session)
+
+    assert getattr(node, "compose_name", None) == "host-1"
+    assert session.calls, "session.edit_node should be called"
+    _node_id, options, _ = session.calls[0]
+    assert getattr(options, "compose_name", None) == "host-1"
+
+
+def test_docker_node_add_node_kwargs_falls_back_to_node_name_when_compose_unreadable(tmp_path):
+    compose_path = tmp_path / "docker-compose-host-9.yml"
+    compose_path.write_text("services:\n  web: [\n", encoding="utf-8")
+
+    kwargs = _docker_node_add_node_kwargs(
+        "host-9",
+        {
+            "Name": "Example",
+            "compose_path": str(compose_path),
+            "compose_service": "web",
+        },
+    )
+
+    assert kwargs.get("compose") == "/tmp/vulns/docker-compose-host-9.yml"
+    assert kwargs.get("compose_name") == "host-9"
+    options = kwargs.get("options")
+    assert getattr(options, "compose_name", None) == "host-9"
 
 
 def test_prepare_compose_escapes_mako_shell_vars(tmp_path):
