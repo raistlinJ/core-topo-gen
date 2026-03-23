@@ -33,6 +33,15 @@ def register(app, *, backend_module: Any) -> None:
             if not xml_path_for_core:
                 return jsonify({'ok': False, 'error': 'No XML found for this scenario.'}), 404
             flow_core_cfg = backend._core_config_from_xml_path(xml_path_for_core, scenario_norm, include_password=True)
+            explicit_core_host = ''
+            explicit_core_port = None
+            if isinstance(flow_core_cfg, dict):
+                explicit_core_host = str(flow_core_cfg.get('grpc_host') or flow_core_cfg.get('host') or '').strip()
+                raw_port = flow_core_cfg.get('grpc_port') if flow_core_cfg.get('grpc_port') not in (None, '') else flow_core_cfg.get('port')
+                try:
+                    explicit_core_port = int(raw_port) if raw_port not in (None, '') else None
+                except Exception:
+                    explicit_core_port = None
             page_core_cfg = None
             try:
                 page_core_cfg = backend._select_core_config_for_page(scenario_norm, include_password=True)
@@ -41,7 +50,7 @@ def register(app, *, backend_module: Any) -> None:
             if isinstance(page_core_cfg, dict) and page_core_cfg:
                 if isinstance(flow_core_cfg, dict) and flow_core_cfg:
                     try:
-                        flow_core_cfg = backend._merge_core_configs(flow_core_cfg, page_core_cfg, include_password=True)
+                        flow_core_cfg = backend._merge_core_configs(page_core_cfg, flow_core_cfg, include_password=True)
                     except Exception:
                         merged = dict(page_core_cfg)
                         merged.update(flow_core_cfg)
@@ -50,6 +59,12 @@ def register(app, *, backend_module: Any) -> None:
                     flow_core_cfg = page_core_cfg
             if isinstance(flow_core_cfg, dict):
                 flow_core_cfg = backend._apply_core_secret_to_config(flow_core_cfg, scenario_norm)
+                if explicit_core_host:
+                    flow_core_cfg['host'] = explicit_core_host
+                    flow_core_cfg['grpc_host'] = explicit_core_host
+                if explicit_core_port is not None and explicit_core_port > 0:
+                    flow_core_cfg['port'] = explicit_core_port
+                    flow_core_cfg['grpc_port'] = explicit_core_port
         except Exception:
             flow_core_cfg = None
         if not isinstance(flow_core_cfg, dict):

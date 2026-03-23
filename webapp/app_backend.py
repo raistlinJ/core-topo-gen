@@ -9884,15 +9884,6 @@ def _secrets_base_dir() -> str:
     return base
 
 
-def _legacy_repo_secrets_base_dir() -> str:
-    try:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    except Exception:
-        return ''
-    candidate = os.path.join(repo_root, 'outputs', 'secrets')
-    return candidate if os.path.isdir(candidate) else ''
-
-
 def _sanitize_secret_slug(raw: str, fallback: str = 'entry') -> str:
     cleaned = ''.join(ch.lower() if ch.isalnum() else '-' for ch in (raw or ''))
     cleaned = re.sub(r'-{2,}', '-', cleaned).strip('-')
@@ -10056,24 +10047,8 @@ def _core_secret_dir() -> str:
     return _ensure_private_dir(core_dir)
 
 
-def _core_secret_dir_candidates() -> list[str]:
-    dirs: list[str] = []
-    primary = _core_secret_dir()
-    if primary:
-        dirs.append(primary)
-    legacy_base = _legacy_repo_secrets_base_dir()
-    legacy_core = os.path.join(legacy_base, 'core') if legacy_base else ''
-    if legacy_core and os.path.isdir(legacy_core) and legacy_core not in dirs:
-        dirs.append(legacy_core)
-    return dirs
-
-
 def _core_secret_key_path() -> str:
     return os.path.join(_core_secret_dir(), '.key')
-
-
-def _core_secret_key_path_for_dir(secret_dir: str) -> str:
-    return os.path.join(secret_dir, '.key')
 
 
 def _load_or_create_core_key() -> bytes:
@@ -10111,48 +10086,6 @@ def _get_core_cipher():
         raise RuntimeError('cryptography package is required for secure CORE credential storage')
     key = _load_or_create_core_key()
     return Fernet(key)
-
-
-def _get_core_cipher_for_secret_dir(secret_dir: str, *, create_if_missing: bool = False):
-    if Fernet is None:  # pragma: no cover - dependency missing
-        raise RuntimeError('cryptography package is required for secure CORE credential storage')
-    env_key = os.environ.get('CORE_SECRET_KEY')
-    if env_key:
-        key_bytes = env_key.encode('utf-8')
-        try:
-            return Fernet(key_bytes)
-        except Exception as exc:  # pragma: no cover - misconfigured env
-            logging.getLogger(__name__).warning('Invalid CORE_SECRET_KEY provided: %s', exc)
-    key_path = _core_secret_key_path_for_dir(secret_dir)
-    if os.path.exists(key_path):
-        with open(key_path, 'rb') as fh:
-            key_bytes = fh.read().strip()
-        if key_bytes:
-            return Fernet(key_bytes)
-    if create_if_missing:
-        return _get_core_cipher()
-    raise FileNotFoundError(f'CORE secret key not found for directory: {secret_dir}')
-
-
-def _load_core_credentials_from_path(path: str) -> Optional[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, 'r', encoding='utf-8') as fh:
-            data = json.load(fh)
-        cipher = _get_core_cipher_for_secret_dir(os.path.dirname(path), create_if_missing=False)
-        encrypted = data.get('password')
-        password_plain = ''
-        if isinstance(encrypted, str) and encrypted:
-            try:
-                password_plain = cipher.decrypt(encrypted.encode('utf-8')).decode('utf-8')
-            except InvalidToken:
-                password_plain = ''
-        data['ssh_password_plain'] = password_plain
-        return data
-    except Exception:
-        logging.getLogger(__name__).exception('Failed to load CORE credentials from %s', path)
-        return None
 
 
 def _derive_core_identifier(
@@ -10274,30 +10207,39 @@ def _save_core_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _load_core_credentials(identifier: str) -> Optional[Dict[str, Any]]:
-    for secret_dir in _core_secret_dir_candidates():
-        path = os.path.join(secret_dir, f"{identifier}.json")
-        if not os.path.exists(path):
-            continue
-        record = _load_core_credentials_from_path(path)
-        if record:
-            return record
-    return None
+    path = os.path.join(_core_secret_dir(), f"{identifier}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        cipher = _get_core_cipher()
+        encrypted = data.get('password')
+        password_plain = ''
+        if isinstance(encrypted, str) and encrypted:
+            try:
+                password_plain = cipher.decrypt(encrypted.encode('utf-8')).decode('utf-8')
+            except InvalidToken:
+                password_plain = ''
+        data['ssh_password_plain'] = password_plain
+        return data
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to load CORE credentials for %s', identifier)
+        return None
 
 
 def _delete_core_credentials(identifier: str) -> bool:
     if not isinstance(identifier, str) or not identifier.strip():
         return False
-    deleted = False
-    for secret_dir in _core_secret_dir_candidates():
-        path = os.path.join(secret_dir, f"{identifier}.json")
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-                deleted = True
-        except Exception:
-            logging.getLogger(__name__).exception('Failed to delete CORE credentials for %s', identifier)
-            raise
-    return deleted
+    path = os.path.join(_core_secret_dir(), f"{identifier}.json")
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to delete CORE credentials for %s', identifier)
+        raise
+    return False
 
 
 def _connect_proxmox_from_secret(identifier: str, *, timeout: float = 8.0) -> tuple[Any, Dict[str, Any]]:
@@ -18812,52 +18754,43 @@ def _select_latest_core_secret_record(scenario_norm: str | None = None) -> Optio
     """Find the most recent stored CORE credential, optionally filtered by scenario."""
 
     try:
-        secret_dirs = _core_secret_dir_candidates()
+        secret_dir = _core_secret_dir()
+        entries = os.listdir(secret_dir)
     except Exception:
         return None
-    if not secret_dirs:
+    if not entries:
         return None
     best_for_scenario: tuple[float, Dict[str, Any]] | None = None
     best_overall: tuple[float, Dict[str, Any]] | None = None
-    seen_identifiers: set[str] = set()
-    for secret_dir in secret_dirs:
+    for name in entries:
+        if not name.endswith('.json'):
+            continue
+        identifier = name[:-5]
         try:
-            entries = os.listdir(secret_dir)
+            record = _load_core_credentials(identifier)
         except Exception:
             continue
-        for name in entries:
-            if not name.endswith('.json'):
-                continue
-            identifier = name[:-5]
-            if identifier in seen_identifiers:
-                continue
-            seen_identifiers.add(identifier)
-            path = os.path.join(secret_dir, name)
+        if not record:
+            continue
+        stored_at = record.get('stored_at')
+        ts_val = 0.0
+        if isinstance(stored_at, str) and stored_at:
             try:
-                record = _load_core_credentials_from_path(path)
+                ts_val = datetime.datetime.fromisoformat(stored_at.replace('Z', '+00:00')).timestamp()
             except Exception:
-                continue
-            if not record:
-                continue
-            stored_at = record.get('stored_at')
-            ts_val = 0.0
-            if isinstance(stored_at, str) and stored_at:
-                try:
-                    ts_val = datetime.datetime.fromisoformat(stored_at.replace('Z', '+00:00')).timestamp()
-                except Exception:
-                    ts_val = 0.0
-            if not ts_val:
-                try:
-                    ts_val = os.path.getmtime(path)
-                except Exception:
-                    ts_val = 0.0
-            record_norm = _normalize_scenario_label(record.get('scenario_name')) if record.get('scenario_name') else ''
-            if scenario_norm and record_norm == scenario_norm:
-                if not best_for_scenario or ts_val > best_for_scenario[0]:
-                    best_for_scenario = (ts_val, record)
-            else:
-                if not best_overall or ts_val > best_overall[0]:
-                    best_overall = (ts_val, record)
+                ts_val = 0.0
+        if not ts_val:
+            try:
+                ts_val = os.path.getmtime(os.path.join(secret_dir, name))
+            except Exception:
+                ts_val = 0.0
+        record_norm = _normalize_scenario_label(record.get('scenario_name')) if record.get('scenario_name') else ''
+        if scenario_norm and record_norm == scenario_norm:
+            if not best_for_scenario or ts_val > best_for_scenario[0]:
+                best_for_scenario = (ts_val, record)
+        else:
+            if not best_overall or ts_val > best_overall[0]:
+                best_overall = (ts_val, record)
     if best_for_scenario:
         return best_for_scenario[1]
     return best_overall[1] if best_overall else None

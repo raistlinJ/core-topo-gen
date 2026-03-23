@@ -60,7 +60,7 @@ def test_api_flow_test_core_connection_uses_saved_page_core_cfg_when_xml_lacks_p
             'port': 50051,
             'ssh_enabled': True,
             'validated': True,
-            'ssh_host': 'localhost',
+            'ssh_host': '',
             'ssh_username': 'core',
             'ssh_password': '',
         },
@@ -79,12 +79,24 @@ def test_api_flow_test_core_connection_uses_saved_page_core_cfg_when_xml_lacks_p
             'core_secret_id': 'core-secret-1',
         },
     )
-    monkeypatch.setattr(backend, '_merge_core_configs', lambda base, override, include_password=True: {**(base or {}), **(override or {})})
     monkeypatch.setattr(backend, '_apply_core_secret_to_config', lambda cfg, scenario_norm: cfg)
     monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
-    monkeypatch.setattr(backend, '_ensure_core_daemon_listening', lambda cfg, timeout=5.0: None)
+    observed = {}
+    def _fake_ensure(cfg, timeout=5.0):
+        observed['host'] = cfg.get('host')
+        observed['port'] = cfg.get('port')
+        observed['ssh_host'] = cfg.get('ssh_host')
+        observed['ssh_password'] = cfg.get('ssh_password')
+        return None
+    monkeypatch.setattr(backend, '_ensure_core_daemon_listening', _fake_ensure)
 
     resp = client.post('/api/flag-sequencing/test_core_connection', json={'scenario': 'Scenario One'})
 
     assert resp.status_code == 200
-    assert resp.get_json() == {'ok': True, 'host': '10.0.0.8', 'port': 50051}
+    assert resp.get_json() == {'ok': True, 'host': 'localhost', 'port': 50051}
+    assert observed == {
+        'host': 'localhost',
+        'port': 50051,
+        'ssh_host': '10.0.0.8',
+        'ssh_password': 'saved-secret',
+    }
