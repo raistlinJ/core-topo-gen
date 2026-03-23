@@ -21,6 +21,9 @@ def _backend_dependencies(backend: Any) -> Any:
         '_latest_preview_plan_for_scenario_norm_origin',
         '_latest_preview_plan_for_scenario_norm',
         '_core_config_from_xml_path',
+        '_load_run_history',
+        '_select_core_config_for_page',
+        '_merge_core_configs',
         '_apply_core_secret_to_config',
         '_flow_normalize_fact_override',
         '_load_preview_payload_from_path',
@@ -293,8 +296,79 @@ def _load_prepare_preview_request_context(*, deps, flow_progress) -> dict[str, A
 
     try:
         flow_core_cfg = deps._core_config_from_xml_path(base_plan_path, scenario_norm, include_password=True)
+        explicit_core_host = ''
+        explicit_core_port = None
         if isinstance(flow_core_cfg, dict):
+            explicit_core_host = str(flow_core_cfg.get('grpc_host') or flow_core_cfg.get('host') or '').strip()
+            raw_port = flow_core_cfg.get('grpc_port') if flow_core_cfg.get('grpc_port') not in (None, '') else flow_core_cfg.get('port')
+            try:
+                explicit_core_port = int(raw_port) if raw_port not in (None, '') else None
+            except Exception:
+                explicit_core_port = None
+
+            page_core_cfg = None
+            try:
+                page_core_cfg = deps._select_core_config_for_page(scenario_norm, include_password=True)
+            except TypeError:
+                try:
+                    history = deps._load_run_history()
+                except Exception:
+                    history = None
+                try:
+                    page_core_cfg = deps._select_core_config_for_page(scenario_norm, history, include_password=True)
+                except Exception:
+                    page_core_cfg = None
+            except Exception:
+                page_core_cfg = None
+
+            if isinstance(page_core_cfg, dict) and page_core_cfg:
+                merged_core_cfg = dict(flow_core_cfg)
+
+                page_password = page_core_cfg.get('ssh_password')
+                if merged_core_cfg.get('ssh_password') in (None, '') and page_password not in (None, ''):
+                    merged_core_cfg['ssh_password'] = page_password
+
+                for field in (
+                    'ssh_username',
+                    'ssh_port',
+                    'venv_bin',
+                    'core_secret_id',
+                    'vm_key',
+                    'vm_name',
+                    'vm_node',
+                    'vmid',
+                    'proxmox_secret_id',
+                    'proxmox_target',
+                    'validated',
+                    'last_tested_status',
+                ):
+                    if merged_core_cfg.get(field) in (None, '', 0, {}):
+                        value = page_core_cfg.get(field)
+                        if value not in (None, '', 0, {}):
+                            merged_core_cfg[field] = value
+
+                def _is_loopback_host(value: Any) -> bool:
+                    try:
+                        text = str(value or '').strip().lower()
+                    except Exception:
+                        return False
+                    return text in {'localhost', '127.0.0.1', '::1'}
+
+                page_ssh_host = page_core_cfg.get('ssh_host')
+                if page_ssh_host not in (None, ''):
+                    current_ssh_host = merged_core_cfg.get('ssh_host')
+                    if current_ssh_host in (None, '') or _is_loopback_host(current_ssh_host):
+                        merged_core_cfg['ssh_host'] = page_ssh_host
+
+                flow_core_cfg = merged_core_cfg
+
             flow_core_cfg = deps._apply_core_secret_to_config(flow_core_cfg, scenario_norm)
+            if explicit_core_host:
+                flow_core_cfg['host'] = explicit_core_host
+                flow_core_cfg['grpc_host'] = explicit_core_host
+            if explicit_core_port is not None and explicit_core_port > 0:
+                flow_core_cfg['port'] = explicit_core_port
+                flow_core_cfg['grpc_port'] = explicit_core_port
     except Exception:
         flow_core_cfg = None
     if not flow_remote_forced and isinstance(flow_core_cfg, dict) and deps._coerce_bool(flow_core_cfg.get('ssh_enabled')):
