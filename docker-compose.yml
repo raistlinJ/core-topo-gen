@@ -11,6 +11,7 @@ services:
       - CORE_PORT=${CORE_PORT:-50051}
       - CORETG_HOST=127.0.0.1
       - WEBAPP_PORT=9090
+      - CORETG_SECRETS_DIR=/root/.core-topo-gen/secrets
     extra_hosts:
       - "host.docker.internal:host-gateway"
     dns:
@@ -20,6 +21,9 @@ services:
       # Mount the repo so checked-out code and template changes are visible
       # without rebuilding the image on every compose restart.
       - .:/app
+      # Mount the host-side secret store so saved VM/Access credentials survive
+      # container rebuilds and remain available to the web app.
+      - ${HOME}/.core-topo-gen:/root/.core-topo-gen
     network_mode: host
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/healthz', timeout=3)"]
