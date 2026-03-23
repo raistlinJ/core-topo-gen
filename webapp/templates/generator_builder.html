@@ -745,55 +745,6 @@
         </div>
       </div>
     </div>
-    <div class="row g-4 mt-1">
-      <div class="col-12">
-        <div class="accordion gb-accordion" id="gbAdvancedAccordion">
-              <div class="accordion-item">
-                <h2 class="accordion-header" id="gbCatalogHeading">
-                  <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#gbCatalogBody" aria-expanded="false" aria-controls="gbCatalogBody">
-                    Install & downloads
-                    <span class="gb-optional-badge">Optional</span>
-                  </button>
-                </h2>
-                <div id="gbCatalogBody" class="accordion-collapse collapse" aria-labelledby="gbCatalogHeading" data-bs-parent="#gbAdvancedAccordion">
-                  <div class="accordion-body">
-                    <div class="d-grid gap-2">
-                      <button class="btn btn-outline-success" type="button" id="gbInstallBtn" disabled><i class="bi bi-plus-square me-1"></i>Add to catalog</button>
-                      <button class="btn btn-outline-secondary" type="button" id="gbDownloadComposeBtn" disabled><i class="bi bi-download me-1"></i>Download docker-compose</button>
-                      <button class="btn btn-outline-secondary" type="button" id="gbDownloadReadmeBtn" disabled><i class="bi bi-download me-1"></i>Download README</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div class="accordion-item mt-3">
-                <h2 class="accordion-header" id="gbManifestHeading">
-                  <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#gbManifestBody" aria-expanded="false" aria-controls="gbManifestBody">
-                    Normalized manifest.yaml
-                    <span class="gb-optional-badge">Optional</span>
-                  </button>
-                </h2>
-                <div id="gbManifestBody" class="accordion-collapse collapse" aria-labelledby="gbManifestHeading" data-bs-parent="#gbAdvancedAccordion">
-                  <div class="accordion-body">
-                    <pre class="gb-code mb-0" id="gbManifestYaml">No manifest generated yet.</pre>
-                  </div>
-                </div>
-              </div>
-              <div class="accordion-item mt-3">
-                <h2 class="accordion-header" id="gbAssistantHeading">
-                  <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#gbAssistantBody" aria-expanded="false" aria-controls="gbAssistantBody">
-                    Raw model response
-                    <span class="gb-optional-badge">Optional</span>
-                  </button>
-                </h2>
-                <div id="gbAssistantBody" class="accordion-collapse collapse" aria-labelledby="gbAssistantHeading" data-bs-parent="#gbAdvancedAccordion">
-                  <div class="accordion-body">
-                    <pre class="gb-code mb-0" id="gbAssistantText">No model response captured yet.</pre>
-                  </div>
-                </div>
-              </div>
-        </div>
-      </div>
-    </div>
   </div>
 </div>
 
@@ -2258,8 +2209,12 @@
     state.manifestYaml = String(result.manifest_yaml || '');
     state.assistantText = String(result.assistant_text || state.assistantText || '');
     state.activeFilePath = '';
-    elements.manifestYaml.textContent = state.manifestYaml || 'No manifest generated yet.';
-    elements.assistantText.textContent = state.assistantText ? formatStructuredText(state.assistantText) : 'No model response captured yet.';
+    if (elements.manifestYaml) {
+      elements.manifestYaml.textContent = state.manifestYaml || 'No manifest generated yet.';
+    }
+    if (elements.assistantText) {
+      elements.assistantText.textContent = state.assistantText ? formatStructuredText(state.assistantText) : 'No model response captured yet.';
+    }
     renderSummary();
     renderFiles();
     updateActionButtons();
@@ -2318,14 +2273,18 @@
 
   function setGenerateBusy(isBusy) {
     state.generateInFlight = !!isBusy;
-    elements.testBtn.disabled = !!isBusy || !state.scaffoldRequest;
-    elements.installBtn.disabled = !!isBusy || !state.scaffoldRequest;
-    elements.promptExampleBtn.disabled = !!isBusy;
-    elements.streamRetryBtn.disabled = !!isBusy;
-    elements.streamCloseBtn.disabled = !!isBusy;
-    elements.streamHeaderCloseBtn.disabled = !!isBusy;
-    elements.downloadComposeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/docker-compose.yml'));
-    elements.downloadReadmeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
+    if (elements.testBtn) elements.testBtn.disabled = !!isBusy || !state.scaffoldRequest;
+    if (elements.installBtn) elements.installBtn.disabled = !!isBusy || !state.scaffoldRequest;
+    if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = !!isBusy;
+    if (elements.streamRetryBtn) elements.streamRetryBtn.disabled = !!isBusy;
+    if (elements.streamCloseBtn) elements.streamCloseBtn.disabled = !!isBusy;
+    if (elements.streamHeaderCloseBtn) elements.streamHeaderCloseBtn.disabled = !!isBusy;
+    if (elements.downloadComposeBtn) {
+      elements.downloadComposeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/docker-compose.yml'));
+    }
+    if (elements.downloadReadmeBtn) {
+      elements.downloadReadmeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
+    }
     if (!isBusy) {
       setGenerateOverlay(false);
       state.generateCancelRequested = false;
@@ -2407,14 +2366,18 @@
   function updateActionButtons() {
     const hasScaffold = !!state.scaffoldRequest;
     const promptReady = isPromptUnlocked();
-    elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
-    elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
-    elements.installBtn.disabled = state.generateInFlight || !hasScaffold;
-    elements.promptSubmitBtn.disabled = state.generateInFlight || !promptReady;
-    elements.promptExampleBtn.disabled = state.generateInFlight || !promptReady;
-    elements.downloadComposeBtn.disabled = state.generateInFlight || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/docker-compose.yml'));
-    elements.downloadReadmeBtn.disabled = state.generateInFlight || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
-    elements.fetchModelsBtn.disabled = state.generateInFlight;
+    if (elements.promptRefineBtn) elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
+    if (elements.testBtn) elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
+    if (elements.installBtn) elements.installBtn.disabled = state.generateInFlight || !hasScaffold;
+    if (elements.promptSubmitBtn) elements.promptSubmitBtn.disabled = state.generateInFlight || !promptReady;
+    if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = state.generateInFlight || !promptReady;
+    if (elements.downloadComposeBtn) {
+      elements.downloadComposeBtn.disabled = state.generateInFlight || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/docker-compose.yml'));
+    }
+    if (elements.downloadReadmeBtn) {
+      elements.downloadReadmeBtn.disabled = state.generateInFlight || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
+    }
+    if (elements.fetchModelsBtn) elements.fetchModelsBtn.disabled = state.generateInFlight;
     if (elements.buildTabTestBtn) {
       const testRunLocked = state.generateInFlight || !hasScaffold || !builderTestState.hasRunHistory;
       elements.buildTabTestBtn.disabled = testRunLocked;
@@ -3020,13 +2983,15 @@
       setTestStatus(String((err && err.message) || err || 'Builder test failed.'), 'danger');
     }
   });
-  elements.installBtn.addEventListener('click', async () => {
-    try {
-      await installGenerated();
-    } catch (err) {
-      setGenerationStatus(String((err && err.message) || err || 'Install failed.'), 'danger');
-    }
-  });
+  if (elements.installBtn) {
+    elements.installBtn.addEventListener('click', async () => {
+      try {
+        await installGenerated();
+      } catch (err) {
+        setGenerationStatus(String((err && err.message) || err || 'Install failed.'), 'danger');
+      }
+    });
+  }
   elements.prompt.addEventListener('input', queuePromptIntentPreview);
   elements.sourceIdHint.addEventListener('input', queuePromptIntentPreview);
   elements.nameHint.addEventListener('input', queuePromptIntentPreview);
@@ -3060,20 +3025,24 @@
   if (elements.intentClearBtn) {
     elements.intentClearBtn.addEventListener('click', () => clearIntentOverrides({ refresh: true }));
   }
-  elements.downloadComposeBtn.addEventListener('click', () => {
-    try {
-      downloadGeneratedFile('/docker-compose.yml');
-    } catch (err) {
-      setGenerationStatus(String((err && err.message) || err || 'Download failed.'), 'danger');
-    }
-  });
-  elements.downloadReadmeBtn.addEventListener('click', () => {
-    try {
-      downloadGeneratedFile('/README.md');
-    } catch (err) {
-      setGenerationStatus(String((err && err.message) || err || 'Download failed.'), 'danger');
-    }
-  });
+  if (elements.downloadComposeBtn) {
+    elements.downloadComposeBtn.addEventListener('click', () => {
+      try {
+        downloadGeneratedFile('/docker-compose.yml');
+      } catch (err) {
+        setGenerationStatus(String((err && err.message) || err || 'Download failed.'), 'danger');
+      }
+    });
+  }
+  if (elements.downloadReadmeBtn) {
+    elements.downloadReadmeBtn.addEventListener('click', () => {
+      try {
+        downloadGeneratedFile('/README.md');
+      } catch (err) {
+        setGenerationStatus(String((err && err.message) || err || 'Download failed.'), 'danger');
+      }
+    });
+  }
   elements.promptExampleBtn.addEventListener('click', loadExamplePrompt);
   elements.streamCopyBtn.addEventListener('click', async () => {
     try {

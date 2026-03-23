@@ -39,8 +39,6 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Submit New' in body
     assert 'Test' in body
     assert 'Submit as Refinement' in body
-    assert 'Download README' in body
-    assert 'Add to catalog' in body
     assert 'Generated Summary' in body
     assert 'Generator Builder Output' in body
     assert 'CORE VM Credentials' in body
@@ -60,7 +58,6 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'gbIntentOverridesPanel' in body
     assert 'data-gb-intent-fill="runtime_inputs"' in body
     assert 'gbIntentOverridesSummary' in body
-    assert 'Install & downloads' in body
     assert 'Locked until validation' in body
     assert 'coretg_builder_model_config' in body
     assert 'After Scaffold' not in body
@@ -68,6 +65,9 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Test &amp; Iterate' not in body
     assert 'Advanced <span class="gb-optional-badge">Optional</span>' not in body
     assert 'Test Configuration' not in body
+    assert 'Install & downloads' not in body
+    assert 'Normalized manifest.yaml' not in body
+    assert 'Raw model response' not in body
 
 
 def test_generator_artifacts_index_merges_sources_reserved_and_custom(monkeypatch):
