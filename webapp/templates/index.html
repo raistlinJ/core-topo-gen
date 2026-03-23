@@ -2811,6 +2811,36 @@
         return null;
     }
 
+    function hasPersistedVerifiedCoreSetup(hitlState) {
+        const hitl = hitlState && typeof hitlState === 'object' ? hitlState : {};
+        const prox = hitl.proxmox && typeof hitl.proxmox === 'object' ? hitl.proxmox : {};
+        const core = hitl.core && typeof hitl.core === 'object' ? hitl.core : {};
+        const vmKey = (core.vm_key ?? '').toString().trim();
+        const proxSecretId = (prox.secret_id ?? '').toString().trim();
+        const coreSecretId = (core.core_secret_id ?? '').toString().trim();
+        const coreHost = (core.grpc_host ?? '').toString().trim();
+        const coreUser = (core.ssh_username ?? '').toString().trim();
+        const coreSshHost = ((core.ssh_host ?? '').toString().trim() || coreHost);
+        const corePort = Number(core.grpc_port);
+        const coreSshPort = Number(core.ssh_port);
+        const lastStatus = (core.last_tested_status ?? '').toString().trim().toLowerCase();
+        return !!(
+            prox.validated === true
+            && core.validated === true
+            && proxSecretId
+            && coreSecretId
+            && vmKey
+            && coreHost
+            && coreUser
+            && coreSshHost
+            && Number.isFinite(corePort)
+            && corePort > 0
+            && Number.isFinite(coreSshPort)
+            && coreSshPort > 0
+            && lastStatus === 'success'
+        );
+    }
+
     function _structuredCloneSafe(value) {
         if (value === null || typeof value !== 'object') return null;
         if (typeof structuredClone === 'function') {
@@ -11283,6 +11313,16 @@
                 verifyFinish({ ok: false, message: msg });
                 markCoreVerifyFailed(msg);
                 return { ok: false, message: msg };
+            }
+
+            if (hasPersistedVerifiedCoreSetup(hitlState)) {
+                const msg = 'Using saved verified Proxmox and CORE settings.';
+                verifySetStatus('Using saved verification…');
+                verifyLog('Saved Proxmox and CORE settings are still marked verified; skipping Proxmox inventory refresh and live CORE revalidation.');
+                verifyLog(`SUCCESS: ${msg}`);
+                verifyFinish({ ok: true, message: msg, tone: 'success' });
+                updateProxmoxSummary(sidx);
+                return { ok: true, reused_saved_verification: true, message: msg };
             }
 
             // Confirm the selected VM exists in the current Proxmox inventory (and has interfaces).
