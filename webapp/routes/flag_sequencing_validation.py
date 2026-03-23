@@ -33,6 +33,21 @@ def register(app, *, backend_module: Any) -> None:
             if not xml_path_for_core:
                 return jsonify({'ok': False, 'error': 'No XML found for this scenario.'}), 404
             flow_core_cfg = backend._core_config_from_xml_path(xml_path_for_core, scenario_norm, include_password=True)
+            page_core_cfg = None
+            try:
+                page_core_cfg = backend._select_core_config_for_page(scenario_norm, include_password=True)
+            except Exception:
+                page_core_cfg = None
+            if isinstance(page_core_cfg, dict) and page_core_cfg:
+                if isinstance(flow_core_cfg, dict) and flow_core_cfg:
+                    try:
+                        flow_core_cfg = backend._merge_core_configs(flow_core_cfg, page_core_cfg, include_password=True)
+                    except Exception:
+                        merged = dict(page_core_cfg)
+                        merged.update(flow_core_cfg)
+                        flow_core_cfg = merged
+                else:
+                    flow_core_cfg = page_core_cfg
             if isinstance(flow_core_cfg, dict):
                 flow_core_cfg = backend._apply_core_secret_to_config(flow_core_cfg, scenario_norm)
         except Exception:
