@@ -2534,6 +2534,7 @@
                 vm_key: '',
                 vm_name: '',
                 vm_node: '',
+                vmid: '',
                 grpc_host: 'localhost',
                 grpc_port: 50051,
                 ssh_host: '',
@@ -2564,6 +2565,7 @@
             core.vm_key = (core.vm_key ?? '').toString();
             core.vm_name = (core.vm_name ?? '').toString();
             core.vm_node = (core.vm_node ?? '').toString();
+            core.vmid = (core.vmid ?? core.vm_id ?? '').toString().trim();
             core.grpc_host = (core.grpc_host ?? '').toString().trim();
             if (!core.grpc_host) core.grpc_host = 'localhost';
             core.host = core.grpc_host;
@@ -2711,6 +2713,102 @@
         }
         applyDefaultProxmoxFields(scen.hitl.proxmox);
         return scen.hitl;
+    }
+
+    function normalizeProxmoxVmNode(value) {
+        if (value === undefined || value === null) return '';
+        return String(value).trim().toLowerCase();
+    }
+
+    function normalizeProxmoxVmId(value) {
+        if (value === undefined || value === null) return '';
+        return String(value).trim();
+    }
+
+    function normalizeProxmoxVmName(value) {
+        if (value === undefined || value === null) return '';
+        return String(value).trim().toLowerCase();
+    }
+
+    function getCanonicalProxmoxVmKey(vm) {
+        if (!vm || typeof vm !== 'object') return '';
+        const node = (vm.node ?? vm.vm_node ?? '').toString().trim();
+        const vmid = (vm.vmid ?? vm.vm_id ?? '').toString().trim();
+        if (!node || !vmid) return '';
+        return `${node}::${vmid}`;
+    }
+
+    function parseProxmoxVmSelection(selection) {
+        let vmKey = '';
+        let node = '';
+        let vmid = '';
+        let vmName = '';
+        if (typeof selection === 'string') {
+            vmKey = selection.trim();
+        } else if (selection && typeof selection === 'object') {
+            vmKey = (selection.vm_key ?? selection.key ?? '').toString().trim();
+            node = (selection.vm_node ?? selection.node ?? '').toString().trim();
+            vmid = (selection.vmid ?? selection.vm_id ?? '').toString().trim();
+            vmName = (selection.vm_name ?? selection.name ?? '').toString().trim();
+        }
+        if ((!node || !vmid) && vmKey.includes('::')) {
+            const parts = vmKey.split('::', 2);
+            node = node || (parts[0] || '').trim();
+            vmid = vmid || (parts[1] || '').trim();
+        }
+        return {
+            vmKey,
+            node,
+            vmid,
+            vmName,
+            nodeNorm: normalizeProxmoxVmNode(node),
+            vmidNorm: normalizeProxmoxVmId(vmid),
+            vmNameNorm: normalizeProxmoxVmName(vmName),
+        };
+    }
+
+    function findProxmoxInventoryVm(inventory, selection) {
+        const vms = Array.isArray(inventory) ? inventory : [];
+        if (!vms.length) return null;
+        const wanted = parseProxmoxVmSelection(selection);
+        if (!wanted.vmKey && !wanted.nodeNorm && !wanted.vmidNorm && !wanted.vmNameNorm) {
+            return null;
+        }
+        if (wanted.vmKey) {
+            const exact = vms.find(vm => getCanonicalProxmoxVmKey(vm) === wanted.vmKey) || null;
+            if (exact) return exact;
+        }
+        if (wanted.nodeNorm && wanted.vmidNorm) {
+            const byNodeAndId = vms.find((vm) => {
+                return normalizeProxmoxVmNode(vm?.node ?? vm?.vm_node) === wanted.nodeNorm
+                    && normalizeProxmoxVmId(vm?.vmid ?? vm?.vm_id) === wanted.vmidNorm;
+            }) || null;
+            if (byNodeAndId) return byNodeAndId;
+        }
+        if (wanted.vmidNorm) {
+            const byId = vms.filter((vm) => normalizeProxmoxVmId(vm?.vmid ?? vm?.vm_id) === wanted.vmidNorm);
+            if (byId.length === 1) return byId[0];
+            if (wanted.nodeNorm) {
+                const byIdAndNode = byId.find((vm) => normalizeProxmoxVmNode(vm?.node ?? vm?.vm_node) === wanted.nodeNorm) || null;
+                if (byIdAndNode) return byIdAndNode;
+            }
+            if (wanted.vmNameNorm) {
+                const byIdAndName = byId.find((vm) => normalizeProxmoxVmName(vm?.name ?? vm?.vm_name) === wanted.vmNameNorm) || null;
+                if (byIdAndName) return byIdAndName;
+            }
+        }
+        if (wanted.nodeNorm && wanted.vmNameNorm) {
+            const byNodeAndName = vms.find((vm) => {
+                return normalizeProxmoxVmNode(vm?.node ?? vm?.vm_node) === wanted.nodeNorm
+                    && normalizeProxmoxVmName(vm?.name ?? vm?.vm_name) === wanted.vmNameNorm;
+            }) || null;
+            if (byNodeAndName) return byNodeAndName;
+        }
+        if (wanted.vmNameNorm) {
+            const byName = vms.filter((vm) => normalizeProxmoxVmName(vm?.name ?? vm?.vm_name) === wanted.vmNameNorm);
+            if (byName.length === 1) return byName[0];
+        }
+        return null;
     }
 
     function _structuredCloneSafe(value) {
@@ -3216,7 +3314,12 @@
             const liveSelectedVm = (() => {
                 const inventory = hitl.proxmox?.inventory;
                 const vms = inventory && Array.isArray(inventory.vms) ? inventory.vms : [];
-                return vms.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === coreVmKey) || null;
+                return findProxmoxInventoryVm(vms, {
+                    vm_key: coreVmKey,
+                    vm_node: core.vm_node,
+                    vmid: core.vmid,
+                    vm_name: core.vm_name,
+                }) || null;
             })();
             const fallbackCoreVm = (!liveSelectedVm && coreVmKey)
                 ? {
@@ -9980,7 +10083,12 @@
         const proxInventory = hitlState.proxmox && hitlState.proxmox.inventory && Array.isArray(hitlState.proxmox.inventory.vms)
             ? hitlState.proxmox.inventory.vms
             : [];
-        const targetVm = proxInventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === vmKey);
+        const targetVm = findProxmoxInventoryVm(proxInventory, {
+            vm_key: vmKey,
+            vm_node: coreState.vm_node,
+            vmid: coreState.vmid,
+            vm_name: coreState.vm_name,
+        });
         if (targetVm) {
             coreVmMeta.vm_name = targetVm.name ? String(targetVm.name) : coreVmMeta.vm_name;
             if (!coreVmMeta.vm_node && targetVm.node) coreVmMeta.vm_node = String(targetVm.node);
@@ -11191,13 +11299,28 @@
                     return vms2;
                 };
                 const vms = await ensureInventory();
-                const selectedVm = vms.find(vm => `${vm?.node ?? ''}::${vm?.vmid ?? ''}` === vmKey) || null;
+                const selectedVm = findProxmoxInventoryVm(vms, {
+                    vm_key: vmKey,
+                    vm_node: core.vm_node,
+                    vmid: core.vmid,
+                    vm_name: core.vm_name,
+                }) || null;
                 if (!selectedVm) {
                     const msg = 'Selected CORE VM is not present in the current Proxmox inventory. Refresh the VM list and re-select the VM.';
                     verifyLog(`FAILED: ${msg}`);
                     verifyFinish({ ok: false, message: msg });
                     markCoreVerifyFailed(msg);
                     return { ok: false, message: msg };
+                }
+                const canonicalVmKey = getCanonicalProxmoxVmKey(selectedVm);
+                if (canonicalVmKey && core.vm_key !== canonicalVmKey) {
+                    core.vm_key = canonicalVmKey;
+                    core.vm_node = (selectedVm.node ?? core.vm_node ?? '').toString().trim();
+                    core.vmid = (selectedVm.vmid ?? core.vmid ?? '').toString().trim();
+                    if (!core.vm_name && selectedVm.name) {
+                        core.vm_name = String(selectedVm.name).trim();
+                    }
+                    persistEditorState();
                 }
                 const ifaceCount = Array.isArray(selectedVm.interfaces) ? selectedVm.interfaces.length : null;
                 if (ifaceCount !== null && ifaceCount < 1) {
@@ -14227,7 +14350,12 @@
         const vmKeyNodePart = (vmKeyParts[0] || '').trim();
         const vmKeyIdPart = (vmKeyParts[1] || '').trim();
         const cachedVmInterfaceCount = Number.isFinite(Number(core.cached_vm_interface_count)) ? Number(core.cached_vm_interface_count) : null;
-        const liveSelectedCoreVm = proxInventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === coreVmKey) || null;
+        const liveSelectedCoreVm = findProxmoxInventoryVm(proxInventory, {
+            vm_key: coreVmKey,
+            vm_node: core.vm_node,
+            vmid: core.vmid,
+            vm_name: core.vm_name,
+        }) || null;
         const fallbackCoreVm = (!liveSelectedCoreVm && coreVmKey) ? {
             name: coreVmName || '',
             node: core.vm_node || vmKeyNodePart || '',
@@ -15052,7 +15180,12 @@
                     })
                     .map(option => `<option value="${escapeHtml(option.key)}" ${option.selected ? 'selected' : ''}>${escapeHtml(option.label)}</option>`);
                 const selectDisabledAttr = step4Enabled ? '' : 'disabled';
-                const selectedVm = selectedKey ? proxInventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === selectedKey) : null;
+                const selectedVm = selectedKey ? findProxmoxInventoryVm(proxInventory, {
+                    vm_key: selectedKey,
+                    vm_node: selectedExternal?.vm_node,
+                    vmid: selectedExternal?.vmid,
+                    vm_name: selectedExternal?.vm_name,
+                }) : null;
                 const physicalInterfaces = selectedVm ? getPhysicalVmInterfaces(selectedVm) : [];
                 const physicalInterfacesSummary = selectedVm ? summarizePhysicalVmInterfaces(selectedVm) : '';
                 const selectedIfaceId = selectedExternal?.interface_id ? String(selectedExternal.interface_id).trim() : '';
@@ -17296,7 +17429,7 @@
                     try { showToast('Select a VM other than the CORE VM.', { autohide: true, delay: 2500 }); } catch (e) { }
                     return;
                 }
-                const selectedVm = inventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === rawValue);
+                const selectedVm = findProxmoxInventoryVm(inventory, rawValue);
                 const [nodePart, vmidPartRaw] = rawValue.split('::');
                 const vmidPart = vmidPartRaw && vmidPartRaw.trim() ? vmidPartRaw.trim() : '';
                 const normalizedVmNode = selectedVm && selectedVm.node !== undefined && selectedVm.node !== null
@@ -17360,7 +17493,7 @@
                 const proxState = hitlState.proxmox || {};
                 const inventory = proxState.inventory && Array.isArray(proxState.inventory.vms) ? proxState.inventory.vms : [];
                 const externalVmKey = ifaceEntry.external_vm.vm_key || '';
-                const selectedVm = inventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === externalVmKey);
+                const selectedVm = findProxmoxInventoryVm(inventory, ifaceEntry.external_vm);
                 const physicalInterfaces = selectedVm ? getPhysicalVmInterfaces(selectedVm) : [];
                 if (!rawValue) {
                     delete ifaceEntry.external_vm.interface_id;
@@ -17664,6 +17797,7 @@
                         coreState.vm_key = '';
                         coreState.vm_name = '';
                         coreState.vm_node = '';
+                        coreState.vmid = '';
                         coreState.last_tested_status = null;
                         coreState.last_tested_message = null;
                         coreState.last_tested_at = null;
@@ -17702,14 +17836,17 @@
                     }
                     const proxState = hitlState.proxmox || {};
                     const inventory = proxState.inventory && Array.isArray(proxState.inventory.vms) ? proxState.inventory.vms : [];
-                    const selectedVm = inventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === rawValue) || null;
+                    const selectedVm = findProxmoxInventoryVm(inventory, rawValue) || null;
                     const [nodePart, vmidPartRaw] = rawValue.split('::');
                     resetCoreSelection({ preserveAuth: true });
-                    coreState.vm_key = rawValue;
+                    coreState.vm_key = getCanonicalProxmoxVmKey(selectedVm) || rawValue;
                     coreState.vm_name = selectedVm && selectedVm.name ? String(selectedVm.name) : '';
                     coreState.vm_node = selectedVm && selectedVm.node !== undefined && selectedVm.node !== null
                         ? String(selectedVm.node)
                         : (nodePart || '').trim();
+                    coreState.vmid = selectedVm && selectedVm.vmid !== undefined && selectedVm.vmid !== null
+                        ? String(selectedVm.vmid).trim()
+                        : (vmidPartRaw || '').trim();
                     if (!coreState.vm_name && coreState.vm_node && vmidPartRaw && vmidPartRaw.trim()) {
                         coreState.vm_name = `${coreState.vm_node}::${vmidPartRaw.trim()}`;
                     }
