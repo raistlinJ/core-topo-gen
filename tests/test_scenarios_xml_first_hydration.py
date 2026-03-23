@@ -112,6 +112,7 @@ def test_layout_exposes_shared_navigation_loading_helper() -> None:
         'window.CORETG_NAVIGATE_PAGE_DETAILS = navigatePageDetails;',
         "const wantsLoading = target.hasAttribute('data-coretg-nav-loading') || target.id === 'navCoreLink';",
         "if (!shouldUseDefaultPageLoading(target)) return;",
+        "if (dest.pathname === window.location.pathname && dest.search === window.location.search && dest.hash) return false;",
         "window.addEventListener('focus', hideNavLoading);",
         "if (!document.hidden) hideNavLoading();",
     ]

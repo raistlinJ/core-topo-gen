@@ -588,6 +588,7 @@
                     if (href.includes('/api/')) return false;
                     const dest = new URL(href, window.location.href);
                     if (dest.origin !== window.location.origin) return false;
+                    if (dest.pathname === window.location.pathname && dest.search === window.location.search && dest.hash) return false;
                     return true;
                 } catch (e) {
                     return false;
