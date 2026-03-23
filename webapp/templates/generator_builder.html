@@ -375,6 +375,7 @@
           <span class="gb-pill"><i class="bi bi-cpu"></i> Provider-aware</span>
           <span class="gb-pill"><i class="bi bi-box-seam"></i> ZIP-ready output</span>
           <span class="gb-pill"><i class="bi bi-file-earmark-code"></i> Manifest-safe scaffold</span>
+          <button class="btn btn-sm btn-outline-danger" type="button" id="gbClearStateBtn">Clear Builder State</button>
         </div>
       </div>
     </div>
@@ -737,6 +738,12 @@
                     <div class="list-group" id="gbTestFiles">
                       <div class="list-group-item text-muted">No test artifacts yet.</div>
                     </div>
+                    <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mt-3 pt-3 border-top">
+                      <div class="small text-muted">Install unlocks after the latest Builder test completes successfully.</div>
+                      <button class="btn btn-outline-success" type="button" id="gbInstallBtn" disabled>
+                        <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -833,6 +840,8 @@
   };
 
   const BUILDER_MODEL_PREFS_KEY = 'coretg_builder_model_config';
+  const BUILDER_WORKSPACE_STATE_KEY = 'coretg_builder_workspace_state';
+  const BUILDER_TEST_SSH_KEY = 'coretg_builder_test_ssh';
 
   const state = {
     catalog: { ...fallbackCatalog },
@@ -1012,7 +1021,207 @@
     testRunActiveStatus: document.getElementById('gbTestRunActiveStatus'),
     testRunActiveSpinner: document.getElementById('gbTestRunActiveSpinner'),
     testRunActiveText: document.getElementById('gbTestRunActiveText'),
+    clearStateBtn: document.getElementById('gbClearStateBtn'),
   };
+
+  function hasSuccessfulBuilderTest() {
+    const latest = builderTestState.latestOutputsData;
+    if (latest && latest.done && Number(latest.returncode) === 0) {
+      return true;
+    }
+    const test = state.lastTestResult;
+    return !!(test && Number(test.returncode) === 0 && (test.done !== false));
+  }
+
+  function buildBuilderWorkspaceStateSnapshot() {
+    return {
+      version: 1,
+      promptUnlocked: !!state.promptUnlocked,
+      pluginType: String(elements.pluginType && elements.pluginType.value || 'flag-generator'),
+      sourceIdHint: String(elements.sourceIdHint && elements.sourceIdHint.value || ''),
+      nameHint: String(elements.nameHint && elements.nameHint.value || ''),
+      prompt: String(elements.prompt && elements.prompt.value || ''),
+      intentOverrides: buildIntentOverridePayload() || {},
+      scaffoldRequest: state.scaffoldRequest || null,
+      scaffoldFiles: state.scaffoldFiles || {},
+      activeFilePath: String(state.activeFilePath || ''),
+      manifestYaml: String(state.manifestYaml || ''),
+      assistantText: String(state.assistantText || ''),
+      lastTestResult: state.lastTestResult || null,
+      iterations: Array.isArray(state.iterations) ? state.iterations : [],
+      lastGenerateMode: String(state.lastGenerateMode || 'create'),
+      transcriptEvents: Array.isArray(state.transcriptEvents) ? state.transcriptEvents : [],
+      promptIntentPreview: state.promptIntentPreview || null,
+      latestOutputsData: builderTestState.latestOutputsData || null,
+      builderRunId: String(builderTestState.runId || ''),
+      builderTestBase: String(builderTestState.testBase || '/api/generators/builder_test'),
+      builderHasRunHistory: !!builderTestState.hasRunHistory,
+      testStatusText: String(elements.testStatus && elements.testStatus.textContent || ''),
+      testStatusClass: String(elements.testStatus && elements.testStatus.className || ''),
+      testStdout: String(elements.testStdout && elements.testStdout.textContent || ''),
+      testStderr: String(elements.testStderr && elements.testStderr.textContent || ''),
+      builderLog: String(document.getElementById('gbGenTestLog')?.textContent || ''),
+    };
+  }
+
+  function persistBuilderWorkspaceState() {
+    try {
+      localStorage.setItem(BUILDER_WORKSPACE_STATE_KEY, JSON.stringify(buildBuilderWorkspaceStateSnapshot()));
+    } catch (e) {}
+  }
+
+  function loadBuilderWorkspaceState() {
+    try {
+      const raw = localStorage.getItem(BUILDER_WORKSPACE_STATE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function removeBuilderWorkspaceState() {
+    try { localStorage.removeItem(BUILDER_WORKSPACE_STATE_KEY); } catch (e) {}
+  }
+
+  function restoreBuilderWorkspaceState(snapshot) {
+    const saved = snapshot && typeof snapshot === 'object' ? snapshot : null;
+    if (!saved) return false;
+    if (elements.pluginType) elements.pluginType.value = String(saved.pluginType || 'flag-generator');
+    if (elements.sourceIdHint) elements.sourceIdHint.value = String(saved.sourceIdHint || '');
+    if (elements.nameHint) elements.nameHint.value = String(saved.nameHint || '');
+    if (elements.prompt) elements.prompt.value = String(saved.prompt || '');
+    fillIntentOverrideInputs(saved.intentOverrides || {}, { refresh: false });
+    state.promptUnlocked = !!saved.promptUnlocked;
+    state.scaffoldRequest = saved.scaffoldRequest || null;
+    state.scaffoldFiles = saved.scaffoldFiles && typeof saved.scaffoldFiles === 'object' ? saved.scaffoldFiles : {};
+    state.activeFilePath = String(saved.activeFilePath || '');
+    state.manifestYaml = String(saved.manifestYaml || '');
+    state.assistantText = String(saved.assistantText || '');
+    state.lastTestResult = saved.lastTestResult || null;
+    state.iterations = Array.isArray(saved.iterations) ? saved.iterations : [];
+    state.lastGenerateMode = String(saved.lastGenerateMode || 'create');
+    state.transcriptEvents = Array.isArray(saved.transcriptEvents) ? saved.transcriptEvents : [];
+    state.promptIntentPreview = saved.promptIntentPreview || null;
+    builderTestState.latestOutputsData = saved.latestOutputsData || null;
+    builderTestState.runId = String(saved.builderRunId || '');
+    builderTestState.testBase = String(saved.builderTestBase || '/api/generators/builder_test');
+    builderTestState.hasRunHistory = !!saved.builderHasRunHistory;
+    builderTestState.current = state.scaffoldRequest;
+    builderTestState.runActive = false;
+    builderTestState.streamEndedAt = null;
+    builderTestState.completionLogged = false;
+    builderTestState.stageLabel = '';
+    builderTestState.lastStageLabel = '';
+    if (state.promptIntentPreview && Array.isArray(state.promptIntentPreview.sections)) {
+      setPromptIntentPreview(
+        state.promptIntentPreview.sections.length ? 'Ready' : 'Idle',
+        state.promptIntentPreview.sections.length ? 'success' : 'secondary',
+        state.promptIntentPreview.sections
+      );
+    }
+    if (state.assistantText) {
+      setStreamOutput(state.assistantText, 'Restored raw model response from local state.');
+    }
+    if (elements.streamMeta) {
+      elements.streamMeta.textContent = state.scaffoldRequest
+        ? `Restored workspace • ${String(state.scaffoldRequest.plugin_id || '').trim() || 'generated scaffold'}`
+        : 'Restored workspace.';
+    }
+    if (elements.testStatus) {
+      elements.testStatus.className = String(saved.testStatusClass || 'alert alert-secondary small');
+      elements.testStatus.textContent = String(saved.testStatusText || (hasSuccessfulBuilderTest() ? 'Restored latest successful Builder test result.' : 'No local test run yet.'));
+    }
+    if (elements.testStdout) {
+      elements.testStdout.textContent = String(saved.testStdout || 'No output yet.');
+    }
+    if (elements.testStderr) {
+      elements.testStderr.textContent = String(saved.testStderr || 'No output yet.');
+    }
+    const logEl = document.getElementById('gbGenTestLog');
+    if (logEl) {
+      logEl.textContent = String(saved.builderLog || 'Press Test from Prompt Response to prepare a run.\n');
+    }
+    renderSummary();
+    renderFiles();
+    renderIterations();
+    renderLatestTestSnapshot();
+    updateActionButtons();
+    return true;
+  }
+
+  function clearBuilderWorkspace({ includePrefs = true, confirmReset = true } = {}) {
+    const proceed = !confirmReset || window.confirm('Clear the saved Generator Builder state and start from scratch?');
+    if (!proceed) return;
+    removeBuilderWorkspaceState();
+    if (includePrefs) {
+      try { localStorage.removeItem(BUILDER_MODEL_PREFS_KEY); } catch (e) {}
+      try { localStorage.removeItem(BUILDER_TEST_SSH_KEY); } catch (e) {}
+    }
+    state.models = [];
+    state.validation = null;
+    state.promptUnlocked = false;
+    state.scaffoldRequest = null;
+    state.scaffoldFiles = {};
+    state.activeFilePath = '';
+    state.manifestYaml = '';
+    state.assistantText = '';
+    state.lastTestResult = null;
+    state.iterations = [];
+    state.generateInFlight = false;
+    state.generateAbortController = null;
+    state.generateCancelRequested = false;
+    state.lastGenerateMode = 'create';
+    state.transcriptEvents = [];
+    state.generateRequestId = '';
+    state.promptIntentPreview = null;
+    if (state.promptIntentPreviewTimer) {
+      try { clearTimeout(state.promptIntentPreviewTimer); } catch (e) {}
+      state.promptIntentPreviewTimer = null;
+    }
+    if (elements.pluginType) elements.pluginType.value = 'flag-generator';
+    if (elements.sourceIdHint) elements.sourceIdHint.value = '';
+    if (elements.nameHint) elements.nameHint.value = '';
+    if (elements.prompt) elements.prompt.value = '';
+    fillIntentOverrideInputs({}, { refresh: false });
+    if (elements.model) {
+      elements.model.innerHTML = '<option value="">Select a model after fetching or validating</option>';
+      elements.model.value = '';
+    }
+    if (elements.apiKey) elements.apiKey.value = '';
+    if (elements.enforceSsl) elements.enforceSsl.checked = true;
+    renderSummary();
+    renderFiles();
+    renderIterations();
+    renderTestFiles([]);
+    setPromptIntentPreview('Idle', 'secondary', []);
+    updateIntentOverrideSummary();
+    if (elements.streamMeta) elements.streamMeta.textContent = 'No prompt has been submitted yet.';
+    if (elements.streamEvents) elements.streamEvents.innerHTML = '<li class="text-muted">No activity yet.</li>';
+    if (elements.validationStatus) {
+      elements.validationStatus.className = 'mt-3 small alert alert-secondary mb-0 gb-status';
+      elements.validationStatus.textContent = 'No validation has been run yet.';
+    }
+    if (elements.generationStatus) {
+      elements.generationStatus.className = 'alert alert-light border small mt-3 mb-0';
+      elements.generationStatus.textContent = 'No scaffold generated yet.';
+    }
+    setStreamState('Waiting for a prompt run…', 'Submit a new prompt or refinement to capture the response here.', 'text-bg-secondary', 'Idle');
+    setStreamOutput('', '');
+    setTestStatus('No local test run yet.', 'secondary');
+    if (elements.testStdout) elements.testStdout.textContent = 'No output yet.';
+    if (elements.testStderr) elements.testStderr.textContent = 'No output yet.';
+    resetBuilderTestUiState();
+    builderTestState.hasRunHistory = false;
+    builderTestState.runId = null;
+    builderTestState.latestOutputsData = null;
+    builderTestState.testCoreCfg = null;
+    renderLatestTestSnapshot();
+    renderProviderOptions();
+    updatePromptLockState();
+    updateActionButtons();
+    persistBuilderWorkspaceState();
+  }
 
   function renderIterations() {
     const items = Array.isArray(state.iterations) ? state.iterations : [];
@@ -1032,11 +1241,13 @@
   function recordIteration(entry) {
     state.iterations.push({ ...(entry || {}) });
     renderIterations();
+    persistBuilderWorkspaceState();
   }
 
   function setTestStatus(message, tone = 'secondary') {
     elements.testStatus.className = `alert alert-${tone} small`;
     elements.testStatus.textContent = message;
+    persistBuilderWorkspaceState();
   }
 
   function setTestRunActiveState(isActive, text, tone = 'secondary') {
@@ -1049,6 +1260,7 @@
     if (elements.testRunActiveText) {
       elements.testRunActiveText.textContent = text || '';
     }
+    persistBuilderWorkspaceState();
   }
 
   function setBuilderTestLogLine(line) {
@@ -1061,11 +1273,13 @@
   function clearBuilderTestLog() {
     const el = document.getElementById('gbGenTestLog');
     if (el) el.textContent = 'Press Test from Prompt Response to prepare a run.\n';
+    persistBuilderWorkspaceState();
   }
 
   function setBuilderTestOutputsHtml(html) {
     const el = document.getElementById('gbGenTestOutputs');
     if (el) el.innerHTML = html || '';
+    persistBuilderWorkspaceState();
   }
 
   function setBuilderTestOutputsStatus(visible, text) {
@@ -1300,6 +1514,7 @@
       showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
     }
     renderLatestTestSnapshot();
+    persistBuilderWorkspaceState();
   }
 
   function renderTestFiles(files) {
@@ -1833,7 +2048,7 @@
 
   function loadSavedBuilderTestCreds() {
     try {
-      const raw = localStorage.getItem('coretg_builder_test_ssh');
+      const raw = localStorage.getItem(BUILDER_TEST_SSH_KEY);
       return raw ? JSON.parse(raw) : null;
     } catch (e) {
       return null;
@@ -1862,7 +2077,7 @@
 
   function saveBuilderTestCreds(creds) {
     try {
-      localStorage.setItem('coretg_builder_test_ssh', JSON.stringify(creds || {}));
+      localStorage.setItem(BUILDER_TEST_SSH_KEY, JSON.stringify(creds || {}));
     } catch (e) {}
   }
 
@@ -2028,6 +2243,7 @@
   function setValidationStatus(message, tone = 'secondary') {
     elements.validationStatus.className = `alert alert-${tone} small mb-0 gb-status`;
     elements.validationStatus.textContent = message;
+    persistBuilderWorkspaceState();
   }
 
   function isPromptUnlocked() {
@@ -2084,6 +2300,7 @@
   function setGenerationStatus(message, tone = 'light') {
     elements.generationStatus.className = `alert alert-${tone} border small mt-3 mb-0`;
     elements.generationStatus.textContent = message;
+    persistBuilderWorkspaceState();
   }
 
   function formatEventTime(date = new Date()) {
@@ -2161,6 +2378,7 @@
   function appendTranscriptEvent(text) {
     state.transcriptEvents.push({ time: formatEventTime(), text: String(text || '') });
     renderTranscriptEvents();
+    persistBuilderWorkspaceState();
   }
 
   function createGenerateRequestId() {
@@ -2238,6 +2456,7 @@
     setGenerationStatus(successDetail, 'success');
     finishStreamModal({ ok: true, detail: successDetail, output: state.assistantText || 'No model response captured yet.' });
     showBuildTabPath(elements.buildTabOutputBtn, elements.resultsFilesTabBtn);
+    persistBuilderWorkspaceState();
   }
 
   function setStreamState(status, detail, badgeClass = 'text-bg-primary', badgeText = 'Running') {
@@ -2245,6 +2464,7 @@
     elements.streamDetail.textContent = detail;
     elements.streamBadge.className = `badge ${badgeClass}`;
     elements.streamBadge.textContent = badgeText;
+    persistBuilderWorkspaceState();
   }
 
   function setStreamOutput(text, hint = '') {
@@ -2253,6 +2473,7 @@
     if (elements.streamParsedSummary) {
       elements.streamParsedSummary.textContent = summarizeStructuredText(text || '');
     }
+    persistBuilderWorkspaceState();
   }
 
   function setGenerateOverlay(visible, title = 'Generating scaffold…', detail = 'The prompt response tab is locked until this run completes or is cancelled.') {
@@ -2274,7 +2495,7 @@
   function setGenerateBusy(isBusy) {
     state.generateInFlight = !!isBusy;
     if (elements.testBtn) elements.testBtn.disabled = !!isBusy || !state.scaffoldRequest;
-    if (elements.installBtn) elements.installBtn.disabled = !!isBusy || !state.scaffoldRequest;
+    if (elements.installBtn) elements.installBtn.disabled = !!isBusy || !state.scaffoldRequest || !hasSuccessfulBuilderTest();
     if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = !!isBusy;
     if (elements.streamRetryBtn) elements.streamRetryBtn.disabled = !!isBusy;
     if (elements.streamCloseBtn) elements.streamCloseBtn.disabled = !!isBusy;
@@ -2291,6 +2512,7 @@
       state.generateAbortController = null;
       state.generateRequestId = '';
     }
+    persistBuilderWorkspaceState();
   }
 
   function openStreamModal(mode, payload) {
@@ -2368,7 +2590,7 @@
     const promptReady = isPromptUnlocked();
     if (elements.promptRefineBtn) elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
     if (elements.testBtn) elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
-    if (elements.installBtn) elements.installBtn.disabled = state.generateInFlight || !hasScaffold;
+    if (elements.installBtn) elements.installBtn.disabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
     if (elements.promptSubmitBtn) elements.promptSubmitBtn.disabled = state.generateInFlight || !promptReady;
     if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = state.generateInFlight || !promptReady;
     if (elements.downloadComposeBtn) {
@@ -2384,6 +2606,7 @@
       elements.buildTabTestBtn.setAttribute('aria-disabled', testRunLocked ? 'true' : 'false');
     }
     updatePromptLockState();
+    persistBuilderWorkspaceState();
   }
 
   async function fetchModelsOnly() {
@@ -2476,6 +2699,7 @@
     if (refresh) {
       queuePromptIntentPreview();
     }
+    persistBuilderWorkspaceState();
   }
 
   function clearIntentOverrides({ refresh = true } = {}) {
@@ -2916,16 +3140,25 @@
     elements.baseUrl.value = '';
     applyProviderDefaults();
     invalidateModelStep();
+    persistBuilderWorkspaceState();
   });
   elements.baseUrl.addEventListener('input', () => {
     persistCurrentProviderModelPrefs();
     invalidateModelStep();
+    persistBuilderWorkspaceState();
   });
-  elements.apiKey.addEventListener('input', () => invalidateModelStep());
-  elements.enforceSsl.addEventListener('change', () => invalidateModelStep());
+  elements.apiKey.addEventListener('input', () => {
+    invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
+  elements.enforceSsl.addEventListener('change', () => {
+    invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
   elements.model.addEventListener('input', () => {
     persistCurrentProviderModelPrefs();
     invalidateModelStep('Model selection changed. Validate again to unlock prompting.');
+    persistBuilderWorkspaceState();
   });
   elements.refreshProvidersBtn.addEventListener('click', async () => {
     await refreshProviders(true);
@@ -2992,10 +3225,22 @@
       }
     });
   }
-  elements.prompt.addEventListener('input', queuePromptIntentPreview);
-  elements.sourceIdHint.addEventListener('input', queuePromptIntentPreview);
-  elements.nameHint.addEventListener('input', queuePromptIntentPreview);
-  elements.pluginType.addEventListener('change', queuePromptIntentPreview);
+  elements.prompt.addEventListener('input', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  elements.sourceIdHint.addEventListener('input', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  elements.nameHint.addEventListener('input', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  elements.pluginType.addEventListener('change', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
   [
     elements.intentRuntimeInputs,
     elements.intentRequires,
@@ -3009,6 +3254,7 @@
     field.addEventListener('input', () => {
       updateIntentOverrideSummary();
       queuePromptIntentPreview();
+      persistBuilderWorkspaceState();
     });
   });
   if (elements.intentOverridesPanel) {
@@ -3024,6 +3270,9 @@
   }
   if (elements.intentClearBtn) {
     elements.intentClearBtn.addEventListener('click', () => clearIntentOverrides({ refresh: true }));
+  }
+  if (elements.clearStateBtn) {
+    elements.clearStateBtn.addEventListener('click', () => clearBuilderWorkspace({ includePrefs: true, confirmReset: true }));
   }
   if (elements.downloadComposeBtn) {
     elements.downloadComposeBtn.addEventListener('click', () => {
@@ -3121,7 +3370,9 @@
   updateActionButtons();
   setPromptIntentPreview('Idle', 'secondary', []);
   updateIntentOverrideSummary();
-  loadExamplePrompt();
+  if (!restoreBuilderWorkspaceState(loadBuilderWorkspaceState())) {
+    loadExamplePrompt();
+  }
   refreshProviders(false);
 })();
 </script>

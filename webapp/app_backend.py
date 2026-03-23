@@ -1258,6 +1258,17 @@ def _cleanup_remote_test_runtime(meta: dict[str, Any]) -> None:
                 node_candidates.append(docker_name)
 
         for node_token in node_candidates:
+            image_ref = ''
+            inspect_node_cmd = f"docker inspect -f '{{{{.Image}}}}' {shlex.quote(node_token)} 2>/dev/null || true"
+            rc, out, err = _exec_ssh_sudo_command(client, inspect_node_cmd, password=pw, timeout=60.0)
+            inspect_lines = [line.strip() for line in str(out or '').splitlines() if line.strip()]
+            if inspect_lines:
+                image_ref = inspect_lines[0]
+            _log(
+                f"docker inspect image (name={node_token}) rc={rc} "
+                f"image={_summarize_for_log(image_ref)} err={_summarize_for_log((err or '').strip())}"
+            )
+
             node_compose = f"/tmp/vulns/docker-compose-{node_token}.yml"
             node_project = f"{node_token}conf"
             down_node_cmd = (
@@ -1277,6 +1288,14 @@ def _cleanup_remote_test_runtime(meta: dict[str, Any]) -> None:
                 f"docker rm container (name={node_token}) rc={rc} "
                 f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
             )
+
+            if image_ref:
+                rm_image_cmd = f"docker rmi -f {shlex.quote(image_ref)} >/dev/null 2>&1 || true"
+                rc, out, err = _exec_ssh_sudo_command(client, rm_image_cmd, password=pw, timeout=120.0)
+                _log(
+                    f"docker rmi container-image (name={node_token}, image={image_ref}) rc={rc} "
+                    f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
+                )
 
         scenario_tag = str(meta.get('test_scenario_tag') or meta.get('scenario_tag') or '').strip()
         if scenario_tag:
@@ -25523,7 +25542,7 @@ if __name__ == '__main__':
 
 
 def _remote_docker_remove_all_containers_script(sudo_password: str | None = None) -> str:
-    """Remote script to delete ALL docker containers on the CORE VM (does not remove images)."""
+    """Remote script to delete ALL docker containers on the CORE VM and remove now-unused container images."""
 
     sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
     return (
@@ -25575,8 +25594,20 @@ def main():
     container_ids, cerr = _list_ids(['ps', '-aq'], timeout=30)
     if cerr:
         errors.append({'stage': 'list_containers', 'output': cerr})
+    image_ids = []
+    if container_ids:
+        for cid in container_ids:
+            try:
+                p_img = _run_docker(['inspect', '-f', '{{.Image}}', cid], timeout=30)
+                if getattr(p_img, 'returncode', 1) == 0:
+                    img = (getattr(p_img, 'stdout', '') or '').strip().splitlines()[:1]
+                    if img and img[0].strip() and img[0].strip() not in image_ids:
+                        image_ids.append(img[0].strip())
+            except Exception as e:
+                errors.append({'stage': 'inspect_container_image', 'container': cid, 'output': str(e)[:4000]})
     stopped_attempted = 0
     removed_attempted = 0
+    images_removed_attempted = 0
     if container_ids:
         for chunk in _chunks(container_ids, 25):
             p = _run_docker(['stop'] + list(chunk), timeout=120)
@@ -25595,6 +25626,17 @@ def main():
             else:
                 removed_attempted += len(chunk)
 
+    for chunk in _chunks(image_ids, 25):
+        if not chunk:
+            continue
+        p = _run_docker(['image', 'rm', '-f'] + list(chunk), timeout=180)
+        if getattr(p, 'returncode', 1) != 0:
+            out = (getattr(p, 'stdout', '') or '').strip()
+            if out:
+                errors.append({'stage': 'rm_images', 'output': out[:4000]})
+        else:
+            images_removed_attempted += len(chunk)
+
     print(json.dumps({
         'ok': True,
         'containers': {
@@ -25603,8 +25645,9 @@ def main():
             'removed_attempted': removed_attempted,
         },
         'images': {
-            'removed_attempted': 0,
-            'skipped': True,
+            'found': len(image_ids),
+            'removed_attempted': images_removed_attempted,
+            'skipped': False,
         },
         'errors': errors,
     }))
@@ -32302,7 +32345,14 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
 
     def _maybe_core_cleanup() -> None:
         _remote_docker_remove_all_containers_script = r"""
-        docker ps -a --format '{{.ID}} {{.Image}} {{.Names}}' | grep -vE 'core-daemon|registry:2' | awk '{print $1}' | xargs -r docker rm -f
+        ids=$(docker ps -a --format '{{.ID}} {{.Names}}' | grep -vE ' core-daemon$| registry:2$' | awk '{print $1}')
+        if [ -n "$ids" ]; then
+            imgs=$(docker inspect -f '{{.Image}}' $ids 2>/dev/null | sort -u)
+            echo "$ids" | xargs -r docker rm -f
+            if [ -n "$imgs" ]; then
+                echo "$imgs" | xargs -r docker rmi -f || true
+            fi
+        fi
         """
         _remote_docker_cleanup_script = r"""
         docker container prune -f

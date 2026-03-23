@@ -38,9 +38,11 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Connect / validate' in body
     assert 'Submit New' in body
     assert 'Test' in body
+    assert 'Install to Catalog' in body
     assert 'Submit as Refinement' in body
     assert 'Generated Summary' in body
     assert 'Generator Builder Output' in body
+    assert 'Clear Builder State' in body
     assert 'CORE VM Credentials' in body
     assert 'Save and Run Test' in body
     assert 'Progress / Log' in body
@@ -60,6 +62,7 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'gbIntentOverridesSummary' in body
     assert 'Locked until validation' in body
     assert 'coretg_builder_model_config' in body
+    assert 'coretg_builder_workspace_state' in body
     assert 'After Scaffold' not in body
     assert 'Compatibility Checklist' not in body
     assert 'Test &amp; Iterate' not in body

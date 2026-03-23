@@ -317,7 +317,7 @@ def register(
                         pass
                     try:
                         subprocess.run(
-                            ['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans'],
+                            ['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans', '--rmi', 'all'],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,
                             text=True,

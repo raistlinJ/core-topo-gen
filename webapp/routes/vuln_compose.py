@@ -552,7 +552,7 @@ def register(
                     except Exception:
                         pass
                     try:
-                        proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                        proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans', '--rmi', 'all'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                         try:
                             logs.append(f"[remove] docker compose down rc={proc.returncode}")
                             if proc.stdout:
