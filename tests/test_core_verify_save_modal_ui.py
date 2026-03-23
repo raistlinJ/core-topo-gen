@@ -121,3 +121,45 @@ def test_flow_save_xml_uses_xml_path_fallback_resolver() -> None:
     ]
     present = [snippet for snippet in forbidden if snippet in text]
     assert not present, "Unexpected shared-helper dependency snippets in flow save paths: " + "; ".join(present)
+
+
+def test_flow_save_and_preview_do_not_swallow_flow_state_save_failures() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "if (!(await saveFlowStateToXml(xmlPath))) {",
+        "throw new Error('Failed to save Flag Sequencing state into XML.');",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing explicit Flag Sequencing save failure handling snippets: " + "; ".join(missing)
+
+    forbidden = [
+        "try { await saveFlowStateToXml(xmlPath); } catch (e) { }",
+    ]
+    present = [snippet for snippet in forbidden if snippet in text]
+    assert not present, "Unexpected swallowed Flag Sequencing save failure snippets still present: " + "; ".join(present)
+
+
+def test_flow_restore_rehydrates_duplicate_toggle_from_saved_state() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "allowNodeDuplicates = !!(saved && saved.allow_node_duplicates);",
+        "generateNoDuplicatesEl.checked = !!allowNodeDuplicates;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing saved duplicate-toggle restore snippets: " + "; ".join(missing)
+
+
+def test_flow_ui_shows_validated_vuln_notice_when_present() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const noticeReasons = reasons.filter((reason) => reason.startsWith('No validated/tested vulnerabilities are currently eligible'));",
+        "flowEnabledHelpEl.textContent = 'Note: ' + noticeReasons.join(' ');",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing validated-vulnerability notification snippets in flow UI: " + "; ".join(missing)

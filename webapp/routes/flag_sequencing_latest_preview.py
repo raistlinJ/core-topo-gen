@@ -162,6 +162,10 @@ def register(app, *, backend_module: Any) -> None:
                 vuln_catalog_count = len(backend._load_backend_vuln_catalog_items() or [])
             except Exception:
                 vuln_catalog_count = 0
+            try:
+                vuln_catalog_total_count = len(backend._load_backend_vuln_catalog_items(selectable_only=False) or [])
+            except Exception:
+                vuln_catalog_total_count = vuln_catalog_count
 
             has_vuln_generator_path = bool(vuln_count > 0 and flag_generator_count > 0)
             has_node_generator_path = bool(docker_nonvuln_count > 0 and flag_node_generator_count > 0)
@@ -172,7 +176,9 @@ def register(app, *, backend_module: Any) -> None:
                 reasons.append('CORE VM must be validated in VM / Access.')
             if not topology_eligible:
                 reasons.append('Topology must include Docker or vulnerability nodes.')
-            if vuln_catalog_count <= 0:
+            if vuln_catalog_total_count > 0 and vuln_catalog_count <= 0:
+                reasons.append('No validated/tested vulnerabilities are currently eligible in the Vulnerability Catalog. Validate at least one vulnerability to use vulnerability-based flag sequencing.')
+            elif vuln_catalog_count <= 0:
                 reasons.append('No vulnerabilities are available in the Vulnerability Catalog.')
             if vuln_count > 0 and flag_generator_count <= 0:
                 reasons.append('No enabled flag-generators are available for vulnerability nodes.')
@@ -189,6 +195,7 @@ def register(app, *, backend_module: Any) -> None:
                 'flag_generator_count': flag_generator_count,
                 'flag_node_generator_count': flag_node_generator_count,
                 'vuln_catalog_count': vuln_catalog_count,
+                'vuln_catalog_total_count': vuln_catalog_total_count,
                 'flow_eligible': flow_eligible,
                 'flow_eligibility_reasons': reasons,
             }

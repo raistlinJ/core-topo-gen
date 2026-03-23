@@ -609,6 +609,10 @@
 
   function updateFlowEnabledUi() {
     const enabled = !!flowEnabled;
+    const reasons = (Array.isArray(flowEligibilityReasons) ? flowEligibilityReasons : [])
+      .map((reason) => String(reason || '').trim())
+      .filter(Boolean);
+    const noticeReasons = reasons.filter((reason) => reason.startsWith('No validated/tested vulnerabilities are currently eligible'));
     if (lengthEl) lengthEl.disabled = !enabled || !flowEligible;
     if (presetEl) presetEl.disabled = !enabled || !flowEligible;
     if (btnEl) btnEl.disabled = !enabled || !flowEligible;
@@ -623,6 +627,8 @@
         flowEnabledHelpEl.textContent = 'Disabled: ' + flowIneligibleMessage().replace(/^Flag sequencing unavailable:\s*/, '');
       } else if (!enabled) {
         flowEnabledHelpEl.textContent = 'Flag sequencing disabled; Execute will run without flows.';
+      } else if (noticeReasons.length) {
+        flowEnabledHelpEl.textContent = 'Note: ' + noticeReasons.join(' ');
       } else {
         flowEnabledHelpEl.textContent = '';
       }
@@ -829,6 +835,11 @@
         const key = normalizeScenarioNorm(scenario);
         if (key && flowStateByScenario && typeof flowStateByScenario === 'object') {
           flowStateByScenario[key] = flowStatePayload;
+        }
+      } catch (e) { }
+      try {
+        if (xmlPath && !isAutosaveXmlPath(xmlPath) && typeof window.coretgSetLatestXmlPathForScenario === 'function') {
+          window.coretgSetLatestXmlPathForScenario(scenario, xmlPath);
         }
       } catch (e) { }
       return true;
@@ -1463,6 +1474,12 @@
         setFlowEnabled(!!saved.flow_enabled, { skipPersist: true });
       } else {
         setFlowEnabled(true, { skipPersist: true });
+      }
+    } catch (e) { }
+    try {
+      allowNodeDuplicates = !!(saved && saved.allow_node_duplicates);
+      if (generateNoDuplicatesEl) {
+        generateNoDuplicatesEl.checked = !!allowNodeDuplicates;
       }
     } catch (e) { }
     const chainLen = saved.chain_ids.length;
@@ -9238,7 +9255,9 @@
         }
       }
 
-      try { await saveFlowStateToXml(xmlPath); } catch (e) { }
+      if (!(await saveFlowStateToXml(xmlPath))) {
+        throw new Error('Failed to save Flag Sequencing state into XML.');
+      }
 
       if (!flowEnabled) {
         try { await clearFlowStateInXml(); } catch (e) { }
@@ -9313,10 +9332,12 @@
           }
         } catch (e) { }
 
+        if (!(await saveFlowStateToXml(xmlPath))) {
+          throw new Error('Failed to save Flag Sequencing state into XML.');
+        }
         if (!hintResolveFailed) {
           setStatus('Saved flow state to XML: ' + basenameFromPath(xmlPath), false);
         }
-        try { await saveFlowStateToXml(xmlPath); } catch (e) { }
         try { await refreshXmlDockPreview({ force: true }); } catch (e) { }
       } else {
         setStatus('Saved XML (missing path).', false);
@@ -9393,8 +9414,10 @@
           downloadXmlEl.removeAttribute('title');
         }
       } catch (e) { }
+      if (!(await saveFlowStateToXml(xmlPath))) {
+        throw new Error('Failed to save Flag Sequencing state into XML.');
+      }
       setStatus('Saved flow state to XML: ' + basenameFromPath(xmlPath), false);
-      try { await saveFlowStateToXml(xmlPath); } catch (e) { }
       try { await refreshXmlDockPreview({ force: true }); } catch (e) { }
       return xmlPath;
     } catch (err) {
@@ -9930,9 +9953,9 @@
           alert('Save XML first to preview.');
           return;
         }
-        try {
-          await saveFlowStateToXml(xmlPath);
-        } catch (e) { }
+        if (!(await saveFlowStateToXml(xmlPath))) {
+          throw new Error('Failed to save Flag Sequencing state into XML.');
+        }
         const baseUrl = String(link.dataset?.previewBaseUrl || '/scenarios/preview');
         const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
         if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {

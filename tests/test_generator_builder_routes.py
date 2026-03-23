@@ -2,6 +2,7 @@ import io
 import json
 import os
 import zipfile
+from pathlib import Path
 
 from webapp import app_backend as backend
 from webapp.routes import ai_provider as ai_provider_routes
@@ -11,6 +12,9 @@ from webapp.routes import generator_builder_routes
 app = backend.app
 app.config.setdefault('TESTING', True)
 app.config['TESTING'] = True
+
+
+GENERATOR_BUILDER_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / 'webapp' / 'templates' / 'generator_builder.html'
 
 
 def _login(client):
@@ -41,6 +45,7 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Install to Catalog' in body
     assert 'Submit as Refinement' in body
     assert 'Generated Summary' in body
+    assert 'Generating Scaffolding' in body
     assert 'Generator Builder Output' in body
     assert 'Clear Builder State' in body
     assert 'CORE VM Credentials' in body
@@ -53,7 +58,8 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Iteration History' in body
     assert 'Latest Test Result' in body
     assert 'gbLatestTestSnapshot' in body
-    assert 'gbPromptIntentPreview' in body
+    assert 'gbGenerateOverlayOutput' in body
+    assert 'gbGenerateOverlayEvents' in body
     assert 'gbIntentApplySuggestedBtn' in body
     assert 'gbIntentRuntimeInputs' in body
     assert 'gbIntentHintTemplates' in body
@@ -71,6 +77,8 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Install & downloads' not in body
     assert 'Normalized manifest.yaml' not in body
     assert 'Raw model response' not in body
+    assert 'Prompt Intent Preview' not in body
+    assert 'gbPromptIntentPreview' not in body
 
 
 def test_generator_artifacts_index_merges_sources_reserved_and_custom(monkeypatch):
@@ -452,6 +460,20 @@ def test_generator_ai_scaffold_openai_compatible_rejects_http_when_ssl_required(
     payload = resp.get_json() or {}
     assert payload.get('ok') is False
     assert payload.get('error') == 'Base URL must use https when Enforce SSL is enabled.'
+
+
+def test_generator_builder_async_test_success_refreshes_install_gating_snippets() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'function updateLatestBuilderTestResult(data, runId) {',
+        'builderTestState.latestOutputsData = data || null;',
+        'state.lastTestResult = data || null;',
+        'updateActionButtons();',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing builder test success install-gating refresh snippets: ' + '; '.join(missing)
 
 
 def test_generator_builder_ai_messages_include_flag_generator_grounding():

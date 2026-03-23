@@ -301,17 +301,47 @@
     display: flex;
   }
   .gb-run-overlay-card {
-    width: min(100%, 28rem);
+    width: min(100%, 72rem);
+    max-height: calc(100vh - 4rem);
     background: rgba(255, 255, 255, 0.96);
     border: 1px solid rgba(214, 222, 231, 0.92);
     border-radius: 16px;
     box-shadow: 0 20px 45px rgba(15, 23, 32, 0.12);
     padding: 1.25rem;
+    overflow: auto;
   }
   .gb-run-overlay-spinner {
     width: 2.25rem;
     height: 2.25rem;
     color: var(--gb-accent);
+  }
+  .gb-run-overlay-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    text-align: left;
+  }
+  .gb-run-overlay-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(18rem, 0.95fr);
+    gap: 1rem;
+    margin-top: 1rem;
+    text-align: left;
+  }
+  .gb-run-overlay-shell .gb-stream-panel {
+    min-height: 14rem;
+  }
+  .gb-run-overlay-shell .gb-stream-output,
+  .gb-run-overlay-shell .gb-stream-events {
+    max-height: min(20rem, 32vh);
+  }
+  .gb-run-overlay-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    margin-top: 1rem;
   }
   .gb-files-pane {
     display: flex;
@@ -345,6 +375,9 @@
   }
   @media (max-width: 991px) {
     .gb-stream-shell {
+      grid-template-columns: 1fr;
+    }
+    .gb-run-overlay-shell {
       grid-template-columns: 1fr;
     }
   }
@@ -389,11 +422,37 @@
           </div>
           <div class="card-body gb-build-card-body">
             <div class="gb-run-overlay" id="gbGenerateOverlay" aria-hidden="true">
-              <div class="gb-run-overlay-card text-center">
-                <div class="spinner-border gb-run-overlay-spinner mb-3" role="status" aria-hidden="true"></div>
-                <div class="fw-semibold mb-1" id="gbGenerateOverlayTitle">Generating scaffold…</div>
-                <div class="small text-muted mb-3" id="gbGenerateOverlayDetail">The prompt response tab is locked until this run completes or is cancelled.</div>
-                <button type="button" class="btn btn-outline-danger" id="gbGenerateCancelBtn">Cancel</button>
+              <div class="gb-run-overlay-card">
+                <div class="gb-run-overlay-header">
+                  <div class="d-flex gap-3 align-items-start flex-grow-1">
+                    <div class="spinner-border gb-run-overlay-spinner" role="status" aria-hidden="true"></div>
+                    <div class="flex-grow-1">
+                      <div class="fw-semibold mb-1" id="gbGenerateOverlayTitle">Generating Scaffolding…</div>
+                      <div class="small text-muted" id="gbGenerateOverlayDetail">The prompt response workspace is temporarily locked while the current run is in progress. You can cancel at any time.</div>
+                      <div class="d-flex align-items-center gap-2 flex-wrap mt-2">
+                        <span class="badge text-bg-primary" id="gbGenerateOverlayBadge">Running</span>
+                        <span class="small text-muted" id="gbGenerateOverlayStatus" aria-live="polite">Submitting the prompt to the selected model and waiting for a normalized scaffold response.</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="gb-run-overlay-shell">
+                  <div class="gb-stream-panel">
+                    <div class="gb-stream-panel-header">Model Output</div>
+                    <div class="gb-stream-panel-subheader" id="gbGenerateOverlayOutputHint"></div>
+                    <div class="px-3 pb-2 small text-muted" id="gbGenerateOverlayParsedSummary">Raw response will appear here after the first streamed chunk.</div>
+                    <pre class="gb-stream-output" id="gbGenerateOverlayOutput" aria-live="polite">No model response captured yet.</pre>
+                  </div>
+                  <div class="gb-stream-panel">
+                    <div class="gb-stream-panel-header">Activity</div>
+                    <ol class="gb-stream-events" id="gbGenerateOverlayEvents" aria-live="polite">
+                      <li class="text-muted">No activity yet.</li>
+                    </ol>
+                  </div>
+                </div>
+                <div class="gb-run-overlay-footer">
+                  <button type="button" class="btn btn-outline-danger" id="gbGenerateCancelBtn">Cancel</button>
+                </div>
               </div>
             </div>
             <ul class="nav nav-pills gb-tab-nav mb-3" role="tablist">
@@ -492,82 +551,72 @@
                     Start with a create request, then use follow-up prompts to refine behavior, fix test failures, or add new capabilities while keeping the current scaffold as context.
                   </div>
                 </div>
-                <div class="gb-intent-preview mb-3" id="gbPromptIntentPreview">
-                  <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
-                    <div class="fw-semibold">Prompt Intent Preview</div>
-                    <span class="badge text-bg-secondary" id="gbPromptIntentBadge">Idle</span>
-                  </div>
-                  <div class="small text-muted" id="gbPromptIntentStatus">Prompt-derived defaults and explicit prompt requirements will preview here before generation.</div>
-                  <div class="mt-2 d-grid gap-2" id="gbPromptIntentBody"></div>
-                  <div class="border-top mt-3 pt-3">
-                    <details class="gb-intent-overrides" id="gbIntentOverridesPanel">
-                      <summary>
-                        <span>Tune Before Generation</span>
-                        <span class="small text-muted" id="gbIntentOverridesSummary">Collapsed. Open to add manual overrides.</span>
-                      </summary>
-                      <div class="gb-intent-overrides-body">
-                        <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
-                          <div class="small text-muted">Only non-empty fields below override the prompt preview on the next generation run.</div>
-                          <div class="d-flex gap-2 flex-wrap">
-                            <button class="btn btn-sm btn-outline-primary" type="button" id="gbIntentApplySuggestedBtn">Use Suggested Defaults</button>
-                            <button class="btn btn-sm btn-outline-secondary" type="button" id="gbIntentClearBtn">Clear Overrides</button>
-                          </div>
-                        </div>
-                        <div class="row g-2">
-                          <div class="col-12 col-lg-6">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentRuntimeInputs">Runtime inputs override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="runtime_inputs">Use suggested</button>
-                            </div>
-                            <textarea class="form-control form-control-sm" id="gbIntentRuntimeInputs" rows="3" placeholder="seed (required)&#10;secret (required, sensitive)"></textarea>
-                          </div>
-                          <div class="col-12 col-lg-6">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentRequires">Artifact requirements override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="requires">Use suggested</button>
-                            </div>
-                            <textarea class="form-control form-control-sm" id="gbIntentRequires" rows="3" placeholder="Knowledge(ip)&#10;Knowledge(hostname) (optional)"></textarea>
-                          </div>
-                          <div class="col-12 col-lg-6">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentProduces">Artifact outputs override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="produces">Use suggested</button>
-                            </div>
-                            <textarea class="form-control form-control-sm" id="gbIntentProduces" rows="3" placeholder="Flag(flag_id)&#10;Credential(user,password)&#10;File(path)"></textarea>
-                          </div>
-                          <div class="col-12 col-lg-6">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentInjectFiles">Inject files override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_files">Use suggested</button>
-                            </div>
-                            <textarea class="form-control form-control-sm" id="gbIntentInjectFiles" rows="3" placeholder="File(path)&#10;File(path) -&gt; /opt/bootstrap"></textarea>
-                          </div>
-                          <div class="col-12 col-lg-6">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentInjectDestination">Inject destination override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_destination">Use suggested</button>
-                            </div>
-                            <input class="form-control form-control-sm" id="gbIntentInjectDestination" placeholder="/opt/bootstrap" />
-                          </div>
-                          <div class="col-12 col-lg-6">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentReadmeNotes">README notes override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="readme_mentions">Use suggested</button>
-                            </div>
-                            <input class="form-control form-control-sm" id="gbIntentReadmeNotes" placeholder="determinism, local runner testing" />
-                          </div>
-                          <div class="col-12">
-                            <div class="gb-intent-field-header">
-                              <label class="form-label small mb-0" for="gbIntentHintTemplates">Hint templates override</label>
-                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="hint_templates">Use suggested</button>
-                            </div>
-                            <textarea class="form-control form-control-sm" id="gbIntentHintTemplates" rows="3" placeholder="{% raw %}Next: SSH using {{OUTPUT.Credential(user,password)}}{% endraw %}"></textarea>
-                          </div>
-                        </div>
+                <details class="gb-intent-overrides mb-3" id="gbIntentOverridesPanel">
+                  <summary>
+                    <span>Tune Before Generation</span>
+                    <span class="small text-muted" id="gbIntentOverridesSummary">Collapsed. Open to add manual overrides.</span>
+                  </summary>
+                  <div class="gb-intent-overrides-body">
+                    <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                      <div class="small text-muted">Only non-empty fields below override the generated defaults used on the next generation run.</div>
+                      <div class="d-flex gap-2 flex-wrap">
+                        <button class="btn btn-sm btn-outline-primary" type="button" id="gbIntentApplySuggestedBtn">Use Suggested Defaults</button>
+                        <button class="btn btn-sm btn-outline-secondary" type="button" id="gbIntentClearBtn">Clear Overrides</button>
                       </div>
-                    </details>
+                    </div>
+                    <div class="row g-2">
+                      <div class="col-12 col-lg-6">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentRuntimeInputs">Runtime inputs override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="runtime_inputs">Use suggested</button>
+                        </div>
+                        <textarea class="form-control form-control-sm" id="gbIntentRuntimeInputs" rows="3" placeholder="seed (required)&#10;secret (required, sensitive)"></textarea>
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentRequires">Artifact requirements override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="requires">Use suggested</button>
+                        </div>
+                        <textarea class="form-control form-control-sm" id="gbIntentRequires" rows="3" placeholder="Knowledge(ip)&#10;Knowledge(hostname) (optional)"></textarea>
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentProduces">Artifact outputs override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="produces">Use suggested</button>
+                        </div>
+                        <textarea class="form-control form-control-sm" id="gbIntentProduces" rows="3" placeholder="Flag(flag_id)&#10;Credential(user,password)&#10;File(path)"></textarea>
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentInjectFiles">Inject files override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_files">Use suggested</button>
+                        </div>
+                        <textarea class="form-control form-control-sm" id="gbIntentInjectFiles" rows="3" placeholder="File(path)&#10;File(path) -&gt; /opt/bootstrap"></textarea>
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentInjectDestination">Inject destination override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_destination">Use suggested</button>
+                        </div>
+                        <input class="form-control form-control-sm" id="gbIntentInjectDestination" placeholder="/opt/bootstrap" />
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentReadmeNotes">README notes override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="readme_mentions">Use suggested</button>
+                        </div>
+                        <input class="form-control form-control-sm" id="gbIntentReadmeNotes" placeholder="determinism, local runner testing" />
+                      </div>
+                      <div class="col-12">
+                        <div class="gb-intent-field-header">
+                          <label class="form-label small mb-0" for="gbIntentHintTemplates">Hint templates override</label>
+                          <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="hint_templates">Use suggested</button>
+                        </div>
+                        <textarea class="form-control form-control-sm" id="gbIntentHintTemplates" rows="3" placeholder="{% raw %}Next: SSH using {{OUTPUT.Credential(user,password)}}{% endraw %}"></textarea>
+                      </div>
+                    </div>
                   </div>
-                </div>
+                </details>
                 <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
                   <button class="btn btn-primary" type="button" id="gbPromptSubmitBtn" disabled>
                     <i class="bi bi-send me-1"></i>Submit New
@@ -674,9 +723,14 @@
                 </div>
                 <div class="gb-files-footer-anchor mt-3">
                   <div class="small text-muted">Run the current scaffold locally from the same spot no matter which Prompt Response subtab you are viewing.</div>
-                  <button class="btn btn-outline-dark btn-sm" type="button" id="gbTestBtn" disabled>
-                    <i class="bi bi-beaker me-1"></i>Test
-                  </button>
+                  <div class="d-flex gap-2 flex-wrap">
+                    <button class="btn btn-outline-dark btn-sm" type="button" id="gbTestBtn" disabled>
+                      <i class="bi bi-beaker me-1"></i>Test
+                    </button>
+                    <button class="btn btn-outline-success btn-sm" type="button" id="gbInstallBtn" disabled>
+                      <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                    </button>
+                  </div>
                 </div>
               </div>
               <div class="tab-pane fade" id="gbBuildTabTest" role="tabpanel">
@@ -738,12 +792,7 @@
                     <div class="list-group" id="gbTestFiles">
                       <div class="list-group-item text-muted">No test artifacts yet.</div>
                     </div>
-                    <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mt-3 pt-3 border-top">
-                      <div class="small text-muted">Install unlocks after the latest Builder test completes successfully.</div>
-                      <button class="btn btn-outline-success" type="button" id="gbInstallBtn" disabled>
-                        <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
-                      </button>
-                    </div>
+                    <div class="small text-muted mt-3 pt-3 border-top">Install unlocks after the latest Builder test completes successfully.</div>
                   </div>
                 </div>
               </div>
@@ -953,10 +1002,6 @@
     fileContent: document.getElementById('gbFileContent'),
     filesCount: document.getElementById('gbFilesCount'),
     latestTestSnapshot: document.getElementById('gbLatestTestSnapshot'),
-    promptIntentPreview: document.getElementById('gbPromptIntentPreview'),
-    promptIntentBadge: document.getElementById('gbPromptIntentBadge'),
-    promptIntentStatus: document.getElementById('gbPromptIntentStatus'),
-    promptIntentBody: document.getElementById('gbPromptIntentBody'),
     intentOverridesPanel: document.getElementById('gbIntentOverridesPanel'),
     intentOverridesSummary: document.getElementById('gbIntentOverridesSummary'),
     intentRuntimeInputs: document.getElementById('gbIntentRuntimeInputs'),
@@ -983,6 +1028,12 @@
     generateOverlay: document.getElementById('gbGenerateOverlay'),
     generateOverlayTitle: document.getElementById('gbGenerateOverlayTitle'),
     generateOverlayDetail: document.getElementById('gbGenerateOverlayDetail'),
+    generateOverlayBadge: document.getElementById('gbGenerateOverlayBadge'),
+    generateOverlayStatus: document.getElementById('gbGenerateOverlayStatus'),
+    generateOverlayOutputHint: document.getElementById('gbGenerateOverlayOutputHint'),
+    generateOverlayParsedSummary: document.getElementById('gbGenerateOverlayParsedSummary'),
+    generateOverlayOutput: document.getElementById('gbGenerateOverlayOutput'),
+    generateOverlayEvents: document.getElementById('gbGenerateOverlayEvents'),
     generateCancelBtn: document.getElementById('gbGenerateCancelBtn'),
     streamMeta: document.getElementById('gbStreamMeta'),
     streamStatus: document.getElementById('gbStreamStatus'),
@@ -1514,6 +1565,7 @@
       showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
     }
     renderLatestTestSnapshot();
+    updateActionButtons();
     persistBuilderWorkspaceState();
   }
 
@@ -2362,17 +2414,23 @@
     return parts.length ? `Parsed JSON summary: ${parts.join(' | ')}` : 'Parsed JSON response.';
   }
 
-  function renderTranscriptEvents() {
+  function renderTranscriptEventsInto(target) {
+    if (!target) return;
     const events = Array.isArray(state.transcriptEvents) ? state.transcriptEvents : [];
     if (!events.length) {
-      elements.streamEvents.innerHTML = '<li class="text-muted">No activity yet.</li>';
+      target.innerHTML = '<li class="text-muted">No activity yet.</li>';
       return;
     }
-    elements.streamEvents.innerHTML = events.map((entry) => {
+    target.innerHTML = events.map((entry) => {
       const time = escapeHtml(String(entry.time || ''));
       const text = escapeHtml(String(entry.text || ''));
       return `<li><span class="gb-stream-event-time">${time}</span><div style="white-space: pre-wrap;">${text}</div></li>`;
     }).join('');
+  }
+
+  function renderTranscriptEvents() {
+    renderTranscriptEventsInto(elements.streamEvents);
+    renderTranscriptEventsInto(elements.generateOverlayEvents);
   }
 
   function appendTranscriptEvent(text) {
@@ -2464,6 +2522,13 @@
     elements.streamDetail.textContent = detail;
     elements.streamBadge.className = `badge ${badgeClass}`;
     elements.streamBadge.textContent = badgeText;
+    if (elements.generateOverlayStatus) {
+      elements.generateOverlayStatus.textContent = `${status}${detail ? `: ${detail}` : ''}`;
+    }
+    if (elements.generateOverlayBadge) {
+      elements.generateOverlayBadge.className = `badge ${badgeClass}`;
+      elements.generateOverlayBadge.textContent = badgeText;
+    }
     persistBuilderWorkspaceState();
   }
 
@@ -2473,10 +2538,20 @@
     if (elements.streamParsedSummary) {
       elements.streamParsedSummary.textContent = summarizeStructuredText(text || '');
     }
+    if (elements.generateOverlayOutputHint) {
+      elements.generateOverlayOutputHint.textContent = hint;
+    }
+    if (elements.generateOverlayOutput) {
+      elements.generateOverlayOutput.textContent = formatStructuredText(text || '');
+      elements.generateOverlayOutput.scrollTop = elements.generateOverlayOutput.scrollHeight;
+    }
+    if (elements.generateOverlayParsedSummary) {
+      elements.generateOverlayParsedSummary.textContent = summarizeStructuredText(text || '');
+    }
     persistBuilderWorkspaceState();
   }
 
-  function setGenerateOverlay(visible, title = 'Generating scaffold…', detail = 'The prompt response tab is locked until this run completes or is cancelled.') {
+  function setGenerateOverlay(visible, title = 'Generating Scaffolding…', detail = 'The prompt response workspace is temporarily locked while the current run is in progress. You can cancel at any time.') {
     if (elements.generateOverlay) {
       elements.generateOverlay.classList.toggle('is-visible', !!visible);
       elements.generateOverlay.setAttribute('aria-hidden', visible ? 'false' : 'true');
@@ -2489,6 +2564,19 @@
     }
     if (elements.generateCancelBtn) {
       elements.generateCancelBtn.disabled = !visible;
+    }
+    if (visible) {
+      renderTranscriptEvents();
+      setStreamOutput(state.assistantText || '', elements.streamOutputHint ? elements.streamOutputHint.textContent : '');
+      if (elements.generateOverlayStatus && elements.streamStatus && elements.streamDetail) {
+        const status = String(elements.streamStatus.textContent || '').trim();
+        const detailText = String(elements.streamDetail.textContent || '').trim();
+        elements.generateOverlayStatus.textContent = `${status}${detailText ? `: ${detailText}` : ''}`;
+      }
+      if (elements.generateOverlayBadge && elements.streamBadge) {
+        elements.generateOverlayBadge.className = elements.streamBadge.className;
+        elements.generateOverlayBadge.textContent = elements.streamBadge.textContent;
+      }
     }
   }
 
