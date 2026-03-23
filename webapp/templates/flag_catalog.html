@@ -1126,9 +1126,15 @@
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
       const isInstalled = isInstalledGeneratorSourcePath(src);
       const isDisabled = !!(g && typeof g === 'object' && g._disabled);
+      const isDuplicateConflict = !!(g && typeof g === 'object' && g._duplicate_conflict);
+      const packId = String((g && g._pack_id) || '').trim();
+      const packLabel = String((g && g._pack_label) || '').trim();
 
       if (isDisabled) {
         tr.classList.add('table-secondary');
+      }
+      if (isDuplicateConflict) {
+        tr.classList.add('table-warning');
       }
 
       const typeLabel = String(g.language || '');
@@ -1138,9 +1144,11 @@
           <div>
             <strong>${escapeHtml(g.name || '')}</strong>
             ${isDisabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+            ${isDuplicateConflict ? `<span class="badge bg-danger ms-2">Duplicate ID</span>` : ''}
             ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
           </div>
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
+          ${isDuplicateConflict ? `<div class="small text-danger">${escapeHtml(String(g._duplicate_conflict_note || 'This installed generator conflicts with another installed generator id. Remove one of the packs to resolve it.'))}</div>` : ''}
         </td>
         <td class="small">${escapeHtml(typeLabel)}</td>
         <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
@@ -1149,13 +1157,26 @@
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
-            <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test generator'}">Test</button>
+            ${isDuplicateConflict
+              ? `<button class="btn btn-sm btn-outline-danger genPackDeleteBtn" type="button" data-packid="${escapeHtml(packId)}" ${packId ? '' : 'disabled'} title="${packId ? 'Uninstall the installed pack that created this duplicate entry' : 'Pack id unavailable'}">Uninstall Pack</button>`
+              : `<button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test generator'}">Test</button>
             <button class="btn btn-sm btn-outline-warning genDisableBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? (isDisabled ? 'Enable generator' : 'Disable generator') : 'Only installed generators can be disabled'}">${isDisabled ? 'Enable' : 'Disable'}</button>
-            <button class="btn btn-sm btn-outline-danger genDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed generator' : 'Only installed generators can be deleted'}">Delete</button>
+            <button class="btn btn-sm btn-outline-danger genDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed generator' : 'Only installed generators can be deleted'}">Delete</button>`}
           </div>
         </td>
       `;
       body.appendChild(tr);
+
+      const packDeleteBtn = tr.querySelector('.genPackDeleteBtn');
+      if (packDeleteBtn && packId) {
+        packDeleteBtn.addEventListener('click', () => {
+          submitPackUninstall(packId, packLabel || g._source_name || g.name || g.id);
+        });
+      }
+
+      if (isDuplicateConflict) {
+        return;
+      }
 
       const btn = tr.querySelector('.genTestBtn');
       if (btn) {
@@ -1255,9 +1276,15 @@
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
       const isInstalled = isInstalledGeneratorSourcePath(src);
       const isDisabled = !!(g && typeof g === 'object' && g._disabled);
+      const isDuplicateConflict = !!(g && typeof g === 'object' && g._duplicate_conflict);
+      const packId = String((g && g._pack_id) || '').trim();
+      const packLabel = String((g && g._pack_label) || '').trim();
 
       if (isDisabled) {
         tr.classList.add('table-secondary');
+      }
+      if (isDuplicateConflict) {
+        tr.classList.add('table-warning');
       }
 
       const typeLabel = String(g.language || '');
@@ -1267,9 +1294,11 @@
           <div>
             <strong>${escapeHtml(g.name || '')}</strong>
             ${isDisabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+            ${isDuplicateConflict ? `<span class="badge bg-danger ms-2">Duplicate ID</span>` : ''}
             ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
           </div>
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
+          ${isDuplicateConflict ? `<div class="small text-danger">${escapeHtml(String(g._duplicate_conflict_note || 'This installed node-generator conflicts with another installed node-generator id. Remove one of the packs to resolve it.'))}</div>` : ''}
         </td>
         <td class="small">${escapeHtml(typeLabel)}</td>
         <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
@@ -1278,13 +1307,26 @@
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
-            <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test node-generator'}">Test</button>
+            ${isDuplicateConflict
+              ? `<button class="btn btn-sm btn-outline-danger nodeGenPackDeleteBtn" type="button" data-packid="${escapeHtml(packId)}" ${packId ? '' : 'disabled'} title="${packId ? 'Uninstall the installed pack that created this duplicate entry' : 'Pack id unavailable'}">Uninstall Pack</button>`
+              : `<button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test node-generator'}">Test</button>
             <button class="btn btn-sm btn-outline-warning nodeGenDisableBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? (isDisabled ? 'Enable node-generator' : 'Disable node-generator') : 'Only installed node-generators can be disabled'}">${isDisabled ? 'Enable' : 'Disable'}</button>
-            <button class="btn btn-sm btn-outline-danger nodeGenDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed node-generator' : 'Only installed node-generators can be deleted'}">Delete</button>
+            <button class="btn btn-sm btn-outline-danger nodeGenDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed node-generator' : 'Only installed node-generators can be deleted'}">Delete</button>`}
           </div>
         </td>
       `;
       body.appendChild(tr);
+
+      const packDeleteBtn = tr.querySelector('.nodeGenPackDeleteBtn');
+      if (packDeleteBtn && packId) {
+        packDeleteBtn.addEventListener('click', () => {
+          submitPackUninstall(packId, packLabel || g._source_name || g.name || g.id);
+        });
+      }
+
+      if (isDuplicateConflict) {
+        return;
+      }
 
       const btn = tr.querySelector('.nodeGenTestBtn');
       if (btn) {
@@ -1874,6 +1916,20 @@
     // Manifests commonly report relative paths like "outputs/installed_generators/...".
     // Accept both absolute and relative forms.
     return norm.includes('outputs/installed_generators') || norm.includes('/installed_generators/');
+  }
+
+  function submitPackUninstall(packId, packLabel) {
+    const pid = String(packId || '').trim();
+    if (!pid) return;
+    const label = String(packLabel || '').trim() || pid;
+    const ok = confirm(`Uninstall pack "${label}"?\n\nThis removes every generator installed by that pack.`);
+    if (!ok) return;
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = `/generator_packs/delete/${encodeURIComponent(pid)}`;
+    form.style.display = 'none';
+    document.body.appendChild(form);
+    form.submit();
   }
 
   function appendPreLine(preId, line) {

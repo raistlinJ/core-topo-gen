@@ -35140,6 +35140,8 @@ try:
         flag_node_generators_from_enabled_sources=lambda: _flag_node_generators_from_enabled_sources(),
         is_installed_generator_view=lambda gen: _is_installed_generator_view(gen),
         annotate_disabled_state=lambda generators, kind: _annotate_disabled_state(generators, kind=kind),
+        load_installed_generator_packs_state=lambda: _load_installed_generator_packs_state(),
+        installed_generators_root=lambda: _installed_generators_root(),
     )
 except Exception:
     try:
