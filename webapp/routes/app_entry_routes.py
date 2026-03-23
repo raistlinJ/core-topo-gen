@@ -293,6 +293,64 @@ def register(app, *, backend_module: Any) -> None:
             include_password=True,
         )
         try:
+            request_provided_core = bool(
+                (isinstance(core_override, dict) and core_override)
+                or (isinstance(scenario_core_override, dict) and scenario_core_override)
+            )
+            history = backend._load_run_history()
+            scenario_for_secret = None
+            try:
+                scenario_for_secret = backend._normalize_scenario_label(str(scenario_name_hint or '').strip())
+            except Exception:
+                scenario_for_secret = None
+            if not scenario_for_secret:
+                try:
+                    if isinstance(scenario_payload, dict) and isinstance(scenario_payload.get('name'), str):
+                        scenario_for_secret = backend._normalize_scenario_label(str(scenario_payload.get('name') or '').strip())
+                except Exception:
+                    scenario_for_secret = None
+
+            selected_cfg = None
+            if scenario_for_secret:
+                selected_cfg = backend._select_core_config_for_page(scenario_for_secret, history, include_password=True)
+
+            pw_raw = core_cfg.get('ssh_password') if isinstance(core_cfg, dict) else None
+            pw_ok = bool(str(pw_raw).strip()) if pw_raw not in (None, '') else False
+
+            if selected_cfg:
+                merged_core_cfg = dict(core_cfg) if isinstance(core_cfg, dict) else {}
+                if not pw_ok:
+                    selected_pw = selected_cfg.get('ssh_password') if isinstance(selected_cfg, dict) else None
+                    if selected_pw not in (None, ''):
+                        merged_core_cfg['ssh_password'] = selected_pw
+                def _is_loopback_host(value):
+                    try:
+                        text = str(value or '').strip().lower()
+                    except Exception:
+                        return False
+                    return text in {'localhost', '127.0.0.1', '::1'}
+
+                for field in ('ssh_username', 'ssh_port', 'venv_bin', 'core_secret_id', 'vm_key', 'vm_name', 'vm_node', 'vmid', 'proxmox_secret_id', 'proxmox_target', 'validated', 'last_tested_status'):
+                    if merged_core_cfg.get(field) in (None, '', 0, {}):
+                        value = selected_cfg.get(field)
+                        if value not in (None, '', 0, {}):
+                            merged_core_cfg[field] = value
+
+                selected_ssh_host = selected_cfg.get('ssh_host') if isinstance(selected_cfg, dict) else None
+                if selected_ssh_host not in (None, ''):
+                    current_ssh_host = merged_core_cfg.get('ssh_host')
+                    if current_ssh_host in (None, '') or _is_loopback_host(current_ssh_host):
+                        merged_core_cfg['ssh_host'] = selected_ssh_host
+
+                if request_provided_core and isinstance(core_cfg, dict):
+                    for field in ('host', 'port', 'grpc_host', 'grpc_port'):
+                        if core_cfg.get(field) not in (None, '', 0):
+                            merged_core_cfg[field] = core_cfg.get(field)
+
+                core_cfg = merged_core_cfg
+        except Exception:
+            pass
+        try:
             core_cfg = backend._require_core_ssh_credentials(core_cfg)
         except backend._SSHTunnelError as exc:
             flash(str(exc))

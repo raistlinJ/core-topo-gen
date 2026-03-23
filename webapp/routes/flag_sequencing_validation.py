@@ -13,6 +13,50 @@ def register(app, *, backend_module: Any) -> None:
 
     backend = backend_module
 
+    def _is_timeout_error(exc: Exception) -> bool:
+        text = str(exc or '').strip().lower()
+        if not text:
+            return False
+        timeout_tokens = (
+            'timed out',
+            'timeout',
+            'ssh command timed out',
+            'ssh sudo command timed out',
+        )
+        return any(token in text for token in timeout_tokens)
+
+    def _is_ssh_auth_error(exc: Exception) -> bool:
+        if _is_timeout_error(exc):
+            return False
+        text = str(exc or '').strip().lower()
+        if not text:
+            return False
+        auth_tokens = (
+            'authenticationexception',
+            'authentication failed',
+            'unable to authenticate',
+            'permission denied',
+            'auth fail',
+            'badauthenticationtype',
+            'password authentication failed',
+            'access denied',
+        )
+        return any(token in text for token in auth_tokens)
+
+    def _invalidate_core_vm_access_for_scenario(scenario_label: str, flow_core_cfg: Any) -> None:
+        try:
+            if scenario_label:
+                backend._clear_hitl_validation_in_scenario_catalog(scenario_label, core=True)
+        except Exception:
+            pass
+        try:
+            if isinstance(flow_core_cfg, dict):
+                secret_id = str(flow_core_cfg.get('core_secret_id') or '').strip()
+                if secret_id:
+                    backend._delete_core_credentials(secret_id)
+        except Exception:
+            pass
+
     @app.route('/api/flag-sequencing/test_core_connection', methods=['POST'])
     def api_flow_test_core_connection():
         payload = request.get_json(silent=True) or {}
@@ -132,6 +176,8 @@ def register(app, *, backend_module: Any) -> None:
             flow_core_cfg = backend._require_core_ssh_credentials(flow_core_cfg)
             backend._ensure_core_daemon_listening(flow_core_cfg, timeout=5.0)
         except Exception as exc:
+            if _is_ssh_auth_error(exc):
+                _invalidate_core_vm_access_for_scenario(scenario_label, flow_core_cfg)
             target = f"{flow_core_cfg.get('host')}:{flow_core_cfg.get('port')}"
             return jsonify({'ok': False, 'error': f'CORE connection failed to {target}: {exc}', 'detail': str(exc)}), 502
         return jsonify({'ok': True, 'host': flow_core_cfg.get('host'), 'port': flow_core_cfg.get('port')})
