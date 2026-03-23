@@ -8330,10 +8330,16 @@
       }
     }
 
-    const allowDupes = !!options.allow_node_duplicates;
-    if (allowDupes) {
-      params.set('allow_node_duplicates', '1');
-    }
+    let allowDupes = !!options.allow_node_duplicates;
+    const syncAllowDuplicateParams = () => {
+      if (allowDupes) {
+        params.set('allow_node_duplicates', '1');
+        params.delete('retry_index');
+      } else {
+        params.delete('allow_node_duplicates');
+      }
+    };
+    syncAllowDuplicateParams();
 
     const buildAttackflowPreviewUrl = (p) => {
       const base = new URLSearchParams(p ? p.toString() : params.toString());
@@ -8645,22 +8651,24 @@
             continue;
           }
 
-          const reduce = await confirmFlowAction(
-            'Retry With Shorter Chain?',
-            'Generate failed after retries. Reduce chain length and retry?',
-            'Retry'
-          );
-          if (reduce) {
-            const nextLenRaw = prompt('New chain length:', String(Math.max(1, (parseInt(length, 10) || 1) - 1)));
-            const nextLen = parseInt(nextLenRaw || '', 10);
-            if (Number.isFinite(nextLen) && nextLen > 0) {
-              length = Math.max(1, Math.min(50, nextLen));
-              if (lengthEl) lengthEl.value = String(length);
-              params.set('length', String(length));
+          if (!allowDupes) {
+            const enableDuplicates = await confirmFlowAction(
+              'Retry With Duplicates?',
+              'Generate failed after retries. Enable duplicates and retry?',
+              'Enable Duplicates'
+            );
+            if (enableDuplicates) {
+              allowDupes = true;
+              options.allow_node_duplicates = true;
+              allowNodeDuplicates = true;
+              if (generateNoDuplicatesEl) {
+                generateNoDuplicatesEl.checked = true;
+              }
+              syncAllowDuplicateParams();
               retriesRemaining = 0;
               attemptedRetries = 0;
               retryIndex = 0;
-              appendLoadingLog(`Reduced chain length to ${length} and retrying`);
+              appendLoadingLog('Enabled duplicates and retrying generate');
               continue;
             }
           }

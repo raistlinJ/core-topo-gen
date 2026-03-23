@@ -111,6 +111,7 @@ def register(
                 'readme_url': readme_url,
                 'validated_ok': bool(item.get('validated_ok')) if item.get('validated_ok') is not None else None,
                 'validated_at': str(item.get('validated_at') or '').strip() or None,
+                'eligible_for_selection': bool(item.get('validated_ok') is True and item.get('validated_incomplete') is not True and not bool(item.get('disabled', False))),
             })
         return jsonify({
             'ok': True,

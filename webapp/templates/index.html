@@ -9507,6 +9507,7 @@
                 // This replaces visible "Random" in the UI and avoids backend preview-plan failures.
                 if (sectionName === 'Vulnerabilities') {
                     const catalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+                    const selectableCatalogItems = catalogItems.filter(it => it && it.eligible_for_selection === true);
                     // Prefer "Ready" vulnerabilities when cache is already available, but do not
                     // trigger save-time Docker/image checks.
                     const cache = (window.__coretg_vuln_status_by_key && typeof window.__coretg_vuln_status_by_key === 'object')
@@ -9524,8 +9525,8 @@
                             return false;
                         }
                     };
-                    const eligibleReady = catalogItems.filter(isReadyItem);
-                    const eligibleAny = eligibleReady.length ? eligibleReady : catalogItems;
+                    const eligibleReady = selectableCatalogItems.filter(isReadyItem);
+                    const eligibleAny = eligibleReady.length ? eligibleReady : selectableCatalogItems;
                     for (let i = 0; i < items.length; i++) {
                         const it = items[i];
                         if (!it || typeof it !== 'object') continue;
@@ -9534,8 +9535,8 @@
                         const isRandomSelected = (!rawSelected || normalized === 'random' || normalized === 'category' || normalized === 'type/vector');
                         if (!isRandomSelected) continue;
                         if (!eligibleAny.length) {
-                            warnings.push('No vulnerabilities available in catalog.');
-                            pushExample({ scenario: scenName, section: 'Vulnerabilities', row: i + 1, field: 'selected', from: rawSelected || 'Random', to: 'Left Random (catalog empty)' });
+                            warnings.push(selectableCatalogItems.length ? 'No ready vulnerabilities available in catalog.' : 'No validated vulnerabilities available in catalog.');
+                            pushExample({ scenario: scenName, section: 'Vulnerabilities', row: i + 1, field: 'selected', from: rawSelected || 'Random', to: 'Left Random (no validated vulnerability available)' });
                             continue;
                         }
 
@@ -21354,10 +21355,22 @@
             }
         };
 
-        const isPickable = (st) => {
+        const selectionBlockReason = (it) => {
             try {
-                if (skipLocalImageStatus) return true;
-                return true;
+                if (!it || typeof it !== 'object') return 'Not selectable';
+                if (it.disabled) return 'Disabled in catalog';
+                if (it.validated_incomplete === true) return 'Test incomplete';
+                if (it.validated_ok === false) return 'Validation failed';
+                if (it.validated_ok !== true) return 'Not yet validated';
+                return '';
+            } catch (e) {
+                return 'Not selectable';
+            }
+        };
+
+        const isPickable = (_st, item) => {
+            try {
+                return !!(item && item.eligible_for_selection === true);
             } catch (e) {
                 return true;
             }
@@ -21501,10 +21514,16 @@
                     </select>
                 `;
                 })();
-                tr.innerHTML = `<td class="text-muted">${idx + 1}</td><td>${nameHtml}</td><td>${validationBadgeHtml(it)}</td><td></td><td>${filesHtml}</td>`;
-                const pickable = isPickable(st);
+                const pickable = isPickable(st, it);
+                const blockedReason = pickable ? '' : selectionBlockReason(it);
+                tr.innerHTML = `<td class="text-muted">${idx + 1}</td><td>${nameHtml}${!pickable && blockedReason ? `<div class="small text-warning-emphasis mt-1">Blocked: ${esc(blockedReason)}</div>` : ''}</td><td>${validationBadgeHtml(it)}</td><td></td><td>${filesHtml}</td>`;
                 tr.style.cursor = pickable ? 'pointer' : 'not-allowed';
                 if (!pickable) tr.classList.add('text-muted');
+                if (!pickable) {
+                    tr.title = blockedReason
+                        ? `Visible for review only: ${blockedReason}`
+                        : 'This vulnerability is visible for review, but it cannot be selected until it passes validation tests.';
+                }
 
                 // Files dropdown behavior: lazy-load files and open selection in a new tab.
                 try {
@@ -21824,7 +21843,7 @@
             try {
                 const ready = eligible.filter(it => {
                     const st = statusByKey.get(itemKey(it)) || null;
-                    return isPickable(st);
+                    return isPickable(st, it);
                 }).length;
                 if (filterMeta) filterMeta.textContent = `${current.length}/${eligible.length} shown (ready: ${ready})`;
             } catch (e) {

@@ -23258,9 +23258,51 @@ def _concretize_traffic_numeric_placeholder(value: Any, *, options: List[float],
     return numeric
 
 
-def _load_backend_vuln_catalog_items() -> List[Dict[str, Any]]:
+def _load_backend_vuln_catalog_items(*, selectable_only: bool = True) -> List[Dict[str, Any]]:
+    try:
+        state = _load_vuln_catalogs_state()
+        entry = _get_active_vuln_catalog_entry(state)
+    except Exception:
+        entry = None
+
+    if isinstance(entry, dict):
+        try:
+            catalog_id = str(entry.get('id') or '').strip()
+            norm_items = _normalize_vuln_catalog_items(entry)
+            out: List[Dict[str, Any]] = []
+            for item in norm_items:
+                if not isinstance(item, dict):
+                    continue
+                eligible = _vuln_catalog_item_is_selectable(item)
+                if selectable_only and not eligible:
+                    continue
+                try:
+                    abs_compose = _vuln_catalog_item_abs_compose_path(catalog_id=catalog_id, item=item)
+                except Exception:
+                    continue
+                out.append({
+                    'Name': _vuln_catalog_item_display_name(item),
+                    'Path': os.path.abspath(abs_compose),
+                    'Type': 'docker-compose',
+                    'Vector': '',
+                    'Startup': '',
+                    'CVE': '',
+                    'Description': '',
+                    'References': '',
+                    'id': str(item.get('id') or '').strip(),
+                    'validated_ok': bool(item.get('validated_ok')) if item.get('validated_ok') is not None else None,
+                    'validated_at': str(item.get('validated_at') or '').strip() or None,
+                    'eligible_for_selection': eligible,
+                })
+            return out
+        except Exception:
+            if selectable_only:
+                return []
+
     try:
         from core_topo_gen.utils.vuln_process import load_vuln_catalog
+        if selectable_only:
+            return []
         items = load_vuln_catalog(_get_repo_root()) or []
         return [item for item in items if isinstance(item, dict)]
     except Exception:
@@ -35521,6 +35563,27 @@ def _normalize_vuln_catalog_items(entry: dict) -> list[dict[str, Any]]:
         out.append(it)
     out.sort(key=lambda d: int(d.get('id') or 0))
     return out
+
+
+def _vuln_catalog_item_display_name(item: dict[str, Any]) -> str:
+    base = str(item.get('name') or '').strip() or 'root'
+    rel_dir = str(item.get('rel_dir') or item.get('dir_rel') or '').strip()
+    if not rel_dir or rel_dir in ('', '.', 'root'):
+        return base
+    parts = [part for part in rel_dir.replace('\\', '/').split('/') if part]
+    if len(parts) >= 2:
+        return f'{parts[-2]}/{parts[-1]}'
+    return parts[-1] if parts else base
+
+
+def _vuln_catalog_item_is_selectable(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if bool(item.get('disabled', False)):
+        return False
+    if item.get('validated_incomplete') is True:
+        return False
+    return item.get('validated_ok') is True
 
 
 def _vuln_catalog_item_abs_compose_path(*, catalog_id: str, item: dict[str, Any]) -> str:
