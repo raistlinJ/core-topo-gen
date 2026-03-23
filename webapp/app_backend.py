@@ -23325,6 +23325,31 @@ def _canonicalize_specific_vulnerability_items(
         return scenario
 
     catalog_items = _load_backend_vuln_catalog_items()
+    if strict:
+        requested_targets = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            selected = str(item.get('selected') or '').strip()
+            if not selected:
+                continue
+            count_raw = item.get('v_count') if item.get('v_count') not in (None, '') else item.get('count')
+            try:
+                count_value = int(count_raw)
+            except Exception:
+                try:
+                    count_value = int(float(count_raw))
+                except Exception:
+                    count_value = 1
+            requested_targets += max(1, count_value)
+        eligible_count = len(catalog_items)
+        if requested_targets > eligible_count:
+            vuln_label = 'vulnerability is' if eligible_count == 1 else 'vulnerabilities are'
+            target_label = 'target is' if requested_targets == 1 else 'targets are'
+            raise ValueError(
+                f'Only {eligible_count} validated/tested {vuln_label} currently eligible in the Vulnerability Catalog, '
+                f'but {requested_targets} vulnerability {target_label} required. Validate more vulnerabilities or reduce the requested vulnerability count.'
+            )
     from core_topo_gen.utils.vuln_process import resolve_vulnerability_catalog_entry
 
     for item in items:

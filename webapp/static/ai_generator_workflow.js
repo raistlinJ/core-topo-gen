@@ -178,6 +178,7 @@
                 enabled_tools: Array.isArray(data.enabled_tools) ? data.enabled_tools : aiState.enabled_tools,
                 last_generation_summary: generationSummary,
                 last_generation_error: '',
+                last_generation_warning: '',
                 prompt_coverage_mismatch: (data.prompt_coverage_mismatch && typeof data.prompt_coverage_mismatch === 'object') ? data.prompt_coverage_mismatch : null,
                 prompt_coverage_retry_used: !!data.prompt_coverage_retry_used,
                 last_best_effort_used: !!data.best_effort_used,
@@ -194,10 +195,24 @@
             deps.render();
         }
 
+        function classifyGenerationWarning(message) {
+            const text = String(message || '').trim();
+            if (!text) return '';
+            if (
+                /validated\/tested\s+vulnerabilit(?:y|ies)/i.test(text)
+                && /(required|eligible|validate more vulnerabilities|reduce the requested vulnerability count)/i.test(text)
+            ) {
+                return text;
+            }
+            return '';
+        }
+
         function handlePreviewFailure({ idx, scenario, promptValue, message }) {
+            const warningMessage = classifyGenerationWarning(message);
             deps.persistAiGeneratorStateForScenario(scenario, idx, {
                 draft_prompt: promptValue,
-                last_generation_error: message,
+                last_generation_error: warningMessage ? '' : message,
+                last_generation_warning: warningMessage,
                 prompt_coverage_mismatch: null,
                 prompt_coverage_retry_used: false,
                 last_best_effort_used: false,
@@ -502,7 +517,10 @@
             const promptValue = (promptInput ? promptInput.value : (aiState.draft_prompt || '')).toString().trim();
             const skipConfirmation = !!(options && options.skipConfirmation);
             if (!promptValue) {
-                deps.persistAiGeneratorStateForScenario(scenario, idx, { last_generation_error: 'Prompt / command intent is required.' });
+                deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                    last_generation_error: 'Prompt / command intent is required.',
+                    last_generation_warning: '',
+                });
                 renderPanel();
                 return;
             }
@@ -511,6 +529,7 @@
                 if (!enabledTools.length) {
                     deps.persistAiGeneratorStateForScenario(scenario, idx, {
                         last_generation_error: 'No MCP tools are enabled. Refresh Connection and enable at least one tool before generating.',
+                        last_generation_warning: '',
                     });
                     renderPanel();
                     return;

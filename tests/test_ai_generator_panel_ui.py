@@ -93,6 +93,48 @@ def test_ai_generator_workflow_blocks_bridge_generation_without_enabled_tools() 
     assert not missing, "Missing AI Generator workflow safeguards for zero enabled MCP tools: " + "; ".join(missing)
 
 
+def test_ai_generator_workflow_classifies_validated_vulnerability_shortages_as_warnings() -> None:
+    text = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_workflow.js").read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "function classifyGenerationWarning(message) {",
+        "last_generation_error: warningMessage ? '' : message",
+        "last_generation_warning: warningMessage",
+        "validated\\/tested\\s+vulnerabilit(?:y|ies)",
+        "validate more vulnerabilities|reduce the requested vulnerability count",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator validated-vulnerability shortage warning snippets: " + "; ".join(missing)
+
+
+def test_ai_generator_panel_renders_validated_vulnerability_warning_block() -> None:
+    text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const generationWarning = (aiState.last_generation_warning || '').toString().trim();",
+        'id="aiGeneratorGenerationWarningWrap"',
+        'id="aiGeneratorGenerationWarning"',
+        'alert alert-warning mb-0 small',
+        'Not enough validated/tested vulnerabilities are currently eligible for this request.',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator validated-vulnerability warning UI snippets: " + "; ".join(missing)
+
+
+def test_index_bootstrap_tracks_ai_generator_warning_state() -> None:
+    text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "last_generation_error: '',",
+        "last_generation_warning: '',",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator warning bootstrap state snippets in index template: " + "; ".join(missing)
+
+
 
 def test_index_bootstrap_caches_ai_provider_catalog_for_panel() -> None:
     text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")

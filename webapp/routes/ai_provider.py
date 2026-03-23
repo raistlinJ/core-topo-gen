@@ -68,7 +68,6 @@ _DEFAULT_MCP_SERVER_PATH = os.path.join(_REPO_ROOT, 'MCP', 'server.py')
 _DEFAULT_MCP_SERVERS_JSON_PATH = os.path.join(_REPO_ROOT, 'MCP', 'mcp-bridge-servers.json')
 _ACTIVE_AI_STREAMS: dict[str, dict[str, Any]] = {}
 _ACTIVE_AI_STREAMS_LOCK = threading.Lock()
-_PROMPT_VULNERABILITY_CATALOG_CACHE: list[dict[str, str]] | None = None
 _EXPLICIT_VULNERABILITY_QUERY_KEYWORDS: tuple[str, ...] = (
     'appweb',
     'jboss',
@@ -342,15 +341,7 @@ def _extract_vulnerability_query_hints(user_prompt: str) -> list[str]:
 
 
 def _load_vulnerability_catalog_for_prompt() -> list[dict[str, str]]:
-    global _PROMPT_VULNERABILITY_CATALOG_CACHE
-    if _PROMPT_VULNERABILITY_CATALOG_CACHE is not None:
-        return list(_PROMPT_VULNERABILITY_CATALOG_CACHE)
-    try:
-        from core_topo_gen.utils.vuln_process import load_vuln_catalog
-        _PROMPT_VULNERABILITY_CATALOG_CACHE = list(load_vuln_catalog(_REPO_ROOT) or [])
-    except Exception:
-        _PROMPT_VULNERABILITY_CATALOG_CACHE = []
-    return list(_PROMPT_VULNERABILITY_CATALOG_CACHE)
+    return list(_get_ai_compiler_vulnerability_catalog())
 
 
 def _get_ai_compiler_vulnerability_catalog() -> list[dict[str, Any]]:

@@ -160,6 +160,7 @@
             const modelFound = validation.model_found !== false;
             const generationSummary = (aiState.last_generation_summary && typeof aiState.last_generation_summary === 'object') ? aiState.last_generation_summary : null;
             const generationError = (aiState.last_generation_error || '').toString().trim();
+            const generationWarning = (aiState.last_generation_warning || '').toString().trim();
             const promptCoverageMismatch = (aiState.prompt_coverage_mismatch && typeof aiState.prompt_coverage_mismatch === 'object') ? aiState.prompt_coverage_mismatch : null;
             const promptCoverageReasons = promptCoverageMismatch && Array.isArray(promptCoverageMismatch.reasons)
                 ? promptCoverageMismatch.reasons.filter(Boolean).map((item) => String(item))
@@ -432,6 +433,12 @@
                                     </div>
                                     <div class="mb-3 ${generationError ? '' : 'd-none'}" id="aiGeneratorGenerationErrorWrap">
                                         <div class="alert alert-danger mb-0 small" id="aiGeneratorGenerationError">${escapeHtml(generationError)}</div>
+                                    </div>
+                                    <div class="mb-3 ${generationWarning ? '' : 'd-none'}" id="aiGeneratorGenerationWarningWrap">
+                                        <div class="alert alert-warning mb-0 small" id="aiGeneratorGenerationWarning">
+                                            <div class="fw-semibold mb-1">Not enough validated/tested vulnerabilities are currently eligible for this request.</div>
+                                            <div>${escapeHtml(generationWarning)}</div>
+                                        </div>
                                     </div>
                                     <div class="mb-3 ${generationSummary ? '' : 'd-none'}" id="aiGeneratorGenerationSummaryWrap">
                                         <div class="alert alert-success mb-0 small" id="aiGeneratorGenerationSummary">${generationSummary ? escapeHtml(formatGenerationSummary(generationSummary)) : ''}</div>

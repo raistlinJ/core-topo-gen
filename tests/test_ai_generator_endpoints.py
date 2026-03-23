@@ -1171,7 +1171,11 @@ def test_ai_generate_scenario_preview_adds_docker_capacity_for_vuln_targets(tmp_
     monkeypatch.setattr(
         backend,
         '_load_backend_vuln_catalog_items',
-        lambda: [{'Name': 'Demo Vuln', 'Path': 'demo/path', 'Description': 'Demo desc'}],
+        lambda: [
+            {'Name': 'Demo Vuln 1', 'Path': 'demo/path/1', 'Description': 'Demo desc 1'},
+            {'Name': 'Demo Vuln 2', 'Path': 'demo/path/2', 'Description': 'Demo desc 2'},
+            {'Name': 'Demo Vuln 3', 'Path': 'demo/path/3', 'Description': 'Demo desc 3'},
+        ],
     )
 
     generated = {
@@ -1193,7 +1197,9 @@ def test_ai_generate_scenario_preview_adds_docker_capacity_for_vuln_targets(tmp_
                 'Vulnerabilities': {
                     'density': 0.0,
                     'items': [
-                        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 3, 'v_name': 'Demo Vuln', 'v_path': 'demo/path'},
+                        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'Demo Vuln 1', 'v_path': 'demo/path/1'},
+                        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'Demo Vuln 2', 'v_path': 'demo/path/2'},
+                        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 1, 'v_name': 'Demo Vuln 3', 'v_path': 'demo/path/3'},
                     ],
                     'flag_type': 'text',
                 },
@@ -1238,6 +1244,82 @@ def test_ai_generate_scenario_preview_adds_docker_capacity_for_vuln_targets(tmp_
         if isinstance(item, dict) and str(item.get('selected') or '').strip() == 'Docker' and str(item.get('v_metric') or '').strip() == 'Count'
     )
     assert docker_total == 3
+
+
+def test_ai_generate_scenario_preview_rejects_when_not_enough_validated_vulns_exist(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+    from webapp.routes import ai_provider
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(
+        backend,
+        '_load_backend_vuln_catalog_items',
+        lambda: [{'Name': 'Only Eligible Vuln', 'Path': 'eligible/path', 'Description': 'Eligible desc'}],
+    )
+
+    generated = {
+        'scenario': {
+            'name': 'GeneratedVulnShortageScenario',
+            'density_count': 0,
+            'notes': 'Generated with too many vulnerability targets.',
+            'sections': {
+                'Node Information': {
+                    'density': 0,
+                    'items': [
+                        {'selected': 'Docker', 'v_metric': 'Count', 'v_count': 3, 'factor': 1.0},
+                    ],
+                },
+                'Routing': {'density': 0.0, 'items': []},
+                'Services': {'density': 0.0, 'items': []},
+                'Traffic': {'density': 0.0, 'items': []},
+                'Vulnerabilities': {
+                    'density': 0.0,
+                    'items': [
+                        {'selected': 'Specific', 'v_metric': 'Count', 'v_count': 3, 'v_name': 'Only Eligible Vuln', 'v_path': 'eligible/path'},
+                    ],
+                    'flag_type': 'text',
+                },
+                'Segmentation': {'density': 0.0, 'items': []},
+            },
+        }
+    }
+
+    monkeypatch.setattr(
+        ai_provider,
+        'urlopen',
+        _fake_ollama_urlopen_factory(generated_payload=generated, models=['llama3.1']),
+    )
+
+    scenario = _scenario_payload('PromptSeedScenario')
+    scenario['ai_generator'] = {
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'llama3.1',
+    }
+
+    resp = client.post(
+        '/api/ai/generate_scenario_preview',
+        json={
+            'provider': 'ollama',
+            'base_url': 'http://127.0.0.1:11434',
+            'model': 'llama3.1',
+            'prompt': 'Generate two servers and three vulnerable docker targets.',
+            'scenarios': [scenario],
+            'scenario_index': 0,
+            'core': {},
+        },
+    )
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert payload.get('success') is False
+    assert 'Only 1 validated/tested vulnerability is currently eligible in the Vulnerability Catalog' in str(payload.get('error') or '')
+    assert '3 vulnerability targets are required' in str(payload.get('error') or '')
 
 
 def test_ai_generate_scenario_preview_canonicalizes_specific_vuln_name_from_matching_path(tmp_path, monkeypatch):
