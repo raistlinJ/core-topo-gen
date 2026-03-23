@@ -128,7 +128,10 @@
             }
             root.classList.remove('d-none');
             const providerCatalog = getProviderCatalog();
-            if ((!providerCatalog || providerCatalog.loaded !== true) && deps && typeof deps.refreshAiProviderCatalog === 'function') {
+            if (
+                (!providerCatalog || (providerCatalog.loaded !== true && providerCatalog.loading !== true && providerCatalog.attempted !== true))
+                && deps && typeof deps.refreshAiProviderCatalog === 'function'
+            ) {
                 deps.refreshAiProviderCatalog().then(() => {
                     try {
                         if ((deps.getScenariosActiveTab && deps.getScenariosActiveTab()) === 'ai-generator') {

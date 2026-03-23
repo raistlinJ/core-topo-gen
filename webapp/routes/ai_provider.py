@@ -727,7 +727,7 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
     if vuln_count and vuln_count > 0:
         coverage['Vulnerabilities'] = {
             'min_items': vuln_count,
-            'reason': f'user requested at least {vuln_count} vulnerabilit{'y' if vuln_count == 1 else 'ies'}',
+            'reason': f"user requested at least {vuln_count} vulnerabilit{'y' if vuln_count == 1 else 'ies'}",
         }
 
     traffic_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'(?:traffic\s+flows?|flows?|traffic\s+streams?|streams?)\b')

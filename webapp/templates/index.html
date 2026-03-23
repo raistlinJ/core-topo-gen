@@ -4922,6 +4922,9 @@
     function getDefaultAiProviderCatalog() {
         return {
             loaded: false,
+            loading: false,
+            attempted: false,
+            error: '',
             default_provider: 'ollama',
             providers: [
                 {
@@ -4965,6 +4968,11 @@
         if (!force && aiProviderCatalogPromise) {
             return aiProviderCatalogPromise;
         }
+        aiProviderCatalogState = {
+            ...(aiProviderCatalogState || getDefaultAiProviderCatalog()),
+            loading: true,
+            error: '',
+        };
         aiProviderCatalogPromise = (async () => {
             try {
                 const resp = await fetch('/api/ai/providers', {
@@ -4981,6 +4989,9 @@
                 }
                 aiProviderCatalogState = {
                     loaded: true,
+                    loading: false,
+                    attempted: true,
+                    error: '',
                     default_provider: String(data.default_provider || 'ollama').trim().toLowerCase() || 'ollama',
                     providers: data.providers.map((entry) => ({ ...(entry || {}) })),
                 };
@@ -4989,6 +5000,9 @@
                 aiProviderCatalogState = {
                     ...getDefaultAiProviderCatalog(),
                     loaded: false,
+                    loading: false,
+                    attempted: true,
+                    error: err && err.message ? String(err.message) : 'Provider catalog request failed',
                 };
             } finally {
                 aiProviderCatalogPromise = null;
