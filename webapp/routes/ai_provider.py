@@ -2044,7 +2044,16 @@ class ProviderAdapter:
     def validate(self, payload: dict[str, Any], *, log: Any = None) -> dict[str, Any]:
         raise NotImplementedError
 
-    def generate(self, payload: dict[str, Any], *, current_scenario: dict[str, Any], user_prompt: str, log: Any = None) -> dict[str, Any]:
+    def generate(
+        self,
+        payload: dict[str, Any],
+        *,
+        current_scenario: dict[str, Any],
+        user_prompt: str,
+        log: Any = None,
+        emit: Callable[..., None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -5524,7 +5533,16 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
         parsed_generation = _extract_json_candidate(raw_generation)
         return raw_generation, parsed_generation or {}, 'json_object'
 
-    def generate(self, payload: dict[str, Any], *, current_scenario: dict[str, Any], user_prompt: str, log: Any = None) -> dict[str, Any]:
+    def generate(
+        self,
+        payload: dict[str, Any],
+        *,
+        current_scenario: dict[str, Any],
+        user_prompt: str,
+        log: Any = None,
+        emit: Callable[..., None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         model = str(payload.get('model') or '').strip()
         if not model:
             raise ProviderAdapterError('model is required.')
@@ -5547,8 +5565,25 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
         provider_attempts: list[dict[str, Any]] = []
         generation_started_at = time.monotonic()
 
+        def _emit_attempt_status(message: str) -> None:
+            if emit is not None:
+                emit('status', message=message)
+
         def _run_attempt(*, attempt_name: str, prompt_text: str) -> tuple[str, dict[str, Any], str]:
             attempt_started_at = time.monotonic()
+            if cancel_check is not None and cancel_check():
+                raise ProviderAdapterError('Generation cancelled by user.', status_code=499)
+            _emit_attempt_status(f'Contacting OpenAI-compatible endpoint ({attempt_name})...')
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat() -> None:
+                while not heartbeat_stop.wait(5.0):
+                    if cancel_check is not None and cancel_check():
+                        return
+                    _emit_attempt_status(f'Still waiting on OpenAI-compatible endpoint ({attempt_name})...')
+
+            if emit is not None:
+                threading.Thread(target=_heartbeat, daemon=True).start()
             try:
                 raw_generation, parsed_generation, format_mode = _run_with_wall_clock_timeout(
                     lambda: self._generate_once(
@@ -5561,6 +5596,7 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
                     ),
                     timeout_seconds=timeout_seconds,
                 )
+                _emit_attempt_status(f'OpenAI-compatible endpoint responded ({attempt_name}).')
             except HTTPError as exc:
                 detail = ''
                 try:
@@ -5618,6 +5654,8 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
                         error_category=error_category,
                     ),
                 ) from exc
+            finally:
+                heartbeat_stop.set()
             _append_provider_attempt(
                 provider_attempts,
                 attempt=attempt_name,
@@ -5634,6 +5672,7 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
                 prompt_text=prompt,
             )
             if not isinstance(parsed_generation, dict) or not parsed_generation:
+                _emit_attempt_status('Initial OpenAI-compatible draft was not valid JSON. Requesting a repair pass...')
                 repair_prompt = _build_ollama_repair_prompt(current_scenario, user_prompt, raw_generation)
                 raw_generation, parsed_generation, format_mode = _run_attempt(
                     attempt_name='repair',
@@ -5641,6 +5680,7 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
                 )
                 prompt = repair_prompt
             if not isinstance(parsed_generation, dict) or not parsed_generation:
+                _emit_attempt_status('Repair draft was still invalid JSON. Requesting a strict JSON rewrite...')
                 strict_prompt = _build_ollama_strict_json_repair_prompt(current_scenario, user_prompt, raw_generation)
                 raw_generation, parsed_generation, format_mode = _run_attempt(
                     attempt_name='strict-rewrite',
@@ -5789,6 +5829,8 @@ def register(
             resolved['has_stored_api_key'] = True
             resolved['api_key_stored_at'] = stored_record.get('stored_at')
         return resolved
+
+    globals()['_resolve_payload_with_stored_api_key'] = _resolve_payload_with_stored_api_key
 
     @app.route('/api/ai/download_transcript', methods=['POST'])
     def api_ai_download_transcript():
@@ -6260,13 +6302,23 @@ def register(
                                     on_response_open=on_response_open,
                                 ))
                         else:
-                            emit('status', message='Contacting provider...')
-                            generation_result = adapter.generate(
-                                payload,
-                                current_scenario=current_scenario,
-                                user_prompt=user_prompt,
-                                log=log,
-                            )
+                            if isinstance(adapter, OpenAiCompatibleProviderAdapter):
+                                generation_result = adapter.generate(
+                                    payload,
+                                    current_scenario=current_scenario,
+                                    user_prompt=user_prompt,
+                                    log=log,
+                                    emit=emit,
+                                    cancel_check=is_cancelled,
+                                )
+                            else:
+                                emit('status', message='Contacting provider...')
+                                generation_result = adapter.generate(
+                                    payload,
+                                    current_scenario=current_scenario,
+                                    user_prompt=user_prompt,
+                                    log=log,
+                                )
                             raw_generation = str(generation_result.get('provider_response') or '').strip()
                             if raw_generation:
                                 emit('llm_delta', text=raw_generation)

@@ -444,7 +444,13 @@
                     <pre class="gb-stream-output" id="gbGenerateOverlayOutput" aria-live="polite">No model response captured yet.</pre>
                   </div>
                   <div class="gb-stream-panel">
-                    <div class="gb-stream-panel-header">Activity</div>
+                    <div class="gb-stream-panel-header d-flex align-items-center justify-content-between gap-2 flex-wrap">
+                      <span>Activity</span>
+                      <label class="form-check form-switch mb-0 small">
+                        <input class="form-check-input" type="checkbox" id="gbGenerateOverlayAutoFollowInput" checked>
+                        <span class="form-check-label">Auto-follow</span>
+                      </label>
+                    </div>
                     <ol class="gb-stream-events" id="gbGenerateOverlayEvents" aria-live="polite">
                       <li class="text-muted">No activity yet.</li>
                     </ol>
@@ -455,20 +461,27 @@
                 </div>
               </div>
             </div>
-            <ul class="nav nav-pills gb-tab-nav mb-3" role="tablist">
-              <li class="nav-item" role="presentation">
-                <button class="nav-link active" id="gbBuildTabModelBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabModel" type="button" role="tab" aria-selected="true">Model Config</button>
-              </li>
-              <li class="nav-item" role="presentation">
-                <button class="nav-link" id="gbBuildTabPromptBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabPrompt" type="button" role="tab" aria-selected="false" disabled aria-disabled="true">Build</button>
-              </li>
-              <li class="nav-item" role="presentation">
-                <button class="nav-link" id="gbBuildTabOutputBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabOutput" type="button" role="tab" aria-selected="false">Prompt Response</button>
-              </li>
-              <li class="nav-item" role="presentation">
-                <button class="nav-link" id="gbBuildTabTestBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabTest" type="button" role="tab" aria-selected="false" disabled aria-disabled="true">Test Run</button>
-              </li>
-            </ul>
+            <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-3">
+              <ul class="nav nav-pills gb-tab-nav mb-0" role="tablist">
+                <li class="nav-item" role="presentation">
+                  <button class="nav-link active" id="gbBuildTabModelBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabModel" type="button" role="tab" aria-selected="true">Model Config</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                  <button class="nav-link" id="gbBuildTabPromptBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabPrompt" type="button" role="tab" aria-selected="false" disabled aria-disabled="true">Build</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                  <button class="nav-link" id="gbBuildTabOutputBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabOutput" type="button" role="tab" aria-selected="false">Prompt Response</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                  <button class="nav-link" id="gbBuildTabTestBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabTest" type="button" role="tab" aria-selected="false" disabled aria-disabled="true">Test Run</button>
+                </li>
+              </ul>
+              <span id="gbInstallBtnHint" title="Install unlocks after a successful Builder test returns rc=0.">
+                <button class="btn btn-outline-success btn-sm" type="button" id="gbInstallBtn" disabled aria-describedby="gbInstallBtnHint">
+                  <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                </button>
+              </span>
+            </div>
             <div class="tab-content">
               <div class="tab-pane fade show active" id="gbBuildTabModel" role="tabpanel">
                 <div class="card gb-model-card">
@@ -486,11 +499,17 @@
                     </div>
                     <div class="mb-3">
                       <label class="form-label">URL</label>
-                      <input class="form-control" id="gbBaseUrl" placeholder="http://127.0.0.1:11434" />
+                      <input class="form-control" id="gbBaseUrl" type="url" inputmode="url" placeholder="http://127.0.0.1:11434" spellcheck="false" />
                     </div>
                     <div class="mb-3">
                       <label class="form-label">API key</label>
-                      <input class="form-control" id="gbApiKey" type="password" placeholder="Optional for hosted providers" />
+                      <input class="form-control" id="gbApiKey" type="password" placeholder="Optional for hosted providers" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" spellcheck="false" />
+                      <div class="d-flex align-items-center gap-2 mt-2 flex-wrap">
+                        <button type="button" class="btn btn-outline-secondary btn-sm d-none" id="gbSaveApiKeyBtn">Save Key</button>
+                        <button type="button" class="btn btn-outline-secondary btn-sm d-none" id="gbClearApiKeyBtn">Clear Stored Key</button>
+                        <span class="small text-muted" id="gbApiKeyStatus">No API key stored securely yet.</span>
+                      </div>
+                      <div class="form-text" id="gbApiKeyHelp">Stored securely on the server for your account. Leave the field blank to keep the current saved key. The base URL is not stored securely.</div>
                     </div>
                     <div class="mb-3">
                       <div class="form-check form-switch">
@@ -611,7 +630,13 @@
                         <pre class="gb-stream-output" id="gbStreamOutput">No model response captured yet.</pre>
                       </div>
                       <div class="gb-stream-panel">
-                        <div class="gb-stream-panel-header">Activity</div>
+                        <div class="gb-stream-panel-header d-flex align-items-center justify-content-between gap-2 flex-wrap">
+                          <span>Activity</span>
+                          <label class="form-check form-switch mb-0 small">
+                            <input class="form-check-input" type="checkbox" id="gbStreamAutoFollowInput" checked>
+                            <span class="form-check-label">Auto-follow</span>
+                          </label>
+                        </div>
                         <ol class="gb-stream-events" id="gbStreamEvents">
                           <li class="text-muted">No activity yet.</li>
                         </ol>
@@ -639,7 +664,6 @@
                           <pre class="gb-code mb-0" id="gbFileContent">No file selected.</pre>
                         </div>
                       </div>
-                      <div class="gb-inline-snapshot d-none" id="gbLatestTestSnapshot"></div>
                     </div>
                   </div>
                   <div class="tab-pane fade" id="gbResultsSummaryTab" role="tabpanel">
@@ -660,9 +684,6 @@
                   <div class="d-flex gap-2 flex-wrap">
                     <button class="btn btn-outline-dark btn-sm" type="button" id="gbTestBtn" disabled>
                       <i class="bi bi-beaker me-1"></i>Test
-                    </button>
-                    <button class="btn btn-outline-success btn-sm" type="button" id="gbInstallBtn" disabled>
-                      <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
                     </button>
                   </div>
                 </div>
@@ -830,6 +851,14 @@
     catalog: { ...fallbackCatalog },
     models: [],
     validation: null,
+    autoFollowEvents: true,
+    hasStoredApiKey: false,
+    apiKeySecretId: '',
+    apiKeyStoredAt: '',
+    apiKeyStatusLoaded: false,
+    apiKeyStatusLoading: false,
+    apiKeyStatusProvider: '',
+    apiKeyStatusMessage: '',
     promptUnlocked: false,
     scaffoldRequest: null,
     scaffoldFiles: {},
@@ -843,6 +872,7 @@
     generateCancelRequested: false,
     lastGenerateMode: 'create',
     transcriptEvents: [],
+    transcriptThinkingText: '',
     generateRequestId: '',
     promptIntentPreview: null,
     promptIntentPreviewTimer: null,
@@ -923,6 +953,10 @@
     baseUrl: document.getElementById('gbBaseUrl'),
     model: document.getElementById('gbModel'),
     apiKey: document.getElementById('gbApiKey'),
+    saveApiKeyBtn: document.getElementById('gbSaveApiKeyBtn'),
+    clearApiKeyBtn: document.getElementById('gbClearApiKeyBtn'),
+    apiKeyStatus: document.getElementById('gbApiKeyStatus'),
+    apiKeyHelp: document.getElementById('gbApiKeyHelp'),
     enforceSsl: document.getElementById('gbEnforceSsl'),
     validationStatus: document.getElementById('gbValidationStatus'),
     generationStatus: document.getElementById('gbGenerationStatus'),
@@ -935,7 +969,7 @@
     fileList: document.getElementById('gbFileList'),
     fileContent: document.getElementById('gbFileContent'),
     filesCount: document.getElementById('gbFilesCount'),
-    latestTestSnapshot: document.getElementById('gbLatestTestSnapshot'),
+    installBtnHint: document.getElementById('gbInstallBtnHint'),
     intentOverridesPanel: document.getElementById('gbIntentOverridesPanel'),
     intentOverridesSummary: document.getElementById('gbIntentOverridesSummary'),
     intentRuntimeInputs: document.getElementById('gbIntentRuntimeInputs'),
@@ -968,6 +1002,7 @@
     generateOverlayParsedSummary: document.getElementById('gbGenerateOverlayParsedSummary'),
     generateOverlayOutput: document.getElementById('gbGenerateOverlayOutput'),
     generateOverlayEvents: document.getElementById('gbGenerateOverlayEvents'),
+    generateOverlayAutoFollowInput: document.getElementById('gbGenerateOverlayAutoFollowInput'),
     generateCancelBtn: document.getElementById('gbGenerateCancelBtn'),
     streamMeta: document.getElementById('gbStreamMeta'),
     streamStatus: document.getElementById('gbStreamStatus'),
@@ -977,6 +1012,7 @@
     streamParsedSummary: document.getElementById('gbStreamParsedSummary'),
     streamOutput: document.getElementById('gbStreamOutput'),
     streamEvents: document.getElementById('gbStreamEvents'),
+    streamAutoFollowInput: document.getElementById('gbStreamAutoFollowInput'),
     streamCopyBtn: document.getElementById('gbStreamCopyBtn'),
     streamDownloadBtn: document.getElementById('gbStreamDownloadBtn'),
     streamRetryBtn: document.getElementById('gbStreamRetryBtn'),
@@ -1072,6 +1108,7 @@
   function restoreBuilderWorkspaceState(snapshot) {
     const saved = snapshot && typeof snapshot === 'object' ? snapshot : null;
     if (!saved) return false;
+    state.autoFollowEvents = saved.autoFollowEvents !== false;
     if (elements.pluginType) elements.pluginType.value = String(saved.pluginType || 'flag-generator');
     if (elements.sourceIdHint) elements.sourceIdHint.value = String(saved.sourceIdHint || '');
     if (elements.nameHint) elements.nameHint.value = String(saved.nameHint || '');
@@ -1087,6 +1124,7 @@
     state.iterations = Array.isArray(saved.iterations) ? saved.iterations : [];
     state.lastGenerateMode = String(saved.lastGenerateMode || 'create');
     state.transcriptEvents = Array.isArray(saved.transcriptEvents) ? saved.transcriptEvents : [];
+    state.transcriptThinkingText = '';
     state.promptIntentPreview = saved.promptIntentPreview || null;
     builderTestState.latestOutputsData = saved.latestOutputsData || null;
     builderTestState.runId = String(saved.builderRunId || '');
@@ -1127,10 +1165,10 @@
     if (logEl) {
       logEl.textContent = String(saved.builderLog || 'Press Test from Prompt Response to prepare a run.\n');
     }
+    syncAutoFollowToggle();
     renderSummary();
     renderFiles();
     renderIterations();
-    renderLatestTestSnapshot();
     updateActionButtons();
     return true;
   }
@@ -1145,6 +1183,14 @@
     }
     state.models = [];
     state.validation = null;
+    state.autoFollowEvents = true;
+    state.hasStoredApiKey = false;
+    state.apiKeySecretId = '';
+    state.apiKeyStoredAt = '';
+    state.apiKeyStatusLoaded = false;
+    state.apiKeyStatusLoading = false;
+    state.apiKeyStatusProvider = '';
+    state.apiKeyStatusMessage = '';
     state.promptUnlocked = false;
     state.scaffoldRequest = null;
     state.scaffoldFiles = {};
@@ -1158,6 +1204,7 @@
     state.generateCancelRequested = false;
     state.lastGenerateMode = 'create';
     state.transcriptEvents = [];
+    state.transcriptThinkingText = '';
     state.generateRequestId = '';
     state.promptIntentPreview = null;
     if (state.promptIntentPreviewTimer) {
@@ -1175,6 +1222,8 @@
     }
     if (elements.apiKey) elements.apiKey.value = '';
     if (elements.enforceSsl) elements.enforceSsl.checked = true;
+    syncAutoFollowToggle(true);
+    renderStoredApiKeyControls();
     renderSummary();
     renderFiles();
     renderIterations();
@@ -1201,7 +1250,6 @@
     builderTestState.runId = null;
     builderTestState.latestOutputsData = null;
     builderTestState.testCoreCfg = null;
-    renderLatestTestSnapshot();
     renderProviderOptions();
     updatePromptLockState();
     updateActionButtons();
@@ -1373,7 +1421,6 @@
     setBuilderTestOutputsHtml('<div class="text-muted">Start a test from Prompt Response to see generated files.</div>');
     setBuilderTestOutputsStatus(false);
     setTestRunActiveState(false, builderTestState.hasRunHistory ? 'No active test run.' : 'No test run has started yet.', 'secondary');
-    renderLatestTestSnapshot();
   }
 
   function clearBuilderCleanupLog() {
@@ -1498,7 +1545,6 @@
       setTestStatus(returncode === 0 ? `Test completed successfully (rc=${returncode}).` : `Test finished with rc=${returncode == null ? 'n/a' : returncode}.`, returncode === 0 ? 'success' : 'danger');
       showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
     }
-    renderLatestTestSnapshot();
     updateActionButtons();
     persistBuilderWorkspaceState();
   }
@@ -1964,6 +2010,175 @@
     return (state.catalog.providers || []).find((entry) => String(entry.provider || '').trim().toLowerCase() === provider) || null;
   }
 
+  function providerSupportsStoredApiKey(provider = elements.provider && elements.provider.value) {
+    const key = String(provider || '').trim().toLowerCase();
+    return !!key && key !== 'ollama';
+  }
+
+  function syncAutoFollowToggle(nextValue = state.autoFollowEvents) {
+    const checked = !!nextValue;
+    state.autoFollowEvents = checked;
+    if (elements.streamAutoFollowInput) elements.streamAutoFollowInput.checked = checked;
+    if (elements.generateOverlayAutoFollowInput) elements.generateOverlayAutoFollowInput.checked = checked;
+  }
+
+  function scrollActivityTargetToBottom(target) {
+    if (!target || !state.autoFollowEvents) return;
+    target.scrollTop = target.scrollHeight;
+    const lastItem = target.lastElementChild;
+    if (lastItem && typeof lastItem.scrollIntoView === 'function') {
+      try {
+        lastItem.scrollIntoView({ block: 'end' });
+      } catch (e) {
+        lastItem.scrollIntoView(false);
+      }
+    }
+  }
+
+  function scheduleActivityAutoFollow() {
+    if (!state.autoFollowEvents) return;
+    const targets = [elements.streamEvents, elements.generateOverlayEvents];
+    const flush = () => targets.forEach((target) => scrollActivityTargetToBottom(target));
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(flush);
+    } else {
+      flush();
+    }
+    window.setTimeout(flush, 0);
+  }
+
+  function renderStoredApiKeyControls() {
+    const provider = String(elements.provider && elements.provider.value || '').trim().toLowerCase();
+    const supported = providerSupportsStoredApiKey(provider);
+    const hasStored = supported && !!state.hasStoredApiKey;
+    const loading = supported && !!state.apiKeyStatusLoading;
+    const statusMessage = String(state.apiKeyStatusMessage || '').trim();
+    if (elements.apiKey) {
+      elements.apiKey.placeholder = supported
+        ? (hasStored ? 'Stored securely. Enter a new key to replace it.' : 'Optional for hosted providers')
+        : 'Not required for Ollama';
+    }
+    if (elements.saveApiKeyBtn) {
+      elements.saveApiKeyBtn.classList.toggle('d-none', !supported);
+      elements.saveApiKeyBtn.textContent = hasStored ? 'Update Key' : 'Save Key';
+      elements.saveApiKeyBtn.disabled = loading;
+    }
+    if (elements.clearApiKeyBtn) {
+      elements.clearApiKeyBtn.classList.toggle('d-none', !hasStored);
+      elements.clearApiKeyBtn.disabled = loading;
+    }
+    if (elements.apiKeyStatus) {
+      const toneClass = statusMessage ? 'text-danger' : (hasStored ? 'text-success' : 'text-muted');
+      elements.apiKeyStatus.className = `small ${toneClass}`;
+      elements.apiKeyStatus.textContent = !supported
+        ? 'This provider does not need a stored API key.'
+        : (loading
+          ? 'Checking secure key status...'
+          : (statusMessage || (hasStored
+            ? `API key stored securely${state.apiKeyStoredAt ? ` • ${state.apiKeyStoredAt}` : ''}`
+            : 'No API key stored securely yet.')));
+    }
+    if (elements.apiKeyHelp) {
+      elements.apiKeyHelp.textContent = supported
+        ? 'Stored securely on the server for your account. Leave the field blank to keep the current saved key. The base URL is not stored securely.'
+        : 'Ollama usually does not require an API key. Provider, URL, model, and TLS preference still persist locally in this browser.';
+    }
+  }
+
+  async function fetchStoredApiKeyStatus(provider) {
+    const resp = await fetch('/api/ai/provider/credential/status', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ provider }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload || payload.success === false) {
+      throw new Error((payload && (payload.error || payload.message)) || `Credential status failed (HTTP ${resp.status})`);
+    }
+    return payload;
+  }
+
+  async function saveStoredApiKey(provider, apiKey) {
+    const resp = await fetch('/api/ai/provider/credential/save', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ provider, api_key: apiKey }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload || payload.success === false) {
+      throw new Error((payload && (payload.error || payload.message)) || `Secure API key save failed (HTTP ${resp.status})`);
+    }
+    return payload;
+  }
+
+  async function clearStoredApiKey(provider) {
+    const resp = await fetch('/api/ai/provider/credential/clear', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ provider }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload || payload.success === false) {
+      throw new Error((payload && (payload.error || payload.message)) || `Secure API key clear failed (HTTP ${resp.status})`);
+    }
+    return payload;
+  }
+
+  async function refreshStoredApiKeyStatus(force = false) {
+    const provider = String(elements.provider && elements.provider.value || '').trim().toLowerCase();
+    if (!providerSupportsStoredApiKey(provider)) {
+      state.hasStoredApiKey = false;
+      state.apiKeySecretId = '';
+      state.apiKeyStoredAt = '';
+      state.apiKeyStatusLoaded = true;
+      state.apiKeyStatusLoading = false;
+      state.apiKeyStatusProvider = provider;
+      state.apiKeyStatusMessage = '';
+      renderStoredApiKeyControls();
+      return;
+    }
+    if (!force && state.apiKeyStatusLoaded && state.apiKeyStatusProvider === provider) {
+      renderStoredApiKeyControls();
+      return;
+    }
+    state.apiKeyStatusLoading = true;
+    state.apiKeyStatusLoaded = false;
+    state.apiKeyStatusProvider = provider;
+    state.apiKeyStatusMessage = '';
+    renderStoredApiKeyControls();
+    try {
+      const payload = await fetchStoredApiKeyStatus(provider);
+      if (state.apiKeyStatusProvider !== provider) return;
+      state.hasStoredApiKey = !!payload.has_api_key;
+      state.apiKeySecretId = String(payload.identifier || '');
+      state.apiKeyStoredAt = String(payload.stored_at || '');
+      state.apiKeyStatusLoaded = true;
+      state.apiKeyStatusLoading = false;
+      state.apiKeyStatusMessage = '';
+    } catch (err) {
+      if (state.apiKeyStatusProvider !== provider) return;
+      state.hasStoredApiKey = false;
+      state.apiKeySecretId = '';
+      state.apiKeyStoredAt = '';
+      state.apiKeyStatusLoaded = true;
+      state.apiKeyStatusLoading = false;
+      state.apiKeyStatusMessage = String((err && err.message) || err || 'Failed to load secure API key status.');
+    }
+    renderStoredApiKeyControls();
+  }
+
   function renderProviderOptions() {
     const providers = Array.isArray(state.catalog.providers) ? state.catalog.providers : [];
     const savedPrefs = loadBuilderModelPrefs();
@@ -1979,6 +2194,7 @@
     }
     persistSelectedProvider(elements.provider.value || current || 'ollama');
     applyProviderDefaults();
+    renderStoredApiKeyControls();
   }
 
   function loadBuilderModelPrefs() {
@@ -2026,6 +2242,7 @@
     providers[provider] = {
       base_url: String(elements.baseUrl.value || '').trim(),
       model: String(elements.model.value || '').trim(),
+      enforce_ssl: !!elements.enforceSsl.checked,
     };
     prefs.selected_provider = provider;
     prefs.providers = providers;
@@ -2167,7 +2384,9 @@
       elements.baseUrl.value = String(entry.default_base_url || '').trim();
     }
     elements.model.value = String(savedPrefs.model || '').trim();
+    elements.enforceSsl.checked = savedPrefs.enforce_ssl !== false;
     renderModelList();
+    refreshStoredApiKeyStatus(false);
   }
 
   async function refreshProviders(force = false) {
@@ -2353,6 +2572,7 @@
     const events = Array.isArray(state.transcriptEvents) ? state.transcriptEvents : [];
     if (!events.length) {
       target.innerHTML = '<li class="text-muted">No activity yet.</li>';
+      scheduleActivityAutoFollow();
       return;
     }
     target.innerHTML = events.map((entry) => {
@@ -2360,6 +2580,7 @@
       const text = escapeHtml(String(entry.text || ''));
       return `<li><span class="gb-stream-event-time">${time}</span><div style="white-space: pre-wrap;">${text}</div></li>`;
     }).join('');
+    scheduleActivityAutoFollow();
   }
 
   function renderTranscriptEvents() {
@@ -2369,6 +2590,28 @@
 
   function appendTranscriptEvent(text) {
     state.transcriptEvents.push({ time: formatEventTime(), text: String(text || '') });
+    renderTranscriptEvents();
+    persistBuilderWorkspaceState();
+  }
+
+  function upsertTranscriptEvent(key, text) {
+    const normalizedKey = String(key || '').trim();
+    const nextText = String(text || '');
+    if (!normalizedKey) {
+      appendTranscriptEvent(nextText);
+      return;
+    }
+    const existingIndex = state.transcriptEvents.findIndex((entry) => String(entry && entry.key || '') === normalizedKey);
+    if (existingIndex >= 0) {
+      state.transcriptEvents[existingIndex] = {
+        ...state.transcriptEvents[existingIndex],
+        time: formatEventTime(),
+        text: nextText,
+        key: normalizedKey,
+      };
+    } else {
+      state.transcriptEvents.push({ time: formatEventTime(), text: nextText, key: normalizedKey });
+    }
     renderTranscriptEvents();
     persistBuilderWorkspaceState();
   }
@@ -2442,7 +2685,6 @@
     renderTestFiles([]);
     state.lastTestResult = null;
     builderTestState.latestOutputsData = null;
-    renderLatestTestSnapshot();
     queuePromptIntentPreview();
     const successDetail = `${mode === 'refine' ? 'Refined' : 'Generated'} ${Object.keys(state.scaffoldFiles || {}).length} scaffold files for ${String((state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator')}.`;
     setGenerationStatus(successDetail, 'success');
@@ -2540,6 +2782,7 @@
   function openStreamModal(mode, payload) {
     state.lastGenerateMode = mode;
     state.transcriptEvents = [];
+    state.transcriptThinkingText = '';
     state.assistantText = '';
     state.generateRequestId = String(payload.request_id || '').trim();
     elements.streamMeta.textContent = `${mode === 'refine' ? 'Refine' : 'Create'} request • ${String(payload.provider || '').trim() || 'provider'} • ${String(payload.model || '').trim() || 'model'}`;
@@ -2607,12 +2850,30 @@
     appendTranscriptEvent('Transcript downloaded.');
   }
 
+  function updateInstallButtonHint(isDisabled, hasScaffold) {
+    const hint = !hasScaffold
+      ? 'Generate a scaffold before installing it into the catalog.'
+      : (hasSuccessfulBuilderTest()
+        ? 'Install this scaffold into the catalog.'
+        : 'Install unlocks after the latest Builder test returns rc=0.');
+    if (elements.installBtnHint) {
+      elements.installBtnHint.setAttribute('title', hint);
+    }
+    if (elements.installBtn) {
+      elements.installBtn.setAttribute('title', isDisabled ? hint : 'Install this scaffold into the catalog.');
+      elements.installBtn.setAttribute('aria-label', isDisabled ? hint : 'Install to Catalog');
+    }
+  }
+
   function updateActionButtons() {
     const hasScaffold = !!state.scaffoldRequest;
     const promptReady = isPromptUnlocked();
     if (elements.promptRefineBtn) elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
     if (elements.testBtn) elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
-    if (elements.installBtn) elements.installBtn.disabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
+    if (elements.installBtn) {
+      elements.installBtn.disabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
+      updateInstallButtonHint(elements.installBtn.disabled, hasScaffold);
+    }
     if (elements.promptSubmitBtn) elements.promptSubmitBtn.disabled = state.generateInFlight || !promptReady;
     if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = state.generateInFlight || !promptReady;
     if (elements.downloadComposeBtn) {
@@ -2908,52 +3169,6 @@
     }, 180);
   }
 
-  function renderLatestTestSnapshot() {
-    const container = elements.latestTestSnapshot;
-    if (!container) return;
-    const data = builderTestState.latestOutputsData;
-    const runId = builderTestState.runId;
-    const base = builderTestState.testBase || '/api/generators/builder_test';
-    const scaffold = Array.isArray(data && data.scaffold) ? data.scaffold : [];
-    const misc = Array.isArray(data && data.misc) ? data.misc : [];
-    const failureSummary = String((data && data.failure_summary) || '').trim();
-    if (!runId || (!scaffold.length && !misc.length)) {
-      container.classList.add('d-none');
-      container.innerHTML = '';
-      return;
-    }
-    const links = [];
-    scaffold.forEach((file) => {
-      const relPath = String(file.path || '');
-      links.push(`<a class="btn btn-sm btn-outline-secondary" href="${escapeHtml(`${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}`)}">${escapeHtml(relPath.replace(/^scaffold\//, ''))}</a>`);
-    });
-    misc.filter((file) => String(file.path || '') === 'run.log').forEach((file) => {
-      const relPath = String(file.path || '');
-      links.push(`<a class="btn btn-sm btn-outline-dark" href="${escapeHtml(`${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}`)}">Download run.log</a>`);
-    });
-    const summaryHtml = failureSummary
-      ? `<div class="small text-danger mb-2" style="white-space: pre-wrap;">${escapeHtml(failureSummary)}</div>`
-      : '<div class="small text-muted mb-2">Saved scaffold and logs from the latest Builder test run.</div>';
-    container.innerHTML = `
-      <div class="d-flex align-items-start justify-content-between gap-3 flex-wrap mb-2">
-        <div>
-          <div class="fw-semibold">Latest Test Snapshot</div>
-          <div class="small text-muted">Saved from run ${escapeHtml(String(runId))}</div>
-        </div>
-        <button type="button" class="btn btn-sm btn-outline-secondary" id="gbLatestTestSnapshotOpenBtn">Open Test Result</button>
-      </div>
-      ${summaryHtml}
-      <div class="d-flex gap-2 flex-wrap">${links.join('')}</div>
-    `;
-    container.classList.remove('d-none');
-    const openBtn = document.getElementById('gbLatestTestSnapshotOpenBtn');
-    if (openBtn) {
-      openBtn.addEventListener('click', () => {
-        showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
-      });
-    }
-  }
-
   async function generateScaffold(mode = 'create') {
     const payload = buildGeneratePayload();
     if (!payload.prompt) {
@@ -3003,32 +3218,40 @@
         const type = String((event && event.type) || '');
         if (type === 'status') {
           const message = String((event && event.message) || 'Working...');
+          state.transcriptThinkingText = '';
           setStreamState(message, 'Waiting for the next update.', 'text-bg-primary', 'Running');
           appendTranscriptEvent(message);
           return;
         }
         if (type === 'llm_prompt') {
+          state.transcriptThinkingText = '';
           appendTranscriptEvent(`LLM prompt:\n${String((event && event.text) || '')}`);
           return;
         }
         if (type === 'llm_thinking') {
-          appendTranscriptEvent(`Thinking:\n${String((event && event.text) || '')}`);
+          const delta = String((event && event.text) || '');
+          if (!delta) return;
+          state.transcriptThinkingText = `${state.transcriptThinkingText || ''}${delta}`;
+          upsertTranscriptEvent('thinking', `Thinking:\n${state.transcriptThinkingText}`);
           return;
         }
         if (type === 'llm_delta') {
           const delta = String((event && event.text) || '');
           if (delta) {
+            state.transcriptThinkingText = '';
             state.assistantText = `${state.assistantText || ''}${delta}`;
             setStreamOutput(state.assistantText, mode === 'refine' ? 'Streaming raw model response for the refine step.' : 'Streaming raw model response for the create step.');
           }
           return;
         }
         if (type === 'error') {
+          state.transcriptThinkingText = '';
           streamError = String((event && event.error) || 'Generation failed.');
           appendTranscriptEvent(`Error: ${streamError}`);
           return;
         }
         if (type === 'result') {
+          state.transcriptThinkingText = '';
           finalResult = event && typeof event.data === 'object' ? event.data : null;
         }
       });
@@ -3160,6 +3383,11 @@
     state.models = [];
     elements.model.value = '';
     elements.baseUrl.value = '';
+    elements.apiKey.value = '';
+    state.apiKeyStatusLoaded = false;
+    state.apiKeyStatusLoading = false;
+    state.apiKeyStatusProvider = String(elements.provider.value || '').trim().toLowerCase();
+    state.apiKeyStatusMessage = '';
     applyProviderDefaults();
     invalidateModelStep();
     persistBuilderWorkspaceState();
@@ -3174,6 +3402,7 @@
     persistBuilderWorkspaceState();
   });
   elements.enforceSsl.addEventListener('change', () => {
+    persistCurrentProviderModelPrefs();
     invalidateModelStep();
     persistBuilderWorkspaceState();
   });
@@ -3207,6 +3436,71 @@
       setValidationStatus(String((err && err.message) || err || 'Validation failed.'), 'danger');
     }
   });
+  if (elements.streamAutoFollowInput) {
+    elements.streamAutoFollowInput.addEventListener('change', () => {
+      syncAutoFollowToggle(elements.streamAutoFollowInput.checked);
+      scheduleActivityAutoFollow();
+      persistBuilderWorkspaceState();
+    });
+  }
+  if (elements.generateOverlayAutoFollowInput) {
+    elements.generateOverlayAutoFollowInput.addEventListener('change', () => {
+      syncAutoFollowToggle(elements.generateOverlayAutoFollowInput.checked);
+      scheduleActivityAutoFollow();
+      persistBuilderWorkspaceState();
+    });
+  }
+  if (elements.saveApiKeyBtn) {
+    elements.saveApiKeyBtn.addEventListener('click', async () => {
+      const provider = String(elements.provider.value || '').trim().toLowerCase();
+      const nextValue = String(elements.apiKey.value || '').trim();
+      if (!providerSupportsStoredApiKey(provider) || !nextValue) return;
+      elements.saveApiKeyBtn.disabled = true;
+      state.apiKeyStatusMessage = '';
+      renderStoredApiKeyControls();
+      try {
+        const stored = await saveStoredApiKey(provider, nextValue);
+        elements.apiKey.value = '';
+        state.hasStoredApiKey = true;
+        state.apiKeySecretId = String(stored.identifier || '');
+        state.apiKeyStoredAt = String(stored.stored_at || '');
+        state.apiKeyStatusLoaded = true;
+        state.apiKeyStatusLoading = false;
+        state.apiKeyStatusProvider = provider;
+        state.apiKeyStatusMessage = '';
+        renderStoredApiKeyControls();
+        if (typeof window.showToast === 'function') {
+          window.showToast('API key stored securely.', { force: true, title: 'Generator Builder', autohide: true, delay: 2500 });
+        }
+      } catch (err) {
+        state.apiKeyStatusMessage = String((err && err.message) || err || 'Failed to store API key securely.');
+        renderStoredApiKeyControls();
+      }
+    });
+  }
+  if (elements.clearApiKeyBtn) {
+    elements.clearApiKeyBtn.addEventListener('click', async () => {
+      const provider = String(elements.provider.value || '').trim().toLowerCase();
+      if (!providerSupportsStoredApiKey(provider)) return;
+      elements.clearApiKeyBtn.disabled = true;
+      state.apiKeyStatusMessage = '';
+      renderStoredApiKeyControls();
+      try {
+        await clearStoredApiKey(provider);
+        state.hasStoredApiKey = false;
+        state.apiKeySecretId = '';
+        state.apiKeyStoredAt = '';
+        state.apiKeyStatusLoaded = true;
+        state.apiKeyStatusLoading = false;
+        state.apiKeyStatusProvider = provider;
+        state.apiKeyStatusMessage = '';
+        renderStoredApiKeyControls();
+      } catch (err) {
+        state.apiKeyStatusMessage = String((err && err.message) || err || 'Failed to clear stored API key.');
+        renderStoredApiKeyControls();
+      }
+    });
+  }
   elements.promptSubmitBtn.addEventListener('click', async () => {
     try {
       await generateScaffold('create');
@@ -3385,6 +3679,7 @@
   })();
 
   renderProviderOptions();
+  syncAutoFollowToggle(state.autoFollowEvents);
   updatePromptLockState();
   renderSummary();
   renderFiles();

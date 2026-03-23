@@ -20,6 +20,7 @@ from webapp.routes._registration import begin_route_registration, mark_routes_re
 
 _GROUNDING_CACHE: dict[str, str] = {}
 _BUILD_GENERATOR_SCAFFOLD: Callable[[dict[str, Any]], tuple[dict[str, str], str, str]] | None = None
+_BUILDER_PROVIDER_HEARTBEAT_SECONDS = 5.0
 
 
 def _derive_plugin_id(name_hint: str, *, fallback: str = 'generated_generator') -> str:
@@ -312,8 +313,39 @@ def _build_builder_ai_scaffold_result(
             verify_ssl=enforce_ssl,
         )
         client.timeout_seconds = timeout_seconds
-        raw_response = client._post_chat(messages=messages)
-        if client._uses_openai_chat_completions():
+        uses_openai_chat = bool(client._uses_openai_chat_completions())
+        heartbeat_done = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
+        if emit is not None:
+            if uses_openai_chat:
+                emit('status', message='Contacting OpenAI-compatible endpoint (initial)...')
+            else:
+                emit('status', message=f'Contacting {provider}...')
+
+            def _heartbeat() -> None:
+                interval = max(float(_BUILDER_PROVIDER_HEARTBEAT_SECONDS), 0.01)
+                while not heartbeat_done.wait(interval):
+                    if cancellation_check and cancellation_check():
+                        return
+                    if uses_openai_chat:
+                        emit('status', message='Still waiting on OpenAI-compatible endpoint (initial)...')
+                    else:
+                        emit('status', message=f'Still waiting on {provider}...')
+
+            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+            heartbeat_thread.start()
+        try:
+            raw_response = client._post_chat(messages=messages)
+        finally:
+            heartbeat_done.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=0.2)
+        if emit is not None:
+            if uses_openai_chat:
+                emit('status', message='OpenAI-compatible endpoint responded (initial).')
+            else:
+                emit('status', message=f'{provider} responded.')
+        if uses_openai_chat:
             assistant_message = ai_provider_routes._extract_openai_chat_message(raw_response)
         else:
             assistant_message = ai_provider_routes._extract_ollama_chat_message(raw_response)
@@ -1683,8 +1715,8 @@ def register(
     @app.route('/api/generators/ai_scaffold', methods=['POST'])
     def api_generators_ai_scaffold():
         require_builder_or_admin()
-        payload = request.get_json(silent=True) or {}
         from webapp.routes import ai_provider as ai_provider_routes
+        payload = ai_provider_routes._resolve_payload_with_stored_api_key(request.get_json(silent=True) or {})
 
         try:
             result = _build_builder_ai_scaffold_result(payload, ai_provider_routes=ai_provider_routes)
@@ -1698,8 +1730,8 @@ def register(
     @app.route('/api/generators/ai_scaffold_stream', methods=['POST'])
     def api_generators_ai_scaffold_stream():
         require_builder_or_admin()
-        payload = request.get_json(silent=True) or {}
         from webapp.routes import ai_provider as ai_provider_routes
+        payload = ai_provider_routes._resolve_payload_with_stored_api_key(request.get_json(silent=True) or {})
 
         request_id = str(payload.get('request_id') or '').strip() or ai_provider_routes._create_stream_request_id()
         payload['request_id'] = request_id

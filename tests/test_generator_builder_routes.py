@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import time
 import zipfile
 from pathlib import Path
 
@@ -57,12 +58,20 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Verify TLS certificates' in body
     assert 'Iteration History' in body
     assert 'Latest Test Result' in body
-    assert 'gbLatestTestSnapshot' in body
+    assert 'gbInstallBtnHint' in body
     assert 'gbGenerateOverlayOutput' in body
     assert 'gbGenerateOverlayEvents' in body
+    assert 'Auto-follow' in body
+    assert 'gbStreamAutoFollowInput' in body
+    assert 'gbGenerateOverlayAutoFollowInput' in body
+    assert 'gbSaveApiKeyBtn' in body
+    assert 'gbClearApiKeyBtn' in body
+    assert '/api/ai/provider/credential/status' in body
+    assert 'Stored securely on the server for your account.' in body
     assert 'Locked until validation' in body
     assert 'coretg_builder_model_config' in body
     assert 'coretg_builder_workspace_state' in body
+    assert '<div class="gb-inline-snapshot d-none" id="gbLatestTestSnapshot"></div>' not in body
     assert 'After Scaffold' not in body
     assert 'Compatibility Checklist' not in body
     assert 'Test &amp; Iterate' not in body
@@ -73,6 +82,20 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Raw model response' not in body
     assert 'Prompt Intent Preview' not in body
     assert 'gbPromptIntentPreview' not in body
+
+
+def test_generator_builder_template_aggregates_thinking_and_scrolls_latest_activity() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "transcriptThinkingText: ''",
+        "function upsertTranscriptEvent(key, text) {",
+        "upsertTranscriptEvent('thinking', `Thinking:\\n${state.transcriptThinkingText}`);",
+        "lastItem.scrollIntoView({ block: 'end' });",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder thinking aggregation / auto-follow snippets: ' + '; '.join(missing)
 
 
 def test_generator_artifacts_index_merges_sources_reserved_and_custom(monkeypatch):
@@ -372,6 +395,59 @@ def test_generator_ai_scaffold_stream_emits_prompt_delta_and_result(monkeypatch)
     result_event = next(event for event in events if event.get('type') == 'result')
     assert result_event['data']['scaffold_request']['plugin_id'] == 'stream_demo'
     assert 'flag_generators/py_stream_demo/generator.py' in result_event['data']['files']
+
+
+def test_generator_ai_scaffold_stream_emits_openai_compatible_progress_statuses(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'https://litellm.example.com/v1'})()
+
+    class _DummyClient:
+        def __init__(self, **kwargs):
+            assert kwargs['provider'] == 'litellm'
+            assert kwargs['api_key'] == 'stored-builder-key'
+
+        def _post_chat(self, *, messages):
+            assert messages[0]['role'] == 'system'
+            time.sleep(0.03)
+            return {'choices': [{'message': {'content': json.dumps({'plugin_id': 'builder_progress_demo'})}}]}
+
+        def _uses_openai_chat_completions(self):
+            return True
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_resolve_payload_with_stored_api_key', lambda payload: {**payload, 'api_key': 'stored-builder-key'})
+    monkeypatch.setattr(ai_provider_routes, '_normalize_openai_compatible_base_url', lambda value, *, enforce_ssl: 'https://litellm.example.com/v1')
+    monkeypatch.setattr(ai_provider_routes, '_RepoMcpBridgeClient', lambda **kwargs: _DummyClient(**kwargs))
+    monkeypatch.setattr(ai_provider_routes, '_extract_openai_chat_message', lambda payload: (payload.get('choices') or [{}])[0].get('message') or {})
+    monkeypatch.setattr(generator_builder_routes, '_BUILDER_PROVIDER_HEARTBEAT_SECONDS', 0.01)
+
+    resp = client.post('/api/generators/ai_scaffold_stream', json={
+        'request_id': 'builder-openai-progress-test',
+        'plugin_type': 'flag-generator',
+        'provider': 'litellm',
+        'base_url': 'https://litellm.example.com/v1',
+        'model': 'gpt-4o-mini',
+        'prompt': 'Build a demo generator.',
+    })
+
+    assert resp.status_code == 200
+    assert resp.mimetype == 'application/x-ndjson'
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
+    statuses = [event.get('message') for event in events if event.get('type') == 'status']
+    assert 'Preparing Builder prompt...' in statuses
+    assert 'Contacting litellm...' in statuses
+    assert 'Contacting OpenAI-compatible endpoint (initial)...' in statuses
+    assert 'Still waiting on OpenAI-compatible endpoint (initial)...' in statuses
+    assert 'OpenAI-compatible endpoint responded (initial).' in statuses
+    event_types = [event.get('type') for event in events]
+    assert 'llm_prompt' in event_types
+    assert 'llm_delta' in event_types
+    assert 'result' in event_types
 
 
 def test_generator_ai_scaffold_openai_compatible_uses_api_key_and_ssl(monkeypatch):
