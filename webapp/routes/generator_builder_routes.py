@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -11,13 +12,14 @@ import uuid
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 
-from flask import jsonify, render_template, request, send_file
+from flask import Response, jsonify, render_template, request, send_file, stream_with_context
 from werkzeug.utils import secure_filename
 
 from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 _GROUNDING_CACHE: dict[str, str] = {}
+_BUILD_GENERATOR_SCAFFOLD: Callable[[dict[str, Any]], tuple[dict[str, str], str, str]] | None = None
 
 
 def _derive_plugin_id(name_hint: str, *, fallback: str = 'generated_generator') -> str:
@@ -182,6 +184,165 @@ def _generate_builder_ollama_response(
     return assistant_text
 
 
+def _generate_builder_ollama_streaming_response(
+    ai_provider_routes: Any,
+    *,
+    messages: list[dict[str, Any]],
+    model: str,
+    base_url: str,
+    verify_ssl: bool,
+    timeout_seconds: float,
+    emit: Callable[..., None],
+    cancellation_check: Callable[[], bool] | None = None,
+    on_response_open: Callable[[Any], None] | None = None,
+) -> str:
+    prompt = _build_direct_generation_prompt(messages)
+    emit('llm_prompt', text=prompt)
+    raw_parts: list[str] = []
+    thinking_parts: list[str] = []
+    try:
+        for chunk in ai_provider_routes._stream_json_lines(
+            f'{base_url}/api/generate',
+            {
+                'model': model,
+                'prompt': prompt,
+                'stream': True,
+                'format': 'json',
+                'options': {'temperature': 0.1},
+            },
+            timeout=timeout_seconds,
+            verify_ssl=verify_ssl,
+            cancellation_check=cancellation_check,
+            on_open=on_response_open,
+        ):
+            if cancellation_check and cancellation_check():
+                raise ai_provider_routes.ProviderAdapterError('Generation cancelled by user.', status_code=499)
+            delta = str(chunk.get('response') or '')
+            if delta:
+                raw_parts.append(delta)
+                emit('llm_delta', text=delta)
+            thinking = str(chunk.get('thinking') or '')
+            if thinking:
+                thinking_parts.append(thinking)
+                emit('llm_thinking', text=thinking)
+    except HTTPError as exc:
+        raise ai_provider_routes.ProviderAdapterError(
+            f'Ollama request failed with HTTP {exc.code}.',
+            status_code=502,
+        ) from exc
+    except URLError as exc:
+        reason = getattr(exc, 'reason', exc)
+        raise ai_provider_routes.ProviderAdapterError(
+            f'Could not reach Ollama at {base_url}: {reason}',
+            status_code=502,
+        ) from exc
+    assistant_text = ''.join(raw_parts).strip()
+    if not assistant_text:
+        assistant_text = ''.join(thinking_parts).strip()
+    if not assistant_text:
+        raise ai_provider_routes.ProviderAdapterError('Ollama returned an empty response.', status_code=502)
+    return assistant_text
+
+
+def _build_builder_ai_scaffold_result(
+    payload: dict[str, Any],
+    *,
+    ai_provider_routes: Any,
+    emit: Callable[..., None] | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
+    on_response_open: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    if _BUILD_GENERATOR_SCAFFOLD is None:
+        raise RuntimeError('build_generator_scaffold is not configured')
+    messages = _build_generator_builder_ai_messages(payload)
+    provider = str(payload.get('provider') or 'ollama').strip().lower() or 'ollama'
+    adapter = ai_provider_routes._get_provider_adapter(provider)
+    model = str(payload.get('model') or '').strip()
+    if not model:
+        raise ValueError('model is required')
+    base_url = str(payload.get('base_url') or '').strip() or str(adapter.capability.default_base_url or '').strip()
+    if not base_url:
+        raise ValueError('base_url is required')
+    enforce_ssl = ai_provider_routes._payload_bool(payload.get('enforce_ssl'), default=True)
+    if provider in {'litellm', 'openai'}:
+        base_url = ai_provider_routes._normalize_openai_compatible_base_url(base_url, enforce_ssl=enforce_ssl)
+    else:
+        base_url = ai_provider_routes._normalize_base_url(base_url)
+    timeout_seconds = ai_provider_routes._normalize_bridge_timeout_seconds(
+        payload.get('timeout_seconds'),
+        default=240.0,
+        low=5.0,
+        high=240.0,
+    )
+
+    direct_prompt = _build_direct_generation_prompt(messages)
+    if emit is not None:
+        emit('status', message='Preparing Builder prompt...')
+        if provider != 'ollama':
+            emit('llm_prompt', text=direct_prompt)
+        emit('status', message=f'Contacting {provider}...')
+
+    if provider == 'ollama' and emit is not None:
+        assistant_text = _generate_builder_ollama_streaming_response(
+            ai_provider_routes,
+            messages=messages,
+            model=model,
+            base_url=base_url,
+            verify_ssl=enforce_ssl,
+            timeout_seconds=timeout_seconds,
+            emit=emit,
+            cancellation_check=cancellation_check,
+            on_response_open=on_response_open,
+        )
+    elif provider == 'ollama':
+        assistant_text = _generate_builder_ollama_response(
+            ai_provider_routes,
+            messages=messages,
+            model=model,
+            base_url=base_url,
+            verify_ssl=enforce_ssl,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        client = ai_provider_routes._RepoMcpBridgeClient(
+            model=model,
+            host=base_url,
+            provider=provider,
+            api_key=str(payload.get('api_key') or '').strip(),
+            verify_ssl=enforce_ssl,
+        )
+        client.timeout_seconds = timeout_seconds
+        raw_response = client._post_chat(messages=messages)
+        if client._uses_openai_chat_completions():
+            assistant_message = ai_provider_routes._extract_openai_chat_message(raw_response)
+        else:
+            assistant_message = ai_provider_routes._extract_ollama_chat_message(raw_response)
+        assistant_text = str(assistant_message.get('content') or '').strip()
+        if emit is not None and assistant_text:
+            emit('llm_delta', text=assistant_text)
+
+    if cancellation_check and cancellation_check():
+        raise ai_provider_routes.ProviderAdapterError('Generation cancelled by user.', status_code=499)
+    if emit is not None:
+        emit('status', message='Normalizing scaffold...')
+    ai_payload = _extract_json_object(assistant_text)
+    scaffold_payload = _normalize_ai_scaffold_payload(ai_payload, payload)
+    scaffold_files, manifest_yaml, folder_path = _BUILD_GENERATOR_SCAFFOLD(scaffold_payload)
+    return {
+        'ok': True,
+        'provider': provider,
+        'base_url': base_url,
+        'model': model,
+        'assistant_json': ai_payload,
+        'assistant_text': assistant_text,
+        'scaffold_request': scaffold_payload,
+        'folder_path': folder_path,
+        'manifest_yaml': manifest_yaml,
+        'scaffold_paths': sorted(scaffold_files.keys()),
+        'files': scaffold_files,
+    }
+
+
 def _repo_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -313,6 +474,693 @@ def _build_targeted_failure_guidance(last_test_result: dict[str, Any] | None) ->
     return lines
 
 
+def _split_outside_parens(value: str, *, delimiters: str = ',') -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in str(value or ''):
+        if ch in delimiters and depth == 0:
+            part = ''.join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')' and depth > 0:
+            depth -= 1
+        buf.append(ch)
+    tail = ''.join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _parse_runtime_input_spec(text: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    normalized = str(text or '').replace('\n', ',')
+    for raw_part in _split_outside_parens(normalized, delimiters=','):
+        part = str(raw_part or '').strip().rstrip('.')
+        if not part:
+            continue
+        match = re.match(r'(?P<name>[A-Za-z0-9_]+)\s*(?:\((?P<meta>[^)]*)\))?$', part)
+        if not match:
+            continue
+        name = str(match.group('name') or '').strip()
+        meta = str(match.group('meta') or '').strip().lower()
+        if not name:
+            continue
+        record: dict[str, Any] = {'name': name, 'type': 'string', 'required': True}
+        if 'optional' in meta:
+            record['required'] = False
+        if 'sensitive' in meta:
+            record['sensitive'] = True
+        result.append(record)
+    return _coerce_runtime_inputs(result)
+
+
+def _parse_artifact_requirements_spec(text: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    normalized = str(text or '').replace('\n', ', ')
+    required_match = re.search(r'require\s+(.+?)(?:\.|$)', normalized, flags=re.IGNORECASE)
+    if required_match:
+        for artifact in _split_outside_parens(required_match.group(1), delimiters=','):
+            art = str(artifact or '').strip().rstrip('.')
+            if art:
+                results.append({'artifact': art, 'optional': False})
+    optional_match = re.search(r'(?:optionally\s+accept|optional(?:ly)?\s+accepts?)\s+(.+?)(?:\.|$)', normalized, flags=re.IGNORECASE)
+    if optional_match:
+        for artifact in _split_outside_parens(optional_match.group(1), delimiters=','):
+            art = str(artifact or '').strip().rstrip('.')
+            if art:
+                results.append({'artifact': art, 'optional': True})
+    normalized, _ = _coerce_requires(results)
+    return normalized
+
+
+def _parse_artifact_override_requirements_spec(text: str) -> list[dict[str, Any]]:
+    normalized_text = str(text or '').strip()
+    if not normalized_text:
+        return []
+    if re.search(r'\brequire\b|\baccept\b', normalized_text, flags=re.IGNORECASE):
+        return _parse_artifact_requirements_spec(normalized_text)
+    results: list[dict[str, Any]] = []
+    normalized = normalized_text.replace('\n', ', ')
+    for artifact in _split_outside_parens(normalized, delimiters=','):
+        part = str(artifact or '').strip().rstrip('.')
+        if not part:
+            continue
+        optional = False
+        optional_match = re.match(r'(.+?)\s*\((optional|required)\)$', part, flags=re.IGNORECASE)
+        if optional_match:
+            part = str(optional_match.group(1) or '').strip()
+            optional = str(optional_match.group(2) or '').strip().lower() == 'optional'
+        if part:
+            results.append({'artifact': part, 'optional': optional})
+    normalized_results, _ = _coerce_requires(results)
+    return normalized_results
+
+
+def _parse_artifact_outputs_spec(text: str) -> list[str]:
+    normalized = str(text or '').strip().replace('\n', ',')
+    parts = [part.strip().rstrip('.') for part in _split_outside_parens(normalized, delimiters=',')]
+    outputs = [str(part or '').strip().rstrip('.') for part in parts]
+    return [item for item in outputs if item]
+
+
+def _parse_hint_templates_spec(text: str) -> list[str]:
+    raw = str(text or '').strip()
+    if not raw:
+        return []
+    if '\n' in raw:
+        return [part.strip() for part in raw.splitlines() if part.strip()]
+    if ';' in raw:
+        parts = [part.strip() for part in raw.split(';') if part.strip()]
+        return parts
+    return [raw]
+
+
+def _parse_readme_mentions_spec(text: str) -> list[str]:
+    raw = str(text or '').strip()
+    if not raw:
+        return []
+    normalized = raw.replace('\n', ', ')
+    return [part.strip() for part in re.split(r'\s+and\s+|,\s*', normalized) if part.strip()]
+
+
+def _format_runtime_input_spec(inputs: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for item in _coerce_runtime_inputs(inputs):
+        name = str(item.get('name') or '').strip()
+        if not name:
+            continue
+        flags = ['required' if item.get('required') is not False else 'optional']
+        if item.get('sensitive') is True:
+            flags.append('sensitive')
+        lines.append(f"{name} ({', '.join(flags)})")
+    return '\n'.join(lines)
+
+
+def _format_requires_spec(requires: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for item in _coerce_requires(requires)[0]:
+        artifact = str(item.get('artifact') or '').strip()
+        if not artifact:
+            continue
+        lines.append(f"{artifact}{' (optional)' if item.get('optional') else ''}")
+    return '\n'.join(lines)
+
+
+def _format_string_list_spec(items: list[str]) -> str:
+    return '\n'.join(_coerce_string_list(items))
+
+
+def _apply_inject_destination(inject_files: list[str], destination: str) -> list[str]:
+    dest = str(destination or '').strip()
+    if not dest:
+        return _coerce_string_list(inject_files)
+    out: list[str] = []
+    for item in _coerce_string_list(inject_files):
+        if '->' in item:
+            out.append(item)
+        else:
+            out.append(f'{item} -> {dest}')
+    return out
+
+
+def _compile_prompt_intent(prompt: str, plugin_type: str) -> dict[str, Any]:
+    text = str(prompt or '').strip()
+    lowered = text.lower()
+    explicit: dict[str, Any] = {}
+    inferred: dict[str, Any] = {}
+    notes: dict[str, Any] = {
+        'write_file_under_outputs_artifacts': False,
+        'needs_hint_template': False,
+        'readme_mentions': [],
+        'inject_destination': '',
+    }
+
+    runtime_match = re.search(r'Runtime inputs:\s*(.+)', text, flags=re.IGNORECASE)
+    if runtime_match:
+        runtime_inputs = _parse_runtime_input_spec(runtime_match.group(1))
+        if runtime_inputs:
+            explicit['runtime_inputs'] = runtime_inputs
+
+    req_match = re.search(r'Artifact requirements:\s*(.+)', text, flags=re.IGNORECASE)
+    if req_match:
+        requires = _parse_artifact_requirements_spec(req_match.group(1))
+        if requires:
+            explicit['requires'] = requires
+
+    produces_match = re.search(r'Artifact outputs:\s*(.+)', text, flags=re.IGNORECASE)
+    if produces_match:
+        produces = _parse_artifact_outputs_spec(produces_match.group(1))
+        if produces:
+            explicit['produces'] = produces
+
+    inject_match = re.search(r'Include\s+inject_files\s+with\s+(.+?)(?:\.|$)', text, flags=re.IGNORECASE)
+    if inject_match:
+        inject_items = _parse_artifact_outputs_spec(inject_match.group(1))
+        if inject_items:
+            explicit['inject_files'] = inject_items
+
+    hint_match = re.search(r'Hint templates?:\s*(.+)', text, flags=re.IGNORECASE)
+    if hint_match:
+        hint_templates = _parse_hint_templates_spec(hint_match.group(1))
+        if hint_templates:
+            explicit['hint_templates'] = hint_templates
+
+    inject_dest_match = re.search(r'Inject destination:\s*(.+?)(?:\.|$)', text, flags=re.IGNORECASE)
+    if inject_dest_match:
+        notes['inject_destination'] = str(inject_dest_match.group(1) or '').strip()
+
+    if re.search(r'hint template', text, flags=re.IGNORECASE):
+        notes['needs_hint_template'] = True
+
+    readme_match = re.search(r'README should mention\s+(.+?)(?:\.|$)', text, flags=re.IGNORECASE)
+    if readme_match:
+        notes['readme_mentions'] = [part.strip() for part in re.split(r'\s+and\s+|,\s*', readme_match.group(1)) if part.strip()]
+
+    if re.search(r'write\s+a\s+\w*\s*file\s+under\s+/outputs/artifacts/', lowered):
+        notes['write_file_under_outputs_artifacts'] = True
+
+    mentions_ssh_credentials = 'ssh' in lowered and any(token in lowered for token in ('credential', 'credentials', 'creds', 'password', 'username'))
+    mentions_hint = 'hint' in lowered or 'next step' in lowered
+    mentions_deterministic = 'determin' in lowered or 'same inputs' in lowered or 'same seed' in lowered
+    mentions_web_creds = any(token in lowered for token in ('http basic', 'basic auth', 'web login', 'web creds', 'token gate', 'token auth'))
+    mentions_ssh_key = 'ssh key' in lowered or 'authorized_keys' in lowered or 'private key' in lowered
+    mentions_stego = any(token in lowered for token in ('stego', 'stegan', 'carrier image', 'png', 'jpeg', 'image flag'))
+
+    if mentions_ssh_credentials and plugin_type == 'flag-generator':
+        inferred['runtime_inputs'] = [
+            {'name': 'seed', 'type': 'string', 'required': True},
+            {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+            {'name': 'flag_prefix', 'type': 'string', 'required': False},
+        ]
+        inferred['requires'] = [
+            {'artifact': 'Knowledge(ip)', 'optional': False},
+            {'artifact': 'Knowledge(hostname)', 'optional': True},
+        ]
+        inferred['produces'] = ['Flag(flag_id)', 'Credential(user)', 'Credential(user,password)', 'File(path)']
+        inferred['inject_files'] = ['File(path)']
+        inferred['hint_templates'] = ['Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}']
+        notes['write_file_under_outputs_artifacts'] = True
+        notes['readme_mentions'] = list(dict.fromkeys(notes['readme_mentions'] + ['determinism', 'local runner testing']))
+
+    if mentions_web_creds and plugin_type == 'flag-generator':
+        inferred.setdefault('runtime_inputs', [
+            {'name': 'seed', 'type': 'string', 'required': True},
+            {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+            {'name': 'flag_prefix', 'type': 'string', 'required': False},
+        ])
+        inferred.setdefault('produces', ['Flag(flag_id)', 'Credential(user)', 'Credential(user,password)', 'File(path)'])
+        inferred.setdefault('hint_templates', ['Next: browse to the service and authenticate with {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}'])
+        notes['write_file_under_outputs_artifacts'] = True
+
+    if mentions_ssh_key and plugin_type == 'flag-generator':
+        inferred.setdefault('runtime_inputs', [
+            {'name': 'seed', 'type': 'string', 'required': True},
+            {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+            {'name': 'flag_prefix', 'type': 'string', 'required': False},
+        ])
+        inferred.setdefault('produces', ['Flag(flag_id)', 'Credential(user)', 'File(path)'])
+        inferred.setdefault('inject_files', ['File(path)'])
+        notes['write_file_under_outputs_artifacts'] = True
+
+    if mentions_stego and plugin_type == 'flag-generator':
+        inferred.setdefault('runtime_inputs', [
+            {'name': 'seed', 'type': 'string', 'required': True},
+            {'name': 'flag_prefix', 'type': 'string', 'required': False},
+        ])
+        inferred.setdefault('produces', ['Flag(flag_id)', 'File(path)'])
+        inferred.setdefault('inject_files', ['File(path)'])
+        notes['write_file_under_outputs_artifacts'] = True
+
+    if mentions_hint:
+        notes['needs_hint_template'] = True
+    if mentions_deterministic:
+        notes['readme_mentions'] = list(dict.fromkeys(notes['readme_mentions'] + ['determinism', 'local runner testing']))
+
+    return {
+        'explicit': explicit,
+        'inferred': inferred,
+        'notes': notes,
+    }
+
+
+def _parse_prompt_intent_overrides(overrides_payload: Any) -> dict[str, Any]:
+    if not isinstance(overrides_payload, dict):
+        return {'manual': {}, 'notes': {}, 'raw': {}}
+
+    manual: dict[str, Any] = {}
+    notes: dict[str, Any] = {}
+    raw: dict[str, str] = {}
+
+    runtime_text = str(overrides_payload.get('runtime_inputs') or '').strip()
+    if runtime_text:
+        raw['runtime_inputs'] = runtime_text
+        runtime_inputs = _parse_runtime_input_spec(runtime_text)
+        if runtime_inputs:
+            manual['runtime_inputs'] = runtime_inputs
+
+    requires_text = str(overrides_payload.get('requires') or '').strip()
+    if requires_text:
+        raw['requires'] = requires_text
+        requires = _parse_artifact_override_requirements_spec(requires_text)
+        if requires:
+            manual['requires'] = requires
+
+    produces_text = str(overrides_payload.get('produces') or '').strip()
+    if produces_text:
+        raw['produces'] = produces_text
+        produces = _parse_artifact_outputs_spec(produces_text)
+        if produces:
+            manual['produces'] = produces
+
+    inject_text = str(overrides_payload.get('inject_files') or '').strip()
+    if inject_text:
+        raw['inject_files'] = inject_text
+        inject_files = _parse_artifact_outputs_spec(inject_text)
+        if inject_files:
+            manual['inject_files'] = inject_files
+
+    inject_destination = str(overrides_payload.get('inject_destination') or '').strip()
+    if inject_destination:
+        raw['inject_destination'] = inject_destination
+        notes['inject_destination'] = inject_destination
+
+    if manual.get('inject_files'):
+        manual['inject_files'] = _apply_inject_destination(manual.get('inject_files') or [], inject_destination)
+
+    hint_text = str(overrides_payload.get('hint_templates') or '').strip()
+    if hint_text:
+        raw['hint_templates'] = hint_text
+        hint_templates = _parse_hint_templates_spec(hint_text)
+        if hint_templates:
+            manual['hint_templates'] = hint_templates
+
+    readme_text = str(overrides_payload.get('readme_mentions') or '').strip()
+    if readme_text:
+        raw['readme_mentions'] = readme_text
+        notes['readme_mentions'] = _parse_readme_mentions_spec(readme_text)
+
+    if 'write_file_under_outputs_artifacts' in overrides_payload:
+        notes['write_file_under_outputs_artifacts'] = bool(overrides_payload.get('write_file_under_outputs_artifacts'))
+    if 'needs_hint_template' in overrides_payload:
+        notes['needs_hint_template'] = bool(overrides_payload.get('needs_hint_template'))
+
+    return {'manual': manual, 'notes': notes, 'raw': raw}
+
+
+def _resolve_prompt_intent(prompt: str, plugin_type: str, overrides_payload: Any = None) -> dict[str, Any]:
+    compiled = _compile_prompt_intent(prompt, plugin_type)
+    explicit = compiled.get('explicit') if isinstance(compiled.get('explicit'), dict) else {}
+    inferred = compiled.get('inferred') if isinstance(compiled.get('inferred'), dict) else {}
+    base_notes = dict(compiled.get('notes') or {}) if isinstance(compiled.get('notes'), dict) else {}
+    override_bundle = _parse_prompt_intent_overrides(overrides_payload)
+    manual = override_bundle.get('manual') if isinstance(override_bundle.get('manual'), dict) else {}
+    manual_notes = override_bundle.get('notes') if isinstance(override_bundle.get('notes'), dict) else {}
+    notes = {**base_notes, **manual_notes}
+
+    merged: dict[str, Any] = {}
+    for key in ('runtime_inputs', 'requires', 'produces', 'inject_files', 'hint_templates'):
+        if manual.get(key):
+            merged[key] = manual.get(key)
+            continue
+        if explicit.get(key):
+            merged[key] = explicit.get(key)
+            continue
+        if inferred.get(key):
+            merged[key] = inferred.get(key)
+
+    inject_destination = str(notes.get('inject_destination') or '').strip()
+    if merged.get('inject_files'):
+        merged['inject_files'] = _apply_inject_destination(merged.get('inject_files') or [], inject_destination)
+
+    editable = {
+        'runtime_inputs': _format_runtime_input_spec(merged.get('runtime_inputs') or []),
+        'requires': _format_requires_spec(merged.get('requires') or []),
+        'produces': _format_string_list_spec(merged.get('produces') or []),
+        'inject_files': _format_string_list_spec(merged.get('inject_files') or []),
+        'inject_destination': inject_destination,
+        'hint_templates': _format_string_list_spec(merged.get('hint_templates') or []),
+        'readme_mentions': ', '.join(str(item).strip() for item in (notes.get('readme_mentions') or []) if str(item).strip()),
+    }
+
+    return {
+        'manual': manual,
+        'manual_notes': manual_notes,
+        'manual_raw': override_bundle.get('raw') if isinstance(override_bundle.get('raw'), dict) else {},
+        'explicit': explicit,
+        'inferred': inferred,
+        'merged': merged,
+        'notes': notes,
+        'editable': editable,
+    }
+
+
+def _merged_prompt_intent_defaults(prompt: str, plugin_type: str) -> dict[str, Any]:
+    resolved = _resolve_prompt_intent(prompt, plugin_type)
+    merged = dict(resolved.get('merged') or {}) if isinstance(resolved.get('merged'), dict) else {}
+    merged['notes'] = resolved.get('notes') if isinstance(resolved.get('notes'), dict) else {}
+    merged['explicit'] = resolved.get('explicit') if isinstance(resolved.get('explicit'), dict) else {}
+    merged['inferred'] = resolved.get('inferred') if isinstance(resolved.get('inferred'), dict) else {}
+    return merged
+
+
+def _build_prompt_intent_preview(payload: dict[str, Any]) -> dict[str, Any]:
+    plugin_type = str(payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+    prompt = str(payload.get('prompt') or '').strip()
+    resolved = _resolve_prompt_intent(prompt, plugin_type, payload.get('intent_overrides'))
+    manual = resolved.get('manual') if isinstance(resolved.get('manual'), dict) else {}
+    explicit = resolved.get('explicit') if isinstance(resolved.get('explicit'), dict) else {}
+    inferred = resolved.get('inferred') if isinstance(resolved.get('inferred'), dict) else {}
+    notes = resolved.get('notes') if isinstance(resolved.get('notes'), dict) else {}
+    merged = resolved.get('merged') if isinstance(resolved.get('merged'), dict) else {}
+    manual_notes = resolved.get('manual_notes') if isinstance(resolved.get('manual_notes'), dict) else {}
+
+    sections: list[dict[str, Any]] = []
+    if manual:
+        items: list[str] = []
+        if manual.get('runtime_inputs'):
+            items.append('Runtime inputs: ' + ', '.join(str(item.get('name')) for item in manual.get('runtime_inputs') if isinstance(item, dict)))
+        if manual.get('requires'):
+            items.append('Artifact requirements: ' + ', '.join(str(item.get('artifact')) + (' (optional)' if item.get('optional') else '') for item in manual.get('requires') if isinstance(item, dict)))
+        if manual.get('produces'):
+            items.append('Artifact outputs: ' + ', '.join(str(item) for item in manual.get('produces') or []))
+        if manual.get('inject_files'):
+            items.append('Inject files: ' + ', '.join(str(item) for item in manual.get('inject_files') or []))
+        if manual.get('hint_templates'):
+            items.append('Hint templates: ' + '; '.join(str(item) for item in manual.get('hint_templates') or []))
+        manual_readme_mentions = [str(item).strip() for item in (manual_notes.get('readme_mentions') or []) if str(item).strip()]
+        if manual_readme_mentions:
+            items.append('README notes: ' + ', '.join(manual_readme_mentions))
+        sections.append({'title': 'Manual Overrides', 'tone': 'warning', 'items': items})
+
+    if explicit:
+        items = []
+        if explicit.get('runtime_inputs'):
+            items.append('Runtime inputs: ' + ', '.join(str(item.get('name')) for item in explicit.get('runtime_inputs') if isinstance(item, dict)))
+        if explicit.get('requires'):
+            items.append('Artifact requirements: ' + ', '.join(str(item.get('artifact')) for item in explicit.get('requires') if isinstance(item, dict)))
+        if explicit.get('produces'):
+            items.append('Artifact outputs: ' + ', '.join(str(item) for item in explicit.get('produces') or []))
+        if explicit.get('inject_files'):
+            items.append('Inject files: ' + ', '.join(str(item) for item in explicit.get('inject_files') or []))
+        if explicit.get('hint_templates'):
+            items.append('Hint templates: ' + '; '.join(str(item) for item in explicit.get('hint_templates') or []))
+        sections.append({'title': 'User-Specified', 'tone': 'primary', 'items': items})
+
+    inferred_items: list[str] = []
+    if not manual.get('runtime_inputs') and not explicit.get('runtime_inputs') and merged.get('runtime_inputs'):
+        inferred_items.append('Runtime inputs: ' + ', '.join(str(item.get('name')) for item in merged.get('runtime_inputs') if isinstance(item, dict)))
+    if not manual.get('requires') and not explicit.get('requires') and merged.get('requires'):
+        inferred_items.append('Artifact requirements: ' + ', '.join(str(item.get('artifact')) for item in merged.get('requires') if isinstance(item, dict)))
+    if not manual.get('produces') and not explicit.get('produces') and merged.get('produces'):
+        inferred_items.append('Artifact outputs: ' + ', '.join(str(item) for item in merged.get('produces') or []))
+    if not manual.get('inject_files') and not explicit.get('inject_files') and merged.get('inject_files'):
+        inferred_items.append('Inject files: ' + ', '.join(str(item) for item in merged.get('inject_files') or []))
+    if not manual.get('hint_templates') and not explicit.get('hint_templates') and merged.get('hint_templates'):
+        inferred_items.append('Hint templates: ' + '; '.join(str(item) for item in merged.get('hint_templates') or []))
+    if inferred_items:
+        sections.append({'title': 'Inferred Defaults', 'tone': 'secondary', 'items': inferred_items})
+
+    note_items: list[str] = []
+    if notes.get('write_file_under_outputs_artifacts'):
+        note_items.append('Write generated file artifacts under /outputs/artifacts/ when File(path) is used.')
+    if notes.get('needs_hint_template'):
+        note_items.append('Include a hint template only if referenced outputs are actually produced.')
+    if notes.get('inject_destination'):
+        note_items.append(f'Inject destination: {notes.get("inject_destination")}')
+    readme_mentions = [str(item).strip() for item in (notes.get('readme_mentions') or []) if str(item).strip()]
+    if readme_mentions:
+        note_items.append('README notes: ' + ', '.join(readme_mentions))
+    if note_items:
+        sections.append({'title': 'Notes', 'tone': 'info', 'items': note_items})
+
+    return {
+        'ok': True,
+        'plugin_type': plugin_type,
+        'manual': manual,
+        'explicit': explicit,
+        'inferred': inferred,
+        'merged': {k: v for k, v in merged.items() if k in {'runtime_inputs', 'requires', 'produces', 'inject_files', 'hint_templates'}},
+        'notes': notes,
+        'sections': sections,
+        'editable': resolved.get('editable') if isinstance(resolved.get('editable'), dict) else {},
+    }
+
+
+def _merged_prompt_intent_defaults(prompt: str, plugin_type: str) -> dict[str, Any]:
+    resolved = _resolve_prompt_intent(prompt, plugin_type)
+    merged = dict(resolved.get('merged') or {}) if isinstance(resolved.get('merged'), dict) else {}
+    merged['notes'] = resolved.get('notes') if isinstance(resolved.get('notes'), dict) else {}
+    merged['explicit'] = resolved.get('explicit') if isinstance(resolved.get('explicit'), dict) else {}
+    merged['inferred'] = resolved.get('inferred') if isinstance(resolved.get('inferred'), dict) else {}
+    return merged
+
+
+def _build_prompt_intent_preview(payload: dict[str, Any]) -> dict[str, Any]:
+    plugin_type = str(payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+    prompt = str(payload.get('prompt') or '').strip()
+    resolved = _resolve_prompt_intent(prompt, plugin_type, payload.get('intent_overrides'))
+    manual = resolved.get('manual') if isinstance(resolved.get('manual'), dict) else {}
+    explicit = resolved.get('explicit') if isinstance(resolved.get('explicit'), dict) else {}
+    inferred = resolved.get('inferred') if isinstance(resolved.get('inferred'), dict) else {}
+    notes = resolved.get('notes') if isinstance(resolved.get('notes'), dict) else {}
+    merged = resolved.get('merged') if isinstance(resolved.get('merged'), dict) else {}
+
+    sections: list[dict[str, Any]] = []
+    if manual:
+        items: list[str] = []
+        if manual.get('runtime_inputs'):
+            items.append('Runtime inputs: ' + ', '.join(str(item.get('name')) for item in manual.get('runtime_inputs') if isinstance(item, dict)))
+        if manual.get('requires'):
+            items.append('Artifact requirements: ' + ', '.join(str(item.get('artifact')) + (' (optional)' if item.get('optional') else '') for item in manual.get('requires') if isinstance(item, dict)))
+        if manual.get('produces'):
+            items.append('Artifact outputs: ' + ', '.join(str(item) for item in manual.get('produces') or []))
+        if manual.get('inject_files'):
+            items.append('Inject files: ' + ', '.join(str(item) for item in manual.get('inject_files') or []))
+        if manual.get('hint_templates'):
+            items.append('Hint templates: ' + '; '.join(str(item) for item in manual.get('hint_templates') or []))
+        manual_readme_mentions = [str(item).strip() for item in (resolved.get('manual_notes') or {}).get('readme_mentions', []) if str(item).strip()]
+        if manual_readme_mentions:
+            items.append('README notes: ' + ', '.join(manual_readme_mentions))
+        sections.append({'title': 'Manual Overrides', 'tone': 'warning', 'items': items})
+
+    if explicit:
+        items: list[str] = []
+        if explicit.get('runtime_inputs'):
+            items.append('Runtime inputs: ' + ', '.join(str(item.get('name')) for item in explicit.get('runtime_inputs') if isinstance(item, dict)))
+        if explicit.get('requires'):
+            items.append('Artifact requirements: ' + ', '.join(str(item.get('artifact')) for item in explicit.get('requires') if isinstance(item, dict)))
+        if explicit.get('produces'):
+            items.append('Artifact outputs: ' + ', '.join(str(item) for item in explicit.get('produces') or []))
+        if explicit.get('inject_files'):
+            items.append('Inject files: ' + ', '.join(str(item) for item in explicit.get('inject_files') or []))
+        if explicit.get('hint_templates'):
+            items.append('Hint templates: ' + '; '.join(str(item) for item in explicit.get('hint_templates') or []))
+        sections.append({'title': 'User-Specified', 'tone': 'primary', 'items': items})
+
+    inferred_items: list[str] = []
+    if not explicit.get('runtime_inputs') and merged.get('runtime_inputs'):
+        inferred_items.append('Runtime inputs: ' + ', '.join(str(item.get('name')) for item in merged.get('runtime_inputs') if isinstance(item, dict)))
+    if not explicit.get('requires') and merged.get('requires'):
+        inferred_items.append('Artifact requirements: ' + ', '.join(str(item.get('artifact')) for item in merged.get('requires') if isinstance(item, dict)))
+    if not explicit.get('produces') and merged.get('produces'):
+        inferred_items.append('Artifact outputs: ' + ', '.join(str(item) for item in merged.get('produces') or []))
+    if not explicit.get('inject_files') and merged.get('inject_files'):
+        inferred_items.append('Inject files: ' + ', '.join(str(item) for item in merged.get('inject_files') or []))
+    if not explicit.get('hint_templates') and merged.get('hint_templates'):
+        inferred_items.append('Hint templates: ' + '; '.join(str(item) for item in merged.get('hint_templates') or []))
+    if inferred_items:
+        sections.append({'title': 'Inferred Defaults', 'tone': 'secondary', 'items': inferred_items})
+
+    note_items: list[str] = []
+    if notes.get('write_file_under_outputs_artifacts'):
+        note_items.append('Write generated file artifacts under /outputs/artifacts/ when File(path) is used.')
+    if notes.get('needs_hint_template'):
+        note_items.append('Include a hint template only if referenced outputs are actually produced.')
+    if notes.get('inject_destination'):
+        note_items.append(f'Inject destination: {notes.get("inject_destination")}')
+    readme_mentions = [str(item).strip() for item in (notes.get('readme_mentions') or []) if str(item).strip()]
+    if readme_mentions:
+        note_items.append('README notes: ' + ', '.join(readme_mentions))
+    if note_items:
+        sections.append({'title': 'Notes', 'tone': 'info', 'items': note_items})
+
+    return {
+        'ok': True,
+        'plugin_type': plugin_type,
+        'manual': manual,
+        'explicit': explicit,
+        'inferred': inferred,
+        'merged': {k: v for k, v in merged.items() if k in {'runtime_inputs', 'requires', 'produces', 'inject_files', 'hint_templates'}},
+        'notes': notes,
+        'sections': sections,
+        'editable': resolved.get('editable') if isinstance(resolved.get('editable'), dict) else {},
+    }
+
+
+def _build_prompt_intent_guidance(prompt: str, plugin_type: str, overrides_payload: Any = None) -> list[str]:
+    resolved = _resolve_prompt_intent(prompt, plugin_type, overrides_payload)
+    manual = resolved.get('manual') if isinstance(resolved.get('manual'), dict) else {}
+    explicit = resolved.get('explicit') if isinstance(resolved.get('explicit'), dict) else {}
+    inferred = resolved.get('inferred') if isinstance(resolved.get('inferred'), dict) else {}
+    notes = resolved.get('notes') if isinstance(resolved.get('notes'), dict) else {}
+    manual_notes = resolved.get('manual_notes') if isinstance(resolved.get('manual_notes'), dict) else {}
+    if not (manual or explicit or inferred or notes):
+        return []
+
+    lines: list[str] = []
+    if manual:
+        lines.append('Builder preview overrides are set. These take precedence over both prompt-derived explicit requirements and heuristics:')
+        if manual.get('runtime_inputs'):
+            labels = []
+            for item in manual.get('runtime_inputs') or []:
+                if not isinstance(item, dict):
+                    continue
+                parts = ['required' if item.get('required') is not False else 'optional']
+                if item.get('sensitive') is True:
+                    parts.append('sensitive')
+                labels.append(f"{item.get('name')} ({', '.join(parts)})")
+            if labels:
+                lines.append(f"- Respect these Builder override runtime inputs: {', '.join(labels)}.")
+        if manual.get('requires'):
+            req_labels = []
+            for item in manual.get('requires') or []:
+                if not isinstance(item, dict):
+                    continue
+                req_labels.append(f"{item.get('artifact')}{' (optional)' if item.get('optional') else ''}")
+            if req_labels:
+                lines.append(f"- Respect these Builder override artifact requirements: {', '.join(req_labels)}.")
+        if manual.get('produces'):
+            lines.append(f"- Respect these Builder override artifact outputs: {', '.join(str(x) for x in (manual.get('produces') or []))}.")
+        if manual.get('inject_files'):
+            lines.append(f"- Respect these Builder override inject_files entries: {', '.join(str(x) for x in (manual.get('inject_files') or []))}. Every one must resolve to a created output file.")
+        if manual.get('hint_templates'):
+            lines.append(f"- Respect these Builder override hint templates: {'; '.join(str(x) for x in (manual.get('hint_templates') or []))}.")
+        manual_readme_mentions = [str(item).strip() for item in (manual_notes.get('readme_mentions') or []) if str(item).strip()]
+        if manual_readme_mentions:
+            lines.append(f"- Respect these Builder override README notes: {', '.join(manual_readme_mentions)}.")
+        lines.append('')
+
+    if explicit:
+        lines.append('User-specified scaffold requirements detected in the prompt. These override heuristic defaults when there is any conflict:')
+        if explicit.get('runtime_inputs'):
+            labels = []
+            for item in explicit.get('runtime_inputs') or []:
+                if not isinstance(item, dict):
+                    continue
+                parts = []
+                if item.get('required') is False:
+                    parts.append('optional')
+                else:
+                    parts.append('required')
+                if item.get('sensitive') is True:
+                    parts.append('sensitive')
+                labels.append(f"{item.get('name')} ({', '.join(parts)})")
+            if labels:
+                lines.append(f"- Respect these user-specified runtime inputs: {', '.join(labels)}.")
+        if explicit.get('requires'):
+            req_labels = []
+            for item in explicit.get('requires') or []:
+                if not isinstance(item, dict):
+                    continue
+                req_labels.append(f"{item.get('artifact')}{' (optional)' if item.get('optional') else ''}")
+            if req_labels:
+                lines.append(f"- Respect these user-specified artifact requirements: {', '.join(req_labels)}.")
+        if explicit.get('produces'):
+            lines.append(f"- Respect these user-specified artifact outputs: {', '.join(str(x) for x in (explicit.get('produces') or []))}.")
+        if explicit.get('inject_files'):
+            lines.append(f"- Respect these user-specified inject_files entries: {', '.join(str(x) for x in (explicit.get('inject_files') or []))}. Every one must resolve to a created output file.")
+        lines.append('')
+
+    if inferred:
+        lines.append('Prompt-derived defaults to apply only when the prompt did not already specify a conflicting requirement:')
+        if inferred.get('runtime_inputs'):
+            labels = []
+            for item in inferred.get('runtime_inputs') or []:
+                if not isinstance(item, dict):
+                    continue
+                parts = []
+                if item.get('required') is False:
+                    parts.append('optional')
+                else:
+                    parts.append('required')
+                if item.get('sensitive') is True:
+                    parts.append('sensitive')
+                labels.append(f"{item.get('name')} ({', '.join(parts)})")
+            if labels:
+                lines.append(f"- Suggested runtime inputs: {', '.join(labels)}.")
+        if inferred.get('requires'):
+            req_labels = []
+            for item in inferred.get('requires') or []:
+                if not isinstance(item, dict):
+                    continue
+                req_labels.append(f"{item.get('artifact')}{' (optional)' if item.get('optional') else ''}")
+            if req_labels:
+                lines.append(f"- Suggested artifact requirements: {', '.join(req_labels)}.")
+        if inferred.get('produces'):
+            lines.append(f"- Suggested artifact outputs: {', '.join(str(x) for x in (inferred.get('produces') or []))}.")
+        if inferred.get('inject_files'):
+            lines.append(f"- Suggested inject_files entries: {', '.join(str(x) for x in (inferred.get('inject_files') or []))}. Only keep them if the file artifacts are actually produced.")
+        if inferred.get('hint_templates'):
+            lines.append(f"- Suggested hint template shape: {str((inferred.get('hint_templates') or [''])[0])}.")
+        lines.append('')
+
+    if notes.get('write_file_under_outputs_artifacts'):
+        lines.append('- Prompt-derived authoring hint: if the prompt asks for a generated file artifact, write it under /outputs/artifacts/ and expose it through outputs.json.')
+    if notes.get('needs_hint_template'):
+        lines.append('- Prompt-derived authoring hint: include a hint template only if the resulting outputs referenced by the template are actually produced.')
+    readme_mentions = [str(item).strip() for item in (notes.get('readme_mentions') or []) if str(item).strip()]
+    if readme_mentions:
+        lines.append(f"- Prompt-derived authoring hint: README should mention {', '.join(readme_mentions)}.")
+    if lines and lines[-1] != '':
+        lines.append('')
+    return lines
+
+
 def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
     plugin_type = str(payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
     source_id_hint = str(payload.get('source_id_hint') or '').strip()
@@ -392,6 +1240,7 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
         *schema_lines,
         '',
     ]
+    context_lines.extend(_build_prompt_intent_guidance(prompt, plugin_type, payload.get('intent_overrides')))
     context_lines.extend(_build_generator_grounding_lines(plugin_type))
     if current_scaffold:
         context_lines.extend([
@@ -446,6 +1295,11 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
 
 def _normalize_ai_scaffold_payload(ai_payload: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
     plugin_type = str(request_payload.get('plugin_type') or ai_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+    resolved_prompt_intent = _resolve_prompt_intent(
+        str(request_payload.get('prompt') or ''),
+        plugin_type,
+        request_payload.get('intent_overrides'),
+    )
     plugin_id = str(ai_payload.get('plugin_id') or request_payload.get('source_id_hint') or '').strip()
     if not plugin_id:
         plugin_id = _derive_plugin_id(ai_payload.get('name') or request_payload.get('name_hint') or '')
@@ -455,11 +1309,60 @@ def _normalize_ai_scaffold_payload(ai_payload: dict[str, Any], request_payload: 
     hint_templates = _coerce_string_list(ai_payload.get('hint_templates'))
     inject_files = _coerce_string_list(ai_payload.get('inject_files'))
     produces = _coerce_string_list(ai_payload.get('produces'))
+
+    manual = resolved_prompt_intent.get('manual') if isinstance(resolved_prompt_intent.get('manual'), dict) else {}
+    explicit = resolved_prompt_intent.get('explicit') if isinstance(resolved_prompt_intent.get('explicit'), dict) else {}
+    notes = resolved_prompt_intent.get('notes') if isinstance(resolved_prompt_intent.get('notes'), dict) else {}
+    merged_defaults = dict(resolved_prompt_intent.get('merged') or {}) if isinstance(resolved_prompt_intent.get('merged'), dict) else {}
+    inject_destination = str(notes.get('inject_destination') or '').strip()
+
+    if manual.get('requires'):
+        requires = _coerce_requires(manual.get('requires'))[0]
+    elif explicit.get('requires'):
+        requires = _coerce_requires(explicit.get('requires'))[0]
+    elif not requires and merged_defaults.get('requires'):
+        requires = _coerce_requires(merged_defaults.get('requires'))[0]
+
+    if manual.get('runtime_inputs'):
+        runtime_inputs = _coerce_runtime_inputs(manual.get('runtime_inputs'))
+    elif explicit.get('runtime_inputs'):
+        runtime_inputs = _coerce_runtime_inputs(explicit.get('runtime_inputs'))
+    elif not runtime_inputs and merged_defaults.get('runtime_inputs'):
+        runtime_inputs = _coerce_runtime_inputs(merged_defaults.get('runtime_inputs'))
+
+    if manual.get('produces'):
+        produces = _coerce_string_list(manual.get('produces'))
+    elif explicit.get('produces'):
+        produces = _coerce_string_list(explicit.get('produces'))
+    elif not produces and merged_defaults.get('produces'):
+        produces = _coerce_string_list(merged_defaults.get('produces'))
+
+    if manual.get('inject_files'):
+        inject_files = _coerce_string_list(manual.get('inject_files'))
+    elif explicit.get('inject_files'):
+        inject_files = _coerce_string_list(explicit.get('inject_files'))
+    elif not inject_files and merged_defaults.get('inject_files'):
+        inject_files = _coerce_string_list(merged_defaults.get('inject_files'))
+
+    inject_files = _apply_inject_destination(inject_files, inject_destination)
+
+    if manual.get('hint_templates'):
+        hint_templates = _coerce_string_list(manual.get('hint_templates'))
+    elif explicit.get('hint_templates'):
+        hint_templates = _coerce_string_list(explicit.get('hint_templates'))
+    elif not hint_templates and merged_defaults.get('hint_templates'):
+        hint_templates = _coerce_string_list(merged_defaults.get('hint_templates'))
+
     compose_text = str(ai_payload.get('compose_text') or '').strip('\n')
     readme_text = str(ai_payload.get('readme_text') or '').strip('\n')
     generator_py_text = str(ai_payload.get('generator_py_text') or ai_payload.get('generator_text') or '').strip('\n')
     env_value = ai_payload.get('env') if isinstance(ai_payload.get('env'), dict) else {}
     env = {str(key): str(value) for key, value in env_value.items() if str(key or '').strip()}
+
+    if notes.get('write_file_under_outputs_artifacts') and 'File(path)' in produces and not any(str(item).startswith('File(path)') for item in inject_files):
+        if explicit.get('inject_files') or merged_defaults.get('inject_files'):
+            inject_files = _apply_inject_destination(_coerce_string_list(explicit.get('inject_files') or merged_defaults.get('inject_files')), inject_destination)
+
     return {
         'plugin_type': plugin_type,
         'plugin_id': plugin_id,
@@ -653,6 +1556,8 @@ def register(
     io_module: Any,
     zipfile_module: Any,
 ) -> None:
+    global _BUILD_GENERATOR_SCAFFOLD
+    _BUILD_GENERATOR_SCAFFOLD = build_generator_scaffold
     if not begin_route_registration(app, 'generator_builder_routes'):
         return
 
@@ -766,6 +1671,15 @@ def register(
             'scaffold_paths': sorted(scaffold_files.keys()),
         })
 
+    @app.route('/api/generators/prompt_intent_preview', methods=['POST'])
+    def api_generators_prompt_intent_preview():
+        require_builder_or_admin()
+        payload = request.get_json(silent=True) or {}
+        try:
+            return jsonify(_build_prompt_intent_preview(payload))
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': str(exc)}), 400
+
     @app.route('/api/generators/ai_scaffold', methods=['POST'])
     def api_generators_ai_scaffold():
         require_builder_or_admin()
@@ -773,72 +1687,95 @@ def register(
         from webapp.routes import ai_provider as ai_provider_routes
 
         try:
-            messages = _build_generator_builder_ai_messages(payload)
-
-            provider = str(payload.get('provider') or 'ollama').strip().lower() or 'ollama'
-            adapter = ai_provider_routes._get_provider_adapter(provider)
-            model = str(payload.get('model') or '').strip()
-            if not model:
-                raise ValueError('model is required')
-            base_url = str(payload.get('base_url') or '').strip() or str(adapter.capability.default_base_url or '').strip()
-            if not base_url:
-                raise ValueError('base_url is required')
-            enforce_ssl = ai_provider_routes._payload_bool(payload.get('enforce_ssl'), default=True)
-            if provider in {'litellm', 'openai'}:
-                base_url = ai_provider_routes._normalize_openai_compatible_base_url(base_url, enforce_ssl=enforce_ssl)
-            else:
-                base_url = ai_provider_routes._normalize_base_url(base_url)
-            timeout_seconds = ai_provider_routes._normalize_bridge_timeout_seconds(
-                payload.get('timeout_seconds'),
-                default=240.0,
-                low=5.0,
-                high=240.0,
-            )
-            if provider == 'ollama':
-                assistant_text = _generate_builder_ollama_response(
-                    ai_provider_routes,
-                    messages=messages,
-                    model=model,
-                    base_url=base_url,
-                    verify_ssl=enforce_ssl,
-                    timeout_seconds=timeout_seconds,
-                )
-            else:
-                client = ai_provider_routes._RepoMcpBridgeClient(
-                    model=model,
-                    host=base_url,
-                    provider=provider,
-                    api_key=str(payload.get('api_key') or '').strip(),
-                    verify_ssl=enforce_ssl,
-                )
-                client.timeout_seconds = timeout_seconds
-                raw_response = client._post_chat(messages=messages)
-                if client._uses_openai_chat_completions():
-                    assistant_message = ai_provider_routes._extract_openai_chat_message(raw_response)
-                else:
-                    assistant_message = ai_provider_routes._extract_ollama_chat_message(raw_response)
-                assistant_text = str(assistant_message.get('content') or '').strip()
-            ai_payload = _extract_json_object(assistant_text)
-            scaffold_payload = _normalize_ai_scaffold_payload(ai_payload, payload)
-            scaffold_files, manifest_yaml, folder_path = build_generator_scaffold(scaffold_payload)
+            result = _build_builder_ai_scaffold_result(payload, ai_provider_routes=ai_provider_routes)
         except ai_provider_routes.ProviderAdapterError as exc:
             return jsonify({'ok': False, 'error': exc.message, **(exc.details or {})}), exc.status_code
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
 
-        return jsonify({
-            'ok': True,
-            'provider': provider,
-            'base_url': base_url,
-            'model': model,
-            'assistant_json': ai_payload,
-            'assistant_text': assistant_text,
-            'scaffold_request': scaffold_payload,
-            'folder_path': folder_path,
-            'manifest_yaml': manifest_yaml,
-            'scaffold_paths': sorted(scaffold_files.keys()),
-            'files': scaffold_files,
-        })
+        return jsonify(result)
+
+    @app.route('/api/generators/ai_scaffold_stream', methods=['POST'])
+    def api_generators_ai_scaffold_stream():
+        require_builder_or_admin()
+        payload = request.get_json(silent=True) or {}
+        from webapp.routes import ai_provider as ai_provider_routes
+
+        request_id = str(payload.get('request_id') or '').strip() or ai_provider_routes._create_stream_request_id()
+        payload['request_id'] = request_id
+        try:
+            ai_provider_routes._get_provider_adapter(payload.get('provider'))
+        except ai_provider_routes.ProviderAdapterError as exc:
+            return jsonify({'ok': False, 'error': exc.message, **(exc.details or {})}), exc.status_code
+
+        stream_entry = ai_provider_routes._register_ai_stream(request_id)
+
+        @stream_with_context
+        def _stream_events():
+            event_queue: queue.Queue[str | None] = queue.Queue()
+
+            def emit(event_type: str, **event_payload: Any) -> None:
+                event_queue.put(ai_provider_routes._ndjson_event(event_type, request_id=request_id, **event_payload))
+
+            def is_cancelled() -> bool:
+                return bool(stream_entry['cancelled'].is_set())
+
+            def on_response_open(response_obj: Any) -> None:
+                stream_entry['response'] = response_obj
+
+            def worker() -> None:
+                try:
+                    result = _build_builder_ai_scaffold_result(
+                        payload,
+                        ai_provider_routes=ai_provider_routes,
+                        emit=emit,
+                        cancellation_check=is_cancelled,
+                        on_response_open=on_response_open,
+                    )
+                    if is_cancelled():
+                        emit('error', error='Generation cancelled by user.', status_code=499)
+                        return
+                    emit('result', data=result)
+                except ai_provider_routes.ProviderAdapterError as exc:
+                    emit('error', error=exc.message, status_code=exc.status_code, details=exc.details or {})
+                except Exception as exc:  # pragma: no cover
+                    emit('error', error=str(exc))
+                finally:
+                    stream_entry['response'] = None
+                    event_queue.put(None)
+
+            threading.Thread(target=worker, daemon=True).start()
+            try:
+                while True:
+                    next_event = event_queue.get()
+                    if next_event is None:
+                        break
+                    yield next_event
+            finally:
+                ai_provider_routes._unregister_ai_stream(request_id)
+
+        return Response(
+            _stream_events(),
+            mimetype='application/x-ndjson',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+            },
+        )
+
+    @app.route('/api/generators/ai_scaffold_stream/cancel', methods=['POST'])
+    def api_generators_ai_scaffold_stream_cancel():
+        require_builder_or_admin()
+        from webapp.routes import ai_provider as ai_provider_routes
+
+        payload = request.get_json(silent=True) or {}
+        request_id = str(payload.get('request_id') or '').strip()
+        if not request_id:
+            return jsonify({'ok': False, 'error': 'request_id is required.'}), 400
+        cancelled = ai_provider_routes._cancel_ai_stream(request_id)
+        if not cancelled:
+            return jsonify({'ok': False, 'error': 'request_id was not active.'}), 404
+        return jsonify({'ok': True, 'request_id': request_id})
 
     @app.route('/api/generators/builder_test', methods=['POST'])
     def api_generators_builder_test():

@@ -149,6 +149,46 @@
     color: rgba(22, 50, 79, 0.7);
     font-size: 0.92rem;
   }
+  .gb-intent-overrides {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.72);
+  }
+  .gb-intent-overrides summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 0.8rem 0.95rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    color: var(--gb-ink);
+    font-weight: 600;
+  }
+  .gb-intent-overrides summary::-webkit-details-marker {
+    display: none;
+  }
+  .gb-intent-overrides[open] summary {
+    border-bottom: 1px solid rgba(214, 222, 231, 0.92);
+    background: rgba(216, 243, 239, 0.28);
+  }
+  .gb-intent-overrides-body {
+    padding: 0.95rem;
+  }
+  .gb-intent-field-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+  }
+  .gb-test-file-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
   .gb-model-card {
     border: 0;
     box-shadow: 0 0.125rem 0.5rem rgba(15, 23, 32, 0.08);
@@ -292,6 +332,12 @@
     background: linear-gradient(180deg, rgba(244, 247, 251, 0.72), rgba(244, 247, 251, 0.98) 35%, rgba(244, 247, 251, 1) 100%);
   }
   .gb-inline-snapshot {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.92);
+    padding: 0.9rem 1rem;
+  }
+  .gb-intent-preview {
     border: 1px solid rgba(214, 222, 231, 0.92);
     border-radius: 14px;
     background: rgba(255, 255, 255, 0.92);
@@ -443,6 +489,82 @@
                   <textarea class="form-control" id="gbPrompt" rows="12" placeholder="Describe the runtime behavior, outputs, required inputs, and any compose constraints." disabled></textarea>
                   <div class="form-text">
                     Start with a create request, then use follow-up prompts to refine behavior, fix test failures, or add new capabilities while keeping the current scaffold as context.
+                  </div>
+                </div>
+                <div class="gb-intent-preview mb-3" id="gbPromptIntentPreview">
+                  <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                    <div class="fw-semibold">Prompt Intent Preview</div>
+                    <span class="badge text-bg-secondary" id="gbPromptIntentBadge">Idle</span>
+                  </div>
+                  <div class="small text-muted" id="gbPromptIntentStatus">Prompt-derived defaults and explicit prompt requirements will preview here before generation.</div>
+                  <div class="mt-2 d-grid gap-2" id="gbPromptIntentBody"></div>
+                  <div class="border-top mt-3 pt-3">
+                    <details class="gb-intent-overrides" id="gbIntentOverridesPanel">
+                      <summary>
+                        <span>Tune Before Generation</span>
+                        <span class="small text-muted" id="gbIntentOverridesSummary">Collapsed. Open to add manual overrides.</span>
+                      </summary>
+                      <div class="gb-intent-overrides-body">
+                        <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                          <div class="small text-muted">Only non-empty fields below override the prompt preview on the next generation run.</div>
+                          <div class="d-flex gap-2 flex-wrap">
+                            <button class="btn btn-sm btn-outline-primary" type="button" id="gbIntentApplySuggestedBtn">Use Suggested Defaults</button>
+                            <button class="btn btn-sm btn-outline-secondary" type="button" id="gbIntentClearBtn">Clear Overrides</button>
+                          </div>
+                        </div>
+                        <div class="row g-2">
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentRuntimeInputs">Runtime inputs override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="runtime_inputs">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentRuntimeInputs" rows="3" placeholder="seed (required)&#10;secret (required, sensitive)"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentRequires">Artifact requirements override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="requires">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentRequires" rows="3" placeholder="Knowledge(ip)&#10;Knowledge(hostname) (optional)"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentProduces">Artifact outputs override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="produces">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentProduces" rows="3" placeholder="Flag(flag_id)&#10;Credential(user,password)&#10;File(path)"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentInjectFiles">Inject files override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_files">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentInjectFiles" rows="3" placeholder="File(path)&#10;File(path) -&gt; /opt/bootstrap"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentInjectDestination">Inject destination override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_destination">Use suggested</button>
+                            </div>
+                            <input class="form-control form-control-sm" id="gbIntentInjectDestination" placeholder="/opt/bootstrap" />
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentReadmeNotes">README notes override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="readme_mentions">Use suggested</button>
+                            </div>
+                            <input class="form-control form-control-sm" id="gbIntentReadmeNotes" placeholder="determinism, local runner testing" />
+                          </div>
+                          <div class="col-12">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentHintTemplates">Hint templates override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="hint_templates">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentHintTemplates" rows="3" placeholder="{% raw %}Next: SSH using {{OUTPUT.Credential(user,password)}}{% endraw %}"></textarea>
+                          </div>
+                        </div>
+                      </div>
+                    </details>
                   </div>
                 </div>
                 <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
@@ -778,6 +900,9 @@
     generateCancelRequested: false,
     lastGenerateMode: 'create',
     transcriptEvents: [],
+    generateRequestId: '',
+    promptIntentPreview: null,
+    promptIntentPreviewTimer: null,
   };
 
   const builderTestState = {
@@ -868,6 +993,21 @@
     fileContent: document.getElementById('gbFileContent'),
     filesCount: document.getElementById('gbFilesCount'),
     latestTestSnapshot: document.getElementById('gbLatestTestSnapshot'),
+    promptIntentPreview: document.getElementById('gbPromptIntentPreview'),
+    promptIntentBadge: document.getElementById('gbPromptIntentBadge'),
+    promptIntentStatus: document.getElementById('gbPromptIntentStatus'),
+    promptIntentBody: document.getElementById('gbPromptIntentBody'),
+    intentOverridesPanel: document.getElementById('gbIntentOverridesPanel'),
+    intentOverridesSummary: document.getElementById('gbIntentOverridesSummary'),
+    intentRuntimeInputs: document.getElementById('gbIntentRuntimeInputs'),
+    intentRequires: document.getElementById('gbIntentRequires'),
+    intentProduces: document.getElementById('gbIntentProduces'),
+    intentInjectFiles: document.getElementById('gbIntentInjectFiles'),
+    intentInjectDestination: document.getElementById('gbIntentInjectDestination'),
+    intentHintTemplates: document.getElementById('gbIntentHintTemplates'),
+    intentReadmeNotes: document.getElementById('gbIntentReadmeNotes'),
+    intentApplySuggestedBtn: document.getElementById('gbIntentApplySuggestedBtn'),
+    intentClearBtn: document.getElementById('gbIntentClearBtn'),
     manifestYaml: document.getElementById('gbManifestYaml'),
     assistantText: document.getElementById('gbAssistantText'),
     refreshProvidersBtn: document.getElementById('gbRefreshProvidersBtn'),
@@ -1198,7 +1338,7 @@
     pushFiles('Output', outputs, 'outputs');
     pushFiles('Scaffold', scaffold, 'scaffold');
     pushFiles('Log', misc, 'logs');
-    renderTestFiles(rows.map((row) => ({ path: row.path, size: row.size, text: null })));
+    renderTestFiles(rows.map((row) => ({ path: row.path, size: row.size, desc: row.desc, href: row.href, text: null })));
     elements.testStdout.textContent = document.getElementById('gbGenTestLog')?.textContent || 'No output yet.';
     const failureSummary = String((data && data.failure_summary) || '').trim();
     const logTail = String((data && data.log_tail) || '').trim();
@@ -1217,12 +1357,19 @@
       elements.testFiles.innerHTML = '<div class="list-group-item text-muted">No test artifacts yet.</div>';
       return;
     }
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    const runId = String(builderTestState.runId || '').trim();
     elements.testFiles.innerHTML = entries.map((entry) => {
       const text = typeof entry.text === 'string' && entry.text.length
         ? `<pre class="mt-2 mb-0" style="white-space: pre-wrap; max-height: 12rem; overflow: auto;">${escapeHtml(entry.text)}</pre>`
         : '';
-      const sizeText = entry.size == null ? '' : `${entry.size} bytes`;
-      return `<div class="list-group-item"><div class="fw-semibold">${escapeHtml(String(entry.path || ''))}</div><div class="small text-muted">${sizeText}</div>${text}</div>`;
+      const relPath = String(entry.path || '').trim();
+      const sizeText = String(entry.size || '').trim();
+      const description = String(entry.desc || '').trim();
+      const href = String(entry.href || '').trim() || (runId && relPath ? `${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}` : '');
+      const meta = [sizeText, description].filter(Boolean).map((item) => `<span>${escapeHtml(item)}</span>`).join('<span class="mx-1">•</span>');
+      const download = href ? `<a class="btn btn-sm btn-outline-secondary" href="${escapeHtml(href)}">Download</a>` : '';
+      return `<div class="list-group-item"><div class="gb-test-file-meta"><div class="fw-semibold">${escapeHtml(relPath)}</div>${download}</div><div class="small text-muted">${meta || 'Artifact from latest run.'}</div>${text}</div>`;
     }).join('');
   }
 
@@ -2056,13 +2203,86 @@
     elements.streamEvents.innerHTML = events.map((entry) => {
       const time = escapeHtml(String(entry.time || ''));
       const text = escapeHtml(String(entry.text || ''));
-      return `<li><span class="gb-stream-event-time">${time}</span><div>${text}</div></li>`;
+      return `<li><span class="gb-stream-event-time">${time}</span><div style="white-space: pre-wrap;">${text}</div></li>`;
     }).join('');
   }
 
   function appendTranscriptEvent(text) {
     state.transcriptEvents.push({ time: formatEventTime(), text: String(text || '') });
     renderTranscriptEvents();
+  }
+
+  function createGenerateRequestId() {
+    return `gb-stream-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  async function consumeNdjsonStream(response, onEvent) {
+    if (!response.body || typeof response.body.getReader !== 'function') {
+      throw new Error('Streaming response body is unavailable in this browser.');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line) {
+          let parsed = null;
+          try { parsed = JSON.parse(line); } catch (e) { parsed = null; }
+          if (parsed && typeof parsed === 'object') {
+            onEvent(parsed);
+          }
+        }
+        newlineIndex = buffer.indexOf('\n');
+      }
+    }
+    buffer += decoder.decode();
+    const tail = buffer.trim();
+    if (tail) {
+      let parsed = null;
+      try { parsed = JSON.parse(tail); } catch (e) { parsed = null; }
+      if (parsed && typeof parsed === 'object') {
+        onEvent(parsed);
+      }
+    }
+  }
+
+  function applyGeneratedScaffoldResult(result, mode, payload) {
+    state.scaffoldRequest = result.scaffold_request || null;
+    state.scaffoldFiles = result.files || {};
+    state.manifestYaml = String(result.manifest_yaml || '');
+    state.assistantText = String(result.assistant_text || state.assistantText || '');
+    state.activeFilePath = '';
+    elements.manifestYaml.textContent = state.manifestYaml || 'No manifest generated yet.';
+    elements.assistantText.textContent = state.assistantText ? formatStructuredText(state.assistantText) : 'No model response captured yet.';
+    renderSummary();
+    renderFiles();
+    updateActionButtons();
+    recordIteration({
+      mode,
+      prompt: payload.prompt,
+      plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
+      status: 'scaffold updated',
+    });
+    appendTranscriptEvent(`Normalized scaffold received for ${(state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator'}.`);
+    appendTranscriptEvent(`Generated ${Object.keys(state.scaffoldFiles || {}).length} scaffold files.`);
+    setTestStatus('Ready to run a CORE VM scaffold test.', 'secondary');
+    elements.testStdout.textContent = 'No output yet.';
+    elements.testStderr.textContent = 'No output yet.';
+    renderTestFiles([]);
+    state.lastTestResult = null;
+    builderTestState.latestOutputsData = null;
+    renderLatestTestSnapshot();
+    queuePromptIntentPreview();
+    const successDetail = `${mode === 'refine' ? 'Refined' : 'Generated'} ${Object.keys(state.scaffoldFiles || {}).length} scaffold files for ${String((state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator')}.`;
+    setGenerationStatus(successDetail, 'success');
+    finishStreamModal({ ok: true, detail: successDetail, output: state.assistantText || 'No model response captured yet.' });
+    showBuildTabPath(elements.buildTabOutputBtn, elements.resultsFilesTabBtn);
   }
 
   function setStreamState(status, detail, badgeClass = 'text-bg-primary', badgeText = 'Running') {
@@ -2110,12 +2330,15 @@
       setGenerateOverlay(false);
       state.generateCancelRequested = false;
       state.generateAbortController = null;
+      state.generateRequestId = '';
     }
   }
 
   function openStreamModal(mode, payload) {
     state.lastGenerateMode = mode;
     state.transcriptEvents = [];
+    state.assistantText = '';
+    state.generateRequestId = String(payload.request_id || '').trim();
     elements.streamMeta.textContent = `${mode === 'refine' ? 'Refine' : 'Create'} request • ${String(payload.provider || '').trim() || 'provider'} • ${String(payload.model || '').trim() || 'model'}`;
     setStreamState(
       mode === 'refine' ? 'Refining scaffold…' : 'Generating scaffold…',
@@ -2241,7 +2464,7 @@
   }
 
   function buildGeneratePayload() {
-    return {
+    const payload = {
       plugin_type: String(elements.pluginType.value || 'flag-generator').trim(),
       source_id_hint: String(elements.sourceIdHint.value || '').trim(),
       name_hint: String(elements.nameHint.value || '').trim(),
@@ -2252,6 +2475,97 @@
       model: String(elements.model.value || '').trim(),
       enforce_ssl: !!elements.enforceSsl.checked,
     };
+    const intentOverrides = buildIntentOverridePayload();
+    if (intentOverrides) {
+      payload.intent_overrides = intentOverrides;
+    }
+    return payload;
+  }
+
+  function buildIntentOverridePayload() {
+    const payload = {};
+    const runtimeInputs = String(elements.intentRuntimeInputs && elements.intentRuntimeInputs.value || '').trim();
+    const requires = String(elements.intentRequires && elements.intentRequires.value || '').trim();
+    const produces = String(elements.intentProduces && elements.intentProduces.value || '').trim();
+    const injectFiles = String(elements.intentInjectFiles && elements.intentInjectFiles.value || '').trim();
+    const injectDestination = String(elements.intentInjectDestination && elements.intentInjectDestination.value || '').trim();
+    const hintTemplates = String(elements.intentHintTemplates && elements.intentHintTemplates.value || '').trim();
+    const readmeNotes = String(elements.intentReadmeNotes && elements.intentReadmeNotes.value || '').trim();
+    if (runtimeInputs) payload.runtime_inputs = runtimeInputs;
+    if (requires) payload.requires = requires;
+    if (produces) payload.produces = produces;
+    if (injectFiles) payload.inject_files = injectFiles;
+    if (injectDestination) payload.inject_destination = injectDestination;
+    if (hintTemplates) payload.hint_templates = hintTemplates;
+    if (readmeNotes) payload.readme_mentions = readmeNotes;
+    return Object.keys(payload).length ? payload : null;
+  }
+
+  function fillIntentOverrideInputs(values, { refresh = false } = {}) {
+    const source = values && typeof values === 'object' ? values : {};
+    if (elements.intentRuntimeInputs) elements.intentRuntimeInputs.value = String(source.runtime_inputs || '');
+    if (elements.intentRequires) elements.intentRequires.value = String(source.requires || '');
+    if (elements.intentProduces) elements.intentProduces.value = String(source.produces || '');
+    if (elements.intentInjectFiles) elements.intentInjectFiles.value = String(source.inject_files || '');
+    if (elements.intentInjectDestination) elements.intentInjectDestination.value = String(source.inject_destination || '');
+    if (elements.intentHintTemplates) elements.intentHintTemplates.value = String(source.hint_templates || '');
+    if (elements.intentReadmeNotes) elements.intentReadmeNotes.value = String(source.readme_mentions || '');
+    if (refresh) {
+      queuePromptIntentPreview();
+    }
+  }
+
+  function clearIntentOverrides({ refresh = true } = {}) {
+    fillIntentOverrideInputs({}, { refresh });
+  }
+
+  function applySuggestedIntentOverrides() {
+    const editable = state.promptIntentPreview && typeof state.promptIntentPreview.editable === 'object'
+      ? state.promptIntentPreview.editable
+      : null;
+    if (!editable) return;
+    fillIntentOverrideInputs(editable, { refresh: true });
+  }
+
+  function applySuggestedIntentOverrideField(key) {
+    const editable = state.promptIntentPreview && typeof state.promptIntentPreview.editable === 'object'
+      ? state.promptIntentPreview.editable
+      : null;
+    if (!editable || !Object.prototype.hasOwnProperty.call(editable, key)) return;
+    const fieldMap = {
+      runtime_inputs: elements.intentRuntimeInputs,
+      requires: elements.intentRequires,
+      produces: elements.intentProduces,
+      inject_files: elements.intentInjectFiles,
+      inject_destination: elements.intentInjectDestination,
+      hint_templates: elements.intentHintTemplates,
+      readme_mentions: elements.intentReadmeNotes,
+    };
+    const field = fieldMap[key];
+    if (!field) return;
+    field.value = String(editable[key] || '');
+    updateIntentOverrideSummary();
+    queuePromptIntentPreview();
+  }
+
+  function countIntentOverrides() {
+    const payload = buildIntentOverridePayload();
+    return payload ? Object.keys(payload).length : 0;
+  }
+
+  function updateIntentOverrideSummary() {
+    if (!elements.intentOverridesSummary) return;
+    const count = countIntentOverrides();
+    const open = !!(elements.intentOverridesPanel && elements.intentOverridesPanel.open);
+    if (!count) {
+      elements.intentOverridesSummary.textContent = open
+        ? 'No manual overrides set.'
+        : 'Collapsed. Open to add manual overrides.';
+      return;
+    }
+    elements.intentOverridesSummary.textContent = open
+      ? `${count} manual override${count === 1 ? '' : 's'} active.`
+      : `${count} manual override${count === 1 ? '' : 's'} active. Open to edit.`;
   }
 
   function renderSummary() {
@@ -2305,6 +2619,84 @@
         renderFiles();
       });
     });
+  }
+
+  function setPromptIntentPreview(status, tone, sections) {
+    const overrideCount = countIntentOverrides();
+    if (elements.promptIntentBadge) {
+      elements.promptIntentBadge.className = `badge text-bg-${tone || 'secondary'}`;
+      elements.promptIntentBadge.textContent = overrideCount ? `${status || 'Idle'} + ${overrideCount} override${overrideCount === 1 ? '' : 's'}` : (status || 'Idle');
+    }
+    if (elements.promptIntentStatus) {
+      elements.promptIntentStatus.textContent = status === 'Empty'
+        ? 'Add more detail to the prompt to preview explicit requirements and inferred defaults.'
+        : overrideCount
+          ? 'This preview shows Builder overrides first, then user-specified requirements, then inferred defaults that still fill gaps.'
+          : 'This preview shows user-specified requirements first, then inferred defaults that fill gaps.';
+    }
+    const body = elements.promptIntentBody;
+    if (!body) return;
+    const items = Array.isArray(sections) ? sections : [];
+    if (!items.length) {
+      body.innerHTML = '<div class="small text-muted">No prompt-intent signals detected yet.</div>';
+      updateIntentOverrideSummary();
+      return;
+    }
+    body.innerHTML = items.map((section) => {
+      const sectionItems = Array.isArray(section && section.items) ? section.items : [];
+      const title = escapeHtml(String((section && section.title) || 'Preview'));
+      const toneClass = escapeHtml(String((section && section.tone) || 'secondary'));
+      const list = sectionItems.length
+        ? `<ul class="small mb-0 ps-3">${sectionItems.map((item) => `<li>${escapeHtml(String(item || ''))}</li>`).join('')}</ul>`
+        : '<div class="small text-muted">No items</div>';
+      return `<div class="border rounded-3 p-2"><div class="fw-semibold text-${toneClass} mb-1">${title}</div>${list}</div>`;
+    }).join('');
+    updateIntentOverrideSummary();
+  }
+
+  async function refreshPromptIntentPreview() {
+    const prompt = String(elements.prompt.value || '').trim();
+    const pluginType = String(elements.pluginType.value || 'flag-generator').trim() || 'flag-generator';
+    if (!prompt) {
+      state.promptIntentPreview = null;
+      setPromptIntentPreview('Empty', 'secondary', []);
+      return;
+    }
+    setPromptIntentPreview('Analyzing', 'info', []);
+    const payload = await fetchJson('/api/generators/prompt_intent_preview', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        prompt,
+        plugin_type: pluginType,
+        intent_overrides: buildIntentOverridePayload(),
+      }),
+    });
+    if (!payload || payload.ok === false) {
+      state.promptIntentPreview = null;
+      setPromptIntentPreview('Error', 'danger', []);
+      if (elements.promptIntentStatus) {
+        elements.promptIntentStatus.textContent = String((payload && payload.error) || 'Failed to preview prompt intent.');
+      }
+      return;
+    }
+    state.promptIntentPreview = payload;
+    const sections = Array.isArray(payload.sections) ? payload.sections : [];
+    setPromptIntentPreview(sections.length ? 'Ready' : 'Idle', sections.length ? 'success' : 'secondary', sections);
+  }
+
+  function queuePromptIntentPreview() {
+    if (state.promptIntentPreviewTimer) {
+      try { clearTimeout(state.promptIntentPreviewTimer); } catch (e) {}
+    }
+    state.promptIntentPreviewTimer = window.setTimeout(() => {
+      state.promptIntentPreviewTimer = null;
+      refreshPromptIntentPreview();
+    }, 180);
   }
 
   function renderLatestTestSnapshot() {
@@ -2369,6 +2761,7 @@
       payload.current_files = state.scaffoldFiles;
       payload.last_test_result = state.lastTestResult;
     }
+    payload.request_id = createGenerateRequestId();
     state.generateCancelRequested = false;
     state.generateAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
     setGenerateBusy(true);
@@ -2379,9 +2772,9 @@
       'The prompt response workspace is temporarily locked while the current run is in progress. You can cancel at any time.'
     );
     setGenerationStatus(mode === 'refine' ? 'Refining current scaffold via AI...' : 'Generating scaffold via AI...', 'info');
-    appendTranscriptEvent('Request submitted to /api/generators/ai_scaffold.');
+    appendTranscriptEvent('Request submitted to /api/generators/ai_scaffold_stream.');
     try {
-      const resp = await fetch('/api/generators/ai_scaffold', {
+      const resp = await fetch('/api/generators/ai_scaffold_stream', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {
@@ -2391,39 +2784,52 @@
         signal: state.generateAbortController ? state.generateAbortController.signal : undefined,
         body: JSON.stringify(payload),
       });
-      const result = await resp.json().catch(() => ({}));
-      if (!resp.ok || result.ok === false) {
+      if (!resp.ok) {
+        const result = await resp.json().catch(() => ({}));
         throw new Error((result && (result.error || result.message)) || `Generation failed (HTTP ${resp.status})`);
       }
-      state.scaffoldRequest = result.scaffold_request || null;
-      state.scaffoldFiles = result.files || {};
-      state.manifestYaml = String(result.manifest_yaml || '');
-      state.assistantText = String(result.assistant_text || '');
-      state.activeFilePath = '';
-      elements.manifestYaml.textContent = state.manifestYaml || 'No manifest generated yet.';
-      elements.assistantText.textContent = state.assistantText ? formatStructuredText(state.assistantText) : 'No model response captured yet.';
-      renderSummary();
-      renderFiles();
-      updateActionButtons();
-      recordIteration({
-        mode,
-        prompt: payload.prompt,
-        plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
-        status: 'scaffold updated',
+      let finalResult = null;
+      let streamError = '';
+      await consumeNdjsonStream(resp, (event) => {
+        const type = String((event && event.type) || '');
+        if (type === 'status') {
+          const message = String((event && event.message) || 'Working...');
+          setStreamState(message, 'Waiting for the next update.', 'text-bg-primary', 'Running');
+          appendTranscriptEvent(message);
+          return;
+        }
+        if (type === 'llm_prompt') {
+          appendTranscriptEvent(`LLM prompt:\n${String((event && event.text) || '')}`);
+          return;
+        }
+        if (type === 'llm_thinking') {
+          appendTranscriptEvent(`Thinking:\n${String((event && event.text) || '')}`);
+          return;
+        }
+        if (type === 'llm_delta') {
+          const delta = String((event && event.text) || '');
+          if (delta) {
+            state.assistantText = `${state.assistantText || ''}${delta}`;
+            setStreamOutput(state.assistantText, mode === 'refine' ? 'Streaming raw model response for the refine step.' : 'Streaming raw model response for the create step.');
+          }
+          return;
+        }
+        if (type === 'error') {
+          streamError = String((event && event.error) || 'Generation failed.');
+          appendTranscriptEvent(`Error: ${streamError}`);
+          return;
+        }
+        if (type === 'result') {
+          finalResult = event && typeof event.data === 'object' ? event.data : null;
+        }
       });
-      appendTranscriptEvent(`Normalized scaffold received for ${(state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator'}.`);
-      appendTranscriptEvent(`Generated ${Object.keys(state.scaffoldFiles || {}).length} scaffold files.`);
-      setTestStatus('Ready to run a CORE VM scaffold test.', 'secondary');
-      elements.testStdout.textContent = 'No output yet.';
-      elements.testStderr.textContent = 'No output yet.';
-      renderTestFiles([]);
-      state.lastTestResult = null;
-      builderTestState.latestOutputsData = null;
-      renderLatestTestSnapshot();
-      const successDetail = `${mode === 'refine' ? 'Refined' : 'Generated'} ${Object.keys(state.scaffoldFiles || {}).length} scaffold files for ${String((state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator')}.`;
-      setGenerationStatus(successDetail, 'success');
-      finishStreamModal({ ok: true, detail: successDetail, output: state.assistantText || 'No model response captured yet.' });
-      showBuildTabPath(elements.buildTabOutputBtn, elements.resultsFilesTabBtn);
+      if (streamError) {
+        throw new Error(streamError);
+      }
+      if (!finalResult || finalResult.ok === false) {
+        throw new Error((finalResult && (finalResult.error || finalResult.message)) || 'Generation stream ended before returning a scaffold result.');
+      }
+      applyGeneratedScaffoldResult(finalResult, mode, payload);
     } catch (err) {
       const aborted = !!(state.generateCancelRequested || (err && err.name === 'AbortError'));
       const message = aborted ? 'Generation cancelled.' : String((err && err.message) || err || 'Generation failed.');
@@ -2510,6 +2916,7 @@
 
   function loadExamplePrompt() {
     const kind = String(elements.pluginType.value || 'flag-generator').trim();
+    clearIntentOverrides({ refresh: false });
     if (kind === 'flag-node-generator') {
       elements.sourceIdHint.value = elements.sourceIdHint.value || 'py_web_token_gate';
       elements.nameHint.value = elements.nameHint.value || 'Token-Gated Web Flag Node';
@@ -2522,6 +2929,7 @@
         'Add a hint template that points the participant toward the token-based web endpoint.',
         'README should include local scripts/run_flag_generator.py usage.',
       ].join('\n');
+      queuePromptIntentPreview();
       return;
     }
     elements.sourceIdHint.value = elements.sourceIdHint.value || 'ssh_creds_drop';
@@ -2535,6 +2943,7 @@
       'Include inject_files with File(path) and a hint template that references the credential outputs.',
       'README should mention determinism and local runner testing.',
     ].join('\n');
+    queuePromptIntentPreview();
   }
 
   elements.provider.addEventListener('change', () => {
@@ -2618,6 +3027,39 @@
       setGenerationStatus(String((err && err.message) || err || 'Install failed.'), 'danger');
     }
   });
+  elements.prompt.addEventListener('input', queuePromptIntentPreview);
+  elements.sourceIdHint.addEventListener('input', queuePromptIntentPreview);
+  elements.nameHint.addEventListener('input', queuePromptIntentPreview);
+  elements.pluginType.addEventListener('change', queuePromptIntentPreview);
+  [
+    elements.intentRuntimeInputs,
+    elements.intentRequires,
+    elements.intentProduces,
+    elements.intentInjectFiles,
+    elements.intentInjectDestination,
+    elements.intentHintTemplates,
+    elements.intentReadmeNotes,
+  ].forEach((field) => {
+    if (!field) return;
+    field.addEventListener('input', () => {
+      updateIntentOverrideSummary();
+      queuePromptIntentPreview();
+    });
+  });
+  if (elements.intentOverridesPanel) {
+    elements.intentOverridesPanel.addEventListener('toggle', updateIntentOverrideSummary);
+  }
+  Array.from(document.querySelectorAll('[data-gb-intent-fill]')).forEach((button) => {
+    button.addEventListener('click', () => {
+      applySuggestedIntentOverrideField(button.getAttribute('data-gb-intent-fill') || '');
+    });
+  });
+  if (elements.intentApplySuggestedBtn) {
+    elements.intentApplySuggestedBtn.addEventListener('click', applySuggestedIntentOverrides);
+  }
+  if (elements.intentClearBtn) {
+    elements.intentClearBtn.addEventListener('click', () => clearIntentOverrides({ refresh: true }));
+  }
   elements.downloadComposeBtn.addEventListener('click', () => {
     try {
       downloadGeneratedFile('/docker-compose.yml');
@@ -2660,6 +3102,17 @@
       state.generateCancelRequested = true;
       setGenerateOverlay(true, 'Cancelling generation…', 'Waiting for the current request to stop cleanly.');
       appendTranscriptEvent('Cancellation requested by user.');
+      if (state.generateRequestId) {
+        fetch('/api/generators/ai_scaffold_stream/cancel', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ request_id: state.generateRequestId }),
+        }).catch(() => null);
+      }
       try {
         state.generateAbortController.abort();
       } catch (e) {}
@@ -2697,6 +3150,8 @@
   renderFiles();
   renderIterations();
   updateActionButtons();
+  setPromptIntentPreview('Idle', 'secondary', []);
+  updateIntentOverrideSummary();
   loadExamplePrompt();
   refreshProviders(false);
 })();

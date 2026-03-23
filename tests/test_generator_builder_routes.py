@@ -53,6 +53,13 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Iteration History' in body
     assert 'Latest Test Result' in body
     assert 'gbLatestTestSnapshot' in body
+    assert 'gbPromptIntentPreview' in body
+    assert 'gbIntentApplySuggestedBtn' in body
+    assert 'gbIntentRuntimeInputs' in body
+    assert 'gbIntentHintTemplates' in body
+    assert 'gbIntentOverridesPanel' in body
+    assert 'data-gb-intent-fill="runtime_inputs"' in body
+    assert 'gbIntentOverridesSummary' in body
     assert 'Install & downloads' in body
     assert 'Locked until validation' in body
     assert 'coretg_builder_model_config' in body
@@ -136,6 +143,63 @@ def test_generator_scaffold_meta_returns_sorted_paths(monkeypatch):
         'manifest_yaml': 'manifest-body',
         'scaffold_paths': ['a/manifest.yaml', 'z/file.txt'],
     }
+
+
+def test_generator_prompt_intent_preview_returns_structured_sections(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    resp = client.post('/api/generators/prompt_intent_preview', json={
+        'plugin_type': 'flag-generator',
+        'prompt': (
+            'Build a flag-generator that derives deterministic SSH credentials and a hint from seed and secret.\n'
+            'Runtime inputs: seed (required), token (required, sensitive).\n'
+            'Artifact outputs: Flag(flag_id), Credential(user,password), File(path).\n'
+            'Include inject_files with File(path).\n'
+            'Inject destination: /opt/bootstrap.\n'
+            'Hint templates: Next: SSH using {{OUTPUT.Credential(user,password)}}.\n'
+            'README should mention determinism and parity testing.'
+        ),
+    })
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('ok') is True
+    titles = [section.get('title') for section in (payload.get('sections') or [])]
+    assert 'User-Specified' in titles
+    assert 'Notes' in titles
+    merged = payload.get('merged') or {}
+    assert merged.get('inject_files') == ['File(path) -> /opt/bootstrap']
+    assert merged.get('hint_templates') == ['Next: SSH using {{OUTPUT.Credential(user,password)}}.']
+
+
+def test_generator_prompt_intent_preview_applies_manual_overrides(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    resp = client.post('/api/generators/prompt_intent_preview', json={
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a flag-generator that derives deterministic SSH credentials and a hint from seed and secret.',
+        'intent_overrides': {
+            'runtime_inputs': 'seed (required)\nnode_name (required)',
+            'produces': 'Flag(flag_id)\nCredential(user)',
+            'inject_files': 'Credential(user)',
+            'readme_mentions': 'custom docs, test parity',
+        },
+    })
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('ok') is True
+    titles = [section.get('title') for section in (payload.get('sections') or [])]
+    assert 'Manual Overrides' in titles
+    assert payload.get('merged', {}).get('produces') == ['Flag(flag_id)', 'Credential(user)']
+    assert payload.get('editable', {}).get('runtime_inputs') == 'seed (required)\nnode_name (required)'
+    assert payload.get('notes', {}).get('readme_mentions') == ['custom docs', 'test parity']
 
 
 def test_generator_scaffold_zip_streams_archive(monkeypatch):
@@ -251,6 +315,58 @@ def test_generator_ai_scaffold_normalizes_model_output(monkeypatch):
     assert 'flag_generators/py_ssh_creds_drop/generator.py' in payload['files']
     assert payload['files']['flag_generators/py_ssh_creds_drop/generator.py'] == 'print("ai")\n'
     assert 'Credential(user,password)' in payload['manifest_yaml']
+
+
+def test_generator_ai_scaffold_stream_emits_prompt_delta_and_result(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'http://127.0.0.1:11434'})()
+
+    assistant_json = {
+        'plugin_id': 'stream_demo',
+        'name': 'Stream Demo',
+        'description': 'Deterministic stream demo.',
+        'requires': [{'artifact': 'Knowledge(ip)', 'optional': False}],
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'print("stream")\n',
+    }
+    full = json.dumps(assistant_json)
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_normalize_base_url', lambda value: str(value))
+
+    def _fake_stream_json_lines(url, payload, *, timeout, headers=None, verify_ssl=True, cancellation_check=None, on_open=None):
+        if callable(on_open):
+            on_open(object())
+        yield {'response': full[: len(full) // 2]}
+        yield {'response': full[len(full) // 2 :]}
+
+    monkeypatch.setattr(ai_provider_routes, '_stream_json_lines', _fake_stream_json_lines)
+
+    resp = client.post('/api/generators/ai_scaffold_stream', json={
+        'request_id': 'builder-stream-test',
+        'plugin_type': 'flag-generator',
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'qwen2.5:7b',
+        'prompt': 'Build a deterministic stream demo generator.',
+    })
+
+    assert resp.status_code == 200
+    assert resp.mimetype == 'application/x-ndjson'
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
+    event_types = [event.get('type') for event in events]
+    assert 'llm_prompt' in event_types
+    assert 'llm_delta' in event_types
+    assert 'result' in event_types
+    result_event = next(event for event in events if event.get('type') == 'result')
+    assert result_event['data']['scaffold_request']['plugin_id'] == 'stream_demo'
+    assert 'flag_generators/py_stream_demo/generator.py' in result_event['data']['files']
 
 
 def test_generator_ai_scaffold_openai_compatible_uses_api_key_and_ssl(monkeypatch):
@@ -396,6 +512,180 @@ def test_generator_builder_ai_messages_add_targeted_inject_failure_guidance():
     assert 'Observed failure to fix first: inject_files referenced file paths that were never created.' in user_content
     assert 'If you keep inject_files: ["File(path)"]' in user_content
     assert 'If no injected file is needed, remove inject_files and remove File(path) from produces.' in user_content
+
+
+def test_generator_builder_ai_messages_add_prompt_derived_ssh_credential_defaults():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a flag-generator that derives deterministic SSH credentials and a hint from seed and secret.',
+    })
+
+    user_content = messages[1]['content']
+    assert 'Prompt-derived defaults to apply only when the prompt did not already specify a conflicting requirement:' in user_content
+    assert 'Suggested runtime inputs: seed (required), secret (required, sensitive), flag_prefix (optional).' in user_content
+    assert 'Suggested artifact requirements: Knowledge(ip), Knowledge(hostname) (optional).' in user_content
+    assert 'Suggested artifact outputs: Flag(flag_id), Credential(user), Credential(user,password), File(path).' in user_content
+    assert 'Suggested inject_files entries: File(path).' in user_content
+    assert 'Suggested hint template shape: Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}.' in user_content
+    assert 'README should mention determinism, local runner testing.' in user_content
+
+
+def test_generator_builder_ai_messages_explicit_prompt_specs_override_heuristics_in_guidance():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': (
+            'Build a deterministic SSH credential generator.\n'
+            'Runtime inputs: seed (required), token (required, sensitive).\n'
+            'Artifact outputs: Flag(flag_id), Credential(user).\n'
+            'Include inject_files with Credential(user).\n'
+            'README should mention parity testing.'
+        ),
+    })
+
+    user_content = messages[1]['content']
+    assert 'User-specified scaffold requirements detected in the prompt. These override heuristic defaults when there is any conflict:' in user_content
+    assert 'Respect these user-specified runtime inputs: seed (required), token (required, sensitive).' in user_content
+    assert 'Respect these user-specified artifact outputs: Flag(flag_id), Credential(user).' in user_content
+    assert 'Respect these user-specified inject_files entries: Credential(user).' in user_content
+    assert 'Suggested runtime inputs: seed (required), secret (required, sensitive), flag_prefix (optional).' in user_content
+    assert 'README should mention parity testing.' in user_content
+
+
+def test_generator_builder_ai_messages_builder_overrides_take_precedence_in_guidance():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a flag-generator that derives deterministic SSH credentials and a hint from seed and secret.',
+        'intent_overrides': {
+            'runtime_inputs': 'seed (required)\nnode_name (required)',
+            'produces': 'Flag(flag_id)\nCredential(user)',
+            'hint_templates': 'Next: use {{OUTPUT.Credential(user)}}',
+        },
+    })
+
+    user_content = messages[1]['content']
+    assert 'Builder preview overrides are set. These take precedence over both prompt-derived explicit requirements and heuristics:' in user_content
+    assert 'Respect these Builder override runtime inputs: seed (required), node_name (required).' in user_content
+    assert 'Respect these Builder override artifact outputs: Flag(flag_id), Credential(user).' in user_content
+    assert 'Respect these Builder override hint templates: Next: use {{OUTPUT.Credential(user)}}.' in user_content
+
+
+def test_normalize_ai_scaffold_payload_uses_prompt_intent_defaults_when_ai_omits_fields():
+    payload = generator_builder_routes._normalize_ai_scaffold_payload(
+        {
+            'plugin_id': 'ssh_creds_demo',
+            'name': 'SSH Demo',
+            'description': 'demo',
+            'generator_py_text': 'print("demo")\n',
+        },
+        {
+            'plugin_type': 'flag-generator',
+            'prompt': 'Build a flag-generator that derives deterministic SSH credentials and a hint from seed and secret.',
+        },
+    )
+
+    assert payload['runtime_inputs'] == [
+        {'name': 'seed', 'type': 'string', 'required': True},
+        {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+        {'name': 'flag_prefix', 'type': 'string', 'required': False},
+    ]
+    assert payload['requires'] == [
+        {'artifact': 'Knowledge(ip)', 'optional': False},
+        {'artifact': 'Knowledge(hostname)', 'optional': True},
+    ]
+    assert payload['produces'] == ['Flag(flag_id)', 'Credential(user)', 'Credential(user,password)', 'File(path)']
+    assert payload['inject_files'] == ['File(path)']
+    assert payload['hint_templates'] == ['Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}']
+
+
+def test_normalize_ai_scaffold_payload_prioritizes_explicit_prompt_specs_over_inferred_defaults():
+    payload = generator_builder_routes._normalize_ai_scaffold_payload(
+        {
+            'plugin_id': 'explicit_demo',
+            'name': 'Explicit Demo',
+            'description': 'demo',
+            'generator_py_text': 'print("demo")\n',
+        },
+        {
+            'plugin_type': 'flag-generator',
+            'prompt': (
+                'Build a deterministic SSH credential generator.\n'
+                'Runtime inputs: seed (required), token (required, sensitive).\n'
+                'Artifact requirements: require Knowledge(ip).\n'
+                'Artifact outputs: Flag(flag_id), Credential(user).\n'
+                'Include inject_files with Credential(user).'
+            ),
+        },
+    )
+
+    assert payload['runtime_inputs'] == [
+        {'name': 'seed', 'type': 'string', 'required': True},
+        {'name': 'token', 'type': 'string', 'required': True, 'sensitive': True},
+    ]
+    assert payload['requires'] == [
+        {'artifact': 'Knowledge(ip)', 'optional': False},
+    ]
+    assert payload['produces'] == ['Flag(flag_id)', 'Credential(user)']
+    assert payload['inject_files'] == ['Credential(user)']
+
+
+def test_normalize_ai_scaffold_payload_applies_hint_templates_and_inject_destination_from_prompt():
+    payload = generator_builder_routes._normalize_ai_scaffold_payload(
+        {
+            'plugin_id': 'hint_demo',
+            'name': 'Hint Demo',
+            'description': 'demo',
+            'generator_py_text': 'print("demo")\n',
+        },
+        {
+            'plugin_type': 'flag-generator',
+            'prompt': (
+                'Build a deterministic SSH credential generator.\n'
+                'Artifact outputs: Flag(flag_id), Credential(user,password), File(path).\n'
+                'Include inject_files with File(path).\n'
+                'Inject destination: /opt/bootstrap.\n'
+                'Hint templates: Next: SSH using {{OUTPUT.Credential(user,password)}}.'
+            ),
+        },
+    )
+
+    assert payload['inject_files'] == ['File(path) -> /opt/bootstrap']
+    assert payload['hint_templates'] == ['Next: SSH using {{OUTPUT.Credential(user,password)}}.']
+
+
+def test_normalize_ai_scaffold_payload_prioritizes_manual_overrides_over_prompt_intent():
+    payload = generator_builder_routes._normalize_ai_scaffold_payload(
+        {
+            'plugin_id': 'manual_demo',
+            'name': 'Manual Demo',
+            'description': 'demo',
+            'generator_py_text': 'print("demo")\n',
+        },
+        {
+            'plugin_type': 'flag-generator',
+            'prompt': (
+                'Build a deterministic SSH credential generator.\n'
+                'Runtime inputs: seed (required), token (required, sensitive).\n'
+                'Artifact outputs: Flag(flag_id), Credential(user,password), File(path).\n'
+                'Include inject_files with File(path).\n'
+                'Hint templates: Next: SSH using {{OUTPUT.Credential(user,password)}}.'
+            ),
+            'intent_overrides': {
+                'runtime_inputs': 'seed (required)\nnode_name (required)',
+                'produces': 'Flag(flag_id)\nCredential(user)',
+                'inject_files': 'Credential(user)',
+                'hint_templates': 'Next: use {{OUTPUT.Credential(user)}}',
+                'readme_mentions': 'custom docs',
+            },
+        },
+    )
+
+    assert payload['runtime_inputs'] == [
+        {'name': 'seed', 'type': 'string', 'required': True},
+        {'name': 'node_name', 'type': 'string', 'required': True},
+    ]
+    assert payload['produces'] == ['Flag(flag_id)', 'Credential(user)']
+    assert payload['inject_files'] == ['Credential(user)']
+    assert payload['hint_templates'] == ['Next: use {{OUTPUT.Credential(user)}}']
 
 
 def test_generator_builder_test_runs_remote_core_vm(monkeypatch):
