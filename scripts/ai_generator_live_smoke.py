@@ -58,6 +58,7 @@ def main() -> int:
 
     _require(index_html, '/static/ai_generator_panel.js', source='index')
     _require(index_html, '/static/ai_generator_workflow.js', source='index')
+    _require(index_html, 'aiGeneratorStreamAutoFollowInput', source='index')
 
     providers_payload = json.loads(providers_text)
     if not providers_payload.get('success'):
@@ -72,11 +73,12 @@ def main() -> int:
         raise AssertionError(f'Unexpected provider keys: {sorted(provider_keys)}')
 
     for needle in (
-        'Auto-heal Prompt',
-        'aiGeneratorAutoHealPromptInput',
-        'aiGeneratorAutoHealLeniencyInput',
-        'High: more retries, best-effort fallback',
         'OpenAI-Compatible',
+        'aiGeneratorSaveApiKeyBtn',
+        'aiGeneratorClearApiKeyBtn',
+        'aiGeneratorApiKeyStatus',
+        'Stored securely on the server for your account.',
+        'type="url" class="form-control" id="aiGeneratorBaseUrlInput"',
     ):
         _require(panel_js, needle, source='ai_generator_panel.js')
 

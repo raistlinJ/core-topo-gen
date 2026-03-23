@@ -4,6 +4,7 @@
         outputStarted: false,
         controller: null,
         running: false,
+        autoFollowEvents: true,
         canRetry: false,
         retryAction: null,
         requestId: '',
@@ -88,8 +89,29 @@
         block.className = className;
         block.textContent = text;
         parentEl.appendChild(block);
-        block.scrollTop = block.scrollHeight;
+        if (streamState.autoFollowEvents) {
+            block.scrollTop = block.scrollHeight;
+        }
         return block;
+    }
+
+    function syncAutoFollowToggle() {
+        const toggle = document.getElementById('aiGeneratorStreamAutoFollowInput');
+        if (!toggle) return;
+        toggle.checked = !!streamState.autoFollowEvents;
+    }
+
+    function scrollActivityToBottom() {
+        if (!streamState.autoFollowEvents) return;
+        const eventsEl = document.getElementById('aiGeneratorStreamEvents');
+        if (eventsEl) {
+            eventsEl.scrollTop = eventsEl.scrollHeight;
+            eventsEl.querySelectorAll('.ai-generator-stream-event-live-tail, .ai-generator-stream-event-toggle-body').forEach((el) => {
+                try {
+                    el.scrollTop = el.scrollHeight;
+                } catch (e) { }
+            });
+        }
     }
 
     function bindPayloadToggle(detailsEl, summaryEl) {
@@ -142,6 +164,9 @@
             ? 'ai-generator-stream-event-live-tail ai-generator-stream-event-toggle-body'
             : 'ai-generator-stream-event-toggle-body';
         full.textContent = renderedText;
+        if (streamState.autoFollowEvents) {
+            full.scrollTop = full.scrollHeight;
+        }
         details.appendChild(summary);
         details.appendChild(full);
         bindPayloadToggle(details, summary);
@@ -157,6 +182,16 @@
                 event.stopPropagation();
             }
         });
+        const autoFollowInput = document.getElementById('aiGeneratorStreamAutoFollowInput');
+        if (autoFollowInput) {
+            autoFollowInput.addEventListener('change', () => {
+                streamState.autoFollowEvents = !!autoFollowInput.checked;
+                if (streamState.autoFollowEvents) {
+                    scrollActivityToBottom();
+                }
+            });
+            syncAutoFollowToggle();
+        }
         modalEl.dataset.aiGeneratorGuarded = '1';
     }
 
@@ -208,7 +243,7 @@
             ...(existingEvent.renderOptions || {}),
             initialOpen: !!(detailsEl && detailsEl.open),
         });
-        eventsEl.scrollTop = eventsEl.scrollHeight;
+        scrollActivityToBottom();
     }
 
     function appendEvent(title, body = '', tone = 'default', options = {}) {
@@ -237,7 +272,7 @@
                     mergeKey,
                     renderOptions: options || {},
                 };
-                eventsEl.scrollTop = eventsEl.scrollHeight;
+                scrollActivityToBottom();
                 updateButtons();
                 return;
             }
@@ -257,7 +292,7 @@
         item.appendChild(bodyEl);
         eventsEl.appendChild(item);
         streamState.events.push({ title: title || 'Update', body: body || '', tone: tone || 'default', mergeKey, renderOptions: options || {} });
-        eventsEl.scrollTop = eventsEl.scrollHeight;
+        scrollActivityToBottom();
         updateButtons();
     }
 
@@ -383,6 +418,7 @@
         streamState.outputStarted = false;
         streamState.controller = null;
         streamState.running = false;
+        streamState.autoFollowEvents = true;
         streamState.canRetry = false;
         streamState.requestId = '';
         streamState.outputText = '';
@@ -397,6 +433,7 @@
         }
         if (outputEl) outputEl.textContent = '';
         if (eventsEl) eventsEl.innerHTML = '';
+        syncAutoFollowToggle();
         renderOutput();
         setStatus('Preparing request...', 'Connecting to the backend stream.', 'primary');
         appendEvent('Starting', 'Opening generation stream.');

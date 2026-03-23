@@ -3,6 +3,7 @@ from pathlib import Path
 
 AI_PANEL_PATH = Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_panel.js"
 INDEX_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "webapp" / "templates" / "index.html"
+AI_STREAM_PATH = Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_stream.js"
 
 
 def test_ai_generator_panel_uses_provider_catalog_instead_of_hardcoded_dropdown() -> None:
@@ -28,10 +29,15 @@ def test_ai_generator_panel_renders_openai_compatible_controls_from_catalog_back
     expected_snippets = [
         "provider === 'litellm'",
         'id="aiGeneratorApiKeyInput"',
+        'id="aiGeneratorSaveApiKeyBtn"',
+        'id="aiGeneratorClearApiKeyBtn"',
+        'id="aiGeneratorApiKeyStatus"',
         'id="aiGeneratorEnforceSslInput"',
         "supportsBridge: true",
         'reachable and MCP tools ready',
         'When on, the OpenAI-compatible base URL must use <strong>https</strong>',
+        'Stored securely on the server for your account.',
+        'Connect fetches models from',
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
@@ -63,6 +69,18 @@ def test_ai_generator_panel_keeps_mcp_tooling_available_for_openai_compatible_pr
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing OpenAI-compatible MCP tool UI snippets in AI Generator panel: " + "; ".join(missing)
+
+
+def test_ai_generator_panel_no_longer_shows_fetch_models_button() -> None:
+    text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    removed_snippets = [
+        'id="aiGeneratorFetchModelsBtn"',
+        'Fetch Models',
+    ]
+
+    present = [snippet for snippet in removed_snippets if snippet in text]
+    assert not present, "Fetch-models button should be removed from AI Generator Provider Config: " + "; ".join(present)
 
 
 def test_ai_generator_workflow_blocks_bridge_generation_without_enabled_tools() -> None:
@@ -108,6 +126,38 @@ def test_ai_generator_panel_renders_validated_vulnerability_warning_block() -> N
     assert not missing, "Missing AI Generator validated-vulnerability warning UI snippets: " + "; ".join(missing)
 
 
+def test_ai_generator_panel_uses_url_field_for_provider_base_url_and_disables_password_manager_hints() -> None:
+    text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'type="url" class="form-control" id="aiGeneratorBaseUrlInput"',
+        'autocomplete="url"',
+        'autocapitalize="off"',
+        'spellcheck="false"',
+        'autocomplete="new-password"',
+        'data-lpignore="true"',
+        'data-1p-ignore="true"',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator URL/API-key field hardening snippets: " + "; ".join(missing)
+
+
+def test_index_ai_generator_state_strips_api_key_from_persisted_storage() -> None:
+    text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const AI_PROVIDER_SECRET_CACHE = window.CORETG_AI_PROVIDER_SECRET_CACHE || {};",
+        "sanitized.api_key = '';",
+        "has_stored_api_key: false,",
+        "api_key_status_loaded: false,",
+        "localMap[key] = sanitizedState;",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator secure API-key persistence snippets in index template: " + "; ".join(missing)
+
+
 def test_index_bootstrap_tracks_ai_generator_warning_state() -> None:
     text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 
@@ -118,6 +168,34 @@ def test_index_bootstrap_tracks_ai_generator_warning_state() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Missing AI Generator warning bootstrap state snippets in index template: " + "; ".join(missing)
+
+
+def test_index_stream_modal_exposes_activity_auto_follow_toggle() -> None:
+    text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'aiGeneratorStreamAutoFollowInput',
+        'Auto-follow',
+        'ai-generator-stream-panel-toggle',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator activity auto-follow toggle snippets in index template: " + "; ".join(missing)
+
+
+def test_ai_generator_stream_defaults_activity_auto_follow_on() -> None:
+    text = AI_STREAM_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'autoFollowEvents: true,',
+        'function syncAutoFollowToggle() {',
+        'function scrollActivityToBottom() {',
+        "const autoFollowInput = document.getElementById('aiGeneratorStreamAutoFollowInput');",
+        'if (streamState.autoFollowEvents) {',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator activity auto-follow stream snippets: " + "; ".join(missing)
 
 
 

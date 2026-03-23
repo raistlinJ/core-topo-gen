@@ -10242,6 +10242,160 @@ def _delete_core_credentials(identifier: str) -> bool:
     return False
 
 
+def _ai_provider_secret_dir() -> str:
+    base = _secrets_base_dir()
+    provider_dir = os.path.join(base, 'ai-provider')
+    return _ensure_private_dir(provider_dir)
+
+
+def _ai_provider_secret_key_path() -> str:
+    return os.path.join(_ai_provider_secret_dir(), '.key')
+
+
+def _load_or_create_ai_provider_key() -> bytes:
+    if Fernet is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('cryptography package is required for secure AI provider credential storage')
+    env_key = os.environ.get('AI_PROVIDER_SECRET_KEY')
+    if env_key:
+        key_bytes = env_key.encode('utf-8')
+        try:
+            Fernet(key_bytes)
+            return key_bytes
+        except Exception as exc:  # pragma: no cover - misconfigured env
+            logging.getLogger(__name__).warning('Invalid AI_PROVIDER_SECRET_KEY provided: %s', exc)
+    key_path = _ai_provider_secret_key_path()
+    if os.path.exists(key_path):
+        try:
+            with open(key_path, 'rb') as fh:
+                key_bytes = fh.read().strip()
+            if key_bytes:
+                Fernet(key_bytes)
+                return key_bytes
+        except Exception:
+            logging.getLogger(__name__).warning('Existing AI provider secret key invalid; regenerating')
+    key_bytes = Fernet.generate_key()
+    tmp_path = key_path + '.tmp'
+    with open(tmp_path, 'wb') as fh:
+        fh.write(key_bytes)
+    os.replace(tmp_path, key_path)
+    _ensure_private_file(key_path)
+    return key_bytes
+
+
+def _get_ai_provider_cipher():
+    if Fernet is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('cryptography package is required for secure AI provider credential storage')
+    key = _load_or_create_ai_provider_key()
+    return Fernet(key)
+
+
+def _derive_ai_provider_identifier(username: str, provider: str) -> str:
+    user_slug = _sanitize_secret_slug(username or '', 'user')
+    provider_slug = _sanitize_secret_slug(provider or '', 'provider')
+    fingerprint_src = f'{username}|{provider}'
+    fingerprint = hashlib.sha256(fingerprint_src.encode('utf-8', 'ignore')).hexdigest()[:12]
+    return f'{user_slug}-{provider_slug}-{fingerprint}'
+
+
+def _save_ai_provider_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cipher = _get_ai_provider_cipher()
+    username = str(payload.get('username') or '').strip()
+    provider = str(payload.get('provider') or '').strip().lower()
+    api_key_raw = payload.get('api_key') or ''
+    if not isinstance(api_key_raw, str):
+        api_key_raw = str(api_key_raw)
+    api_key = api_key_raw.strip()
+    if not username:
+        raise ValueError('username is required to persist AI provider credentials')
+    if not provider:
+        raise ValueError('provider is required to persist AI provider credentials')
+    if not api_key:
+        raise ValueError('api_key is required to persist AI provider credentials')
+    identifier = _derive_ai_provider_identifier(username, provider)
+    encrypted_api_key = cipher.encrypt(api_key.encode('utf-8')).decode('utf-8')
+    record = {
+        'identifier': identifier,
+        'username': username,
+        'provider': provider,
+        'api_key': encrypted_api_key,
+        'stored_at': _local_timestamp_display(),
+    }
+    path = os.path.join(_ai_provider_secret_dir(), f'{identifier}.json')
+    tmp_path = path + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(record, fh, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(f'Failed to persist AI provider credentials at {path}: {exc}') from exc
+    _ensure_private_file(path)
+    return {
+        'identifier': identifier,
+        'username': username,
+        'provider': provider,
+        'stored_at': record['stored_at'],
+    }
+
+
+def _load_ai_provider_credentials(identifier: str) -> Optional[Dict[str, Any]]:
+    path = os.path.join(_ai_provider_secret_dir(), f'{identifier}.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        cipher = _get_ai_provider_cipher()
+        encrypted = data.get('api_key')
+        api_key_plain = ''
+        if isinstance(encrypted, str) and encrypted:
+            try:
+                api_key_plain = cipher.decrypt(encrypted.encode('utf-8')).decode('utf-8')
+            except InvalidToken:
+                api_key_plain = ''
+        data['api_key_plain'] = api_key_plain
+        return data
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to load AI provider credentials for %s', identifier)
+        return None
+
+
+def _load_ai_provider_credentials_for_user(username: str, provider: str) -> Optional[Dict[str, Any]]:
+    username_text = str(username or '').strip()
+    provider_text = str(provider or '').strip().lower()
+    if not username_text or not provider_text:
+        return None
+    identifier = _derive_ai_provider_identifier(username_text, provider_text)
+    return _load_ai_provider_credentials(identifier)
+
+
+def _delete_ai_provider_credentials(identifier: str) -> bool:
+    if not isinstance(identifier, str) or not identifier.strip():
+        return False
+    path = os.path.join(_ai_provider_secret_dir(), f'{identifier}.json')
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to delete AI provider credentials for %s', identifier)
+        raise
+    return False
+
+
+def _delete_ai_provider_credentials_for_user(username: str, provider: str) -> bool:
+    username_text = str(username or '').strip()
+    provider_text = str(provider or '').strip().lower()
+    if not username_text or not provider_text:
+        return False
+    identifier = _derive_ai_provider_identifier(username_text, provider_text)
+    return _delete_ai_provider_credentials(identifier)
+
+
 def _connect_proxmox_from_secret(identifier: str, *, timeout: float = 8.0) -> tuple[Any, Dict[str, Any]]:
     if ProxmoxAPI is None:  # pragma: no cover - dependency missing
         raise RuntimeError('Proxmox integration unavailable: install proxmoxer package')
@@ -38319,6 +38473,10 @@ try:
 
     _ai_provider_routes.register(
         app,
+        current_user_getter=lambda: _current_user(),
+        save_ai_provider_credentials=lambda payload: _save_ai_provider_credentials(payload),
+        load_ai_provider_credentials_for_user=lambda username, provider: _load_ai_provider_credentials_for_user(username, provider),
+        delete_ai_provider_credentials_for_user=lambda username, provider: _delete_ai_provider_credentials_for_user(username, provider),
         logger=app.logger,
     )
 except Exception:
@@ -38332,6 +38490,10 @@ try:
 
     _ai_provider_routes.register(
         app,
+        current_user_getter=lambda: _current_user(),
+        save_ai_provider_credentials=lambda payload: _save_ai_provider_credentials(payload),
+        load_ai_provider_credentials_for_user=lambda username, provider: _load_ai_provider_credentials_for_user(username, provider),
+        delete_ai_provider_credentials_for_user=lambda username, provider: _delete_ai_provider_credentials_for_user(username, provider),
         logger=app.logger,
     )
 except Exception:

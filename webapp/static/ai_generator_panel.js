@@ -118,6 +118,51 @@
             return parts.join(', ');
         }
 
+        async function fetchStoredApiKeyStatus(provider) {
+            const resp = await fetch('/api/ai/provider/credential/status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ provider }),
+            });
+            let data = null;
+            try { data = await resp.json(); } catch (err) { data = null; }
+            if (!resp.ok || !data || data.success === false) {
+                throw new Error((data && (data.error || data.message)) || `Credential status failed (HTTP ${resp.status})`);
+            }
+            return data;
+        }
+
+        async function saveStoredApiKey(provider, apiKey) {
+            const resp = await fetch('/api/ai/provider/credential/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ provider, api_key: apiKey }),
+            });
+            let data = null;
+            try { data = await resp.json(); } catch (err) { data = null; }
+            if (!resp.ok || !data || data.success === false) {
+                throw new Error((data && (data.error || data.message)) || `Secure API key save failed (HTTP ${resp.status})`);
+            }
+            return data;
+        }
+
+        async function clearStoredApiKey(provider) {
+            const resp = await fetch('/api/ai/provider/credential/clear', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ provider }),
+            });
+            let data = null;
+            try { data = await resp.json(); } catch (err) { data = null; }
+            if (!resp.ok || !data || data.success === false) {
+                throw new Error((data && (data.error || data.message)) || `Secure API key clear failed (HTTP ${resp.status})`);
+            }
+            return data;
+        }
+
         function renderAiGeneratorPanel() {
             const root = document.getElementById('aiGeneratorRoot');
             if (!root) return;
@@ -173,6 +218,43 @@
             const providerMeta = resolveProviderMeta(provider, providerEntries);
             const supportsBridge = !!providerMeta.supportsBridge;
             const providerLabel = providerMeta.label;
+            const usesSecureApiKeyStorage = provider === 'litellm';
+            const hasStoredApiKey = !!aiState.has_stored_api_key;
+            const apiKeyStoredAt = (aiState.api_key_stored_at || '').toString().trim();
+            const apiKeyStatusLoaded = aiState.api_key_status_loaded === true && aiState.api_key_status_provider === provider;
+            const apiKeyStatusLoading = usesSecureApiKeyStorage && aiState.api_key_status_loading === true && aiState.api_key_status_provider === provider;
+            if (usesSecureApiKeyStorage && !apiKeyStatusLoaded && !apiKeyStatusLoading) {
+                deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                    api_key_status_loading: true,
+                    api_key_status_loaded: false,
+                    api_key_status_provider: provider,
+                });
+                fetchStoredApiKeyStatus(provider).then((status) => {
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        has_stored_api_key: !!status.has_api_key,
+                        api_key_secret_id: status.identifier || null,
+                        api_key_stored_at: status.stored_at || null,
+                        api_key_status_loaded: true,
+                        api_key_status_loading: false,
+                        api_key_status_provider: provider,
+                    });
+                    renderAiGeneratorPanel();
+                }).catch((err) => {
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        has_stored_api_key: false,
+                        api_key_secret_id: null,
+                        api_key_stored_at: null,
+                        api_key_status_loaded: true,
+                        api_key_status_loading: false,
+                        api_key_status_provider: provider,
+                        validation: {
+                            ...validation,
+                            message: err && err.message ? String(err.message) : 'Failed to load secure API key status.',
+                        },
+                    });
+                    renderAiGeneratorPanel();
+                });
+            }
             const connectionActionLabel = isCheckingValidation ? 'Connecting...' : (isValidated ? 'Refresh Connection' : 'Connect');
             const connectionStatus = (() => {
                 if (isCheckingValidation) {
@@ -319,8 +401,13 @@
                 ? `
                                 <div class="mb-3">
                                     <label class="form-label">API Key <span class="text-muted">(optional)</span></label>
-                                    <input type="password" class="form-control" id="aiGeneratorApiKeyInput" value="${escapeHtml(aiState.api_key || '')}" placeholder="sk-...">
-                                    <div class="form-text">Sent as a Bearer token when provided. It is kept in browser-local AI Generator state and not written into scenario XML.</div>
+                                    <input type="password" class="form-control" id="aiGeneratorApiKeyInput" value="${escapeHtml(aiState.api_key || '')}" placeholder="${hasStoredApiKey ? 'Stored securely. Enter a new key to replace it.' : 'sk-...'}" autocomplete="new-password" data-lpignore="true" data-1p-ignore="true" spellcheck="false">
+                                    <div class="d-flex align-items-center gap-2 mt-2 flex-wrap">
+                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="aiGeneratorSaveApiKeyBtn">${hasStoredApiKey ? 'Update Key' : 'Save Key'}</button>
+                                        <button type="button" class="btn btn-outline-secondary btn-sm ${hasStoredApiKey ? '' : 'd-none'}" id="aiGeneratorClearApiKeyBtn">Clear Stored Key</button>
+                                        <span class="small ${hasStoredApiKey ? 'text-success' : 'text-muted'}" id="aiGeneratorApiKeyStatus">${apiKeyStatusLoading ? 'Checking secure key status...' : (hasStoredApiKey ? `API key stored securely${apiKeyStoredAt ? ` • ${escapeHtml(apiKeyStoredAt)}` : ''}` : 'No API key stored securely yet.')}</span>
+                                    </div>
+                                    <div class="form-text">Stored securely on the server for your account. Leave the field blank to keep the current saved key. The base URL is not stored securely.</div>
                                 </div>
                                 <div class="form-check form-switch mb-3">
                                     <input class="form-check-input" type="checkbox" role="switch" id="aiGeneratorEnforceSslInput" ${aiState.enforce_ssl === false ? '' : 'checked'}>
@@ -353,15 +440,12 @@
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label">${escapeHtml(providerMeta.baseUrlLabel)}</label>
-                                    <input type="text" class="form-control" id="aiGeneratorBaseUrlInput" value="${escapeHtml(aiState.base_url || '')}" placeholder="${escapeHtml(providerMeta.baseUrlPlaceholder)}">
+                                    <input type="url" class="form-control" id="aiGeneratorBaseUrlInput" value="${escapeHtml(aiState.base_url || '')}" placeholder="${escapeHtml(providerMeta.baseUrlPlaceholder)}" autocomplete="url" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url">
                                 </div>
                                 ${directProviderFields}
                                 <div class="mb-3">
                                     <label class="form-label">LLM Model</label>
-                                    <div class="d-flex gap-2 align-items-center mb-2">
-                                        <button type="button" class="btn btn-outline-secondary btn-sm" id="aiGeneratorFetchModelsBtn">Fetch Models</button>
-                                        <div class="small text-muted">${supportsBridge ? `Refreshes models from ${escapeHtml(providerLabel)} only. Use Connect to validate MCP bridge discovery.` : `Refreshes models from ${escapeHtml(providerLabel)} using the configured base URL and optional API key.`}</div>
-                                    </div>
+                                    <div class="small text-muted mb-2">${supportsBridge ? `Connect fetches models from ${escapeHtml(providerLabel)} and then validates MCP bridge discovery.` : `Connect fetches models from ${escapeHtml(providerLabel)} using the configured base URL and optional API key.`}</div>
                                     <select class="form-select" id="aiGeneratorModelSelect">${modelOptions}</select>
                                 </div>
                                 ${bridgeMarkup}
@@ -442,12 +526,13 @@
             const mcpServerUrlInput = document.getElementById('aiGeneratorMcpServerUrlInput');
             const serversJsonInput = document.getElementById('aiGeneratorServersJsonInput');
             const apiKeyInput = document.getElementById('aiGeneratorApiKeyInput');
+            const saveApiKeyBtn = document.getElementById('aiGeneratorSaveApiKeyBtn');
+            const clearApiKeyBtn = document.getElementById('aiGeneratorClearApiKeyBtn');
             const enforceSslInput = document.getElementById('aiGeneratorEnforceSslInput');
             const autoDiscoveryInput = document.getElementById('aiGeneratorAutoDiscoveryInput');
             const hilEnabledInput = document.getElementById('aiGeneratorHilEnabledInput');
             const autoHealPromptInput = document.getElementById('aiGeneratorAutoHealPromptInput');
             const autoHealLeniencyInput = document.getElementById('aiGeneratorAutoHealLeniencyInput');
-            const fetchModelsBtn = document.getElementById('aiGeneratorFetchModelsBtn');
             const promptInput = document.getElementById('aiGeneratorPromptInput');
             const validateBtn = document.getElementById('aiGeneratorValidateBtn');
             const buildPacketBtn = document.getElementById('aiGeneratorBuildPacketBtn');
@@ -464,6 +549,9 @@
                         provider: nextProvider,
                         base_url: shouldResetBaseUrl ? nextMeta.defaultBaseUrl : currentBaseUrl,
                         enforce_ssl: nextProvider === 'litellm' ? true : aiState.enforce_ssl,
+                        api_key_status_loaded: false,
+                        api_key_status_loading: false,
+                        api_key_status_provider: nextProvider,
                         validation: resetValidation(),
                     });
                     renderAiGeneratorPanel();
@@ -480,6 +568,94 @@
             if (apiKeyInput) {
                 apiKeyInput.addEventListener('input', () => {
                     deps.persistAiGeneratorStateForScenario(scenario, idx, { api_key: apiKeyInput.value, validation: resetValidation() });
+                });
+                apiKeyInput.addEventListener('change', async () => {
+                    const nextValue = String(apiKeyInput.value || '').trim();
+                    if (!nextValue) return;
+                    try {
+                        const stored = await saveStoredApiKey(provider, nextValue);
+                        deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                            api_key: '',
+                            has_stored_api_key: true,
+                            api_key_secret_id: stored.identifier || null,
+                            api_key_stored_at: stored.stored_at || null,
+                            api_key_status_loaded: true,
+                            api_key_status_loading: false,
+                            api_key_status_provider: provider,
+                        });
+                        if (typeof window.showToast === 'function') {
+                            window.showToast('API key stored securely.', { force: true, title: 'AI Generator', autohide: true, delay: 2500 });
+                        }
+                        renderAiGeneratorPanel();
+                    } catch (err) {
+                        deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                            validation: {
+                                ...validation,
+                                message: err && err.message ? String(err.message) : 'Failed to store API key securely.',
+                            },
+                        });
+                        renderAiGeneratorPanel();
+                    }
+                });
+            }
+            if (saveApiKeyBtn && apiKeyInput) {
+                saveApiKeyBtn.addEventListener('click', async () => {
+                    const nextValue = String(apiKeyInput.value || '').trim();
+                    if (!nextValue) return;
+                    saveApiKeyBtn.disabled = true;
+                    try {
+                        const stored = await saveStoredApiKey(provider, nextValue);
+                        deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                            api_key: '',
+                            has_stored_api_key: true,
+                            api_key_secret_id: stored.identifier || null,
+                            api_key_stored_at: stored.stored_at || null,
+                            api_key_status_loaded: true,
+                            api_key_status_loading: false,
+                            api_key_status_provider: provider,
+                        });
+                        if (typeof window.showToast === 'function') {
+                            window.showToast('API key stored securely.', { force: true, title: 'AI Generator', autohide: true, delay: 2500 });
+                        }
+                        renderAiGeneratorPanel();
+                    } catch (err) {
+                        deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                            validation: {
+                                ...validation,
+                                message: err && err.message ? String(err.message) : 'Failed to store API key securely.',
+                            },
+                        });
+                        renderAiGeneratorPanel();
+                    }
+                });
+            }
+            if (clearApiKeyBtn) {
+                clearApiKeyBtn.addEventListener('click', async () => {
+                    clearApiKeyBtn.disabled = true;
+                    try {
+                        await clearStoredApiKey(provider);
+                        deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                            api_key: '',
+                            has_stored_api_key: false,
+                            api_key_secret_id: null,
+                            api_key_stored_at: null,
+                            api_key_status_loaded: true,
+                            api_key_status_loading: false,
+                            api_key_status_provider: provider,
+                        });
+                        if (typeof window.showToast === 'function') {
+                            window.showToast('Stored API key cleared.', { force: true, title: 'AI Generator', autohide: true, delay: 2500 });
+                        }
+                        renderAiGeneratorPanel();
+                    } catch (err) {
+                        deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                            validation: {
+                                ...validation,
+                                message: err && err.message ? String(err.message) : 'Failed to clear stored API key.',
+                            },
+                        });
+                        renderAiGeneratorPanel();
+                    }
                 });
             }
             if (enforceSslInput) {
@@ -564,11 +740,6 @@
             if (validateBtn) {
                 validateBtn.addEventListener('click', () => {
                     deps.validateAiGeneratorConfig();
-                });
-            }
-            if (fetchModelsBtn) {
-                fetchModelsBtn.addEventListener('click', () => {
-                    deps.fetchAiGeneratorModels();
                 });
             }
             if (buildPacketBtn) {

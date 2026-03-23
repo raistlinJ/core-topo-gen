@@ -777,6 +777,10 @@
                     <div class="ai-generator-stream-panel">
                         <div class="ai-generator-stream-panel-header ai-generator-stream-panel-header-row">
                             <span>Activity</span>
+                            <label class="ai-generator-stream-panel-toggle" for="aiGeneratorStreamAutoFollowInput">
+                                <input type="checkbox" class="form-check-input mt-0" id="aiGeneratorStreamAutoFollowInput" checked>
+                                <span>Auto-follow</span>
+                            </label>
                         </div>
                         <div id="aiGeneratorStreamEvents"></div>
                     </div>
@@ -5049,7 +5053,9 @@
 
     function stripSensitiveAiGeneratorState(nextState) {
         if (!nextState || typeof nextState !== 'object') return nextState;
-        return { ...nextState };
+        const sanitized = { ...nextState };
+        sanitized.api_key = '';
+        return sanitized;
     }
 
     function getDefaultAiProviderCatalog() {
@@ -5160,6 +5166,12 @@
             auto_heal_leniency: 'medium',
             base_url: 'http://127.0.0.1:11434',
             api_key: '',
+            has_stored_api_key: false,
+            api_key_secret_id: null,
+            api_key_stored_at: null,
+            api_key_status_loaded: false,
+            api_key_status_loading: false,
+            api_key_status_provider: '',
             enforce_ssl: true,
             model: '',
             mcp_server_path: 'MCP/server.py',
@@ -5200,6 +5212,9 @@
     function saveAiGeneratorStateMap(nextMap) {
         writeJsonToLocalStorage(AI_GENERATOR_STATE_STORAGE_KEY, nextMap || {});
     }
+
+    const AI_PROVIDER_SECRET_CACHE = window.CORETG_AI_PROVIDER_SECRET_CACHE || {};
+    window.CORETG_AI_PROVIDER_SECRET_CACHE = AI_PROVIDER_SECRET_CACHE;
 
     function normalizeAiBridgeMode(rawValue) {
         const text = String(rawValue || '').trim().toLowerCase();
@@ -5244,6 +5259,14 @@
                 ...scenarioValidation,
             },
         };
+        const providerKey = String(merged.provider || defaults.provider || 'ollama').trim().toLowerCase() || 'ollama';
+        merged.provider = providerKey;
+        const mergedApiKey = typeof merged.api_key === 'string' ? merged.api_key.trim() : '';
+        if (mergedApiKey) {
+            AI_PROVIDER_SECRET_CACHE[providerKey] = mergedApiKey;
+        }
+        const cachedApiKey = String(AI_PROVIDER_SECRET_CACHE[providerKey] || '').trim();
+        merged.api_key = cachedApiKey || mergedApiKey;
         const messageText = String(merged.validation.message || '').trim();
         const hasExplicitBridgeFlag = Object.prototype.hasOwnProperty.call(localValidation, 'bridge_ok') || Object.prototype.hasOwnProperty.call(scenarioValidation, 'bridge_ok');
         const hasExplicitOllamaFlag = Object.prototype.hasOwnProperty.call(localValidation, 'ollama_ok') || Object.prototype.hasOwnProperty.call(scenarioValidation, 'ollama_ok');
@@ -5323,10 +5346,18 @@
         next.auto_heal_leniency = normalizeAiAutoHealLeniency(next.auto_heal_leniency || 'medium');
         next.enforce_ssl = next.enforce_ssl === false ? false : true;
         if (typeof next.api_key !== 'string') next.api_key = '';
-        scenario.ai_generator = stripSensitiveAiGeneratorState(next);
+        const providerKey = String(next.provider || current.provider || 'ollama').trim().toLowerCase() || 'ollama';
+        next.provider = providerKey;
+        if (next.api_key.trim()) {
+            AI_PROVIDER_SECRET_CACHE[providerKey] = next.api_key.trim();
+        } else if (partialState && Object.prototype.hasOwnProperty.call(partialState, 'api_key')) {
+            delete AI_PROVIDER_SECRET_CACHE[providerKey];
+        }
+        const sanitizedState = stripSensitiveAiGeneratorState(next);
+        scenario.ai_generator = sanitizedState;
         const localMap = loadAiGeneratorStateMap();
         for (const key of getAiGeneratorScenarioKeys(scenario, idx)) {
-            localMap[key] = next;
+            localMap[key] = sanitizedState;
         }
         saveAiGeneratorStateMap(localMap);
         try { persistUserScopedUiPrefsSoon(); } catch (err) { }

@@ -5725,11 +5725,70 @@ def _get_provider_adapter(provider: Any) -> ProviderAdapter:
     return adapter
 
 
-def register(app, *, logger=None) -> None:
+def register(
+    app,
+    *,
+    current_user_getter: Callable[[], dict[str, Any] | None] | None = None,
+    save_ai_provider_credentials: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    load_ai_provider_credentials_for_user: Callable[[str, str], dict[str, Any] | None] | None = None,
+    delete_ai_provider_credentials_for_user: Callable[[str, str], bool] | None = None,
+    logger=None,
+) -> None:
     if not begin_route_registration(app, 'ai_provider_routes'):
         return
 
     log = logger or getattr(app, 'logger', None)
+
+    def _current_username() -> str:
+        try:
+            current = current_user_getter() if callable(current_user_getter) else None
+        except Exception:
+            current = None
+        if not isinstance(current, dict):
+            return 'default-user'
+        return str(current.get('username') or '').strip() or 'default-user'
+
+    def _stored_ai_provider_record(provider: Any) -> dict[str, Any] | None:
+        username = _current_username()
+        provider_key = str(provider or '').strip().lower()
+        if not username or not provider_key or not callable(load_ai_provider_credentials_for_user):
+            return None
+        try:
+            return load_ai_provider_credentials_for_user(username, provider_key)
+        except Exception:
+            if log is not None:
+                log.exception('[ai-provider] failed to load stored API key metadata for %s/%s', username, provider_key)
+            return None
+
+    def _resolve_payload_with_stored_api_key(payload: dict[str, Any]) -> dict[str, Any]:
+        resolved = dict(payload or {})
+        provider_key = str(resolved.get('provider') or '').strip().lower()
+        api_key = str(resolved.get('api_key') or '').strip()
+        if api_key:
+            if callable(save_ai_provider_credentials):
+                username = _current_username()
+                if username:
+                    try:
+                        stored_meta = save_ai_provider_credentials({
+                            'username': username,
+                            'provider': provider_key,
+                            'api_key': api_key,
+                        })
+                        if isinstance(stored_meta, dict):
+                            resolved['api_key_secret_id'] = stored_meta.get('identifier')
+                            resolved['has_stored_api_key'] = True
+                            resolved['api_key_stored_at'] = stored_meta.get('stored_at')
+                    except Exception:
+                        if log is not None:
+                            log.exception('[ai-provider] failed to persist API key for %s/%s', username, provider_key)
+            return resolved
+        stored_record = _stored_ai_provider_record(provider_key)
+        if stored_record:
+            resolved['api_key'] = str(stored_record.get('api_key_plain') or '').strip()
+            resolved['api_key_secret_id'] = stored_record.get('identifier')
+            resolved['has_stored_api_key'] = True
+            resolved['api_key_stored_at'] = stored_record.get('stored_at')
+        return resolved
 
     @app.route('/api/ai/download_transcript', methods=['POST'])
     def api_ai_download_transcript():
@@ -5766,17 +5825,88 @@ def register(app, *, logger=None) -> None:
             'checked_at': _utc_timestamp(),
         })
 
+    @app.route('/api/ai/provider/credential/status', methods=['POST'])
+    def api_ai_provider_credential_status():
+        payload = request.get_json(silent=True) or {}
+        provider_key = str(payload.get('provider') or '').strip().lower()
+        if not provider_key:
+            return jsonify({'success': False, 'error': 'provider is required.'}), 400
+        stored_record = _stored_ai_provider_record(provider_key)
+        return jsonify({
+            'success': True,
+            'provider': provider_key,
+            'has_api_key': bool(stored_record and str(stored_record.get('api_key_plain') or '').strip()),
+            'identifier': stored_record.get('identifier') if stored_record else None,
+            'stored_at': stored_record.get('stored_at') if stored_record else None,
+        })
+
+    @app.route('/api/ai/provider/credential/save', methods=['POST'])
+    def api_ai_provider_credential_save():
+        payload = request.get_json(silent=True) or {}
+        provider_key = str(payload.get('provider') or '').strip().lower()
+        api_key = str(payload.get('api_key') or '').strip()
+        username = _current_username()
+        if not provider_key:
+            return jsonify({'success': False, 'error': 'provider is required.'}), 400
+        if not api_key:
+            return jsonify({'success': False, 'error': 'api_key is required.'}), 400
+        if not callable(save_ai_provider_credentials):
+            return jsonify({'success': False, 'error': 'Secure API key storage is not available.'}), 500
+        try:
+            stored_meta = save_ai_provider_credentials({
+                'username': username,
+                'provider': provider_key,
+                'api_key': api_key,
+            })
+        except Exception as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 500
+        return jsonify({
+            'success': True,
+            'provider': provider_key,
+            'identifier': stored_meta.get('identifier'),
+            'stored_at': stored_meta.get('stored_at'),
+            'has_api_key': True,
+        })
+
+    @app.route('/api/ai/provider/credential/clear', methods=['POST'])
+    def api_ai_provider_credential_clear():
+        payload = request.get_json(silent=True) or {}
+        provider_key = str(payload.get('provider') or '').strip().lower()
+        username = _current_username()
+        if not provider_key:
+            return jsonify({'success': False, 'error': 'provider is required.'}), 400
+        if not callable(delete_ai_provider_credentials_for_user):
+            return jsonify({'success': False, 'error': 'Secure API key storage is not available.'}), 500
+        try:
+            removed = bool(delete_ai_provider_credentials_for_user(username, provider_key))
+        except Exception as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 500
+        return jsonify({
+            'success': True,
+            'provider': provider_key,
+            'removed': removed,
+            'has_api_key': False,
+        })
+
     @app.route('/api/ai/provider/validate', methods=['POST'])
     def api_ai_provider_validate():
-        payload = request.get_json(silent=True) or {}
+        payload = _resolve_payload_with_stored_api_key(request.get_json(silent=True) or {})
         try:
             adapter = _get_provider_adapter(payload.get('provider'))
             response = adapter.validate(payload, log=log)
             skip_bridge = bool(payload.get('skip_bridge'))
             if _should_use_mcp_bridge_for_request(adapter, payload, skip_bridge=skip_bridge):
+                bridge_model = str(response.get('model') or payload.get('model') or '').strip()
+                if not bridge_model:
+                    response_models = response.get('models') if isinstance(response.get('models'), list) else []
+                    for entry in response_models:
+                        model_name = str(entry or '').strip()
+                        if model_name:
+                            bridge_model = model_name
+                            break
                 bridge = asyncio.run(_mcp_bridge_discover(
                     payload,
-                    model=str(response.get('model') or payload.get('model') or '').strip() or 'qwen2.5:7b',
+                    model=bridge_model or 'qwen2.5:7b',
                     host=str(response.get('base_url') or payload.get('base_url') or '').strip(),
                 ))
                 response['bridge'] = bridge
@@ -5792,7 +5922,7 @@ def register(app, *, logger=None) -> None:
 
     @app.route('/api/ai/generate_scenario_preview', methods=['POST'])
     def api_ai_generate_scenario_preview():
-        payload = request.get_json(silent=True) or {}
+        payload = _resolve_payload_with_stored_api_key(request.get_json(silent=True) or {})
         try:
             adapter = _get_provider_adapter(payload.get('provider'))
         except ProviderAdapterError as exc:
@@ -5978,7 +6108,7 @@ def register(app, *, logger=None) -> None:
 
     @app.route('/api/ai/generate_scenario_preview_stream', methods=['POST'])
     def api_ai_generate_scenario_preview_stream():
-        payload = request.get_json(silent=True) or {}
+        payload = _resolve_payload_with_stored_api_key(request.get_json(silent=True) or {})
         try:
             _get_provider_adapter(payload.get('provider'))
         except ProviderAdapterError as exc:
@@ -6203,6 +6333,13 @@ def register(app, *, logger=None) -> None:
 try:
     _app = getattr(app_backend, 'app', None)
     if _app is not None:
-        register(_app, logger=getattr(_app, 'logger', None))
+        register(
+            _app,
+            current_user_getter=lambda: app_backend._current_user(),
+            save_ai_provider_credentials=lambda payload: app_backend._save_ai_provider_credentials(payload),
+            load_ai_provider_credentials_for_user=lambda username, provider: app_backend._load_ai_provider_credentials_for_user(username, provider),
+            delete_ai_provider_credentials_for_user=lambda username, provider: app_backend._delete_ai_provider_credentials_for_user(username, provider),
+            logger=getattr(_app, 'logger', None),
+        )
 except Exception:
     pass

@@ -16,6 +16,12 @@ def _login(client):
     assert resp.status_code in (302, 303)
 
 
+def _configure_secrets_dir(tmp_path, monkeypatch):
+    secrets_dir = tmp_path / 'secrets'
+    monkeypatch.setenv('CORETG_SECRETS_DIR', str(secrets_dir))
+    return secrets_dir
+
+
 def _scenario_payload(name='AiScenario'):
     return {
         'name': name,
@@ -97,6 +103,121 @@ def _fake_openai_compatible_urlopen_factory(*, generated_payload, models=None, e
         return _FakeResponse({'choices': [{'message': {'role': 'assistant', 'content': content}}]})
 
     return fake_urlopen
+
+
+def test_ai_provider_secure_api_key_status_save_and_clear(tmp_path, monkeypatch):
+    _configure_secrets_dir(tmp_path, monkeypatch)
+
+    with app.test_client() as client:
+        _login(client)
+
+        status_before = client.post('/api/ai/provider/credential/status', json={'provider': 'litellm'})
+        assert status_before.status_code == 200
+        assert status_before.get_json()['has_api_key'] is False
+
+        save_resp = client.post('/api/ai/provider/credential/save', json={'provider': 'litellm', 'api_key': 'persist-me'})
+        assert save_resp.status_code == 200
+        save_json = save_resp.get_json()
+        assert save_json['success'] is True
+        assert save_json['has_api_key'] is True
+        assert save_json['identifier']
+
+        status_after = client.post('/api/ai/provider/credential/status', json={'provider': 'litellm'})
+        assert status_after.status_code == 200
+        status_json = status_after.get_json()
+        assert status_json['has_api_key'] is True
+        assert status_json['identifier'] == save_json['identifier']
+
+        clear_resp = client.post('/api/ai/provider/credential/clear', json={'provider': 'litellm'})
+        assert clear_resp.status_code == 200
+        assert clear_resp.get_json()['has_api_key'] is False
+
+        status_cleared = client.post('/api/ai/provider/credential/status', json={'provider': 'litellm'})
+        assert status_cleared.status_code == 200
+        assert status_cleared.get_json()['has_api_key'] is False
+
+
+def test_ai_provider_validate_uses_stored_secure_api_key_when_request_omits_it(tmp_path, monkeypatch):
+    _configure_secrets_dir(tmp_path, monkeypatch)
+    from webapp.routes import ai_provider
+
+    fake_urlopen = _fake_openai_compatible_urlopen_factory(
+        generated_payload={'name': 'ignored'},
+        models=['gpt-4o-mini'],
+        expected_api_key='stored-secret-key',
+    )
+    monkeypatch.setattr(ai_provider, 'urlopen', fake_urlopen)
+    monkeypatch.setattr(ai_provider, 'McpBridgeClient', _FakeMcpBridgeClient)
+
+    with app.test_client() as client:
+        _login(client)
+        save_resp = client.post('/api/ai/provider/credential/save', json={'provider': 'litellm', 'api_key': 'stored-secret-key'})
+        assert save_resp.status_code == 200
+
+        resp = client.post(
+            '/api/ai/provider/validate',
+            json={
+                'provider': 'litellm',
+                'base_url': 'https://litellm.example/v1',
+                'model': 'gpt-4o-mini',
+                'enforce_ssl': True,
+                'skip_bridge': True,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['success'] is True
+
+
+def test_ai_provider_validate_uses_first_discovered_openai_compatible_model_for_bridge_discovery(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    fake_urlopen = _fake_openai_compatible_urlopen_factory(
+        generated_payload={'name': 'ignored'},
+        models=['gpt-4o-mini', 'gpt-4.1-mini'],
+        expected_api_key='test-litellm-key',
+    )
+    monkeypatch.setattr(ai_provider, 'urlopen', fake_urlopen)
+
+    captured = {}
+
+    async def fake_discover(payload, *, model, host):
+        captured['model'] = model
+        captured['host'] = host
+        return {
+            'bridge_mode': 'mcp-python-sdk',
+            'mcp_server_path': 'MCP/server.py',
+            'mcp_server_url': '',
+            'servers_json_path': 'MCP/mcp-bridge-servers.json',
+            'auto_discovery': False,
+            'hil_enabled': False,
+            'tools': [],
+            'enabled_tools': [],
+        }
+
+    monkeypatch.setattr(ai_provider, '_mcp_bridge_discover', fake_discover)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': '',
+            'bridge_mode': 'mcp-python-sdk',
+            'mcp_server_path': 'MCP/server.py',
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+    assert captured.get('model') == 'gpt-4o-mini'
+    assert captured.get('host') == 'https://litellm.example/v1'
 
 
 class _FakeTool:
@@ -1405,6 +1526,7 @@ def test_ai_generate_scenario_preview_canonicalizes_specific_vuln_name_from_matc
 
 
 def test_mcp_bridge_generate_refreshes_preview_from_final_scenario(monkeypatch):
+    from webapp import app_backend as backend
     from webapp.routes import ai_provider
 
     client = _FakeMcpBridgeClient()
@@ -1484,6 +1606,15 @@ def test_mcp_bridge_generate_refreshes_preview_from_final_scenario(monkeypatch):
             'prompt_coverage_retry_used': False,
         }
 
+    monkeypatch.setattr(
+        backend,
+        '_load_backend_vuln_catalog_items',
+        lambda: [{
+            'Name': 'jboss/CVE-2017-12149',
+            'Path': 'https://github.com/vulhub/vulhub/tree/master/jboss/CVE-2017-12149',
+            'Description': 'JBoss Java deserialization',
+        }],
+    )
     monkeypatch.setattr(ai_provider, '_mcp_bridge_connect', fake_connect)
     monkeypatch.setattr(ai_provider, '_apply_mcp_bridge_tool_selection', lambda *_args, **_kwargs: {tool.name: True for tool in client.tool_manager.get_available_tools()})
     monkeypatch.setattr(ai_provider, '_mcp_bridge_call_tool', fake_call_tool)
