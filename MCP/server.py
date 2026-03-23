@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from copy import deepcopy
@@ -21,6 +22,8 @@ from webapp import app_backend
 JSONRPC_VERSION = '2.0'
 PROTOCOL_VERSION = '2025-11-05'
 PROTOCOL_VERSION = '2025-03-26'
+_VULN_CATALOG_JSON_PATH_ENV = 'CORE_TOPO_GEN_VULN_CATALOG_JSON_PATH'
+_VULN_CATALOG_JSON_ENV = 'CORE_TOPO_GEN_VULN_CATALOG_JSON'
 
 
 def _jsonrpc_result(message_id: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -39,6 +42,30 @@ def _jsonrpc_error(message_id: Any, code: int, message: str, data: dict[str, Any
     if data:
         payload['error']['data'] = data
     return payload
+
+
+def _load_vulnerability_catalog_override() -> list[dict[str, str]] | None:
+    raw_path = str(os.environ.get(_VULN_CATALOG_JSON_PATH_ENV) or '').strip()
+    raw_json = str(os.environ.get(_VULN_CATALOG_JSON_ENV) or '').strip()
+
+    payload: Any = None
+    if raw_path:
+        try:
+            with open(raw_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except Exception:
+            return None
+    elif raw_json:
+        try:
+            payload = json.loads(raw_json)
+        except Exception:
+            return None
+    else:
+        return None
+
+    if not isinstance(payload, list):
+        return None
+    return [dict(entry) for entry in payload if isinstance(entry, dict)]
 
 
 @dataclass
@@ -327,7 +354,7 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.search_vulnerability_catalog': MCPTool(
                 name='scenario.search_vulnerability_catalog',
-                description='Search the local vulnerability catalog by free text or type/vector to find concrete vulnerabilities the draft can reference.',
+                description='Search the local vulnerability catalog by free text, catalog metadata, and available README content to find concrete vulnerabilities the draft can reference.',
                 input_schema={
                     'type': 'object',
                     'properties': {
@@ -341,7 +368,7 @@ class ScenarioAuthoringMCPServer:
             ),
             'scenario.add_vulnerability_item': MCPTool(
                 name='scenario.add_vulnerability_item',
-                description='Append exactly one concrete vulnerability item to the draft Vulnerabilities section. Prefer search_vulnerability_catalog first, then pass explicit v_name and v_path from the chosen result, or pass explicit v_type and v_vector for a Type/Vector row. For requests like "3 different vulnerabilities", call this tool three separate times with one vulnerability per call. Do not pass factor.',
+                description='Append exactly one concrete vulnerability item to the draft Vulnerabilities section. Prefer search_vulnerability_catalog first, then pass explicit v_name and v_path from the chosen result. For requests like "3 different vulnerabilities", call this tool three separate times with one vulnerability per call. Do not pass factor.',
                 input_schema={
                     'type': 'object',
                     'properties': {
@@ -1109,8 +1136,80 @@ class ScenarioAuthoringMCPServer:
 
     def _load_vulnerability_catalog(self) -> list[dict[str, str]]:
         if self._vulnerability_catalog is None:
-            self._vulnerability_catalog = list(load_vuln_catalog(ROOT_DIR) or [])
+            override_catalog = _load_vulnerability_catalog_override()
+            if isinstance(override_catalog, list):
+                self._vulnerability_catalog = override_catalog
+            else:
+                self._vulnerability_catalog = list(load_vuln_catalog(ROOT_DIR) or [])
         return self._vulnerability_catalog
+
+    def _find_vulnerability_catalog_readme(self, entry: dict[str, Any]) -> str:
+        raw_path = str(entry.get('Path') or '').strip()
+        if not raw_path:
+            return ''
+        if re.match(r'^https?://', raw_path, re.IGNORECASE):
+            return ''
+        candidate_path = raw_path
+        if os.path.isfile(candidate_path):
+            base_dir = os.path.dirname(candidate_path)
+        elif os.path.isdir(candidate_path):
+            base_dir = candidate_path
+        else:
+            return ''
+        preferred_names = [
+            'README.md',
+            'README.markdown',
+            'README.txt',
+            'README',
+            'readme.md',
+            'readme.markdown',
+            'readme.txt',
+            'readme',
+        ]
+        for name in preferred_names:
+            readme_path = os.path.join(base_dir, name)
+            if os.path.isfile(readme_path):
+                return readme_path
+        try:
+            for name in sorted(os.listdir(base_dir)):
+                lowered = str(name or '').strip().lower()
+                if not lowered.startswith('readme'):
+                    continue
+                readme_path = os.path.join(base_dir, name)
+                if os.path.isfile(readme_path):
+                    return readme_path
+        except Exception:
+            return ''
+        return ''
+
+    def _read_vulnerability_catalog_readme(self, entry: dict[str, Any]) -> str:
+        cache = getattr(self, '_vulnerability_readme_cache', None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._vulnerability_readme_cache = cache
+        cache_key = str(entry.get('Path') or '').strip()
+        if cache_key in cache:
+            return str(cache.get(cache_key) or '')
+        readme_path = self._find_vulnerability_catalog_readme(entry)
+        if not readme_path:
+            cache[cache_key] = ''
+            return ''
+        try:
+            with open(readme_path, 'r', encoding='utf-8', errors='ignore') as handle:
+                text = handle.read(20000)
+        except Exception:
+            text = ''
+        cache[cache_key] = text
+        return text
+
+    def _tokenize_vulnerability_catalog_query(self, query: str) -> list[str]:
+        raw_tokens = [token for token in re.findall(r'[a-z0-9]+', str(query or '').lower()) if token]
+        stopwords = {
+            'a', 'an', 'and', 'any', 'attack', 'attacks', 'add', 'catalog', 'concrete', 'different', 'few', 'find',
+            'for', 'from', 'in', 'into', 'of', 'on', 'or', 'related', 'request', 'requests', 'some', 'that', 'the',
+            'these', 'this', 'to', 'use', 'user', 'with', 'vulnerability', 'vulnerabilities', 'vuln', 'vulns',
+        }
+        return [token for token in raw_tokens if token not in stopwords]
 
     def _search_vulnerability_catalog(self, arguments: dict[str, Any]) -> dict[str, Any]:
         catalog = self._load_vulnerability_catalog()
@@ -1131,7 +1230,7 @@ class ScenarioAuthoringMCPServer:
             limit = 10
         limit = max(1, min(limit, 50))
 
-        query_tokens = [token for token in query.lower().split() if token]
+        query_tokens = self._tokenize_vulnerability_catalog_query(query)
         matches: list[tuple[int, dict[str, str]]] = []
         for entry in catalog:
             entry_type = str(entry.get('Type') or '').strip().lower()
@@ -1141,6 +1240,8 @@ class ScenarioAuthoringMCPServer:
             if v_vector and entry_vector != v_vector:
                 continue
 
+            readme_text = self._read_vulnerability_catalog_readme(entry)
+
             haystack = ' '.join([
                 str(entry.get('Name') or ''),
                 str(entry.get('CVE') or ''),
@@ -1148,7 +1249,13 @@ class ScenarioAuthoringMCPServer:
                 str(entry.get('Type') or ''),
                 str(entry.get('Vector') or ''),
                 str(entry.get('Path') or ''),
+                readme_text,
             ]).lower()
+            name_text = str(entry.get('Name') or '').lower()
+            cve_text = str(entry.get('CVE') or '').lower()
+            path_text = str(entry.get('Path') or '').lower()
+            description_text = str(entry.get('Description') or '').lower()
+            readme_lower = readme_text.lower()
             score = 0
             if not query_tokens:
                 score = 1
@@ -1156,12 +1263,18 @@ class ScenarioAuthoringMCPServer:
                 for token in query_tokens:
                     if token in haystack:
                         score += 3
-                    if token in str(entry.get('Name') or '').lower():
+                    if token in name_text:
                         score += 4
-                    if token in str(entry.get('CVE') or '').lower():
+                    if token in cve_text:
                         score += 5
-                    if token in str(entry.get('Path') or '').lower():
+                    if token in path_text:
                         score += 2
+                    if token in description_text:
+                        score += 2
+                    if token in readme_lower:
+                        score += 2
+                if query and query.lower() in readme_lower:
+                    score += 6
             if score > 0:
                 matches.append((score, entry))
 
@@ -1179,6 +1292,7 @@ class ScenarioAuthoringMCPServer:
                 'vector': str(entry.get('Vector') or ''),
                 'cve': str(entry.get('CVE') or ''),
                 'description': str(entry.get('Description') or ''),
+                'readme_available': bool(readme_text),
                 'score': score,
             })
         response = {
@@ -1201,6 +1315,35 @@ class ScenarioAuthoringMCPServer:
         if resolved:
             return resolved
 
+        normalized_name = str(v_name or '').strip().lower()
+        normalized_path = str(v_path or '').strip().lower().rstrip('/')
+        fallback_matches: list[dict[str, str]] = []
+        for entry in catalog:
+            entry_name = str(entry.get('Name') or '').strip()
+            entry_path = str(entry.get('Path') or '').strip()
+            entry_name_lower = entry_name.lower()
+            entry_path_lower = entry_path.lower().rstrip('/')
+
+            path_match = bool(normalized_path) and (
+                entry_path_lower == normalized_path
+                or entry_path_lower.endswith(normalized_path)
+                or normalized_path.endswith(entry_path_lower)
+            )
+            name_match = bool(normalized_name) and (
+                entry_name_lower == normalized_name
+                or entry_name_lower.startswith(normalized_name + '/')
+                or normalized_name in entry_name_lower
+            )
+            if not path_match and not name_match:
+                continue
+            fallback_matches.append({
+                'name': canonical_vulnerability_name(entry_name, entry_path, str(entry.get('CVE') or '')),
+                'path': entry_path,
+            })
+
+        if len(fallback_matches) == 1:
+            return fallback_matches[0]
+
         raise ValueError('Specific vulnerability must match an enabled catalog entry by v_path or v_name')
 
     def _touch_draft_after_mutation(self, draft: ScenarioDraft) -> None:
@@ -1208,6 +1351,25 @@ class ScenarioAuthoringMCPServer:
         draft.preview = None
         draft.preview_plan = None
         draft.flow_meta = None
+
+    def _upsert_explicit_count_item(self, items: list[Any], *, selected: str, new_item: dict[str, Any]) -> list[Any]:
+        normalized_selected = str(selected or '').strip().lower()
+        if not normalized_selected:
+            return list(items) + [new_item]
+        next_items = list(items)
+        for index, existing in enumerate(next_items):
+            if not isinstance(existing, dict):
+                continue
+            existing_selected = str(existing.get('selected') or '').strip().lower()
+            existing_metric = str(existing.get('v_metric') or '').strip().lower()
+            if existing_selected != normalized_selected or existing_metric != 'count':
+                continue
+            merged = dict(existing)
+            merged.update(new_item)
+            next_items[index] = merged
+            return next_items
+        next_items.append(new_item)
+        return next_items
 
     def _add_node_role_item(self, draft: ScenarioDraft, arguments: dict[str, Any]) -> dict[str, Any]:
         sections = draft.scenario.get('sections') if isinstance(draft.scenario.get('sections'), dict) else {}
@@ -1262,7 +1424,7 @@ class ScenarioAuthoringMCPServer:
         if 'density' not in node_section:
             node_section['density'] = 0
 
-        node_section['items'] = list(items) + [new_item]
+        node_section['items'] = self._upsert_explicit_count_item(items, selected=selected, new_item=new_item)
         sections['Node Information'] = node_section
         draft.scenario['sections'] = sections
         self._touch_draft_after_mutation(draft)
@@ -1364,9 +1526,9 @@ class ScenarioAuthoringMCPServer:
             routing_section['density'] = 0.0 if count is not None else 0.5
 
         try:
-            factor = float(arguments.get('factor') or 0.0)
+            factor = float(arguments.get('factor') or 1.0)
         except Exception:
-            factor = 0.0
+            factor = 1.0
         factor = max(0.0, factor)
         if count is None and factor <= 0:
             factor = 1.0
@@ -1411,7 +1573,7 @@ class ScenarioAuthoringMCPServer:
         if r2s_hosts_max is not None:
             new_item['r2s_hosts_max'] = r2s_hosts_max
 
-        routing_section['items'] = list(items) + [new_item]
+        routing_section['items'] = self._upsert_explicit_count_item(items, selected=selected, new_item=new_item)
         sections['Routing'] = routing_section
         draft.scenario['sections'] = sections
         self._touch_draft_after_mutation(draft)
@@ -1678,7 +1840,7 @@ class ScenarioAuthoringMCPServer:
         if seed is not None:
             payload['seed'] = seed
         with app_backend.app.test_request_context('/api/plan/preview_full', method='POST', json=payload):
-            response = app_backend.app.make_response(app_backend.api_plan_preview_full())
+            response = app_backend.app.make_response(app_backend.app.dispatch_request())
             data = response.get_json(silent=True) or {}
         if response.status_code >= 400 or data.get('ok') is False:
             raise ValueError(data.get('error') or f'Preview failed (HTTP {response.status_code})')

@@ -4,6 +4,8 @@ from typing import Any, Callable, Optional
 
 from flask import jsonify, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -30,6 +32,9 @@ def register(
     Important: `proxmox_api_getter` is used for late-binding so tests can
     monkeypatch `webapp.app_backend.ProxmoxAPI`.
     """
+
+    if not begin_route_registration(app, "proxmox_routes"):
+        return
 
     log = logger or getattr(app, "logger", None)
 
@@ -405,3 +410,5 @@ def register(
             return jsonify({"success": False, "error": "Failed to fetch Proxmox VM inventory"}), 500
 
         return jsonify({"success": True, "inventory": inventory})
+
+    mark_routes_registered(app, "proxmox_routes")

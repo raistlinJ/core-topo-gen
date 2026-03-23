@@ -130,7 +130,7 @@
                   <div>
                     <label class="form-label small text-muted mb-1" for="flowGenerateMaxRetries">Max retries</label>
                     <input id="flowGenerateMaxRetries" class="form-control form-control-sm" type="number" min="0"
-                      max="50" value="5" style="width: 90px;">
+                      max="50" value="10" style="width: 90px;">
                   </div>
                   <div class="dropdown">
 
@@ -195,7 +195,7 @@
               </table>
             </div>
             <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
-              <div id="flowDiagram" class="mermaid">graph LR\n A[Generate] --> B[Flow]</div>
+              <div id="flowDiagram">Please generate a chain. It will appear here.</div>
             </div>
 
             <dialog id="flowNodeDetailsDialog" class="p-0 border rounded"
@@ -334,7 +334,7 @@
 
 <!-- Generate options (minimal) -->
 <dialog id="flowGenerateOptionsDialog" class="p-0 border rounded" style="max-width: 520px; width: calc(100% - 2rem);">
-  <form method="dialog" class="m-0">
+  <form method="dialog" class="m-0" id="flowGenerateOptionsForm">
     <div class="p-3 border-bottom d-flex align-items-center justify-content-between">
       <div class="fw-semibold">Generate options</div>
       <button class="btn btn-sm btn-outline-secondary" value="cancel" type="submit">Close</button>
@@ -351,7 +351,7 @@
     </div>
     <div class="p-3 border-top d-flex justify-content-end gap-2">
       <button class="btn btn-outline-secondary" value="cancel" type="submit">Cancel</button>
-      <button class="btn btn-primary" value="generate" type="submit">Generate</button>
+      <button class="btn btn-primary" value="generate" type="submit" id="flowGenerateOptionsSubmitBtn">Generate</button>
     </div>
   </form>
 </dialog>
@@ -422,7 +422,9 @@
     const loadingLogLabelEl = document.getElementById('flowLoadingLogLabel');
     const loadingLogEl = document.getElementById('flowLoadingLog');
     const generateOptionsDialogEl = document.getElementById('flowGenerateOptionsDialog');
+    const generateOptionsFormEl = document.getElementById('flowGenerateOptionsForm');
     const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
+    const generateOptionsSubmitBtnEl = document.getElementById('flowGenerateOptionsSubmitBtn');
     const flowEnabledToggleEl = document.getElementById('flowEnabledToggle');
     const flowEnabledHelpEl = document.getElementById('flowEnabledHelp');
     const flowControlsCardEl = document.getElementById('flowControlsCard');
@@ -436,10 +438,13 @@
   const scenarioNamesCache = {{ (scenarios or[])| tojson }};
   const initialScenario = {{ (active_scenario or '')| tojson }};
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
-  let flowEnabled = true;
+    let flowEnabled = !!(flowEnabledToggleEl ? flowEnabledToggleEl.checked : true);
+    const fallbackText = 'Please generate a chain. It will appear here.';
   let flowEligible = true;
+  let flowEligibilityReasons = [];
   let topologyDirty = false;
   let topologyDirtyReason = '';
+  let generateOptionsHandled = false;
 
   function normalizeTopologyDirtyState(isDirty, reason) {
     const dirty = !!isDirty;
@@ -592,6 +597,16 @@
     }
   }
 
+  function flowIneligibleMessage() {
+    const reasons = (Array.isArray(flowEligibilityReasons) ? flowEligibilityReasons : [])
+      .map((reason) => String(reason || '').trim())
+      .filter(Boolean);
+    if (reasons.length) {
+      return 'Flag sequencing unavailable: ' + reasons.join(' ');
+    }
+    return 'Flag sequencing requires Docker or vulnerability nodes in the topology.';
+  }
+
   function updateFlowEnabledUi() {
     const enabled = !!flowEnabled;
     if (lengthEl) lengthEl.disabled = !enabled || !flowEligible;
@@ -605,7 +620,7 @@
     if (flowVizCardEl) flowVizCardEl.classList.toggle('d-none', !enabled);
     if (flowEnabledHelpEl) {
       if (!flowEligible) {
-        flowEnabledHelpEl.textContent = 'Disabled: CORE VM must be validated (VM / Access) and topology must include Docker or vulnerability nodes.';
+        flowEnabledHelpEl.textContent = 'Disabled: ' + flowIneligibleMessage().replace(/^Flag sequencing unavailable:\s*/, '');
       } else if (!enabled) {
         flowEnabledHelpEl.textContent = 'Flag sequencing disabled; Execute will run without flows.';
       } else {
@@ -2247,11 +2262,13 @@
       } catch (e) { }
       const data = await fetchJson(url);
       try {
+        flowEligibilityReasons = (data && Array.isArray(data.flow_eligibility_reasons))
+          ? data.flow_eligibility_reasons.map((reason) => String(reason || '').trim()).filter(Boolean)
+          : [];
         const eligible = (data && data.flow_eligible !== undefined) ? !!data.flow_eligible : true;
-        const coreValidated = (data && data.core_validated !== undefined) ? !!data.core_validated : true;
         const dockerCount = Number.isFinite(+data.docker_count) ? (+data.docker_count) : 0;
         const vulnCount = Number.isFinite(+data.vuln_count) ? (+data.vuln_count) : 0;
-        flowEligible = (coreValidated && (eligible || (dockerCount > 0 || vulnCount > 0)));
+        flowEligible = (eligible || (dockerCount > 0 || vulnCount > 0));
         if (!flowEligible) {
           // Guardrail: do not clear/persist FlowState on transient ineligibility checks
           // from stale XML pointers; only disable controls for this view.
@@ -2270,11 +2287,26 @@
         updateMeta();
         return path;
       }
-    } catch (e) { }
-    try {
-      flowEligible = true;
-      updateFlowEnabledUi();
-    } catch (e) { }
+    } catch (e) {
+      const payload = e && typeof e === 'object' ? e.payload : null;
+      const payloadError = payload && typeof payload === 'object' ? String(payload.error || payload.message || '').trim() : '';
+      if (payloadError && payloadError.includes('No XML found for this scenario')) {
+        flowEligibilityReasons = [];
+        flowEligible = true;
+        updateFlowEnabledUi();
+        return '';
+      }
+      try {
+        flowEligibilityReasons = (payload && Array.isArray(payload.flow_eligibility_reasons))
+          ? payload.flow_eligibility_reasons.map((reason) => String(reason || '').trim()).filter(Boolean)
+          : [String((payload && (payload.error || payload.message)) || (e && e.message) || 'Flag sequencing prerequisites are not met.').trim()].filter(Boolean);
+        flowEligible = (payload && typeof payload === 'object' && ('flow_eligible' in payload)) ? !!payload.flow_eligible : false;
+        if (!flowEligible) {
+          setFlowEnabled(false, { skipPersist: true, clearStateOnDisable: false });
+        }
+        updateFlowEnabledUi();
+      } catch (innerError) { }
+    }
     return '';
   }
 
@@ -2313,7 +2345,7 @@
         await renderMermaid(diagram);
       } catch (e) { }
       if (!flowEligible) {
-        setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+        setStatus(flowIneligibleMessage(), true);
       } else if (topologyDirty) {
         setStatus('Topology/IP changed. Re-run Generate to refresh flow and flags.', true);
       } else if (!flowEnabled) {
@@ -2371,7 +2403,7 @@
         if (!flowEligible && next) {
           try { flowEnabledToggleEl.checked = false; } catch (e) { }
           setFlowEnabled(false, { skipPersist: false });
-          setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+          setStatus(flowIneligibleMessage(), true);
           return;
         }
         setFlowEnabled(next, { skipPersist: false });
@@ -8239,7 +8271,7 @@
       // If rendering fails, keep a stable fallback state.
       const wrap = document.getElementById('flowDiagram');
       if (wrap) {
-        wrap.textContent = 'No Chain Exists';
+        wrap.textContent = 'Please generate a chain. It will appear here.';
         wrap.removeAttribute('data-processed');
       }
     }
@@ -8267,7 +8299,7 @@
     lastResolvePayload = null;
 
     if (!flowEligible) {
-      setStatus('Flag sequencing requires Docker or vulnerability nodes in the topology.', true);
+      setStatus(flowIneligibleMessage(), true);
       return;
     }
     if (!flowEnabled) {
@@ -8461,9 +8493,9 @@
       let retriesRemaining = 0;
       try {
         if (generateMaxRetriesEl) {
-          retriesRemaining = Math.max(0, Math.min(50, parseInt(generateMaxRetriesEl.value || '0', 10) || 0));
+          retriesRemaining = Math.max(0, Math.min(50, parseInt(generateMaxRetriesEl.value || '10', 10) || 10));
         }
-      } catch (e) { retriesRemaining = 0; }
+      } catch (e) { retriesRemaining = 10; }
       let attemptedRetries = 0;
       let retryIndex = 0;
       const _resolvedFlagValue = (fa) => {
@@ -9101,7 +9133,7 @@
       let previewPlan = '';
       if (flowEnabled) {
         if (!flowEligible) {
-          throw new Error('Flag sequencing requires Docker or vulnerability nodes in the topology.');
+          throw new Error(flowIneligibleMessage());
         }
         if (!Array.isArray(currentChain) || currentChain.length === 0) {
           throw new Error('Generate a chain first.');
@@ -9207,7 +9239,14 @@
       // Navigate to Preview tab.
       const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
       const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + '&scenario=' + encodeURIComponent(scenario);
-      window.location.href = url;
+      if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+        window.CORETG_NAVIGATE_WITH_LOADING(url, {
+          title: 'Retrieving Page Details',
+          message: 'Retrieving page details…',
+        });
+      } else {
+        window.location.href = url;
+      }
     } catch (e) {
       setStatus('Preview failed: ' + String(e && e.message || e), true);
     } finally {
@@ -9402,6 +9441,12 @@
   } catch (e) { }
 
   // Generate options dialog.
+  function runGenerateFromDialogOptions() {
+    const allowDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : false;
+    allowNodeDuplicates = !!allowDupes;
+    generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates, resolveOnGenerate: true });
+  }
+
   try {
     if (generateOptionsDialogEl) {
       try {
@@ -9409,13 +9454,46 @@
           generateNoDuplicatesEl.checked = !!allowNodeDuplicates;
         }
       } catch (e) { }
+      if (generateOptionsFormEl) {
+        generateOptionsFormEl.addEventListener('submit', (event) => {
+          try {
+            const submitter = event && event.submitter ? event.submitter : null;
+            const submitValue = String((submitter && submitter.value) || '');
+            if (submitValue !== 'generate') {
+              generateOptionsHandled = false;
+              return;
+            }
+            generateOptionsHandled = true;
+            try { event.preventDefault(); } catch (e) { }
+            try {
+              if (generateOptionsDialogEl.open && typeof generateOptionsDialogEl.close === 'function') {
+                generateOptionsDialogEl.close('generate');
+              }
+            } catch (e) { }
+            runGenerateFromDialogOptions();
+          } catch (e) { }
+        });
+      } else if (generateOptionsSubmitBtnEl) {
+        generateOptionsSubmitBtnEl.addEventListener('click', (event) => {
+          try { event.preventDefault(); } catch (e) { }
+          generateOptionsHandled = true;
+          try {
+            if (generateOptionsDialogEl.open && typeof generateOptionsDialogEl.close === 'function') {
+              generateOptionsDialogEl.close('generate');
+            }
+          } catch (e) { }
+          runGenerateFromDialogOptions();
+        });
+      }
       generateOptionsDialogEl.addEventListener('close', () => {
         try {
           const rv = String(generateOptionsDialogEl.returnValue || '');
+          if (generateOptionsHandled) {
+            generateOptionsHandled = false;
+            return;
+          }
           if (rv !== 'generate') return;
-          const allowDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : false;
-          allowNodeDuplicates = !!allowDupes;
-          generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates, resolveOnGenerate: true });
+          runGenerateFromDialogOptions();
         } catch (e) { }
       });
     }
@@ -9849,7 +9927,14 @@
         } catch (e) { }
         const baseUrl = String(link.dataset?.previewBaseUrl || '/scenarios/preview');
         const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
-        window.location.href = url;
+        if (typeof window.CORETG_NAVIGATE_WITH_LOADING === 'function') {
+          window.CORETG_NAVIGATE_WITH_LOADING(url, {
+            title: 'Retrieving Page Details',
+            message: 'Retrieving page details…',
+          });
+        } else {
+          window.location.href = url;
+        }
       } catch (e) { }
     });
   });

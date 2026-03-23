@@ -32,6 +32,9 @@ View the WebUI images gallery [`docs/screenshots.md`](docs/screenshots.md).
 
 ## Install
 - Prereqs: Python 3.10+ and [uv](https://docs.astral.sh/uv/)
+- Optional for attack graph PDF export: Graphviz `dot`
+	- macOS: `brew install graphviz`
+	- Debian/Ubuntu: `sudo apt-get install graphviz`
 - Install dependencies:
 ```bash
 uv sync --extra dev
@@ -77,6 +80,7 @@ docker compose up -d --build
 ```bash
 curl -k https://localhost/healthz
 ```
+- The Docker image now includes Graphviz, so attack graph PDF export works in Compose-based runs.
 - In host-network mode, nginx serves `80/443` and the web app is bound to `127.0.0.1:9090` (not externally exposed).
 - Safety: in Execute → Advanced, `Delete all docker containers` is disabled when the Web UI is running in Docker.
 - Stop Docker stack:

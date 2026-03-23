@@ -5,6 +5,8 @@ from typing import Any, Callable
 
 from flask import jsonify, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -17,6 +19,9 @@ def register(
 
     Extracted from `webapp.app_backend`.
     """
+
+    if not begin_route_registration(app, "webui_logs_routes"):
+        return
 
     def _require_admin():
         current = current_user_getter()
@@ -85,3 +90,5 @@ def register(
             return jsonify({"ok": False, "error": f"Failed clearing log: {exc}"}), 500
 
         return jsonify({"ok": True})
+
+    mark_routes_registered(app, "webui_logs_routes")

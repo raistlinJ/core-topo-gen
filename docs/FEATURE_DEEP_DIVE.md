@@ -1,7 +1,12 @@
 # Feature Deep Dive
 
 ## AI Generator workflow
+- For a dedicated summary of the recent compiler, retry, validation, and preview-sync improvements, see [AI Generator Workflow](AI_GENERATOR_WORKFLOW.md).
 - The AI Generator tab sends the current in-browser scenario state, the user prompt, the selected Ollama model/base URL, and the enabled MCP tools to the Flask AI generation route.
+- Before model-authored rows are trusted, the backend runs a deterministic intent compiler in `core_topo_gen/planning/ai_topology_intent.py`.
+- That compiler currently owns explicit prompt intent for `Node Information`, `Routing`, `Services`, `Traffic`, `Vulnerabilities`, and `Segmentation`.
+- The compiler emits two things from the same prompt: backend-compatible section payloads and MCP seed operations. Both the direct JSON path and the MCP bridge path use that same compiled intent so they do not drift.
+- Practical rule: the model should supply missing details around the seeded template, but explicit counts and concrete section requests for compiler-managed sections are backend-authored, not free-form LLM-authored.
 - In MCP mode, Ollama does not write XML directly. The backend opens the repo-local MCP server and creates an in-memory draft from the current scenario.
 - Ollama then uses narrow `scenario.*` tools to mutate that draft. Typical tools are:
 	- `scenario.get_authoring_schema`: fetch valid backend-supported section values and defaults.
@@ -14,11 +19,26 @@
 	- `scenario.preview_draft`: run the backend preview planner on the current draft.
 	- `scenario.save_xml`: persist the current draft to XML when explicitly needed.
 - Those MCP tools execute repo/backend logic, not free-form model logic. The model chooses the tool calls, but the actual mutations and validation happen inside the backend.
+- After direct JSON generation, the backend reapplies the compiled intent before preview so explicit compiler-managed sections cannot be silently overridden by malformed model rows.
 - The preview shown after generation comes from the backend planner, not from the model. The planner computes routers, hosts, switches, flow metadata, and other derived state from the current in-memory draft.
 - After a successful AI generation, the frontend replaces the current scenario/editor state with the generated scenario and stores the preview metadata in browser/app state. This still does not write XML by itself.
 - XML is only written when a save path is used:
 	- the normal Save XML button serializes the current editor state through `/save_xml_api`
 	- the MCP tool `scenario.save_xml` can also persist the current in-memory draft
+
+### Intent compiler boundary
+- `compile_ai_topology_intent(...)` is the boundary between prompt understanding and scenario row authoring.
+- Use the compiler for explicit structural asks such as router counts, host-role counts, service counts, traffic protocol/pattern counts, vulnerability counts with enabled-catalog grounding, and segmentation control counts.
+- Use the model for what remains fuzzy: notes, non-compiler-managed details, or filling in optional context around a valid seeded scenario.
+- `preview_full` remains the final validation authority. The compiler reduces authoring error rates; it does not replace backend preview, canonicalization, or concretization.
+- The earlier `Phase1` naming has been removed; use the generalized intent-compiler names in new code and tests.
+
+### Route registration pattern
+- Extracted Flask route modules under `webapp/routes/` should register through explicit `register(app, ...)` functions and remain safe to call more than once.
+- Shared idempotent registration lives in `webapp/routes/_registration.py`; use it instead of per-module ad hoc guard attributes.
+- Internally, a route module may bind handlers directly or register a blueprint, but the external registration surface should stay explicit and idempotent.
+- `webapp/app_backend.py` still performs the top-level registration and now logs route-registration failures instead of silently swallowing them.
+- This pattern exists to tolerate import-order differences in tests and route-module extraction work without turning setup issues into silent `404` failures.
 
 ### State flow
 ```mermaid

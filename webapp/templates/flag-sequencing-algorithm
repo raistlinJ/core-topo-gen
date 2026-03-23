@@ -1,0 +1,63 @@
+The DAG itself is not seed-driven. The seed affects node selection in some paths and generator selection, but the DAG build is a deterministic dependency pass over the already chosen generators.
+
+The flow has three separate stages:
+
+Chain node selection
+In app_backend.py:13017, _pick_flag_chain_nodes(...) does not use round robin. It is a heuristic:
+It finds eligible nodes first: vuln nodes, plus non-vuln Docker nodes if flag-node-generators are enabled.
+If one connected component already has enough eligible nodes, it picks from the largest component.
+Otherwise it approximates graph diameter with two BFS passes, takes eligible nodes along that path, then falls back to a BFS walk, then fills from remaining eligible nodes.
+After that it shuffles the final order.
+So this part is “graph heuristic + shuffle”, not greedy optimization and not round robin.
+
+There is a separate duplicate-allowed variant in app_backend.py:13172, _pick_flag_chain_nodes_allow_duplicates(...), and that one does use                                                      a seed when it has to extend the chain with repeated nodes.
+
+Generator assignment
+In app_backend.py:16387, _flow_compute_flag_assignments(...) is where the flow seed matters most.
+The seed comes from app_backend.py:15341, _get_flow_seed(...), with priority:
+explicit override
+preview.flow_seed
+preview.seed
+0
+Then assignment works like this:
+
+It builds a candidate pool per chain position based on node type:
+vuln nodes can take flag-generator
+non-vuln Docker nodes can take flag-node-generator
+It tracks “known facts” / artifacts produced so far.
+If goal_facts exist, it tries a DFS/backtracking search first to find a solvable sequence.
+Otherwise it does a greedy-ish step-by-step selection:
+filter candidates whose requirements are already satisfied
+score them by how many new facts they produce, with extra weight for goal facts
+choose among scored candidates using seeded randomness
+So this stage is best described as “constraint-filtered, score-based selection with seeded weighted randomness”, plus optional DFS when goal facts are present.
+
+DAG reorder
+After chain nodes and generators are already chosen, app_backend.py:18388, _flow_reorder_chain_by_generator_dag(...), may reorder the chain for non-preset auto-generated flows.
+That function calls dag.py:94, build_dag(...). The DAG builder:
+
+computes required artifacts from instance requires plus plugin requires
+computes produced artifacts from plugin produces
+adds an edge from every compatible producer to every consumer
+honors explicit source bindings if present
+treats “initial artifacts” as pre-existing inputs
+Important point: it does not pick one producer greedily. It connects all valid producers for each required artifact.
+
+Then it topologically sorts the resulting graph using Kahn’s algorithm in dag.py:234:
+
+start with nodes that have zero incoming edges
+process them in sorted order
+remove outgoing edges
+append newly ready nodes, again sorted
+So when multiple orderings are valid, tie-breaking is lexical by challenge id, not seeded randomness.
+
+What that means in practice:
+
+The seed influences which nodes get chosen and which generators get assigned.
+The DAG does not use the seed.
+The DAG reorder is dependency-driven and deterministic for a given set of chosen generators.
+It is not round robin.
+It is not a greedy “pick nearest dependency” algorithm.
+It is “build full artifact dependency graph, then topologically sort”.
+One more nuance: presets and saved chains mostly bypass DAG reordering. In app_backend.py:19154, the reorder is only applied for auto-generated, non-preset, non-duplicate chains. Presets keep their intended order.
+

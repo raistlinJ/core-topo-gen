@@ -10,7 +10,6 @@ def test_build_run_form_data_includes_advanced_flags() -> None:
     expected_lines = [
         "if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');",
         "if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');",
-        "if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');",
         "if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');",
         "if (adv && adv.startCoreDaemon) form.append('adv_start_core_daemon', '1');",
         "if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');",
@@ -18,6 +17,13 @@ def test_build_run_form_data_includes_advanced_flags() -> None:
 
     missing = [line for line in expected_lines if line not in text]
     assert not missing, "Missing execute advanced FormData mapping lines: " + "; ".join(missing)
+
+    forbidden_lines = [
+        "if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');",
+    ]
+
+    present = [line for line in forbidden_lines if line in text]
+    assert not present, "Unexpected CORE version-check FormData mapping lines still present: " + "; ".join(present)
 
 
 def test_execute_summary_uses_validation_unavailable_details() -> None:

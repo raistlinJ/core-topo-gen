@@ -176,3 +176,60 @@ def test_flow_preview_tab_persists_flow_state_before_redirect() -> None:
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, "Preview-tab navigation should persist flow state before redirect: " + "; ".join(missing)
+
+
+def test_flow_empty_state_uses_placeholder_message_instead_of_mermaid_error() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        '<div id="flowDiagram">Please generate a chain. It will appear here.</div>',
+        "const fallbackText = 'Please generate a chain. It will appear here.';",
+        "if (!diagramText || !String(diagramText).trim()) {",
+        "if (renderedText.includes('syntax error in text')) {",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing flow empty-state placeholder snippets: " + "; ".join(missing)
+
+
+def test_flow_generate_max_retries_defaults_to_ten() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'max="50" value="10" style="width: 90px;">',
+        "parseInt(generateMaxRetriesEl.value || '10', 10) || 10",
+        "} catch (e) { retriesRemaining = 10; }",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing flow max-retries default snippets: " + "; ".join(missing)
+
+
+def test_flow_generate_dialog_has_explicit_submit_wiring() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'id="flowGenerateOptionsForm"',
+        'id="flowGenerateOptionsSubmitBtn"',
+        'let generateOptionsHandled = false;',
+        'function runGenerateFromDialogOptions() {',
+        "generateOptionsFormEl.addEventListener('submit'",
+        "generateOptionsDialogEl.close('generate');",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing explicit generate-dialog submit wiring in flow template: " + "; ".join(missing)
+
+
+def test_flow_enabled_state_is_declared_before_use() -> None:
+    text = FLOW_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "const flowEnabledToggleEl = document.getElementById('flowEnabledToggle');",
+        "let flowEnabled = !!(flowEnabledToggleEl ? flowEnabledToggleEl.checked : true);",
+        'const enabled = !!flowEnabled;',
+        'if (!flowEnabled) {',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing declared flowEnabled state binding in flow template: " + "; ".join(missing)

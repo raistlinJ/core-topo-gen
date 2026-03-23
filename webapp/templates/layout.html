@@ -95,8 +95,9 @@
                             {% if current_user.is_authenticated %}
                             <span class="small text-white-50">{{ current_user.username }}</span>
                             <a class="btn btn-sm btn-outline-light" href="{{ url_for('me_password') }}">Password</a>
-                            <form action="{{ url_for('logout') }}" method="post" class="d-inline">
-                                <button class="btn btn-sm btn-outline-danger">Logout</button>
+                            <form action="{{ url_for('logout') }}" method="post" class="d-inline"
+                                data-coretg-logout-form="1">
+                                <button class="btn btn-sm btn-outline-danger" type="submit">Logout</button>
                             </form>
                             {% if current_user.role == 'admin' and ui_view_mode == 'admin' %}
                             <div class="dropdown">
@@ -223,7 +224,7 @@
         <div class="modal-dialog modal-dialog-centered">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title">Loading…</h5>
+                    <h5 class="modal-title" id="navLoadingTitle">Loading…</h5>
                 </div>
                 <div class="modal-body">
                     <div class="small text-muted mb-2" id="navLoadingText">Loading…</div>
@@ -430,10 +431,85 @@
         };
     </script>
 
+    <script>
+        (function () {
+            const logoutForms = Array.from(document.querySelectorAll('form[data-coretg-logout-form="1"]'));
+            if (!logoutForms.length) return;
+
+            let logoutSubmitInFlight = false;
+
+            async function prepareBeforeLogout() {
+                const handler = window.CORETG_PREPARE_LOGOUT;
+                if (typeof handler !== 'function') {
+                    return { ok: true, skipped: true };
+                }
+                try {
+                    const result = await handler();
+                    if (result === false) {
+                        return { ok: false, error: 'Unable to persist the current VM/access state before logout.' };
+                    }
+                    if (result && typeof result === 'object') {
+                        if (result.ok === false) {
+                            return result;
+                        }
+                        return { ok: true, ...(result || {}) };
+                    }
+                    return { ok: true };
+                } catch (err) {
+                    return {
+                        ok: false,
+                        error: (err && err.message) ? err.message : 'Unable to persist the current VM/access state before logout.',
+                    };
+                }
+            }
+
+            logoutForms.forEach((form) => {
+                form.addEventListener('submit', async (event) => {
+                    if (logoutSubmitInFlight) return;
+                    event.preventDefault();
+
+                    const submitButton = form.querySelector('button[type="submit"]');
+                    const originalLabel = submitButton ? submitButton.textContent : '';
+                    if (submitButton) {
+                        submitButton.disabled = true;
+                        submitButton.textContent = 'Saving...';
+                    }
+
+                    const result = await prepareBeforeLogout();
+                    if (result && result.ok === false) {
+                        if (submitButton) {
+                            submitButton.disabled = false;
+                            submitButton.textContent = originalLabel || 'Logout';
+                        }
+                        if (typeof window.alertWithModal === 'function') {
+                            await window.alertWithModal(
+                                'Logout blocked',
+                                (result.error || 'Unable to persist the current VM/access state before logout. Please try again.').toString(),
+                                'OK',
+                                'danger'
+                            );
+                        } else {
+                            window.alert((result.error || 'Unable to persist the current VM/access state before logout. Please try again.').toString());
+                        }
+                        return;
+                    }
+
+                    logoutSubmitInFlight = true;
+                    if (submitButton) {
+                        submitButton.textContent = 'Logging out...';
+                    }
+                    HTMLFormElement.prototype.submit.call(form);
+                });
+            });
+        })();
+    </script>
+
     {% if not hide_chrome %}
     <script>
-        // Show a loading modal when clicking the CORE navbar link.
+        // Shared navigation loading modal for slow or heavy page transitions.
         (function () {
+            let navLoadingInstance = null;
+
             function shouldInterceptClick(ev) {
                 if (!ev) return false;
                 if (ev.defaultPrevented) return false;
@@ -441,61 +517,130 @@
                 if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
                 return true;
             }
-            function showNavLoading(message) {
+
+            function showNavLoading(message, title) {
                 try {
                     const el = document.getElementById('navLoadingModal');
                     if (!el) return null;
+                    const titleEl = document.getElementById('navLoadingTitle');
                     const textEl = document.getElementById('navLoadingText');
+                    if (titleEl) titleEl.textContent = title || 'Loading…';
                     if (textEl) textEl.textContent = message || 'Loading…';
                     if (window.bootstrap && window.bootstrap.Modal) {
                         const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+                        navLoadingInstance = inst;
                         inst.show();
                         return inst;
                     }
                 } catch (e) { }
-                let navLoadingInstance = null;
                 return null;
             }
+
+            function hideNavLoading() {
+                try {
+                    const el = document.getElementById('navLoadingModal');
+                    if (!el || !window.bootstrap || !window.bootstrap.Modal) return;
+                    const inst = navLoadingInstance || bootstrap.Modal.getInstance(el);
+                    if (inst && typeof inst.hide === 'function') inst.hide();
+                } catch (e) { }
+                navLoadingInstance = null;
+                try {
+                    document.querySelectorAll('.modal-backdrop').forEach((backdrop) => backdrop.remove());
+                } catch (e) { }
+                try { document.body.classList.remove('modal-open'); } catch (e) { }
+                try {
+                    document.body.style.removeProperty('overflow');
+                    document.body.style.removeProperty('padding-right');
+                } catch (e) { }
+            }
+
+            function navigateWithLoading(href, opts) {
+                const url = String(href || '').trim();
+                if (!url) return false;
+                const options = (opts && typeof opts === 'object') ? opts : {};
+                showNavLoading(options.message || 'Loading…', options.title || 'Loading…');
+                requestAnimationFrame(() => {
+                    setTimeout(() => {
+                        window.location.assign(url);
+                    }, Number.isFinite(+options.delayMs) ? Math.max(0, +options.delayMs) : 60);
+                });
+                return true;
+            }
+
+            function navigatePageDetails(href, opts) {
+                const options = (opts && typeof opts === 'object') ? opts : {};
+                return navigateWithLoading(href, {
+                    title: options.title || 'Retrieving Page Details',
+                    message: options.message || 'Retrieving page details…',
+                    delayMs: options.delayMs,
+                });
+            }
+
+            function shouldUseDefaultPageLoading(target) {
+                try {
+                    if (!target || !target.getAttribute) return false;
+                    const href = String(target.getAttribute('href') || '').trim();
+                    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return false;
+                    if (href.startsWith('mailto:') || href.startsWith('tel:')) return false;
+                    if (target.hasAttribute('download')) return false;
+                    if ((target.target || '').toLowerCase() === '_blank') return false;
+                    if (href.includes('/download_report') || href.includes('/generator_packs_download') || href.includes('/vuln_catalog_packs_download')) return false;
+                    if (href.includes('/api/')) return false;
+                    const dest = new URL(href, window.location.href);
+                    if (dest.origin !== window.location.origin) return false;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            window.CORETG_SHOW_NAV_LOADING = showNavLoading;
+            window.CORETG_HIDE_NAV_LOADING = hideNavLoading;
+            window.CORETG_NAVIGATE_WITH_LOADING = navigateWithLoading;
+            window.CORETG_NAVIGATE_PAGE_DETAILS = navigatePageDetails;
+
             document.addEventListener('click', (ev) => {
                 try {
-                    const coreLink = document.getElementById('navCoreLink');
-                    if (!coreLink) return;
-                    const target = ev.target && ev.target.closest ? ev.target.closest('a') : null;
-                    if (!target || target !== coreLink) return;
-                    const href = coreLink.getAttribute('href') || '';
-                    if (!href) return;
+                    const target = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+                    if (!target) return;
                     if (!shouldInterceptClick(ev)) return;
 
-                    const dest = new URL(href, window.location.origin);
-                    const here = new URL(window.location.href);
-                    const el = document.getElementById('navLoadingModal');
-                    const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
-                    navLoadingInstance = inst;
-                    inst.show();
-                    return inst;
+                    const href = target.getAttribute('href') || '';
+                    if (!href) return;
 
-                    function hideNavLoading() {
-                        try {
-                            const el = document.getElementById('navLoadingModal');
-                            if (!el || !window.bootstrap || !window.bootstrap.Modal) return;
-                            const inst = navLoadingInstance || bootstrap.Modal.getInstance(el);
-                            if (inst && typeof inst.hide === 'function') inst.hide();
-                        } catch (e) { }
-                        navLoadingInstance = null;
-                        // Defensive: if a stale backdrop survived, remove it.
-                        try {
-                            document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
-                        } catch (e) { }
-                        try { document.body.classList.remove('modal-open'); } catch (e) { }
-                    }
+                    const wantsLoading = target.hasAttribute('data-coretg-nav-loading') || target.id === 'navCoreLink';
+                    if (!wantsLoading) return;
 
-                    // Expose for pages that intercept navigation (e.g., CORE nav guard).
-                    window.CORETG_HIDE_NAV_LOADING = hideNavLoading;
+                    ev.preventDefault();
+                    navigateWithLoading(href, {
+                        title: target.getAttribute('data-coretg-nav-loading-title') || 'Loading…',
+                        message: target.getAttribute('data-coretg-nav-loading-message') || 'Loading…',
+                    });
                 } catch (e) { }
             }, true);
 
+            document.addEventListener('click', (ev) => {
+                try {
+                    if (!shouldInterceptClick(ev)) return;
+                    const target = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+                    if (!target) return;
+                    if (ev.defaultPrevented) return;
+                    if (!shouldUseDefaultPageLoading(target)) return;
+                    ev.preventDefault();
+                    navigatePageDetails(target.getAttribute('href') || '');
+                } catch (e) { }
+            }, false);
+
             // If the page comes back from bfcache, ensure we don't keep the modal up.
             try { window.addEventListener('pageshow', hideNavLoading); } catch (e) { }
+            try { window.addEventListener('focus', hideNavLoading); } catch (e) { }
+            try {
+                document.addEventListener('visibilitychange', () => {
+                    try {
+                        if (!document.hidden) hideNavLoading();
+                    } catch (e) { }
+                });
+            } catch (e) { }
         })();
     </script>
     {% endif %}

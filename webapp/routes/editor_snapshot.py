@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from flask import jsonify, request
+from flask import Blueprint, jsonify, request
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -18,9 +19,13 @@ def register(
     Extracted from `webapp.app_backend`.
     """
 
-    log = logger or getattr(app, "logger", None)
+    if not begin_route_registration(app, 'editor_snapshot_routes'):
+        return
 
-    @app.route("/api/editor_snapshot", methods=["POST"])
+    log = logger or getattr(app, "logger", None)
+    blueprint = Blueprint('editor_snapshot', __name__)
+
+    @blueprint.route("/api/editor_snapshot", methods=["POST"])
     def api_editor_snapshot():
         user = current_user_getter()
         if not user or not user.get("username"):
@@ -45,3 +50,12 @@ def register(
             return jsonify({"success": False, "error": "Unable to persist snapshot"}), 500
 
         return jsonify({"success": True})
+
+    app.register_blueprint(blueprint)
+    app.add_url_rule(
+        "/api/editor_snapshot",
+        endpoint="api_editor_snapshot",
+        view_func=app.view_functions['editor_snapshot.api_editor_snapshot'],
+        methods=["POST"],
+    )
+    mark_routes_registered(app, 'editor_snapshot_routes')

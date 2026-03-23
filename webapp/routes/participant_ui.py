@@ -5,6 +5,8 @@ from typing import Any, Callable, Optional
 
 from flask import abort, jsonify, redirect, render_template, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -21,6 +23,7 @@ def register(
     load_participant_ui_stats: Callable[[], dict[str, Any]],
     save_participant_ui_stats: Callable[[dict[str, Any]], Any],
     local_timestamp_display: Callable[[], str],
+    format_local_timestamp: Callable[[Any], str],
     load_summary_counts: Callable[[Optional[str]], dict[str, Any]],
     load_summary_metadata: Callable[[Optional[str]], dict[str, Any]],
     subnet_cidrs_from_session_xml: Callable[[Optional[str]], list[str]],
@@ -39,6 +42,9 @@ def register(
     Important: callers should pass late-bound lambdas for helpers that tests monkeypatch
     in `webapp.app_backend` (e.g., `_participant_ui_state`, `_load_run_history`).
     """
+
+    if not begin_route_registration(app, "participant_ui_routes"):
+        return
 
     @app.route("/participant-ui")
     def participant_ui_page():
@@ -151,7 +157,8 @@ def register(
 
         history = load_run_history()
         last_run = latest_run_history_for_scenario(scenario_norm, history)
-        last_execute_ts = (last_run or {}).get("timestamp") if isinstance(last_run, dict) else ""
+        last_execute_raw = (last_run or {}).get("timestamp") if isinstance(last_run, dict) else ""
+        last_execute_ts = format_local_timestamp(last_execute_raw)
         returncode = (last_run or {}).get("returncode") if isinstance(last_run, dict) else None
         try:
             returncode_int = int(returncode) if returncode is not None else None
@@ -182,6 +189,8 @@ def register(
         session_xml_path = None
         if isinstance(last_run, dict):
             session_xml_path = last_run.get("session_xml_path") or last_run.get("post_xml_path")
+        if (not session_xml_path) and scenario_norm:
+            session_xml_path = latest_session_xml_for_scenario_norm(scenario_norm)
         session_xml_exists = bool(session_xml_path and os.path.exists(str(session_xml_path)))
         subnetworks = subnet_cidrs_from_session_xml(session_xml_path) if session_xml_exists else []
         vulnerability_ips = vulnerability_ipv4s_from_session_xml(session_xml_path) if session_xml_exists else []
@@ -289,7 +298,7 @@ def register(
                 "gateway": gateway or "",
                 "open_stats": {
                     "open_count": int(scenario_stats.get("open_count") or 0),
-                    "last_open_ts": str(scenario_stats.get("last_open_ts") or ""),
+                    "last_open_ts": format_local_timestamp(scenario_stats.get("last_open_ts")),
                 },
                 "execute": {
                     "last_execute_ts": str(last_execute_ts or ""),
@@ -398,11 +407,11 @@ def register(
                 "scenario_norm": scenario_norm,
                 "scenario": {
                     "open_count": int(scenario_stats.get("open_count") or 0),
-                    "last_open_ts": scenario_stats.get("last_open_ts") or "",
+                    "last_open_ts": format_local_timestamp(scenario_stats.get("last_open_ts")),
                 },
                 "totals": {
                     "open_count": int(totals.get("open_count") or 0),
-                    "last_open_ts": totals.get("last_open_ts") or "",
+                    "last_open_ts": format_local_timestamp(totals.get("last_open_ts")),
                 },
             }
         )
@@ -478,3 +487,5 @@ def register(
             abort(404)
 
         return redirect(resolved)
+
+    mark_routes_registered(app, "participant_ui_routes")

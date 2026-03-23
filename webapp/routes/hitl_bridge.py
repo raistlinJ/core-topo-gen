@@ -4,6 +4,8 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from flask import jsonify, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -26,6 +28,9 @@ def register(
     Important: pass `connect_proxmox_from_secret` / `ensure_proxmox_bridge` as
     late-bound callables so unit tests can monkeypatch the original symbols.
     """
+
+    if not begin_route_registration(app, "hitl_bridge_routes"):
+        return
 
     log = logger or getattr(app, "logger", None)
 
@@ -615,3 +620,5 @@ def register(
             pass
 
         return jsonify(response)
+
+    mark_routes_registered(app, "hitl_bridge_routes")

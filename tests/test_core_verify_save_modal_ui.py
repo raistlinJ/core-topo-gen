@@ -43,6 +43,20 @@ def test_core_verify_save_does_not_refresh_interfaces_in_step2() -> None:
     assert not present, "Unexpected Step 2 interface-refresh gating snippets still present: " + "; ".join(present)
 
 
+def test_validate_core_connection_clears_docker_fix_flag_in_docker_mode() -> None:
+    text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "let effectiveAdvFixDockerDaemon = !!advFixDockerDaemon;",
+        "if (WEBUI_RUNNING_IN_DOCKER && effectiveAdvFixDockerDaemon) {",
+        "coreState.adv_fix_docker_daemon = false;",
+        "adv_fix_docker_daemon: effectiveAdvFixDockerDaemon,",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing shared CORE validation docker-fix guard snippets: " + "; ".join(missing)
+
+
 def test_save_xml_button_uses_direct_local_save() -> None:
     text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 

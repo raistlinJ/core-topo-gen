@@ -1,0 +1,27 @@
+<ul class="nav nav-tabs mb-3" id="generatorCatalogTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <a class="nav-link {% if active_generator_catalog_tab == 'packs' %}active{% endif %}"
+       id="flagGenSourcesTab"
+       href="{{ url_for('flag_catalog_page') }}#flagGenSources">Generator Packs</a>
+  </li>
+  <li class="nav-item" role="presentation">
+    <a class="nav-link {% if active_generator_catalog_tab == 'flag-generators' %}active{% endif %}"
+       id="flagGeneratorsTab"
+       href="{{ url_for('flag_catalog_page') }}#flagGenerators">Flag-Generators</a>
+  </li>
+  <li class="nav-item" role="presentation">
+    <a class="nav-link {% if active_generator_catalog_tab == 'flag-node-generators' %}active{% endif %}"
+       id="flagNodeGeneratorsTab"
+       href="{{ url_for('flag_catalog_page') }}#flagNodeGenerators">Flag-Node-Generators</a>
+  </li>
+  <li class="nav-item" role="presentation">
+    <a class="nav-link {% if active_generator_catalog_tab == 'batch-test' %}active{% endif %}"
+       id="flagBatchTab"
+       href="{{ url_for('flag_catalog_page') }}#flagBatch">Batch Test</a>
+  </li>
+  <li class="nav-item" role="presentation">
+    <a class="nav-link {% if active_generator_catalog_tab == 'generator-builder' %}active{% endif %}"
+       id="flagGeneratorBuilderTab"
+       href="{{ url_for('generator_builder_page') }}"><i class="bi bi-wrench-adjustable me-1"></i>Generator Builder</a>
+  </li>
+</ul>

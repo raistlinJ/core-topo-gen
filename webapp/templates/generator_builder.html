@@ -4,812 +4,3376 @@
 {% block active_page %}{% set active_page = 'generator_builder' %}{% endblock %}
 
 {% block content %}
-<div class="container-fluid mt-2">
-  <div class="row">
-    <div class="col-12">
-      <ul class="nav nav-tabs mb-3" role="tablist">
-        <li class="nav-item" role="presentation">
-          <a class="nav-link" href="{{ url_for('flag_catalog_page') }}">Generator Sources</a>
-        </li>
-        <li class="nav-item" role="presentation">
-          <a class="nav-link" href="{{ url_for('flag_catalog_page') }}">Flag-Generators</a>
-        </li>
-        <li class="nav-item" role="presentation">
-          <a class="nav-link" href="{{ url_for('flag_catalog_page') }}">Flag-Node-Generators</a>
-        </li>
-        <li class="nav-item" role="presentation">
-          <a class="nav-link active" aria-current="page" href="{{ url_for('generator_builder_page') }}"><i class="bi bi-wrench-adjustable me-1"></i>Generator Builder</a>
-        </li>
-      </ul>
-      <div class="card shadow-sm mb-3">
-        <div class="card-header d-flex align-items-center justify-content-between">
-          <div class="fw-semibold"><i class="bi bi-wrench-adjustable"></i> Generator Builder</div>
-          <span class="badge text-bg-secondary">Scaffold + manifest</span>
+<style>
+  :root {
+    --gb-ink: #16324f;
+    --gb-accent: #0f766e;
+    --gb-accent-soft: #d8f3ef;
+    --gb-sand: #f6efe4;
+    --gb-line: #d6dee7;
+    --gb-code-bg: #0f1720;
+    --gb-code-ink: #e8eef5;
+  }
+  .gb-shell {
+    background:
+      radial-gradient(circle at top right, rgba(15, 118, 110, 0.18), transparent 28%),
+      linear-gradient(180deg, #fffdf9 0%, #f4f7fb 100%);
+    border: 1px solid rgba(22, 50, 79, 0.08);
+    border-radius: 20px;
+  }
+  .gb-hero {
+    background: linear-gradient(135deg, rgba(246, 239, 228, 0.95), rgba(216, 243, 239, 0.95));
+    border: 1px solid rgba(15, 118, 110, 0.12);
+    border-radius: 18px;
+  }
+  .gb-kicker {
+    color: var(--gb-accent);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  .gb-title {
+    color: var(--gb-ink);
+    font-family: "Avenir Next", "IBM Plex Sans", "Segoe UI", sans-serif;
+    font-size: clamp(1.8rem, 2.8vw, 2.6rem);
+    font-weight: 700;
+    line-height: 1.05;
+  }
+  .gb-lead {
+    color: rgba(22, 50, 79, 0.82);
+    max-width: 58rem;
+  }
+  .gb-panel {
+    border: 1px solid var(--gb-line);
+    border-radius: 16px;
+    box-shadow: 0 10px 30px rgba(15, 23, 32, 0.04);
+  }
+  .gb-panel .card-header {
+    background: rgba(255, 255, 255, 0.75);
+    border-bottom: 1px solid rgba(214, 222, 231, 0.85);
+  }
+  .gb-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.32rem 0.65rem;
+    border-radius: 999px;
+    background: var(--gb-accent-soft);
+    color: var(--gb-accent);
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+  .gb-code {
+    background: var(--gb-code-bg);
+    color: var(--gb-code-ink);
+    border-radius: 14px;
+    min-height: 24rem;
+    max-height: 42rem;
+    overflow: auto;
+    padding: 1rem;
+    white-space: pre;
+    font-size: 0.88rem;
+    line-height: 1.45;
+  }
+  .gb-file-list .list-group-item.active {
+    background: var(--gb-accent);
+    border-color: var(--gb-accent);
+  }
+  .gb-status {
+    min-height: 2.5rem;
+  }
+  .gb-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.75rem;
+  }
+  .gb-summary-item {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.85);
+    padding: 0.8rem 0.9rem;
+  }
+  .gb-summary-item small {
+    display: block;
+    color: rgba(22, 50, 79, 0.66);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.7rem;
+    margin-bottom: 0.3rem;
+  }
+  .gb-summary-item strong {
+    color: var(--gb-ink);
+    word-break: break-word;
+  }
+  .gb-tab-nav .nav-link {
+    color: rgba(22, 50, 79, 0.8);
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-weight: 600;
+  }
+  .gb-tab-nav .nav-link.active {
+    background: var(--gb-accent-soft);
+    color: var(--gb-accent);
+    border-color: rgba(15, 118, 110, 0.18);
+  }
+  .gb-accordion .accordion-item {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.84);
+  }
+  .gb-accordion .accordion-button {
+    font-weight: 600;
+    color: var(--gb-ink);
+    background: rgba(255, 255, 255, 0.88);
+    box-shadow: none;
+  }
+  .gb-accordion .accordion-button:not(.collapsed) {
+    color: var(--gb-accent);
+    background: rgba(216, 243, 239, 0.55);
+  }
+  .gb-optional-badge {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 0.55rem;
+    padding: 0.14rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid rgba(15, 118, 110, 0.18);
+    color: var(--gb-accent);
+    font-size: 0.72rem;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+  .gb-compact-note {
+    color: rgba(22, 50, 79, 0.7);
+    font-size: 0.92rem;
+  }
+  .gb-intent-overrides {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.72);
+  }
+  .gb-intent-overrides summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 0.8rem 0.95rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    color: var(--gb-ink);
+    font-weight: 600;
+  }
+  .gb-intent-overrides summary::-webkit-details-marker {
+    display: none;
+  }
+  .gb-intent-overrides[open] summary {
+    border-bottom: 1px solid rgba(214, 222, 231, 0.92);
+    background: rgba(216, 243, 239, 0.28);
+  }
+  .gb-intent-overrides-body {
+    padding: 0.95rem;
+  }
+  .gb-intent-field-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.25rem;
+  }
+  .gb-test-file-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .gb-model-card {
+    border: 0;
+    box-shadow: 0 0.125rem 0.5rem rgba(15, 23, 32, 0.08);
+    height: 100%;
+  }
+  .gb-model-card .card-header {
+    background: rgba(255, 255, 255, 0.96);
+    border-bottom: 0;
+    padding-bottom: 0;
+  }
+  .gb-step-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 999px;
+    background: rgba(15, 118, 110, 0.1);
+    color: var(--gb-accent);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .gb-lock-note {
+    border: 1px dashed rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(246, 239, 228, 0.45);
+    color: rgba(22, 50, 79, 0.74);
+    padding: 0.85rem 1rem;
+  }
+  .gb-tab-nav .nav-link:disabled,
+  .gb-tab-nav .nav-link[aria-disabled="true"] {
+    opacity: 0.55;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
+  .gb-helper-list {
+    margin: 0;
+    padding-left: 1rem;
+  }
+  .gb-helper-list li + li {
+    margin-top: 0.45rem;
+  }
+  .gb-stream-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1.3fr) minmax(18rem, 0.9fr);
+    gap: 1rem;
+  }
+  .gb-stream-panel {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.92);
+    min-height: 18rem;
+    overflow: hidden;
+  }
+  .gb-stream-panel-header {
+    padding: 0.85rem 1rem 0.35rem;
+    font-weight: 700;
+    color: var(--gb-ink);
+  }
+  .gb-stream-panel-subheader {
+    padding: 0 1rem 0.65rem;
+    color: rgba(22, 50, 79, 0.66);
+    font-size: 0.85rem;
+  }
+  .gb-stream-output,
+  .gb-stream-events {
+    margin: 0;
+    padding: 0 1rem 1rem;
+    max-height: 26rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-size: 0.9rem;
+  }
+  .gb-stream-events {
+    list-style: none;
+  }
+  .gb-stream-events li + li {
+    margin-top: 0.75rem;
+  }
+  .gb-stream-events .gb-stream-event-time {
+    display: block;
+    color: rgba(22, 50, 79, 0.6);
+    font-size: 0.78rem;
+    margin-bottom: 0.15rem;
+  }
+  .gb-stream-status {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+  .gb-build-card-body {
+    position: relative;
+  }
+  .gb-run-overlay {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    background: rgba(244, 247, 251, 0.82);
+    backdrop-filter: blur(2px);
+    z-index: 20;
+    border-radius: 0 0 16px 16px;
+  }
+  .gb-run-overlay.is-visible {
+    display: flex;
+  }
+  .gb-run-overlay-card {
+    width: min(100%, 28rem);
+    background: rgba(255, 255, 255, 0.96);
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 16px;
+    box-shadow: 0 20px 45px rgba(15, 23, 32, 0.12);
+    padding: 1.25rem;
+  }
+  .gb-run-overlay-spinner {
+    width: 2.25rem;
+    height: 2.25rem;
+    color: var(--gb-accent);
+  }
+  .gb-files-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  .gb-files-footer-anchor {
+    position: sticky;
+    bottom: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-top: 0.9rem;
+    padding-bottom: 0.1rem;
+    border-top: 1px solid rgba(214, 222, 231, 0.92);
+    background: linear-gradient(180deg, rgba(244, 247, 251, 0.72), rgba(244, 247, 251, 0.98) 35%, rgba(244, 247, 251, 1) 100%);
+  }
+  .gb-inline-snapshot {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.92);
+    padding: 0.9rem 1rem;
+  }
+  .gb-intent-preview {
+    border: 1px solid rgba(214, 222, 231, 0.92);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.92);
+    padding: 0.9rem 1rem;
+  }
+  @media (max-width: 991px) {
+    .gb-stream-shell {
+      grid-template-columns: 1fr;
+    }
+  }
+  @media (max-width: 991px) {
+    .gb-code {
+      min-height: 16rem;
+    }
+  }
+</style>
+
+<div class="container-fluid py-3">
+  <div class="gb-shell p-3 p-lg-4">
+    {% set active_generator_catalog_tab = 'generator-builder' %}
+    {% include 'partials/generator_catalog_tabs.html' %}
+
+    <div class="gb-hero p-4 mb-4">
+      <div class="d-flex flex-column flex-lg-row gap-3 align-items-lg-end justify-content-between">
+        <div>
+          <div class="gb-kicker mb-2">Prompt-Driven Authoring</div>
+          <div class="gb-title mb-2">Generator Builder</div>
+          <div class="gb-lead mb-0">
+            Describe the generator you want, choose the model, and generate a compatible scaffold for
+            <span class="fw-semibold">flag-generators</span> or <span class="fw-semibold">flag-node-generators</span>.
+            The AI response is normalized into the same ZIP scaffold format the repo already installs and tests.
+          </div>
         </div>
-        <div class="card-body">
-          <div class="alert alert-info small mb-3">
-            Builds a ready-to-zip scaffold for creating new generators.
-            The scaffold includes <span class="font-monospace">manifest.yaml</span> for Generator Packs and follows the runtime contract used by the generator runner.
-            <div class="mt-2">
-              <div class="fw-semibold">Conventions</div>
-              <ul class="mb-0">
-                <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in <span class="font-monospace">manifest.yaml</span>.</li>
-                <li>For file outputs: write under <span class="font-monospace">/outputs/artifacts/...</span> and reference in <span class="font-monospace">outputs.json</span> as <span class="font-monospace">artifacts/&lt;name&gt;</span>.</li>
-                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">File(path)</span>) in <span class="font-monospace">manifest.yaml</span> under <span class="font-monospace">injects</span>.</li>
-              </ul>
-            </div>
-            <div class="mt-2">
-              <div class="fw-semibold">Examples</div>
-              <div class="small text-muted">
-                <div>Artifacts: <span class="font-monospace">requires: [Knowledge(ip)]</span> → <span class="font-monospace">produces: [Credential(user, password), Flag(flag_id)]</span></div>
-                <div>Injects: <span class="font-monospace">injects: [File(path)]</span></div>
-                <div>Hint template: <span class="font-monospace">Next: {{ '{{OUTPUT.Knowledge(ip)}}' }}</span></div>
-                <div>outputs.json: <span class="font-monospace">{"outputs": {"Flag(flag_id)": "FLAG{...}", "File(path)": "artifacts/creds.txt"}}</span></div>
-              </div>
-            </div>
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">Generator type</label>
-            <select class="form-select" id="gbPluginType">
-              <option value="flag-generator">flag-generator (writes outputs.json)</option>
-              <option value="flag-node-generator">flag-node-generator (writes docker-compose.yml + outputs.json)</option>
-            </select>
-          </div>
-
-          <div class="row g-2">
-            <div class="col-12 col-md-6">
-              <label class="form-label">Source ID</label>
-              <input class="form-control" id="gbPluginId" placeholder="e.g. my_ssh_creds">
-              <div class="form-text">Used as the <span class="font-monospace">manifest.yaml</span> <code>id</code>. Installed Generator Packs are assigned a new numeric id at install time.</div>
-            </div>
-            <div class="col-12 col-md-6">
-              <label class="form-label">Folder name</label>
-              <input class="form-control" id="gbFolderName" placeholder="e.g. py_my_ssh_creds">
-              <div class="form-text">Created under <code>flag_generators/</code> or <code>flag_node_generators/</code>.</div>
-            </div>
-          </div>
-
-          <div class="mb-2 mt-2">
-            <label class="form-label">Display name</label>
-            <input class="form-control" id="gbName" placeholder="e.g. SSH Credentials">
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">Description</label>
-            <textarea class="form-control" id="gbDescription" rows="2" placeholder="One sentence summary."></textarea>
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">Inputs (artifacts)</label>
-            <div class="d-flex gap-2">
-              <button class="btn btn-sm btn-outline-primary" type="button" id="gbReqAddBtn"><i class="bi bi-plus-circle"></i> Add inputs</button>
-              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbReqClearBtn">Clear</button>
-            </div>
-            <div class="form-text">Select artifact keys the generator reads. Mark any selected input as <span class="fw-semibold">required</span>; others default to optional.</div>
-            <div class="mt-2" id="gbRequiresList"></div>
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">Outputs (artifacts)</label>
-            <div class="d-flex gap-2">
-              <button class="btn btn-sm btn-outline-primary" type="button" id="gbProdAddBtn"><i class="bi bi-plus-circle"></i> Add outputs</button>
-              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbProdClearBtn">Clear</button>
-            </div>
-            <div class="form-text">These are artifact keys the generator will write into <code>outputs.json</code>.</div>
-            <div class="mt-2" id="gbProducesList"></div>
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">Inject files (allowlist)</label>
-            <div class="d-flex gap-2">
-              <button class="btn btn-sm btn-outline-primary" type="button" id="gbInjAddBtn"><i class="bi bi-plus-circle"></i> Add inject_files</button>
-              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbInjClearBtn">Clear</button>
-            </div>
-            <div class="form-text">Artifacts staged into scenarios under <code>injected/</code>. Prefer output keys (e.g. <code>File(path)</code>).</div>
-            <div class="mt-2" id="gbInjectFilesList"></div>
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">Runtime inputs (config schema)</label>
-            <div class="d-flex flex-wrap gap-2">
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="gbInSeed" checked>
-                <label class="form-check-label" for="gbInSeed">seed</label>
-              </div>
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="gbInSecret" checked>
-                <label class="form-check-label" for="gbInSecret">secret</label>
-              </div>
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="gbInNodeName">
-                <label class="form-check-label" for="gbInNodeName">node_name</label>
-              </div>
-              <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="gbInFlagPrefix" checked>
-                <label class="form-check-label" for="gbInFlagPrefix">flag_prefix</label>
-              </div>
-            </div>
-            <div class="form-text">Flow-synthesized values must be modeled as runtime inputs, not artifact inputs.</div>
-          </div>
-
-          <div class="mb-3">
-            <label class="form-label">Hint templates (one per line)</label>
-            <textarea class="form-control" id="gbHintTemplates" rows="3" placeholder="Next: ... using {{ '{{OUTPUT.some_key}}' }}"></textarea>
-          </div>
-
-          <div class="mb-2">
-            <label class="form-label">docker-compose.yml (scaffold)</label>
-            <textarea class="form-control font-monospace" id="gbDockerCompose" rows="8"></textarea>
-            <div class="form-text">This compose is included in the scaffold folder to run <code>generator.py</code> in a container.</div>
-          </div>
-
-          <div class="mb-3">
-            <label class="form-label">README.md (scaffold)</label>
-            <textarea class="form-control font-monospace" id="gbReadme" rows="6"></textarea>
-          </div>
-
-          <div class="d-flex gap-2">
-            <button class="btn btn-outline-primary" id="gbBtnZip"><i class="bi bi-file-earmark-zip"></i> Download scaffold zip</button>
-          </div>
-
-          <div class="mt-2 small text-muted">
-            To install a generator, upload the ZIP as a Generator Pack on the <a href="{{ url_for('flag_catalog_page') }}" class="text-muted">Flag-Catalog</a> page.
-            For local dev, you can also unzip into the repo and run <span class="font-monospace">scripts/run_flag_generator.py</span> against it.
-          </div>
-
-          <div class="mt-3 small text-muted">
-            Reference: <span class="text-muted">docs/GENERATOR_AUTHORING.md</span> and <a href="{{ url_for('flag_catalog_page') }}" class="text-muted">Flag-Catalog</a>
-          </div>
-        </div>
-      </div>
-
-      <div class="card shadow-sm mb-3">
-        <div class="card-header fw-semibold"><i class="bi bi-braces"></i> manifest.yaml (generated)</div>
-        <div class="card-body">
-          <div class="small text-muted mb-2">
-            This is the pack manifest generated from the form.
-          </div>
-          <textarea class="form-control font-monospace" id="gbManifestYaml" rows="12" readonly></textarea>
+        <div class="d-flex flex-wrap gap-2">
+          <span class="gb-pill"><i class="bi bi-cpu"></i> Provider-aware</span>
+          <span class="gb-pill"><i class="bi bi-box-seam"></i> ZIP-ready output</span>
+          <span class="gb-pill"><i class="bi bi-file-earmark-code"></i> Manifest-safe scaffold</span>
+          <button class="btn btn-sm btn-outline-danger" type="button" id="gbClearStateBtn">Clear Builder State</button>
         </div>
       </div>
     </div>
-  </div>
 
-  <div class="row">
-    <div class="col-12">
-      <div class="card shadow-sm">
-        <div class="card-header fw-semibold"><i class="bi bi-folder2-open"></i> Scaffold files</div>
-        <div class="card-body">
-          <ul class="mb-0" id="gbFiles"></ul>
+    <div class="row g-4">
+      <div class="col-12">
+        <div class="card gb-panel h-100">
+          <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <div class="fw-semibold"><i class="bi bi-stars me-2"></i>Build</div>
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="gbPromptExampleBtn">Load example</button>
+          </div>
+          <div class="card-body gb-build-card-body">
+            <div class="gb-run-overlay" id="gbGenerateOverlay" aria-hidden="true">
+              <div class="gb-run-overlay-card text-center">
+                <div class="spinner-border gb-run-overlay-spinner mb-3" role="status" aria-hidden="true"></div>
+                <div class="fw-semibold mb-1" id="gbGenerateOverlayTitle">Generating scaffold…</div>
+                <div class="small text-muted mb-3" id="gbGenerateOverlayDetail">The prompt response tab is locked until this run completes or is cancelled.</div>
+                <button type="button" class="btn btn-outline-danger" id="gbGenerateCancelBtn">Cancel</button>
+              </div>
+            </div>
+            <ul class="nav nav-pills gb-tab-nav mb-3" role="tablist">
+              <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="gbBuildTabModelBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabModel" type="button" role="tab" aria-selected="true">Model Config</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="gbBuildTabPromptBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabPrompt" type="button" role="tab" aria-selected="false" disabled aria-disabled="true">Build</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="gbBuildTabOutputBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabOutput" type="button" role="tab" aria-selected="false">Prompt Response</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="gbBuildTabTestBtn" data-bs-toggle="tab" data-bs-target="#gbBuildTabTest" type="button" role="tab" aria-selected="false" disabled aria-disabled="true">Test Run</button>
+              </li>
+            </ul>
+            <div class="tab-content">
+              <div class="tab-pane fade show active" id="gbBuildTabModel" role="tabpanel">
+                <div class="card gb-model-card">
+                  <div class="card-header d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                    <strong>Provider Config</strong>
+                    <span class="badge text-bg-secondary" id="gbConnectionBadge">Locked</span>
+                  </div>
+                  <div class="card-body">
+                    <div class="mb-3">
+                      <label class="form-label">Provider</label>
+                      <div class="d-flex gap-2 align-items-center">
+                        <select class="form-select" id="gbProvider"></select>
+                        <button type="button" class="btn btn-outline-secondary btn-sm flex-shrink-0" id="gbRefreshProvidersBtn">Refresh</button>
+                      </div>
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">URL</label>
+                      <input class="form-control" id="gbBaseUrl" placeholder="http://127.0.0.1:11434" />
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">API key</label>
+                      <input class="form-control" id="gbApiKey" type="password" placeholder="Optional for hosted providers" />
+                    </div>
+                    <div class="mb-3">
+                      <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="gbEnforceSsl" checked>
+                        <label class="form-check-label" for="gbEnforceSsl">Verify TLS certificates</label>
+                      </div>
+                    </div>
+                    <div class="mb-3">
+                      <label class="form-label">LLM Model</label>
+                      <div class="d-flex gap-2 align-items-center mb-2 flex-wrap">
+                        <button type="button" class="btn btn-outline-secondary btn-sm" id="gbFetchModelsBtn">Fetch Models</button>
+                        <div class="small text-muted">Refreshes available models from the selected provider using the configured URL, optional API key, and TLS settings above.</div>
+                      </div>
+                      <select class="form-select" id="gbModel">
+                        <option value="">Select a model after fetching or validating</option>
+                      </select>
+                    </div>
+                    <div class="d-flex gap-2 align-items-center flex-wrap mt-3">
+                      <button class="btn btn-primary" type="button" id="gbValidateBtn">Connect / validate</button>
+                      <div class="small text-muted">Validates provider reachability, current URL/API-key/TLS settings, and available LLM models before prompting.</div>
+                    </div>
+                    <div class="mt-3 small alert alert-secondary mb-0 gb-status" id="gbValidationStatus">No validation has been run yet.</div>
+                  </div>
+                </div>
+              </div>
+              <div class="tab-pane fade" id="gbBuildTabPrompt" role="tabpanel">
+                <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+                  <div>
+                    <span class="gb-step-badge">Step 2</span>
+                    <div class="small text-muted mt-2">Prompting unlocks after the model/provider step completes successfully.</div>
+                  </div>
+                  <span class="badge text-bg-secondary" id="gbPromptLockBadge">Locked until validation</span>
+                </div>
+                <div class="gb-lock-note mb-3 d-none" id="gbPromptLockedNote">
+                  Complete the Model step first: fetch models if needed, then use Connect / validate to unlock prompting.
+                </div>
+                <div class="row g-3 mb-3">
+                  <div class="col-12 col-md-4">
+                    <label class="form-label">Generator kind</label>
+                    <select class="form-select" id="gbPluginType" disabled>
+                      <option value="flag-generator">flag-generator</option>
+                      <option value="flag-node-generator">flag-node-generator</option>
+                    </select>
+                  </div>
+                  <div class="col-12 col-md-4">
+                    <label class="form-label">Source ID hint</label>
+                    <input class="form-control" id="gbSourceIdHint" placeholder="ssh_creds_drop" disabled />
+                  </div>
+                  <div class="col-12 col-md-4">
+                    <label class="form-label">Name hint</label>
+                    <input class="form-control" id="gbNameHint" placeholder="SSH Credentials Drop" disabled />
+                  </div>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label">Iteration Prompt</label>
+                  <textarea class="form-control" id="gbPrompt" rows="12" placeholder="Describe the runtime behavior, outputs, required inputs, and any compose constraints." disabled></textarea>
+                  <div class="form-text">
+                    Start with a create request, then use follow-up prompts to refine behavior, fix test failures, or add new capabilities while keeping the current scaffold as context.
+                  </div>
+                </div>
+                <div class="gb-intent-preview mb-3" id="gbPromptIntentPreview">
+                  <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                    <div class="fw-semibold">Prompt Intent Preview</div>
+                    <span class="badge text-bg-secondary" id="gbPromptIntentBadge">Idle</span>
+                  </div>
+                  <div class="small text-muted" id="gbPromptIntentStatus">Prompt-derived defaults and explicit prompt requirements will preview here before generation.</div>
+                  <div class="mt-2 d-grid gap-2" id="gbPromptIntentBody"></div>
+                  <div class="border-top mt-3 pt-3">
+                    <details class="gb-intent-overrides" id="gbIntentOverridesPanel">
+                      <summary>
+                        <span>Tune Before Generation</span>
+                        <span class="small text-muted" id="gbIntentOverridesSummary">Collapsed. Open to add manual overrides.</span>
+                      </summary>
+                      <div class="gb-intent-overrides-body">
+                        <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mb-2">
+                          <div class="small text-muted">Only non-empty fields below override the prompt preview on the next generation run.</div>
+                          <div class="d-flex gap-2 flex-wrap">
+                            <button class="btn btn-sm btn-outline-primary" type="button" id="gbIntentApplySuggestedBtn">Use Suggested Defaults</button>
+                            <button class="btn btn-sm btn-outline-secondary" type="button" id="gbIntentClearBtn">Clear Overrides</button>
+                          </div>
+                        </div>
+                        <div class="row g-2">
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentRuntimeInputs">Runtime inputs override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="runtime_inputs">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentRuntimeInputs" rows="3" placeholder="seed (required)&#10;secret (required, sensitive)"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentRequires">Artifact requirements override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="requires">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentRequires" rows="3" placeholder="Knowledge(ip)&#10;Knowledge(hostname) (optional)"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentProduces">Artifact outputs override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="produces">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentProduces" rows="3" placeholder="Flag(flag_id)&#10;Credential(user,password)&#10;File(path)"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentInjectFiles">Inject files override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_files">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentInjectFiles" rows="3" placeholder="File(path)&#10;File(path) -&gt; /opt/bootstrap"></textarea>
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentInjectDestination">Inject destination override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="inject_destination">Use suggested</button>
+                            </div>
+                            <input class="form-control form-control-sm" id="gbIntentInjectDestination" placeholder="/opt/bootstrap" />
+                          </div>
+                          <div class="col-12 col-lg-6">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentReadmeNotes">README notes override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="readme_mentions">Use suggested</button>
+                            </div>
+                            <input class="form-control form-control-sm" id="gbIntentReadmeNotes" placeholder="determinism, local runner testing" />
+                          </div>
+                          <div class="col-12">
+                            <div class="gb-intent-field-header">
+                              <label class="form-label small mb-0" for="gbIntentHintTemplates">Hint templates override</label>
+                              <button class="btn btn-link btn-sm p-0 text-decoration-none" type="button" data-gb-intent-fill="hint_templates">Use suggested</button>
+                            </div>
+                            <textarea class="form-control form-control-sm" id="gbIntentHintTemplates" rows="3" placeholder="{% raw %}Next: SSH using {{OUTPUT.Credential(user,password)}}{% endraw %}"></textarea>
+                          </div>
+                        </div>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+                <div class="d-flex gap-2 flex-wrap align-items-center mb-3">
+                  <button class="btn btn-primary" type="button" id="gbPromptSubmitBtn" disabled>
+                    <i class="bi bi-send me-1"></i>Submit New
+                  </button>
+                  <button class="btn btn-outline-primary" type="button" id="gbPromptRefineBtn" disabled>
+                    <i class="bi bi-arrow-repeat me-1"></i>Submit as Refinement
+                  </button>
+                  <button type="button" class="btn btn-outline-secondary" id="gbStreamRetryBtn" disabled>
+                    <i class="bi bi-arrow-clockwise me-1"></i>Retry
+                  </button>
+                  <div class="small text-muted">
+                    Use Submit New for the first scaffold, Test to run the current scaffold locally, Submit as Refinement to iterate from the current generated state, or Retry to rerun the last generation action.
+                  </div>
+                </div>
+                <div class="gb-compact-note">
+                  Flow: Submit New to create the first scaffold, Test to run it locally, then use Submit as Refinement or Retry to iterate on the current generated state.
+                </div>
+                <div class="alert alert-light border small mt-3 mb-0" id="gbGenerationStatus">No scaffold generated yet.</div>
+              </div>
+              <div class="tab-pane fade" id="gbBuildTabOutput" role="tabpanel">
+                <div class="d-flex align-items-start justify-content-between gap-3 flex-wrap mb-3">
+                  <div>
+                    <div class="fw-semibold">Generator Builder Output</div>
+                    <div class="small text-muted" id="gbStreamMeta">No prompt has been submitted yet.</div>
+                  </div>
+                  <div class="d-flex gap-2 flex-wrap">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="gbStreamHeaderCloseBtn">Back to Prompt</button>
+                  </div>
+                </div>
+                <ul class="nav nav-pills gb-tab-nav mb-3" role="tablist">
+                  <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="gbPromptResponseModelTabBtn" data-bs-toggle="tab" data-bs-target="#gbPromptResponseModelTab" type="button" role="tab" aria-selected="true">Model Output</button>
+                  </li>
+                  <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="gbResultsFilesTabBtn" data-bs-toggle="tab" data-bs-target="#gbResultsFilesTab" type="button" role="tab" aria-selected="false">Scaffold Files</button>
+                  </li>
+                  <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="gbResultsSummaryTabBtn" data-bs-toggle="tab" data-bs-target="#gbResultsSummaryTab" type="button" role="tab" aria-selected="false">Generated Summary</button>
+                  </li>
+                  <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="gbResultsHistoryTabBtn" data-bs-toggle="tab" data-bs-target="#gbResultsHistoryTab" type="button" role="tab" aria-selected="false">Iteration History</button>
+                  </li>
+                </ul>
+                <div class="tab-content">
+                  <div class="tab-pane fade show active" id="gbPromptResponseModelTab" role="tabpanel">
+                    <div class="gb-stream-status">
+                      <div>
+                        <div class="fw-semibold" id="gbStreamStatus">Waiting for a prompt run…</div>
+                        <div class="small text-muted" id="gbStreamDetail">Submit a new prompt or refinement to capture the response here.</div>
+                      </div>
+                      <span class="badge text-bg-secondary" id="gbStreamStateBadge">Idle</span>
+                    </div>
+                    <div class="gb-stream-shell">
+                      <div class="gb-stream-panel">
+                        <div class="gb-stream-panel-header">Model Output</div>
+                        <div class="gb-stream-panel-subheader" id="gbStreamOutputHint"></div>
+                        <div class="px-3 pb-2 small text-muted" id="gbStreamParsedSummary">Raw response will appear here after the first run.</div>
+                        <pre class="gb-stream-output" id="gbStreamOutput">No model response captured yet.</pre>
+                      </div>
+                      <div class="gb-stream-panel">
+                        <div class="gb-stream-panel-header">Activity</div>
+                        <ol class="gb-stream-events" id="gbStreamEvents">
+                          <li class="text-muted">No activity yet.</li>
+                        </ol>
+                      </div>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap align-items-center mt-3">
+                      <button type="button" class="btn btn-outline-secondary btn-sm" id="gbStreamCopyBtn">Copy Transcript</button>
+                      <button type="button" class="btn btn-outline-secondary btn-sm" id="gbStreamDownloadBtn">Download Transcript</button>
+                      <button type="button" class="btn btn-outline-secondary btn-sm" id="gbStreamCloseBtn">Back to Prompt</button>
+                    </div>
+                  </div>
+                  <div class="tab-pane fade" id="gbResultsFilesTab" role="tabpanel">
+                    <div class="gb-files-pane">
+                      <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+                        <div class="fw-semibold"><i class="bi bi-folder2-open me-2"></i>Scaffold Files</div>
+                        <span class="small text-muted" id="gbFilesCount">0 files</span>
+                      </div>
+                      <div class="row g-3">
+                        <div class="col-12 col-md-4">
+                          <div class="list-group gb-file-list" id="gbFileList">
+                            <div class="list-group-item text-muted">Generate a scaffold to preview files.</div>
+                          </div>
+                        </div>
+                        <div class="col-12 col-md-8">
+                          <pre class="gb-code mb-0" id="gbFileContent">No file selected.</pre>
+                        </div>
+                      </div>
+                      <div class="gb-inline-snapshot d-none" id="gbLatestTestSnapshot"></div>
+                    </div>
+                  </div>
+                  <div class="tab-pane fade" id="gbResultsSummaryTab" role="tabpanel">
+                    <div class="fw-semibold mb-3"><i class="bi bi-info-square me-2"></i>Generated Summary</div>
+                    <div class="gb-summary-grid" id="gbSummaryGrid">
+                      <div class="gb-summary-item"><small>Status</small><strong>Awaiting generation</strong></div>
+                    </div>
+                  </div>
+                  <div class="tab-pane fade" id="gbResultsHistoryTab" role="tabpanel">
+                    <div class="fw-semibold mb-3"><i class="bi bi-clock-history me-2"></i>Iteration History</div>
+                    <div class="list-group" id="gbIterationHistory">
+                      <div class="list-group-item text-muted">No iterations yet.</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="gb-files-footer-anchor mt-3">
+                  <div class="small text-muted">Run the current scaffold locally from the same spot no matter which Prompt Response subtab you are viewing.</div>
+                  <button class="btn btn-outline-dark btn-sm" type="button" id="gbTestBtn" disabled>
+                    <i class="bi bi-beaker me-1"></i>Test
+                  </button>
+                </div>
+              </div>
+              <div class="tab-pane fade" id="gbBuildTabTest" role="tabpanel">
+                <div class="d-flex align-items-start justify-content-between gap-3 flex-wrap mb-3">
+                  <div>
+                    <div class="fw-semibold" id="gbGenTestName">Test Generator</div>
+                    <div class="small text-muted" id="gbGenTestId">Press Test from Prompt Response to start a run and populate progress here.</div>
+                  </div>
+                  <div class="d-flex gap-2 flex-wrap">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="gbTestBackToBuildBtn">Back to Prompt</button>
+                  </div>
+                </div>
+                <ul class="nav nav-pills gb-tab-nav mb-3" role="tablist">
+                  <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="gbTestProgressTabBtn" data-bs-toggle="tab" data-bs-target="#gbTestProgressTab" type="button" role="tab" aria-selected="true">Run Progress</button>
+                  </li>
+                  <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="gbResultsTestTabBtn" data-bs-toggle="tab" data-bs-target="#gbResultsTestTab" type="button" role="tab" aria-selected="false">Latest Test Result</button>
+                  </li>
+                </ul>
+                <div class="tab-content">
+                  <div class="tab-pane fade show active" id="gbTestProgressTab" role="tabpanel">
+                    <div class="alert alert-secondary small d-flex align-items-center gap-2" id="gbTestRunActiveStatus">
+                      <span class="spinner-border spinner-border-sm d-none" id="gbTestRunActiveSpinner" role="status" aria-hidden="true"></span>
+                      <span id="gbTestRunActiveText">No test run has started yet.</span>
+                    </div>
+                    <form id="gbGenTestForm">
+                      <div id="gbGenTestInputsBlock">
+                        <div id="gbGenTestInputs"><div class="text-muted small">No runtime inputs for the current scaffold.</div></div>
+                      </div>
+                    </form>
+                    <div class="mt-3">
+                      <div class="small text-muted mb-1">Progress / Log</div>
+                      <pre class="small bg-light p-2" id="gbGenTestLog" style="max-height: 220px; overflow: auto;">Press Test from Prompt Response to prepare a run.</pre>
+                    </div>
+                    <div class="mt-3">
+                      <div class="small text-muted mb-1">Generated Files</div>
+                      <div id="gbGenTestOutputsStatus" class="small text-muted mb-2" style="display:none;">
+                        <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+                        <span id="gbGenTestOutputsStatusText">Working…</span>
+                      </div>
+                      <div id="gbGenTestOutputs" class="small"><div class="text-muted">Start a test from Prompt Response to see generated files.</div></div>
+                    </div>
+                  </div>
+                  <div class="tab-pane fade" id="gbResultsTestTab" role="tabpanel">
+                    <div class="fw-semibold mb-3"><i class="bi bi-terminal me-2"></i>Latest Test Result</div>
+                    <div class="alert alert-secondary small" id="gbTestStatus">No local test run yet.</div>
+                    <div class="row g-3">
+                      <div class="col-12 col-lg-6">
+                        <div class="small text-muted mb-1">stdout</div>
+                        <pre class="gb-code mb-0" id="gbTestStdout">No output yet.</pre>
+                      </div>
+                      <div class="col-12 col-lg-6">
+                        <div class="small text-muted mb-1">stderr</div>
+                        <pre class="gb-code mb-0" id="gbTestStderr">No output yet.</pre>
+                      </div>
+                    </div>
+                    <div class="small text-muted mt-3 mb-1">Produced files</div>
+                    <div class="list-group" id="gbTestFiles">
+                      <div class="list-group-item text-muted">No test artifacts yet.</div>
+                    </div>
+                    <div class="d-flex align-items-center justify-content-between gap-2 flex-wrap mt-3 pt-3 border-top">
+                      <div class="small text-muted">Install unlocks after the latest Builder test completes successfully.</div>
+                      <button class="btn btn-outline-success" type="button" id="gbInstallBtn" disabled>
+                        <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Artifact Selector Modal -->
-<div class="modal fade" id="gbArtifactModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+<div class="modal fade" id="gbTestCredsModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title" id="gbArtifactModalTitle">Select artifacts</h5>
+        <h5 class="modal-title">CORE VM Credentials</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
-        <div class="card mb-3">
-          <div class="card-body py-2">
-            <div class="row g-2 align-items-end">
-              <div class="col-12 col-md-6">
-                <label class="form-label mb-1">Add custom artifact</label>
-                <input class="form-control" id="gbCustomArtifact" placeholder="e.g. ssh.private_key" />
-              </div>
-              <div class="col-12 col-md-4">
-                <label class="form-label mb-1">Type (optional)</label>
-                <input class="form-control" id="gbCustomArtifactType" placeholder="e.g. text" />
-              </div>
-              <div class="col-12 col-md-2">
-                <button type="button" class="btn btn-outline-primary w-100" id="gbCustomArtifactAddBtn">Add</button>
-              </div>
-            </div>
-            <div class="small text-muted mt-1">Custom artifacts are saved and will appear in this list for future generators.</div>
-          </div>
+        <div class="small text-muted mb-3">
+          Builder tests run against the CORE VM test target. Last saved credentials are preloaded so you can reuse or edit them.
         </div>
-
-        <div class="row g-2 align-items-center mb-2">
-          <div class="col-12 col-md-6">
-            <input class="form-control" id="gbArtifactFilter" placeholder="Filter (substring or regex)…" />
-          </div>
-          <div class="col-12 col-md-3">
-            <div class="form-check">
-              <input class="form-check-input" type="checkbox" id="gbArtifactFilterRegex" />
-              <label class="form-check-label" for="gbArtifactFilterRegex">Regex</label>
-            </div>
-          </div>
-          <div class="col-12 col-md-3 text-md-end">
-            <span class="small text-muted" id="gbArtifactFilterMeta"></span>
-          </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Host</label>
+          <input class="form-control" id="gbTestCredsHost" placeholder="core-vm.example" />
         </div>
-
-        <div class="alert alert-warning py-2 px-3 small d-none" id="gbArtifactRegexError"></div>
-
-        <div class="table-responsive">
-          <table class="table table-sm align-middle">
-            <thead>
-              <tr>
-                <th style="width: 56px;">Pick</th>
-                <th style="width: 110px;" id="gbArtifactRequiredHeader" class="d-none">Required</th>
-                <th>Artifact</th>
-                <th style="width: 160px;">Type</th>
-                <th>Description</th>
-                <th>Produced by</th>
-              </tr>
-            </thead>
-            <tbody id="gbArtifactBody"></tbody>
-          </table>
+        <div class="mb-3">
+          <label class="form-label">SSH Port</label>
+          <input class="form-control" id="gbTestCredsPort" type="number" value="22" />
         </div>
+        <div class="mb-3">
+          <label class="form-label">SSH Username</label>
+          <input class="form-control" id="gbTestCredsUser" />
+        </div>
+        <div class="mb-0">
+          <label class="form-label">SSH Password</label>
+          <input class="form-control" id="gbTestCredsPass" type="password" />
+        </div>
+        <div class="alert alert-secondary small mt-3 mb-0" id="gbTestCredsStatus">Last saved generator-test CORE credentials will be reused unless you edit them here.</div>
       </div>
       <div class="modal-footer">
         <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-        <button type="button" class="btn btn-primary" id="gbArtifactApplyBtn">Add selected</button>
+        <button type="button" class="btn btn-primary" id="gbTestCredsContinue">Save and Run Test</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="gbGenTestCleanupModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" style="max-width: 600px;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Cleaning up</h5>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex align-items-center gap-2">
+          <span id="gbGenTestCleanupSpinner" class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+          <span id="gbGenTestCleanupText">Cleaning up, please wait…</span>
+        </div>
+        <pre class="small bg-light p-2 mt-2 mb-0" id="gbGenTestCleanupLog" style="max-height: 320px; overflow: auto;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" id="gbGenTestCleanupCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
       </div>
     </div>
   </div>
 </div>
 
 <script>
-(function(){
-  const SAMPLE_COMPOSE = (
-    "services:\n"+
-    "  generator:\n"+
-    "    image: python:3.12-slim\n"+
-    "    working_dir: /app\n"+
-    "    command: [\"python\", \"/app/generator.py\"]\n"+
-    "    environment:\n"+
-    "      INPUTS_DIR: ${INPUTS_DIR}\n"+
-    "      OUTPUTS_DIR: ${OUTPUTS_DIR}\n"+
-    "    volumes:\n"+
-    "      - ./generator.py:/app/generator.py:ro\n"+
-    "      - ${INPUTS_DIR}:/inputs:ro\n"+
-    "      - ${OUTPUTS_DIR}:/outputs\n"
-  );
-
-  function sampleReadme(displayName, pluginId, pluginType){
-    const dn = (displayName || '').trim() || (pluginId || '').trim() || 'My Generator';
-    const pid = (pluginId || '').trim() || 'my_generator';
-    const pt = (pluginType || '').trim() || 'flag-generator';
-    return `# ${dn}\n\nTODO: describe this generator.\n\n- plugin_id: \`${pid}\`\n- type: \`${pt}\`\n`;
-  }
-
-  function defaultFolder(pluginId){
-    const base = (pluginId || '').trim() || 'my_generator';
-    if(base.startsWith('py_')) return base;
-    return 'py_' + base;
-  }
-
-  function buildPayload(){
-    const plugin_type = document.getElementById('gbPluginType').value;
-    const plugin_id = document.getElementById('gbPluginId').value.trim();
-    const folder_name = (document.getElementById('gbFolderName').value.trim() || defaultFolder(plugin_id));
-    const name = document.getElementById('gbName').value.trim();
-    const description = document.getElementById('gbDescription').value.trim();
-
-    const requires = state.requires.slice();
-    const produces = state.produces.slice();
-    const inject_files = state.inject_files.slice();
-
-    const hint_templates = String(document.getElementById('gbHintTemplates').value || '')
-      .split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-
-    const compose_text = String(document.getElementById('gbDockerCompose').value || '');
-    const readme_text = String(document.getElementById('gbReadme').value || '');
-
-    const inputs = {
-      seed: document.getElementById('gbInSeed').checked,
-      secret: document.getElementById('gbInSecret').checked,
-      node_name: document.getElementById('gbInNodeName').checked,
-      flag_prefix: document.getElementById('gbInFlagPrefix').checked,
-    };
-
-    return { plugin_type, plugin_id, folder_name, name, description, requires, produces, inject_files, inputs, hint_templates, compose_text, readme_text };
-  }
-
-  const state = {
-    artifacts: [],
-    requires: [], // [{artifact, optional}]
-    produces: [], // ["artifact", ...]
-    inject_files: [], // ["artifact_or_output_key", ...]
-    modalMode: null, // 'requires'|'produces'|'inject_files'
-    artifactMeta: new Map(),
+(() => {
+  const fallbackCatalog = {
+    loaded: false,
+    default_provider: 'ollama',
+    providers: [
+      {
+        provider: 'ollama',
+        label: 'Ollama',
+        enabled: true,
+        default_base_url: 'http://127.0.0.1:11434',
+        requires_model: true,
+        requires_api_key: false,
+        description: 'Local or LAN-hosted Ollama models for offline-capable generator authoring.',
+      },
+      {
+        provider: 'litellm',
+        label: 'OpenAI-Compatible',
+        enabled: true,
+        default_base_url: 'https://localhost:4000/v1',
+        requires_model: true,
+        requires_api_key: false,
+        description: 'OpenAI-compatible chat-completions endpoints for hosted models.',
+      },
+    ],
   };
 
-  function escapeHtml(s){
-    return String(s).replace(/[&<>\"']/g, (c)=>({
-      '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'
-    })[c] || c);
+  const BUILDER_MODEL_PREFS_KEY = 'coretg_builder_model_config';
+  const BUILDER_WORKSPACE_STATE_KEY = 'coretg_builder_workspace_state';
+  const BUILDER_TEST_SSH_KEY = 'coretg_builder_test_ssh';
+
+  const state = {
+    catalog: { ...fallbackCatalog },
+    models: [],
+    validation: null,
+    promptUnlocked: false,
+    scaffoldRequest: null,
+    scaffoldFiles: {},
+    activeFilePath: '',
+    manifestYaml: '',
+    assistantText: '',
+    lastTestResult: null,
+    iterations: [],
+    generateInFlight: false,
+    generateAbortController: null,
+    generateCancelRequested: false,
+    lastGenerateMode: 'create',
+    transcriptEvents: [],
+    generateRequestId: '',
+    promptIntentPreview: null,
+    promptIntentPreviewTimer: null,
+  };
+
+  const builderTestState = {
+    current: null,
+    testBase: '/api/generators/builder_test',
+    hasRunHistory: false,
+    eventSource: null,
+    runId: null,
+    testCoreCfg: null,
+    savedUploads: {},
+    outputsPollTimer: null,
+    outputsLastSig: null,
+    outputsStablePolls: 0,
+    runActive: false,
+    streamEndedAt: null,
+    completionLogged: false,
+    stageLabel: '',
+    lastStageLabel: '',
+    latestOutputsData: null,
+  };
+
+  let pendingBuilderCleanupRunId = null;
+  let pendingBuilderCleanupTestBase = null;
+
+  function escapeHtml(text) {
+    return String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
-  function uniq(arr){
-    const out = [];
-    const seen = new Set();
-    for(const x of (arr || [])){
-      const v = String(x || '').trim();
-      if(!v || seen.has(v)) continue;
-      seen.add(v);
-      out.push(v);
-    }
-    return out;
-  }
-
-  function refreshTooltips(root){
+  async function fetchJson(url, options) {
+    let resp;
     try {
-      if(!root || !window.bootstrap || !bootstrap.Tooltip) return;
-      const els = root.querySelectorAll('[data-bs-toggle="tooltip"]');
-      els.forEach((el)=>{
-        try { bootstrap.Tooltip.getInstance(el)?.dispose(); } catch(e) {}
-        try { new bootstrap.Tooltip(el, { trigger: 'hover', container: 'body' }); } catch(e) {}
-      });
-    } catch(e) {
-      // ignore
+      resp = await fetch(url, options);
+    } catch (e) {
+      return { ok: false, error: `Network error calling ${url}: ${String(e)}` };
     }
-  }
-
-  function tooltipTitleForMeta(meta){
-    const m = meta || {};
-    const desc = String(m.description || '').trim();
-    const tp = String(m.type || '').trim();
-    const parts = [];
-    if(desc) parts.push(desc);
-    if(tp) parts.push(`Type: ${tp}`);
-    if(m.sensitive === true) parts.push('Sensitive: yes');
-    else if(m.sensitive === false) parts.push('Sensitive: no');
-    const prodTxt = String(m.producers_text || '').trim();
-    if(prodTxt) parts.push(`Produced by: ${prodTxt}`);
-    return parts.join(' • ');
-  }
-
-  function renderRequires(){
-    const host = document.getElementById('gbRequiresList');
-    host.innerHTML = '';
-    if(!state.requires.length){
-      host.innerHTML = '<div class="small text-muted">(none)</div>';
-      return;
-    }
-    const ul = document.createElement('ul');
-    ul.className = 'list-group';
-    state.requires.forEach((item, idx)=>{
-      const li = document.createElement('li');
-      li.className = 'list-group-item d-flex align-items-center justify-content-between';
-      const left = document.createElement('div');
-      const meta = state.artifactMeta.get(item.artifact);
-      const title = tooltipTitleForMeta(meta);
-      left.innerHTML = title
-        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(item.artifact)}</span>`
-        : `<span class="font-monospace">${escapeHtml(item.artifact)}</span>`;
-      const right = document.createElement('div');
-      right.className = 'd-flex align-items-center gap-2';
-
-      const optWrap = document.createElement('div');
-      optWrap.className = 'form-check form-switch mb-0';
-      const optId = `gbReqOpt_${idx}`;
-      optWrap.innerHTML = `
-        <input class="form-check-input" type="checkbox" id="${optId}" ${(!item.optional) ? 'checked' : ''}>
-        <label class="form-check-label small" for="${optId}">required</label>
-      `;
-      optWrap.querySelector('input').addEventListener('change', (ev)=>{
-        // UI is "required" but state stores "optional".
-        state.requires[idx].optional = !ev.target.checked;
-      });
-
-      const rm = document.createElement('button');
-      rm.className = 'btn btn-sm btn-outline-danger';
-      rm.type = 'button';
-      rm.textContent = 'Remove';
-      rm.addEventListener('click', ()=>{
-        state.requires.splice(idx, 1);
-        renderRequires();
-      });
-
-      right.appendChild(optWrap);
-      right.appendChild(rm);
-      li.appendChild(left);
-      li.appendChild(right);
-      ul.appendChild(li);
-    });
-    host.appendChild(ul);
-    refreshTooltips(host);
-  }
-
-  function renderProduces(){
-    const host = document.getElementById('gbProducesList');
-    host.innerHTML = '';
-    if(!state.produces.length){
-      host.innerHTML = '<div class="small text-muted">(none)</div>';
-      return;
-    }
-    const ul = document.createElement('ul');
-    ul.className = 'list-group';
-    state.produces.forEach((artifact, idx)=>{
-      const li = document.createElement('li');
-      li.className = 'list-group-item d-flex align-items-center justify-content-between';
-      const meta = state.artifactMeta.get(artifact);
-      const title = tooltipTitleForMeta(meta);
-      li.innerHTML = title
-        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(artifact)}</span>`
-        : `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
-      const rm = document.createElement('button');
-      rm.className = 'btn btn-sm btn-outline-danger';
-      rm.type = 'button';
-      rm.textContent = 'Remove';
-      rm.addEventListener('click', ()=>{
-        state.produces.splice(idx, 1);
-        renderProduces();
-      });
-      li.appendChild(rm);
-      ul.appendChild(li);
-    });
-    host.appendChild(ul);
-    refreshTooltips(host);
-  }
-
-  function renderInjectFiles(){
-    const host = document.getElementById('gbInjectFilesList');
-    host.innerHTML = '';
-    if(!state.inject_files.length){
-      host.innerHTML = '<div class="small text-muted">(none)</div>';
-      return;
-    }
-    const ul = document.createElement('ul');
-    ul.className = 'list-group';
-    state.inject_files.forEach((artifact, idx)=>{
-      const li = document.createElement('li');
-      li.className = 'list-group-item d-flex align-items-center justify-content-between';
-      const meta = state.artifactMeta.get(artifact);
-      const title = tooltipTitleForMeta(meta);
-      li.innerHTML = title
-        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(artifact)}</span>`
-        : `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
-      const rm = document.createElement('button');
-      rm.className = 'btn btn-sm btn-outline-danger';
-      rm.type = 'button';
-      rm.textContent = 'Remove';
-      rm.addEventListener('click', ()=>{
-        state.inject_files.splice(idx, 1);
-        renderInjectFiles();
-      });
-      li.appendChild(rm);
-      ul.appendChild(li);
-    });
-    host.appendChild(ul);
-    refreshTooltips(host);
-  }
-
-  function normalizeSelected(){
-    state.requires = (state.requires || []).map(x=>({
-      artifact: String(x && x.artifact || '').trim(),
-      optional: !!(x && x.optional),
-    })).filter(x=>x.artifact);
-    // de-dupe requires by artifact (keep first; OR optional if any)
-    const map = new Map();
-    state.requires.forEach(x=>{
-      if(!map.has(x.artifact)) map.set(x.artifact, {artifact:x.artifact, optional:x.optional});
-      else if(x.optional) map.get(x.artifact).optional = true;
-    });
-    state.requires = Array.from(map.values()).sort((a,b)=>a.artifact.localeCompare(b.artifact));
-    state.produces = uniq(state.produces).sort((a,b)=>a.localeCompare(b));
-    state.inject_files = uniq(state.inject_files).sort((a,b)=>a.localeCompare(b));
-  }
-
-  async function loadArtifacts(){
-    const res = await fetch('/api/generators/artifacts_index', { method: 'GET' });
-    const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
-    if(!res.ok || !data.ok) throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
-    state.artifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
-    state.artifactMeta = new Map();
-    (state.artifacts || []).forEach((a)=>{
-      const key = String(a && a.artifact || '').trim();
-      if(!key) return;
-      state.artifactMeta.set(key, a);
-    });
-  }
-
-  async function addCustomArtifact(){
-    const artEl = document.getElementById('gbCustomArtifact');
-    const tpEl = document.getElementById('gbCustomArtifactType');
-    const artifact = String(artEl.value || '').trim();
-    const type = String(tpEl.value || '').trim();
-    if(!artifact){
-      alert('Artifact is required.');
-      return;
-    }
-    const res = await fetch('/api/generators/artifacts_index/custom', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({artifact, type}),
-    });
-    const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
-    if(!res.ok || !data.ok){
-      throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
-    }
-    // Refresh index so it shows up immediately + for future selections.
-    await loadArtifacts();
-    document.getElementById('gbArtifactFilter').value = artifact;
-    document.getElementById('gbArtifactFilterRegex').checked = false;
-    renderArtifactTable();
-  }
-
-  function openArtifactModal(mode){
-    state.modalMode = mode;
-    document.getElementById('gbArtifactModalTitle').textContent = (mode === 'requires')
-      ? 'Select input artifacts'
-      : (mode === 'produces')
-        ? 'Select output artifacts'
-        : 'Select injected artifacts';
-    // Show/hide "Required" column only for Inputs.
-    const reqHeader = document.getElementById('gbArtifactRequiredHeader');
-    if(reqHeader){
-      if(mode === 'requires') reqHeader.classList.remove('d-none');
-      else reqHeader.classList.add('d-none');
-    }
-    document.getElementById('gbArtifactFilter').value = '';
-    document.getElementById('gbArtifactFilterRegex').checked = false;
-    document.getElementById('gbArtifactRegexError').classList.add('d-none');
-    renderArtifactTable();
-    const el = document.getElementById('gbArtifactModal');
-    bootstrap.Modal.getOrCreateInstance(el).show();
-  }
-
-  function filterArtifacts(all, query, useRegex){
-    const q = String(query || '').trim();
-    if(!q) return {items: all, error: null};
-    if(useRegex){
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    const redirectedToLogin = !!(resp.redirected && (resp.url || '').includes('/login'));
+    if (redirectedToLogin || (!ct.includes('application/json') && !ct.includes('+json'))) {
+      let snippet = '';
       try {
-        const re = new RegExp(q, 'i');
-        return {
-          items: all.filter(a=>re.test(String(a.artifact||'')) || re.test(String((a.type||''))) || re.test(String((a.description||''))) || re.test(String((a.producers_text||'')))),
-          error: null,
-        };
-      } catch(e){
-        return {items: [], error: String(e && e.message ? e.message : e)};
-      }
+        const txt = await resp.text();
+        snippet = (txt || '').slice(0, 200);
+      } catch (e) {}
+      return {
+        ok: false,
+        error: 'Login required (your session may have expired). Please reload and sign in at /login.' + (snippet ? ` Response: ${snippet}` : ''),
+        _nonJson: true,
+        _status: resp.status,
+        _url: resp.url,
+      };
     }
-    const low = q.toLowerCase();
+    try {
+      return await resp.json();
+    } catch (e) {
+      let snippet = '';
+      try {
+        const txt = await resp.text();
+        snippet = (txt || '').slice(0, 200);
+      } catch (e2) {}
+      return { ok: false, error: 'Failed to parse server response.' + (snippet ? ` Response: ${snippet}` : ''), _parseError: true };
+    }
+  }
+
+  const elements = {
+    pluginType: document.getElementById('gbPluginType'),
+    sourceIdHint: document.getElementById('gbSourceIdHint'),
+    nameHint: document.getElementById('gbNameHint'),
+    prompt: document.getElementById('gbPrompt'),
+    provider: document.getElementById('gbProvider'),
+    baseUrl: document.getElementById('gbBaseUrl'),
+    model: document.getElementById('gbModel'),
+    apiKey: document.getElementById('gbApiKey'),
+    enforceSsl: document.getElementById('gbEnforceSsl'),
+    validationStatus: document.getElementById('gbValidationStatus'),
+    generationStatus: document.getElementById('gbGenerationStatus'),
+    testStatus: document.getElementById('gbTestStatus'),
+    testStdout: document.getElementById('gbTestStdout'),
+    testStderr: document.getElementById('gbTestStderr'),
+    testFiles: document.getElementById('gbTestFiles'),
+    iterationHistory: document.getElementById('gbIterationHistory'),
+    summaryGrid: document.getElementById('gbSummaryGrid'),
+    fileList: document.getElementById('gbFileList'),
+    fileContent: document.getElementById('gbFileContent'),
+    filesCount: document.getElementById('gbFilesCount'),
+    latestTestSnapshot: document.getElementById('gbLatestTestSnapshot'),
+    promptIntentPreview: document.getElementById('gbPromptIntentPreview'),
+    promptIntentBadge: document.getElementById('gbPromptIntentBadge'),
+    promptIntentStatus: document.getElementById('gbPromptIntentStatus'),
+    promptIntentBody: document.getElementById('gbPromptIntentBody'),
+    intentOverridesPanel: document.getElementById('gbIntentOverridesPanel'),
+    intentOverridesSummary: document.getElementById('gbIntentOverridesSummary'),
+    intentRuntimeInputs: document.getElementById('gbIntentRuntimeInputs'),
+    intentRequires: document.getElementById('gbIntentRequires'),
+    intentProduces: document.getElementById('gbIntentProduces'),
+    intentInjectFiles: document.getElementById('gbIntentInjectFiles'),
+    intentInjectDestination: document.getElementById('gbIntentInjectDestination'),
+    intentHintTemplates: document.getElementById('gbIntentHintTemplates'),
+    intentReadmeNotes: document.getElementById('gbIntentReadmeNotes'),
+    intentApplySuggestedBtn: document.getElementById('gbIntentApplySuggestedBtn'),
+    intentClearBtn: document.getElementById('gbIntentClearBtn'),
+    manifestYaml: document.getElementById('gbManifestYaml'),
+    assistantText: document.getElementById('gbAssistantText'),
+    refreshProvidersBtn: document.getElementById('gbRefreshProvidersBtn'),
+    validateBtn: document.getElementById('gbValidateBtn'),
+    fetchModelsBtn: document.getElementById('gbFetchModelsBtn'),
+    promptSubmitBtn: document.getElementById('gbPromptSubmitBtn'),
+    promptRefineBtn: document.getElementById('gbPromptRefineBtn'),
+    testBtn: document.getElementById('gbTestBtn'),
+    installBtn: document.getElementById('gbInstallBtn'),
+    downloadComposeBtn: document.getElementById('gbDownloadComposeBtn'),
+    downloadReadmeBtn: document.getElementById('gbDownloadReadmeBtn'),
+    promptExampleBtn: document.getElementById('gbPromptExampleBtn'),
+    generateOverlay: document.getElementById('gbGenerateOverlay'),
+    generateOverlayTitle: document.getElementById('gbGenerateOverlayTitle'),
+    generateOverlayDetail: document.getElementById('gbGenerateOverlayDetail'),
+    generateCancelBtn: document.getElementById('gbGenerateCancelBtn'),
+    streamMeta: document.getElementById('gbStreamMeta'),
+    streamStatus: document.getElementById('gbStreamStatus'),
+    streamDetail: document.getElementById('gbStreamDetail'),
+    streamBadge: document.getElementById('gbStreamStateBadge'),
+    streamOutputHint: document.getElementById('gbStreamOutputHint'),
+    streamParsedSummary: document.getElementById('gbStreamParsedSummary'),
+    streamOutput: document.getElementById('gbStreamOutput'),
+    streamEvents: document.getElementById('gbStreamEvents'),
+    streamCopyBtn: document.getElementById('gbStreamCopyBtn'),
+    streamDownloadBtn: document.getElementById('gbStreamDownloadBtn'),
+    streamRetryBtn: document.getElementById('gbStreamRetryBtn'),
+    streamCloseBtn: document.getElementById('gbStreamCloseBtn'),
+    streamHeaderCloseBtn: document.getElementById('gbStreamHeaderCloseBtn'),
+    testCredsModal: document.getElementById('gbTestCredsModal'),
+    testCredsHost: document.getElementById('gbTestCredsHost'),
+    testCredsPort: document.getElementById('gbTestCredsPort'),
+    testCredsUser: document.getElementById('gbTestCredsUser'),
+    testCredsPass: document.getElementById('gbTestCredsPass'),
+    testCredsStatus: document.getElementById('gbTestCredsStatus'),
+    testCredsContinue: document.getElementById('gbTestCredsContinue'),
+    buildTabModelBtn: document.getElementById('gbBuildTabModelBtn'),
+    buildTabPromptBtn: document.getElementById('gbBuildTabPromptBtn'),
+    buildTabOutputBtn: document.getElementById('gbBuildTabOutputBtn'),
+    buildTabTestBtn: document.getElementById('gbBuildTabTestBtn'),
+    promptResponseModelTabBtn: document.getElementById('gbPromptResponseModelTabBtn'),
+    testProgressTabBtn: document.getElementById('gbTestProgressTabBtn'),
+    resultsFilesTabBtn: document.getElementById('gbResultsFilesTabBtn'),
+    resultsSummaryTabBtn: document.getElementById('gbResultsSummaryTabBtn'),
+    resultsHistoryTabBtn: document.getElementById('gbResultsHistoryTabBtn'),
+    resultsTestTabBtn: document.getElementById('gbResultsTestTabBtn'),
+    connectionBadge: document.getElementById('gbConnectionBadge'),
+    promptLockBadge: document.getElementById('gbPromptLockBadge'),
+    promptLockedNote: document.getElementById('gbPromptLockedNote'),
+    testBackToBuildBtn: document.getElementById('gbTestBackToBuildBtn'),
+    testRunActiveStatus: document.getElementById('gbTestRunActiveStatus'),
+    testRunActiveSpinner: document.getElementById('gbTestRunActiveSpinner'),
+    testRunActiveText: document.getElementById('gbTestRunActiveText'),
+    clearStateBtn: document.getElementById('gbClearStateBtn'),
+  };
+
+  function hasSuccessfulBuilderTest() {
+    const latest = builderTestState.latestOutputsData;
+    if (latest && latest.done && Number(latest.returncode) === 0) {
+      return true;
+    }
+    const test = state.lastTestResult;
+    return !!(test && Number(test.returncode) === 0 && (test.done !== false));
+  }
+
+  function buildBuilderWorkspaceStateSnapshot() {
     return {
-      items: all.filter(a=>{
-        const art = String(a.artifact||'').toLowerCase();
-        const typ = String(a.type||'').toLowerCase();
-        const desc = String(a.description||'').toLowerCase();
-        const prod = String(a.producers_text||'').toLowerCase();
-        return art.includes(low) || typ.includes(low) || desc.includes(low) || prod.includes(low);
-      }),
-      error: null,
+      version: 1,
+      promptUnlocked: !!state.promptUnlocked,
+      pluginType: String(elements.pluginType && elements.pluginType.value || 'flag-generator'),
+      sourceIdHint: String(elements.sourceIdHint && elements.sourceIdHint.value || ''),
+      nameHint: String(elements.nameHint && elements.nameHint.value || ''),
+      prompt: String(elements.prompt && elements.prompt.value || ''),
+      intentOverrides: buildIntentOverridePayload() || {},
+      scaffoldRequest: state.scaffoldRequest || null,
+      scaffoldFiles: state.scaffoldFiles || {},
+      activeFilePath: String(state.activeFilePath || ''),
+      manifestYaml: String(state.manifestYaml || ''),
+      assistantText: String(state.assistantText || ''),
+      lastTestResult: state.lastTestResult || null,
+      iterations: Array.isArray(state.iterations) ? state.iterations : [],
+      lastGenerateMode: String(state.lastGenerateMode || 'create'),
+      transcriptEvents: Array.isArray(state.transcriptEvents) ? state.transcriptEvents : [],
+      promptIntentPreview: state.promptIntentPreview || null,
+      latestOutputsData: builderTestState.latestOutputsData || null,
+      builderRunId: String(builderTestState.runId || ''),
+      builderTestBase: String(builderTestState.testBase || '/api/generators/builder_test'),
+      builderHasRunHistory: !!builderTestState.hasRunHistory,
+      testStatusText: String(elements.testStatus && elements.testStatus.textContent || ''),
+      testStatusClass: String(elements.testStatus && elements.testStatus.className || ''),
+      testStdout: String(elements.testStdout && elements.testStdout.textContent || ''),
+      testStderr: String(elements.testStderr && elements.testStderr.textContent || ''),
+      builderLog: String(document.getElementById('gbGenTestLog')?.textContent || ''),
     };
   }
 
-  function renderArtifactTable(){
-    const body = document.getElementById('gbArtifactBody');
-    const q = document.getElementById('gbArtifactFilter').value;
-    const useRegex = document.getElementById('gbArtifactFilterRegex').checked;
-    const all = (state.artifacts || []).map(a=>{
-      const producers = Array.isArray(a.producers) ? a.producers : [];
-      const producersText = producers.map(p=>p && (p.name || p.plugin_id) ? (p.name || p.plugin_id) : '').filter(Boolean).join(', ');
-      return {
-        ...a,
-        producers,
-        producers_text: producersText,
-      };
-    });
+  function persistBuilderWorkspaceState() {
+    try {
+      localStorage.setItem(BUILDER_WORKSPACE_STATE_KEY, JSON.stringify(buildBuilderWorkspaceStateSnapshot()));
+    } catch (e) {}
+  }
 
-    const {items, error} = filterArtifacts(all, q, useRegex);
-    const errEl = document.getElementById('gbArtifactRegexError');
-    if(error){
-      errEl.textContent = 'Invalid regex: ' + error;
-      errEl.classList.remove('d-none');
-    } else {
-      errEl.classList.add('d-none');
+  function loadBuilderWorkspaceState() {
+    try {
+      const raw = localStorage.getItem(BUILDER_WORKSPACE_STATE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+      return null;
     }
-    document.getElementById('gbArtifactFilterMeta').textContent = `${items.length} shown / ${all.length} total`;
+  }
 
-    body.innerHTML = '';
-    items.forEach((a, idx)=>{
-      const tr = document.createElement('tr');
-      const checkboxId = `gbArtPick_${idx}`;
-      const reqId = `gbArtReq_${idx}`;
-      const title = tooltipTitleForMeta(a);
-      const showRequired = (state.modalMode === 'requires');
-      tr.innerHTML = `
-        <td><input class="form-check-input" type="checkbox" id="${checkboxId}" data-role="pick" data-artifact="${escapeHtml(a.artifact)}"></td>
-        <td class="${showRequired ? '' : 'd-none'}">
-          <input class="form-check-input" type="checkbox" id="${reqId}" data-role="required" data-artifact="${escapeHtml(a.artifact)}" disabled>
-        </td>
-        <td class="font-monospace">${title ? `<span data-bs-toggle=\"tooltip\" data-bs-title=\"${escapeHtml(title)}\">${escapeHtml(a.artifact || '')}</span>` : escapeHtml(a.artifact || '')}</td>
-        <td>${escapeHtml(a.type || '')}</td>
-        <td class="small">${escapeHtml(a.description || '')}</td>
-        <td class="small">${escapeHtml(a.producers_text || '')}</td>
+  function removeBuilderWorkspaceState() {
+    try { localStorage.removeItem(BUILDER_WORKSPACE_STATE_KEY); } catch (e) {}
+  }
+
+  function restoreBuilderWorkspaceState(snapshot) {
+    const saved = snapshot && typeof snapshot === 'object' ? snapshot : null;
+    if (!saved) return false;
+    if (elements.pluginType) elements.pluginType.value = String(saved.pluginType || 'flag-generator');
+    if (elements.sourceIdHint) elements.sourceIdHint.value = String(saved.sourceIdHint || '');
+    if (elements.nameHint) elements.nameHint.value = String(saved.nameHint || '');
+    if (elements.prompt) elements.prompt.value = String(saved.prompt || '');
+    fillIntentOverrideInputs(saved.intentOverrides || {}, { refresh: false });
+    state.promptUnlocked = !!saved.promptUnlocked;
+    state.scaffoldRequest = saved.scaffoldRequest || null;
+    state.scaffoldFiles = saved.scaffoldFiles && typeof saved.scaffoldFiles === 'object' ? saved.scaffoldFiles : {};
+    state.activeFilePath = String(saved.activeFilePath || '');
+    state.manifestYaml = String(saved.manifestYaml || '');
+    state.assistantText = String(saved.assistantText || '');
+    state.lastTestResult = saved.lastTestResult || null;
+    state.iterations = Array.isArray(saved.iterations) ? saved.iterations : [];
+    state.lastGenerateMode = String(saved.lastGenerateMode || 'create');
+    state.transcriptEvents = Array.isArray(saved.transcriptEvents) ? saved.transcriptEvents : [];
+    state.promptIntentPreview = saved.promptIntentPreview || null;
+    builderTestState.latestOutputsData = saved.latestOutputsData || null;
+    builderTestState.runId = String(saved.builderRunId || '');
+    builderTestState.testBase = String(saved.builderTestBase || '/api/generators/builder_test');
+    builderTestState.hasRunHistory = !!saved.builderHasRunHistory;
+    builderTestState.current = state.scaffoldRequest;
+    builderTestState.runActive = false;
+    builderTestState.streamEndedAt = null;
+    builderTestState.completionLogged = false;
+    builderTestState.stageLabel = '';
+    builderTestState.lastStageLabel = '';
+    if (state.promptIntentPreview && Array.isArray(state.promptIntentPreview.sections)) {
+      setPromptIntentPreview(
+        state.promptIntentPreview.sections.length ? 'Ready' : 'Idle',
+        state.promptIntentPreview.sections.length ? 'success' : 'secondary',
+        state.promptIntentPreview.sections
+      );
+    }
+    if (state.assistantText) {
+      setStreamOutput(state.assistantText, 'Restored raw model response from local state.');
+    }
+    if (elements.streamMeta) {
+      elements.streamMeta.textContent = state.scaffoldRequest
+        ? `Restored workspace • ${String(state.scaffoldRequest.plugin_id || '').trim() || 'generated scaffold'}`
+        : 'Restored workspace.';
+    }
+    if (elements.testStatus) {
+      elements.testStatus.className = String(saved.testStatusClass || 'alert alert-secondary small');
+      elements.testStatus.textContent = String(saved.testStatusText || (hasSuccessfulBuilderTest() ? 'Restored latest successful Builder test result.' : 'No local test run yet.'));
+    }
+    if (elements.testStdout) {
+      elements.testStdout.textContent = String(saved.testStdout || 'No output yet.');
+    }
+    if (elements.testStderr) {
+      elements.testStderr.textContent = String(saved.testStderr || 'No output yet.');
+    }
+    const logEl = document.getElementById('gbGenTestLog');
+    if (logEl) {
+      logEl.textContent = String(saved.builderLog || 'Press Test from Prompt Response to prepare a run.\n');
+    }
+    renderSummary();
+    renderFiles();
+    renderIterations();
+    renderLatestTestSnapshot();
+    updateActionButtons();
+    return true;
+  }
+
+  function clearBuilderWorkspace({ includePrefs = true, confirmReset = true } = {}) {
+    const proceed = !confirmReset || window.confirm('Clear the saved Generator Builder state and start from scratch?');
+    if (!proceed) return;
+    removeBuilderWorkspaceState();
+    if (includePrefs) {
+      try { localStorage.removeItem(BUILDER_MODEL_PREFS_KEY); } catch (e) {}
+      try { localStorage.removeItem(BUILDER_TEST_SSH_KEY); } catch (e) {}
+    }
+    state.models = [];
+    state.validation = null;
+    state.promptUnlocked = false;
+    state.scaffoldRequest = null;
+    state.scaffoldFiles = {};
+    state.activeFilePath = '';
+    state.manifestYaml = '';
+    state.assistantText = '';
+    state.lastTestResult = null;
+    state.iterations = [];
+    state.generateInFlight = false;
+    state.generateAbortController = null;
+    state.generateCancelRequested = false;
+    state.lastGenerateMode = 'create';
+    state.transcriptEvents = [];
+    state.generateRequestId = '';
+    state.promptIntentPreview = null;
+    if (state.promptIntentPreviewTimer) {
+      try { clearTimeout(state.promptIntentPreviewTimer); } catch (e) {}
+      state.promptIntentPreviewTimer = null;
+    }
+    if (elements.pluginType) elements.pluginType.value = 'flag-generator';
+    if (elements.sourceIdHint) elements.sourceIdHint.value = '';
+    if (elements.nameHint) elements.nameHint.value = '';
+    if (elements.prompt) elements.prompt.value = '';
+    fillIntentOverrideInputs({}, { refresh: false });
+    if (elements.model) {
+      elements.model.innerHTML = '<option value="">Select a model after fetching or validating</option>';
+      elements.model.value = '';
+    }
+    if (elements.apiKey) elements.apiKey.value = '';
+    if (elements.enforceSsl) elements.enforceSsl.checked = true;
+    renderSummary();
+    renderFiles();
+    renderIterations();
+    renderTestFiles([]);
+    setPromptIntentPreview('Idle', 'secondary', []);
+    updateIntentOverrideSummary();
+    if (elements.streamMeta) elements.streamMeta.textContent = 'No prompt has been submitted yet.';
+    if (elements.streamEvents) elements.streamEvents.innerHTML = '<li class="text-muted">No activity yet.</li>';
+    if (elements.validationStatus) {
+      elements.validationStatus.className = 'mt-3 small alert alert-secondary mb-0 gb-status';
+      elements.validationStatus.textContent = 'No validation has been run yet.';
+    }
+    if (elements.generationStatus) {
+      elements.generationStatus.className = 'alert alert-light border small mt-3 mb-0';
+      elements.generationStatus.textContent = 'No scaffold generated yet.';
+    }
+    setStreamState('Waiting for a prompt run…', 'Submit a new prompt or refinement to capture the response here.', 'text-bg-secondary', 'Idle');
+    setStreamOutput('', '');
+    setTestStatus('No local test run yet.', 'secondary');
+    if (elements.testStdout) elements.testStdout.textContent = 'No output yet.';
+    if (elements.testStderr) elements.testStderr.textContent = 'No output yet.';
+    resetBuilderTestUiState();
+    builderTestState.hasRunHistory = false;
+    builderTestState.runId = null;
+    builderTestState.latestOutputsData = null;
+    builderTestState.testCoreCfg = null;
+    renderLatestTestSnapshot();
+    renderProviderOptions();
+    updatePromptLockState();
+    updateActionButtons();
+    persistBuilderWorkspaceState();
+  }
+
+  function renderIterations() {
+    const items = Array.isArray(state.iterations) ? state.iterations : [];
+    if (!items.length) {
+      elements.iterationHistory.innerHTML = '<div class="list-group-item text-muted">No iterations yet.</div>';
+      return;
+    }
+    elements.iterationHistory.innerHTML = items.slice().reverse().map((entry) => {
+      const mode = escapeHtml(String(entry.mode || 'create'));
+      const prompt = escapeHtml(String(entry.prompt || ''));
+      const status = escapeHtml(String(entry.status || 'updated'));
+      const pluginId = escapeHtml(String(entry.plugin_id || ''));
+      return `<div class="list-group-item"><div class="d-flex justify-content-between gap-3"><div><div class="fw-semibold text-capitalize">${mode}</div><div class="small text-muted">${pluginId || '(pending id)'}</div></div><div class="small text-muted">${status}</div></div><div class="small mt-2" style="white-space: pre-wrap;">${prompt}</div></div>`;
+    }).join('');
+  }
+
+  function recordIteration(entry) {
+    state.iterations.push({ ...(entry || {}) });
+    renderIterations();
+    persistBuilderWorkspaceState();
+  }
+
+  function setTestStatus(message, tone = 'secondary') {
+    elements.testStatus.className = `alert alert-${tone} small`;
+    elements.testStatus.textContent = message;
+    persistBuilderWorkspaceState();
+  }
+
+  function setTestRunActiveState(isActive, text, tone = 'secondary') {
+    if (elements.testRunActiveStatus) {
+      elements.testRunActiveStatus.className = `alert alert-${tone} small d-flex align-items-center gap-2`;
+    }
+    if (elements.testRunActiveSpinner) {
+      elements.testRunActiveSpinner.classList.toggle('d-none', !isActive);
+    }
+    if (elements.testRunActiveText) {
+      elements.testRunActiveText.textContent = text || '';
+    }
+    persistBuilderWorkspaceState();
+  }
+
+  function setBuilderTestLogLine(line) {
+    const el = document.getElementById('gbGenTestLog');
+    if (!el) return;
+    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function clearBuilderTestLog() {
+    const el = document.getElementById('gbGenTestLog');
+    if (el) el.textContent = 'Press Test from Prompt Response to prepare a run.\n';
+    persistBuilderWorkspaceState();
+  }
+
+  function setBuilderTestOutputsHtml(html) {
+    const el = document.getElementById('gbGenTestOutputs');
+    if (el) el.innerHTML = html || '';
+    persistBuilderWorkspaceState();
+  }
+
+  function setBuilderTestOutputsStatus(visible, text) {
+    const box = document.getElementById('gbGenTestOutputsStatus');
+    const label = document.getElementById('gbGenTestOutputsStatusText');
+    if (!box || !label) return;
+    if (!visible) {
+      box.style.display = 'none';
+      label.textContent = '';
+      return;
+    }
+    box.style.display = 'block';
+    label.textContent = text || 'Working…';
+  }
+
+  function setBuilderTestInputsEnabled(enabled) {
+    const form = document.getElementById('gbGenTestForm');
+    if (!form) return;
+    const on = !!enabled;
+    form.querySelectorAll('input, select, textarea, button').forEach((el) => {
+      try { el.disabled = !on; } catch (e) {}
+    });
+  }
+
+  function setBuilderTestInputsCollapsed(collapsed) {
+    const block = document.getElementById('gbGenTestInputsBlock');
+    if (block) block.hidden = !!collapsed;
+  }
+
+  function setBuilderTestStage(label) {
+    const text = String(label || '').trim();
+    builderTestState.stageLabel = text;
+    if (text) setBuilderTestOutputsStatus(true, text);
+  }
+
+  function applyBuilderTestStage(label, source) {
+    const text = String(label || '').trim();
+    if (!text) return;
+    setBuilderTestStage(text);
+    if (builderTestState.lastStageLabel !== text) {
+      builderTestState.lastStageLabel = text;
+      const src = String(source || '').trim();
+      setBuilderTestLogLine(`[stage${src ? ':' + src : ''}] ${text}`);
+    }
+  }
+
+  function stageFromBuilderPhase(payload) {
+    const phase = payload && payload.phase ? String(payload.phase).toLowerCase() : '';
+    const stage = payload && payload.stage ? String(payload.stage).toLowerCase() : '';
+    const kind = payload && payload.kind ? String(payload.kind).toLowerCase() : '';
+    if (stage.includes('upload') || stage.includes('sync') || stage.includes('packaging') || stage.includes('hash')) return 'Uploading files to CORE VM…';
+    if (stage.includes('sanitize') || stage.includes('template') || stage.includes('render')) return 'Modifying docker-compose/image metadata…';
+    if (stage.includes('tunnel') || stage.includes('ssh')) return 'Connecting to CORE VM…';
+    if (stage.includes('core') || stage.includes('scenario') || stage.includes('topology') || stage.includes('build')) return 'Creating CORE scenario…';
+    if (stage.includes('docker') || stage.includes('image')) return 'Creating image…';
+    if (kind === 'error' || stage.includes('error') || stage.includes('fail')) return 'Error while running test.';
+    if (!phase) return '';
+    if (phase === 'starting') return 'Starting generator…';
+    if (phase === 'generator_done') return 'Generator done. Finalizing outputs…';
+    if (phase === 'done') return 'Run complete. Finalizing outputs…';
+    if (phase === 'error' || phase === 'failed') return 'Error while running test.';
+    if (phase === 'cleanup_start') return 'Cleaning up run artifacts…';
+    if (phase === 'cleanup_done') return 'Cleanup complete.';
+    return '';
+  }
+
+  function stageFromBuilderLogLine(line) {
+    const lower = String(line || '').toLowerCase();
+    if (!lower) return '';
+    if (lower.includes('[upload]') || lower.includes('uploading to core vm') || lower.includes('repo upload:')) return 'Uploading files to CORE VM…';
+    if (lower.includes('compose sanitize') || lower.includes('sanitiz')) return 'Modifying docker-compose/image metadata…';
+    if (lower.includes('docker build') || lower.includes('building ')) return 'Creating image…';
+    if (lower.includes('core session') || lower.includes('creating session') || lower.includes('topology built') || lower.includes('creating core scenario')) return 'Creating CORE scenario…';
+    if (lower.includes('[async error]') || lower.includes('traceback') || lower.includes('exception') || lower.includes('error:')) return 'Error while running test.';
+    return '';
+  }
+
+  function stopBuilderTestOutputsPolling() {
+    if (builderTestState.outputsPollTimer) {
+      try { clearInterval(builderTestState.outputsPollTimer); } catch (e) {}
+      builderTestState.outputsPollTimer = null;
+    }
+    builderTestState.outputsLastSig = null;
+    builderTestState.outputsStablePolls = 0;
+  }
+
+  function resetBuilderTestUiState() {
+    stopBuilderTestOutputsPolling();
+    if (builderTestState.eventSource) {
+      try { builderTestState.eventSource.close(); } catch (e) {}
+      builderTestState.eventSource = null;
+    }
+    builderTestState.runId = null;
+    builderTestState.current = null;
+    builderTestState.testBase = '/api/generators/builder_test';
+    builderTestState.savedUploads = {};
+    builderTestState.runActive = false;
+    builderTestState.streamEndedAt = null;
+    builderTestState.completionLogged = false;
+    builderTestState.stageLabel = '';
+    builderTestState.lastStageLabel = '';
+    builderTestState.latestOutputsData = null;
+    setBuilderTestInputsEnabled(true);
+    setBuilderTestInputsCollapsed(false);
+    clearBuilderTestLog();
+    setBuilderTestOutputsHtml('<div class="text-muted">Start a test from Prompt Response to see generated files.</div>');
+    setBuilderTestOutputsStatus(false);
+    setTestRunActiveState(false, builderTestState.hasRunHistory ? 'No active test run.' : 'No test run has started yet.', 'secondary');
+    renderLatestTestSnapshot();
+  }
+
+  function clearBuilderCleanupLog() {
+    const el = document.getElementById('gbGenTestCleanupLog');
+    if (el) el.textContent = '';
+  }
+
+  function setBuilderCleanupLogLine(line) {
+    const el = document.getElementById('gbGenTestCleanupLog');
+    if (!el) return;
+    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setBuilderCleanupSpinner(active) {
+    const sp = document.getElementById('gbGenTestCleanupSpinner');
+    if (sp) sp.style.display = active ? 'inline-block' : 'none';
+  }
+
+  function humanFileSize(bytes) {
+    const n = Number(bytes);
+    if (!isFinite(n) || n < 0) return '';
+    if (n < 1024) return `${n} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let value = n / 1024;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`;
+  }
+
+  function describeBuilderTestFile(path, category) {
+    const relPath = String(path || '');
+    const key = String(category || '').toLowerCase();
+    if (relPath === 'run.log') return 'Run log';
+    if (relPath === 'outputs.json') return 'Outputs manifest';
+    if (key === 'scaffold') {
+      if (relPath.endsWith('/manifest.yaml')) return 'Generated scaffold manifest';
+      if (relPath.endsWith('/generator.py')) return 'Generated scaffold implementation';
+      if (relPath.endsWith('/docker-compose.yml')) return 'Generated scaffold compose file';
+      if (relPath.endsWith('/README.md')) return 'Generated scaffold README';
+      if (relPath.endsWith('/_scaffold_request.json')) return 'Normalized scaffold request';
+      return 'Generated scaffold file';
+    }
+    if (key === 'inputs') {
+      if (relPath.endsWith('/config.json') || relPath === 'inputs/config.json') return 'Generator config';
+      return 'Input file';
+    }
+    if (key === 'logs') return 'Log file';
+    if (key === 'outputs') return 'Generated output';
+    return 'File';
+  }
+
+  function renderBuilderTestFilesTable(rows) {
+    const items = Array.isArray(rows) ? rows : [];
+    if (!items.length) {
+      return '<div class="text-muted">No files available.</div>';
+    }
+    const body = items.map((row, idx) => `
+      <tr>
+        <td class="text-muted">${idx + 1}</td>
+        <td class="text-muted">${escapeHtml(row.category || '')}</td>
+        <td style="word-break: break-all;">${escapeHtml(row.path || '')}</td>
+        <td class="text-muted">${escapeHtml(row.size || '')}</td>
+        <td class="text-muted">${escapeHtml(row.desc || '')}</td>
+        <td><a href="${escapeHtml(row.href || '#')}">Download</a></td>
+      </tr>
+    `).join('');
+    return `
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead>
+            <tr>
+              <th style="width: 50px;">#</th>
+              <th style="width: 90px;">Type</th>
+              <th>Path</th>
+              <th style="width: 90px;">Size</th>
+              <th>Description</th>
+              <th style="width: 90px;">Action</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function updateLatestBuilderTestResult(data, runId) {
+    builderTestState.latestOutputsData = data || null;
+    state.lastTestResult = data || null;
+    const inputs = Array.isArray(data && data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data && data.outputs) ? data.outputs : (Array.isArray(data && data.files) ? data.files : []);
+    const scaffold = Array.isArray(data && data.scaffold) ? data.scaffold : [];
+    const misc = Array.isArray(data && data.misc) ? data.misc : [];
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    const rows = [];
+    const pushFiles = (label, files, categoryKey) => {
+      (files || []).forEach((file) => {
+        const relPath = file.path || '';
+        rows.push({
+          category: label,
+          path: relPath,
+          size: humanFileSize(file.size),
+          desc: describeBuilderTestFile(relPath, categoryKey),
+          href: `${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}`,
+        });
+      });
+    };
+    pushFiles('Input', inputs, 'inputs');
+    pushFiles('Output', outputs, 'outputs');
+    pushFiles('Scaffold', scaffold, 'scaffold');
+    pushFiles('Log', misc, 'logs');
+    renderTestFiles(rows.map((row) => ({ path: row.path, size: row.size, desc: row.desc, href: row.href, text: null })));
+    elements.testStdout.textContent = document.getElementById('gbGenTestLog')?.textContent || 'No output yet.';
+    const failureSummary = String((data && data.failure_summary) || '').trim();
+    const logTail = String((data && data.log_tail) || '').trim();
+    elements.testStderr.textContent = failureSummary || logTail || 'See the test dialog progress log for the full run transcript.';
+    const returncode = data && Object.prototype.hasOwnProperty.call(data, 'returncode') ? data.returncode : null;
+    if (data && data.done) {
+      setTestStatus(returncode === 0 ? `Test completed successfully (rc=${returncode}).` : `Test finished with rc=${returncode == null ? 'n/a' : returncode}.`, returncode === 0 ? 'success' : 'danger');
+      showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
+    }
+    renderLatestTestSnapshot();
+    persistBuilderWorkspaceState();
+  }
+
+  function renderTestFiles(files) {
+    const entries = Array.isArray(files) ? files : [];
+    if (!entries.length) {
+      elements.testFiles.innerHTML = '<div class="list-group-item text-muted">No test artifacts yet.</div>';
+      return;
+    }
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    const runId = String(builderTestState.runId || '').trim();
+    elements.testFiles.innerHTML = entries.map((entry) => {
+      const text = typeof entry.text === 'string' && entry.text.length
+        ? `<pre class="mt-2 mb-0" style="white-space: pre-wrap; max-height: 12rem; overflow: auto;">${escapeHtml(entry.text)}</pre>`
+        : '';
+      const relPath = String(entry.path || '').trim();
+      const sizeText = String(entry.size || '').trim();
+      const description = String(entry.desc || '').trim();
+      const href = String(entry.href || '').trim() || (runId && relPath ? `${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}` : '');
+      const meta = [sizeText, description].filter(Boolean).map((item) => `<span>${escapeHtml(item)}</span>`).join('<span class="mx-1">•</span>');
+      const download = href ? `<a class="btn btn-sm btn-outline-secondary" href="${escapeHtml(href)}">Download</a>` : '';
+      return `<div class="list-group-item"><div class="gb-test-file-meta"><div class="fw-semibold">${escapeHtml(relPath)}</div>${download}</div><div class="small text-muted">${meta || 'Artifact from latest run.'}</div>${text}</div>`;
+    }).join('');
+  }
+
+  function defaultBuilderTestValue(inputName, inputType) {
+    const normalizedName = String(inputName || '').trim().toLowerCase();
+    const normalizedType = String(inputType || 'string').trim().toLowerCase();
+    if (normalizedName === 'seed') return 'demo-seed';
+    if (normalizedName === 'secret') return 'demo-secret';
+    if (normalizedName === 'node_name') return 'node1';
+    if (normalizedName === 'flag_prefix') return 'FLAG';
+    if (normalizedType === 'number' || normalizedType === 'int') return '1';
+    if (normalizedType === 'float') return '1.0';
+    if (normalizedType === 'boolean') return 'true';
+    if (normalizedType === 'json') return '{"demo": true}';
+    return `demo-${normalizedName || 'value'}`;
+  }
+
+  function isBuilderFileInputType(inputType) {
+    const normalized = String(inputType || '').trim().toLowerCase();
+    return normalized === 'file' || normalized === 'path' || normalized === 'artifact' || normalized === 'binary';
+  }
+
+  function buildBuilderTestInputRow(inputDef) {
+    const name = inputDef && inputDef.name ? String(inputDef.name) : '';
+    if (!name) return '';
+    const required = !((inputDef && Object.prototype.hasOwnProperty.call(inputDef, 'required')) ? (inputDef.required === false) : false);
+    const type = inputDef && inputDef.type ? String(inputDef.type) : 'string';
+    const label = `${name}${required ? ' *' : ''}`;
+    if (isBuilderFileInputType(type)) {
+      return `
+        <div class="mb-3">
+          <label class="form-label">${escapeHtml(label)}</label>
+          <input class="form-control" type="file" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+        </div>
       `;
-      body.appendChild(tr);
-
-      // Required checkbox only makes sense when picked.
-      try {
-        const pickEl = tr.querySelector('input[data-role="pick"]');
-        const reqEl = tr.querySelector('input[data-role="required"]');
-        if(pickEl && reqEl){
-          pickEl.addEventListener('change', ()=>{
-            const on = !!pickEl.checked;
-            reqEl.disabled = !on;
-            if(!on) reqEl.checked = false;
-          });
-        }
-      } catch(e) {}
-    });
-    refreshTooltips(body);
-  }
-
-  function applyArtifactSelections(){
-    const rows = Array.from(document.querySelectorAll('#gbArtifactBody tr'));
-    const picked = [];
-    rows.forEach((tr)=>{
-      const pickEl = tr.querySelector('input[data-role="pick"]');
-      if(!pickEl || !pickEl.checked) return;
-      const artifact = String(pickEl.getAttribute('data-artifact') || '').trim();
-      if(!artifact) return;
-      const reqEl = tr.querySelector('input[data-role="required"]');
-      const required = !!(reqEl && reqEl.checked);
-      picked.push({artifact, required});
-    });
-
-    if(state.modalMode === 'requires'){
-      // Default to optional unless explicitly marked required.
-      picked.forEach(({artifact, required})=>state.requires.push({artifact, optional: !required}));
-    } else if(state.modalMode === 'produces'){
-      picked.forEach(({artifact})=>state.produces.push(artifact));
-    } else if(state.modalMode === 'inject_files'){
-      picked.forEach(({artifact})=>state.inject_files.push(artifact));
     }
-    normalizeSelected();
-    renderRequires();
-    renderProduces();
-    renderInjectFiles();
-    bootstrap.Modal.getOrCreateInstance(document.getElementById('gbArtifactModal')).hide();
+    const inputType = String(type || '').toLowerCase() === 'number' ? 'number' : 'text';
+    const defaultValue = defaultBuilderTestValue(name, type);
+    return `
+      <div class="mb-3">
+        <label class="form-label">${escapeHtml(label)}</label>
+        <input class="form-control" type="${escapeHtml(inputType)}" name="${escapeHtml(name)}" value="${escapeHtml(defaultValue)}" ${required ? 'required' : ''} />
+      </div>
+    `;
   }
 
-  async function postJson(url, payload){
-    const res = await fetch(url, {
+  function openBuilderTestModal(scaffoldRequest, testBase) {
+    builderTestState.current = scaffoldRequest;
+    builderTestState.testBase = testBase || '/api/generators/builder_test';
+    builderTestState.runId = null;
+    builderTestState.savedUploads = {};
+    stopBuilderTestOutputsPolling();
+    if (builderTestState.eventSource) {
+      try { builderTestState.eventSource.close(); } catch (e) {}
+      builderTestState.eventSource = null;
+    }
+
+    const runtimeInputs = Array.isArray(scaffoldRequest && scaffoldRequest.runtime_inputs) ? scaffoldRequest.runtime_inputs : [];
+    const inputsHtml = runtimeInputs.map(buildBuilderTestInputRow).join('') || '<div class="text-muted small">No inputs</div>';
+    const nameEl = document.getElementById('gbGenTestName');
+    const idEl = document.getElementById('gbGenTestId');
+    const inputsEl = document.getElementById('gbGenTestInputs');
+    if (nameEl) nameEl.textContent = String((scaffoldRequest && scaffoldRequest.name) || (scaffoldRequest && scaffoldRequest.plugin_id) || 'Generated scaffold');
+    if (idEl) idEl.textContent = String((scaffoldRequest && scaffoldRequest.plugin_id) || '');
+    if (inputsEl) inputsEl.innerHTML = inputsHtml;
+    clearBuilderTestLog();
+    setBuilderTestOutputsHtml('<div class="text-muted">Waiting for outputs…</div>');
+    setBuilderTestOutputsStatus(false);
+    setTestRunActiveState(false, 'Preparing test run…', 'secondary');
+    showBuildTabPath(elements.buildTabTestBtn, elements.testProgressTabBtn);
+  }
+
+  async function loadBuilderTestOutputs(runId) {
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`, { method: 'GET' });
+    if (!data || data.ok === false) {
+      setBuilderTestOutputsHtml(`<div class="text-danger">${escapeHtml((data && data.error) || 'Failed loading outputs')}</div>`);
+      setBuilderTestOutputsStatus(false);
+      return;
+    }
+    const inputs = Array.isArray(data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
+    const scaffold = Array.isArray(data.scaffold) ? data.scaffold : [];
+    const misc = Array.isArray(data.misc) ? data.misc : [];
+    if (!data.done) {
+      setBuilderTestOutputsStatus(true, 'Generating outputs…');
+    } else {
+      setBuilderTestOutputsStatus(false);
+    }
+    const all = [].concat(inputs, outputs, scaffold, misc);
+    if (!all.length) {
+      const rc = (data && (data.returncode === 0 || data.returncode)) ? String(data.returncode) : '';
+      setBuilderTestOutputsHtml(`<div class="text-muted">No outputs found${rc ? ` (returncode=${escapeHtml(rc)})` : ''}.</div>`);
+      updateLatestBuilderTestResult(data, runId);
+      return;
+    }
+    const rows = [];
+    const pushFiles = (categoryLabel, files, categoryKey) => {
+      (files || []).forEach((file) => {
+        const relPath = file.path || '';
+        rows.push({
+          category: categoryLabel,
+          path: relPath,
+          size: humanFileSize(file.size),
+          desc: describeBuilderTestFile(relPath, categoryKey),
+          href: `${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}`,
+        });
+      });
+    };
+    pushFiles('Input', inputs, 'inputs');
+    pushFiles('Output', outputs, 'outputs');
+    pushFiles('Scaffold', scaffold, 'scaffold');
+    pushFiles('Log', misc, 'logs');
+    setBuilderTestOutputsHtml(renderBuilderTestFilesTable(rows));
+    updateLatestBuilderTestResult(data, runId);
+  }
+
+  async function loadBuilderTestOutputsWithRetry(runId, attempts = 10) {
+    for (let index = 0; index < attempts; index += 1) {
+      const base = builderTestState.testBase || '/api/generators/builder_test';
+      const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`, { method: 'GET' });
+      if (data && data._nonJson) {
+        setBuilderTestOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
+        setBuilderTestOutputsStatus(false);
+        return;
+      }
+      const inputs = data && Array.isArray(data.inputs) ? data.inputs : [];
+      const outputs = data && Array.isArray(data.outputs) ? data.outputs : (data && Array.isArray(data.files) ? data.files : []);
+      const scaffold = data && Array.isArray(data.scaffold) ? data.scaffold : [];
+      const misc = data && Array.isArray(data.misc) ? data.misc : [];
+      if (data && data.ok && (inputs.length || outputs.length || scaffold.length || misc.length)) {
+        await loadBuilderTestOutputs(runId);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    await loadBuilderTestOutputs(runId);
+  }
+
+  async function ensureCoreVmReadyForBuilderTest(coreCfg) {
+    if (!coreCfg || typeof coreCfg !== 'object') return true;
+    const requestOptions = (cleanup) => ({
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload),
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({ core: coreCfg, cleanup: !!cleanup }),
     });
-    const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
-    if(!res.ok || !data.ok){
-      const msg = data && data.error ? data.error : ('HTTP ' + res.status);
-      throw new Error(msg);
+    const precheck = await fetchJson('/api/test/core_sessions/prepare', requestOptions(false));
+    if (!precheck || precheck.ok === false) {
+      throw new Error((precheck && precheck.error) ? precheck.error : 'Unable to verify CORE sessions.');
     }
-    return data;
+    if (!precheck.active) return true;
+    const sessionCount = Number(precheck.session_count || 0) || 1;
+    const warningMessage = [
+      `A CORE session is currently running (${sessionCount} active).`,
+      '',
+      'To run this test, the active CORE session must be stopped and cleaned up.',
+      '',
+      'Warning: this may cause loss of current progress/data, and you will need to restart the scenario.',
+      '',
+      'Do you want to continue?',
+    ].join('\n');
+    let shouldCleanup = false;
+    if (typeof window.confirmWithModal === 'function') {
+      shouldCleanup = await window.confirmWithModal('Active CORE Session', warningMessage, 'Stop & Cleanup', 'danger');
+    } else {
+      shouldCleanup = window.confirm(warningMessage);
+    }
+    if (!shouldCleanup) return false;
+    const cleanupResp = await fetchJson('/api/test/core_sessions/prepare', requestOptions(true));
+    if (!cleanupResp || cleanupResp.ok === false) {
+      throw new Error((cleanupResp && cleanupResp.error) ? cleanupResp.error : 'Failed to stop and clean up active CORE session(s).');
+    }
+    return true;
   }
 
-  function renderResult(data){
-    document.getElementById('gbManifestYaml').value = String(data.manifest_yaml || '').trim() + '\n';
-    const ul = document.getElementById('gbFiles');
-    ul.innerHTML = '';
-    (data.scaffold_paths || []).forEach(p=>{
-      const li = document.createElement('li');
-      li.textContent = p;
-      ul.appendChild(li);
-    });
+  function builderTestFileListSignature(data) {
+    const paths = [];
+    const add = (entries) => {
+      (Array.isArray(entries) ? entries : []).forEach((file) => {
+        if (file && file.path) paths.push(String(file.path));
+      });
+    };
+    add(data && data.inputs);
+    add(data && data.outputs);
+    add(data && data.scaffold);
+    add(data && data.files);
+    add(data && data.misc);
+    paths.sort();
+    return JSON.stringify(paths);
   }
 
-  document.getElementById('gbPluginId').addEventListener('input', (ev)=>{
-    const pluginId = ev.target.value || '';
-    const folder = document.getElementById('gbFolderName');
-    if(!folder.value.trim()) folder.value = defaultFolder(pluginId);
-  });
+  async function pollBuilderTestOutputsOnce(runId) {
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`, { method: 'GET' });
+    if (!data) return;
+    if (data._nonJson) {
+      setBuilderTestOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
+      setBuilderTestOutputsStatus(false);
+      stopBuilderTestOutputsPolling();
+      builderTestState.runActive = false;
+      setBuilderTestInputsCollapsed(false);
+      setTestRunActiveState(false, data.error || 'Login required while fetching test outputs.', 'danger');
+      return;
+    }
+    if (data.ok === false) {
+      setBuilderTestOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
+      setBuilderTestOutputsStatus(false);
+      stopBuilderTestOutputsPolling();
+      builderTestState.runActive = false;
+      setBuilderTestInputsCollapsed(false);
+      setTestRunActiveState(false, data.error || 'Failed loading test outputs.', 'danger');
+      return;
+    }
+    const signature = builderTestFileListSignature(data);
+    if (builderTestState.outputsLastSig === signature) {
+      builderTestState.outputsStablePolls = (builderTestState.outputsStablePolls || 0) + 1;
+    } else {
+      builderTestState.outputsLastSig = signature;
+      builderTestState.outputsStablePolls = 0;
+    }
+    const inputs = Array.isArray(data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
+    const misc = Array.isArray(data.misc) ? data.misc : [];
+    const hasAny = !!(inputs.length || outputs.length || misc.length);
+    const fileCount = inputs.length + outputs.length + misc.length;
+    const stableTarget = 3;
+    const finalizeGraceMs = 3000;
+    const streamGraceSatisfied = !builderTestState.streamEndedAt || ((Date.now() - builderTestState.streamEndedAt) >= finalizeGraceMs);
+    if (!data.done) {
+      const stage = builderTestState.stageLabel ? String(builderTestState.stageLabel) : '';
+      if (!stage) setBuilderTestOutputsStatus(true, `Generating outputs… (${fileCount} file${fileCount === 1 ? '' : 's'} so far)`);
+    } else if (data.done && (!streamGraceSatisfied || builderTestState.outputsStablePolls < stableTarget)) {
+      const stage = builderTestState.stageLabel ? String(builderTestState.stageLabel) : '';
+      if (!stage) {
+        const stableNow = Math.min(stableTarget, (builderTestState.outputsStablePolls || 0) + 1);
+        setBuilderTestOutputsStatus(true, `Finalizing file list… (${fileCount} file${fileCount === 1 ? '' : 's'}, stable ${stableNow}/${stableTarget})`);
+      }
+    } else {
+      setBuilderTestOutputsStatus(false);
+    }
+    if (hasAny || data.done) {
+      await loadBuilderTestOutputs(runId);
+    }
+    if (data.done && streamGraceSatisfied && builderTestState.outputsStablePolls >= stableTarget) {
+      stopBuilderTestOutputsPolling();
+      builderTestState.runActive = false;
+      setBuilderTestInputsEnabled(true);
+      setBuilderTestInputsCollapsed(false);
+      if (!builderTestState.completionLogged) {
+        setBuilderTestLogLine(`Completed. Final files ready (${fileCount}).`);
+        builderTestState.completionLogged = true;
+      }
+      setTestRunActiveState(false, `Test run completed. ${fileCount} file${fileCount === 1 ? '' : 's'} collected.`, 'success');
+    }
+  }
 
-  document.getElementById('gbPluginType').addEventListener('change', ()=>{
-    const isNodeGen = document.getElementById('gbPluginType').value === 'flag-node-generator';
-    document.getElementById('gbInNodeName').checked = isNodeGen;
-    if(isNodeGen){
-      document.getElementById('gbInSecret').checked = false;
+  function startBuilderTestOutputsPolling(runId) {
+    stopBuilderTestOutputsPolling();
+    setBuilderTestOutputsStatus(true, 'Generating outputs…');
+    pollBuilderTestOutputsOnce(runId);
+    builderTestState.outputsPollTimer = setInterval(() => {
+      pollBuilderTestOutputsOnce(runId);
+    }, 1000);
+  }
+
+  async function cleanupBuilderRunArtifacts(runId, testBase) {
+    if (!runId) return { ok: true };
+    const cleanupText = document.getElementById('gbGenTestCleanupText');
+    const closeBtn = document.getElementById('gbGenTestCleanupCloseBtn');
+    clearBuilderCleanupLog();
+    setBuilderCleanupLogLine(`[ui][cleanup] begin run_id=${runId}`);
+    if (cleanupText) cleanupText.textContent = 'Cleaning up, please wait…';
+    if (closeBtn) closeBtn.disabled = true;
+    setBuilderCleanupSpinner(true);
+    const cleanupModalEl = document.getElementById('gbGenTestCleanupModal');
+    const cleanupModal = cleanupModalEl && window.bootstrap && bootstrap.Modal ? bootstrap.Modal.getOrCreateInstance(cleanupModalEl) : null;
+    try { cleanupModal?.show(); } catch (e) {}
+    try {
+      const timeoutMs = 30000;
+      const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      const base = testBase || builderTestState.testBase || '/api/generators/builder_test';
+      const url = `${base}/cleanup/${encodeURIComponent(runId)}`;
+      const doReq = async () => fetchJson(url, { method: 'POST', signal: controller ? controller.signal : undefined });
+      const resp = await Promise.race([
+        doReq(),
+        new Promise((resolve) => setTimeout(() => {
+          try { if (controller) controller.abort(); } catch (e) {}
+          resolve({ ok: false, error: `Cleanup timed out after ${timeoutMs}ms.` });
+        }, timeoutMs)),
+      ]);
+      setBuilderCleanupLogLine(`[ui][cleanup] response ok=${resp && resp.ok !== false}`);
+      if (resp && resp.ok === false) {
+        setBuilderCleanupLogLine(`[ui][cleanup] error: ${resp.error || 'unknown error'}`);
+        if (cleanupText) cleanupText.textContent = resp.error || 'Cleanup failed.';
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      } else if (cleanupText) {
+        cleanupText.textContent = 'Cleanup completed.';
+      }
+      return resp || { ok: true };
+    } finally {
+      if (closeBtn) closeBtn.disabled = false;
+      setBuilderCleanupSpinner(false);
+      setBuilderCleanupLogLine('[ui][cleanup] end');
+    }
+  }
+
+  async function runCurrentBuilderTest() {
+    const form = document.getElementById('gbGenTestForm');
+    if (!form || !builderTestState.current) return;
+    const fd = new FormData(form);
+    if (builderTestState.testCoreCfg && typeof builderTestState.testCoreCfg === 'object') {
+      fd.append('core', JSON.stringify(builderTestState.testCoreCfg));
+    }
+    fd.append('scaffold_request', JSON.stringify(builderTestState.current));
+
+    clearBuilderTestLog();
+    setBuilderTestOutputsHtml('<div class="text-muted">Waiting for outputs…</div>');
+    stopBuilderTestOutputsPolling();
+    setBuilderTestStage('Starting generator…');
+    builderTestState.runActive = false;
+    builderTestState.streamEndedAt = null;
+    builderTestState.completionLogged = false;
+    builderTestState.stageLabel = 'Starting generator…';
+    builderTestState.lastStageLabel = '';
+    builderTestState.hasRunHistory = true;
+    setBuilderTestInputsEnabled(false);
+    setBuilderTestInputsCollapsed(true);
+    setBuilderTestLogLine('[ui] preparing request…');
+    setTestRunActiveState(true, 'Starting test run…', 'info');
+
+    try {
+      const canProceed = await ensureCoreVmReadyForBuilderTest(builderTestState.testCoreCfg || null);
+      if (!canProceed) {
+        setBuilderTestLogLine('[ui] Run cancelled.');
+        setBuilderTestOutputsStatus(false);
+        setBuilderTestInputsEnabled(true);
+        setBuilderTestInputsCollapsed(false);
+        showBuildTabPath(elements.buildTabTestBtn, elements.testProgressTabBtn);
+        setTestRunActiveState(false, 'Test run cancelled before start.', 'secondary');
+        return;
+      }
+    } catch (err) {
+      setBuilderTestLogLine(`ERROR: ${String(err)}`);
+      setBuilderTestOutputsStatus(false);
+      setBuilderTestInputsEnabled(true);
+      setBuilderTestInputsCollapsed(false);
+      showBuildTabPath(elements.buildTabTestBtn, elements.testProgressTabBtn);
+      setTestRunActiveState(false, String(err), 'danger');
+      return;
     }
 
-    // Update README sample if it's still untouched.
-    try {
-      const readmeEl = document.getElementById('gbReadme');
-      if(readmeEl && !readmeEl.dataset.userEdited){
-        readmeEl.value = sampleReadme(document.getElementById('gbName').value, document.getElementById('gbPluginId').value, document.getElementById('gbPluginType').value);
-      }
-    } catch(e) {}
-  });
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    setBuilderTestLogLine(`[ui] POST ${base}/run …`);
+    const data = await fetchJson(`${base}/run`, { method: 'POST', body: fd });
+    setBuilderTestLogLine(`[ui] response received (status unknown; ok=${data && data.ok !== false})`);
 
-  document.getElementById('gbDockerCompose').addEventListener('input', (ev)=>{ ev.target.dataset.userEdited = '1'; });
-  document.getElementById('gbReadme').addEventListener('input', (ev)=>{ ev.target.dataset.userEdited = '1'; });
-  document.getElementById('gbName').addEventListener('input', ()=>{
-    try {
-      const readmeEl = document.getElementById('gbReadme');
-      if(readmeEl && !readmeEl.dataset.userEdited){
-        readmeEl.value = sampleReadme(document.getElementById('gbName').value, document.getElementById('gbPluginId').value, document.getElementById('gbPluginType').value);
-      }
-    } catch(e) {}
-  });
-
-  document.getElementById('gbPluginId').addEventListener('input', ()=>{
-    try {
-      const readmeEl = document.getElementById('gbReadme');
-      if(readmeEl && !readmeEl.dataset.userEdited){
-        readmeEl.value = sampleReadme(document.getElementById('gbName').value, document.getElementById('gbPluginId').value, document.getElementById('gbPluginType').value);
-      }
-    } catch(e) {}
-  });
-
-  document.getElementById('gbReqAddBtn').addEventListener('click', async ()=>{
-    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
-    openArtifactModal('requires');
-  });
-  document.getElementById('gbProdAddBtn').addEventListener('click', async ()=>{
-    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
-    openArtifactModal('produces');
-  });
-  document.getElementById('gbInjAddBtn').addEventListener('click', async ()=>{
-    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
-    openArtifactModal('inject_files');
-  });
-  document.getElementById('gbReqClearBtn').addEventListener('click', ()=>{ state.requires = []; renderRequires(); });
-  document.getElementById('gbProdClearBtn').addEventListener('click', ()=>{ state.produces = []; renderProduces(); });
-  document.getElementById('gbInjClearBtn').addEventListener('click', ()=>{ state.inject_files = []; renderInjectFiles(); });
-  document.getElementById('gbArtifactFilter').addEventListener('input', renderArtifactTable);
-  document.getElementById('gbArtifactFilterRegex').addEventListener('change', renderArtifactTable);
-  document.getElementById('gbArtifactApplyBtn').addEventListener('click', applyArtifactSelections);
-  document.getElementById('gbCustomArtifactAddBtn').addEventListener('click', async ()=>{
-    try {
-      await addCustomArtifact();
-    } catch(e){
-      alert('Failed: ' + (e && e.message ? e.message : e));
+    if (!data || data.ok === false) {
+      setBuilderTestLogLine(`ERROR: ${data && data.error ? data.error : 'Failed to start run'}`);
+      setBuilderTestOutputsStatus(false);
+      builderTestState.runActive = false;
+      setBuilderTestInputsEnabled(true);
+      setBuilderTestInputsCollapsed(false);
+      showBuildTabPath(elements.buildTabTestBtn, elements.testProgressTabBtn);
+      setTestStatus(String((data && data.error) || 'Builder test failed to start.'), 'danger');
+      setTestRunActiveState(false, String((data && data.error) || 'Builder test failed to start.'), 'danger');
+      return;
     }
-  });
 
-  // Initialize defaults
-  try {
-    document.getElementById('gbDockerCompose').value = SAMPLE_COMPOSE;
-    document.getElementById('gbReadme').value = sampleReadme('', '', document.getElementById('gbPluginType').value);
-  } catch(e) {}
-  // Default produces includes 'flag'
-  state.produces = ['flag'];
-  normalizeSelected();
-  renderRequires();
-  renderProduces();
-  renderInjectFiles();
+    const runId = data.run_id;
+    builderTestState.runId = runId;
+    builderTestState.savedUploads = (data && data.saved_uploads) ? data.saved_uploads : {};
+    setBuilderTestLogLine(`[ui] run_id=${runId}`);
+    setBuilderTestLogLine(`Started run ${runId}`);
+    builderTestState.runActive = true;
+    setTestStatus(`Builder test started (run ${runId}).`, 'info');
+    setTestRunActiveState(true, `Test run ${runId} is in progress…`, 'info');
+    showBuildTabPath(elements.buildTabTestBtn, elements.testProgressTabBtn);
 
-  document.getElementById('gbBtnZip').addEventListener('click', async ()=>{
+    startBuilderTestOutputsPolling(runId);
+
+    const es = new EventSource(`/stream/${encodeURIComponent(runId)}`);
+    builderTestState.eventSource = es;
+    setBuilderTestLogLine('[ui] opening log stream…');
+    es.onmessage = (ev) => {
+      const line = ev && typeof ev.data === 'string' ? ev.data : '';
+      setBuilderTestLogLine(line);
+      const stage = stageFromBuilderLogLine(line);
+      if (stage) applyBuilderTestStage(stage, 'log');
+    };
+    es.addEventListener('phase', (ev) => {
+      try {
+        const payload = JSON.parse(ev.data || '{}');
+        if (payload && payload.phase) {
+          setBuilderTestLogLine(`[phase] ${payload.phase}`);
+        } else if (payload && payload.stage) {
+          setBuilderTestLogLine(`[phase] ${payload.stage}`);
+        }
+        const stage = stageFromBuilderPhase(payload);
+        if (stage) applyBuilderTestStage(stage, 'phase');
+      } catch (e) {}
+    });
+    es.addEventListener('end', async () => {
+      try { es.close(); } catch (e) {}
+      builderTestState.eventSource = null;
+      builderTestState.streamEndedAt = Date.now();
+      setBuilderTestLogLine('Stream ended; finalizing outputs…');
+      await loadBuilderTestOutputsWithRetry(runId);
+    });
+    es.onerror = () => {
+      setBuilderTestLogLine('Log stream disconnected.');
+      try { es.close(); } catch (e) {}
+      builderTestState.eventSource = null;
+      startBuilderTestOutputsPolling(runId);
+    };
+  }
+
+  function downloadGeneratedFile(suffix) {
+    const entries = Object.entries(state.scaffoldFiles || {});
+    const match = entries.find(([path]) => path.endsWith(suffix));
+    if (!match) {
+      throw new Error(`Generated file not found: ${suffix}`);
+    }
+    const [path, content] = match;
+    const blob = new Blob([String(content || '')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = path.split('/').pop() || suffix.split('/').pop() || 'download.txt';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function getSelectedProviderEntry() {
+    const provider = String(elements.provider.value || state.catalog.default_provider || 'ollama').trim().toLowerCase();
+    return (state.catalog.providers || []).find((entry) => String(entry.provider || '').trim().toLowerCase() === provider) || null;
+  }
+
+  function renderProviderOptions() {
+    const providers = Array.isArray(state.catalog.providers) ? state.catalog.providers : [];
+    const savedPrefs = loadBuilderModelPrefs();
+    const current = String(elements.provider.value || savedPrefs.selected_provider || state.catalog.default_provider || 'ollama').trim().toLowerCase();
+    elements.provider.innerHTML = providers.map((entry) => {
+      const provider = String(entry.provider || '').trim();
+      const label = String(entry.label || provider || 'Provider').trim() || 'Provider';
+      const selected = provider.toLowerCase() === current ? ' selected' : '';
+      return `<option value="${provider}"${selected}>${label}</option>`;
+    }).join('');
+    if (!elements.provider.value && providers.length) {
+      elements.provider.value = String(savedPrefs.selected_provider || state.catalog.default_provider || providers[0].provider || 'ollama');
+    }
+    persistSelectedProvider(elements.provider.value || current || 'ollama');
+    applyProviderDefaults();
+  }
+
+  function loadBuilderModelPrefs() {
     try {
-      const payload = buildPayload();
-      const res = await fetch('/api/generators/scaffold_zip', {
+      const raw = localStorage.getItem(BUILDER_MODEL_PREFS_KEY);
+      const parsed = raw ? JSON.parse(raw) : {};
+      return {
+        selected_provider: String((parsed && parsed.selected_provider) || '').trim().toLowerCase(),
+        providers: parsed && typeof parsed.providers === 'object' && !Array.isArray(parsed.providers) ? { ...parsed.providers } : {},
+      };
+    } catch (e) {
+      return { selected_provider: '', providers: {} };
+    }
+  }
+
+  function saveBuilderModelPrefs(prefs) {
+    try {
+      localStorage.setItem(BUILDER_MODEL_PREFS_KEY, JSON.stringify({
+        selected_provider: String((prefs && prefs.selected_provider) || '').trim().toLowerCase(),
+        providers: prefs && typeof prefs.providers === 'object' && !Array.isArray(prefs.providers) ? prefs.providers : {},
+      }));
+    } catch (e) {}
+  }
+
+  function getSavedProviderModelPrefs(provider) {
+    const key = String(provider || '').trim().toLowerCase();
+    if (!key) return {};
+    const prefs = loadBuilderModelPrefs();
+    const providerPrefs = prefs.providers && typeof prefs.providers === 'object' ? prefs.providers[key] : null;
+    return providerPrefs && typeof providerPrefs === 'object' ? providerPrefs : {};
+  }
+
+  function persistSelectedProvider(provider) {
+    const key = String(provider || '').trim().toLowerCase();
+    const prefs = loadBuilderModelPrefs();
+    prefs.selected_provider = key;
+    saveBuilderModelPrefs(prefs);
+  }
+
+  function persistCurrentProviderModelPrefs() {
+    const provider = String(elements.provider.value || '').trim().toLowerCase();
+    if (!provider) return;
+    const prefs = loadBuilderModelPrefs();
+    const providers = prefs.providers && typeof prefs.providers === 'object' ? { ...prefs.providers } : {};
+    providers[provider] = {
+      base_url: String(elements.baseUrl.value || '').trim(),
+      model: String(elements.model.value || '').trim(),
+    };
+    prefs.selected_provider = provider;
+    prefs.providers = providers;
+    saveBuilderModelPrefs(prefs);
+  }
+
+  function loadSavedBuilderTestCreds() {
+    try {
+      const raw = localStorage.getItem(BUILDER_TEST_SSH_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function loadSavedBuilderTestCredsFromServer() {
+    try {
+      const resp = await fetch('/api/flag_generators_test/core_credentials/get', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({}),
+      });
+      const payload = await resp.json().catch(() => ({}));
+      if (resp.ok && payload && payload.ok && payload.credentials) {
+        return payload.credentials;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function saveBuilderTestCreds(creds) {
+    try {
+      localStorage.setItem(BUILDER_TEST_SSH_KEY, JSON.stringify(creds || {}));
+    } catch (e) {}
+  }
+
+  async function saveBuilderTestCredsToServer(creds) {
+    const resp = await fetch('/api/flag_generators_test/core_credentials/save', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({
+        ssh_host: String((creds && creds.ssh_host) || '').trim(),
+        ssh_port: (creds && creds.ssh_port) || 22,
+        ssh_username: String((creds && creds.ssh_username) || '').trim(),
+        ssh_password: String((creds && creds.ssh_password) || ''),
+      }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || payload.ok === false) {
+      throw new Error((payload && (payload.error || payload.message)) || `Credential save failed (HTTP ${resp.status})`);
+    }
+    return payload;
+  }
+
+  async function promptBuilderTestCreds() {
+    const modalEl = elements.testCredsModal;
+    if (!modalEl || !window.bootstrap || !bootstrap.Modal) {
+      throw new Error('Credential dialog is unavailable.');
+    }
+    const modal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+    const saved = (await loadSavedBuilderTestCredsFromServer()) || loadSavedBuilderTestCreds() || {};
+    elements.testCredsHost.value = String(saved.ssh_host || '').trim();
+    elements.testCredsPort.value = String(saved.ssh_port || 22);
+    elements.testCredsUser.value = String(saved.ssh_username || '').trim();
+    elements.testCredsPass.value = String(saved.ssh_password || '');
+    elements.testCredsStatus.className = 'alert alert-secondary small mt-3 mb-0';
+    elements.testCredsStatus.textContent = 'Last saved generator-test CORE credentials will be reused unless you edit them here.';
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+        if (elements.testCredsContinue) {
+          elements.testCredsContinue.disabled = false;
+          elements.testCredsContinue.onclick = null;
+        }
+      };
+
+      const onHidden = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(null);
+      };
+
+      modalEl.addEventListener('hidden.bs.modal', onHidden);
+      elements.testCredsContinue.onclick = async () => {
+        const creds = {
+          ssh_host: String(elements.testCredsHost.value || '').trim(),
+          ssh_port: parseInt(String(elements.testCredsPort.value || '22'), 10) || 22,
+          ssh_username: String(elements.testCredsUser.value || '').trim(),
+          ssh_password: String(elements.testCredsPass.value || ''),
+        };
+        if (!creds.ssh_host || !creds.ssh_username || !creds.ssh_password) {
+          elements.testCredsStatus.className = 'alert alert-danger small mt-3 mb-0';
+          elements.testCredsStatus.textContent = 'SSH host, username, and password are required.';
+          return;
+        }
+        elements.testCredsContinue.disabled = true;
+        try {
+          await saveBuilderTestCredsToServer(creds);
+          saveBuilderTestCreds(creds);
+          settled = true;
+          cleanup();
+          resolve(creds);
+          modal.hide();
+        } catch (err) {
+          elements.testCredsContinue.disabled = false;
+          elements.testCredsStatus.className = 'alert alert-danger small mt-3 mb-0';
+          elements.testCredsStatus.textContent = String((err && err.message) || err || 'Failed saving CORE VM credentials.');
+        }
+      };
+
+      modal.show();
+      window.setTimeout(() => {
+        try { elements.testCredsHost.focus(); } catch (e) {}
+      }, 50);
+    });
+  }
+
+  function applyProviderDefaults() {
+    const entry = getSelectedProviderEntry();
+    if (!entry) return;
+    const savedPrefs = getSavedProviderModelPrefs(entry.provider);
+    if (String(savedPrefs.base_url || '').trim()) {
+      elements.baseUrl.value = String(savedPrefs.base_url || '').trim();
+    } else if (!String(elements.baseUrl.value || '').trim()) {
+      elements.baseUrl.value = String(entry.default_base_url || '').trim();
+    }
+    elements.model.value = String(savedPrefs.model || '').trim();
+    renderModelList();
+  }
+
+  async function refreshProviders(force = false) {
+    try {
+      const resp = await fetch('/api/ai/providers', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json' },
+      });
+      if (!resp.ok) {
+        throw new Error(`Provider catalog request failed (HTTP ${resp.status})`);
+      }
+      const payload = await resp.json();
+      if (!payload || payload.success === false || !Array.isArray(payload.providers)) {
+        throw new Error((payload && (payload.error || payload.message)) || 'Provider catalog response was invalid.');
+      }
+      state.catalog = {
+        loaded: true,
+        default_provider: String(payload.default_provider || 'ollama').trim().toLowerCase() || 'ollama',
+        providers: payload.providers.map((entry) => ({ ...(entry || {}) })),
+      };
+      renderProviderOptions();
+    } catch (err) {
+      if (force) {
+        console.warn('[generator-builder] falling back to default provider catalog', err);
+      }
+      state.catalog = { ...fallbackCatalog };
+      renderProviderOptions();
+    }
+  }
+
+  function renderModelList() {
+    const models = Array.isArray(state.models) ? state.models : [];
+    const currentValue = String(elements.model.value || '').trim();
+    const options = ['<option value="">Select a model after fetching or validating</option>'];
+    if (currentValue && !models.includes(currentValue)) {
+      options.push(`<option value="${currentValue.replace(/"/g, '&quot;')}" selected>${escapeHtml(currentValue)}</option>`);
+    }
+    models.forEach((name) => {
+      const value = String(name || '').trim();
+      if (!value) return;
+      const selected = value === currentValue ? ' selected' : '';
+      options.push(`<option value="${value.replace(/"/g, '&quot;')}"${selected}>${escapeHtml(value)}</option>`);
+    });
+    elements.model.innerHTML = options.join('');
+  }
+
+  function buildValidationPayload() {
+    return {
+      provider: String(elements.provider.value || 'ollama').trim(),
+      base_url: String(elements.baseUrl.value || '').trim(),
+      api_key: String(elements.apiKey.value || '').trim(),
+      model: String(elements.model.value || '').trim(),
+      enforce_ssl: !!elements.enforceSsl.checked,
+      skip_bridge: true,
+    };
+  }
+
+  function setValidationStatus(message, tone = 'secondary') {
+    elements.validationStatus.className = `alert alert-${tone} small mb-0 gb-status`;
+    elements.validationStatus.textContent = message;
+    persistBuilderWorkspaceState();
+  }
+
+  function isPromptUnlocked() {
+    return !!state.promptUnlocked;
+  }
+
+  function showBuildTab(buttonEl) {
+    if (!buttonEl || !window.bootstrap || !bootstrap.Tab) return;
+    bootstrap.Tab.getOrCreateInstance(buttonEl).show();
+  }
+
+  function showBuildTabPath(parentButtonEl, childButtonEl) {
+    showBuildTab(parentButtonEl);
+    if (!childButtonEl) return;
+    window.requestAnimationFrame(() => {
+      showBuildTab(childButtonEl);
+    });
+  }
+
+  function updatePromptLockState() {
+    const unlocked = isPromptUnlocked();
+    const controls = [elements.pluginType, elements.sourceIdHint, elements.nameHint, elements.prompt, elements.promptExampleBtn];
+    controls.forEach((el) => {
+      if (el) el.disabled = !unlocked || state.generateInFlight;
+    });
+    if (elements.buildTabPromptBtn) {
+      elements.buildTabPromptBtn.disabled = !unlocked;
+      elements.buildTabPromptBtn.setAttribute('aria-disabled', unlocked ? 'false' : 'true');
+    }
+    if (elements.promptLockBadge) {
+      elements.promptLockBadge.className = `badge ${unlocked ? 'text-bg-success' : 'text-bg-secondary'}`;
+      elements.promptLockBadge.textContent = unlocked ? 'Unlocked' : 'Locked until validation';
+    }
+    if (elements.connectionBadge) {
+      elements.connectionBadge.className = `badge ${unlocked ? 'text-bg-success' : 'text-bg-secondary'}`;
+      elements.connectionBadge.textContent = unlocked ? 'Validated' : 'Locked';
+    }
+    if (elements.promptLockedNote) {
+      elements.promptLockedNote.classList.toggle('d-none', unlocked);
+    }
+  }
+
+  function invalidateModelStep(message = 'Provider settings changed. Validate again to unlock prompting.') {
+    state.validation = null;
+    state.promptUnlocked = false;
+    updatePromptLockState();
+    updateActionButtons();
+    setValidationStatus(message, 'secondary');
+    if (elements.buildTabModelBtn) {
+      showBuildTab(elements.buildTabModelBtn);
+    }
+  }
+
+  function setGenerationStatus(message, tone = 'light') {
+    elements.generationStatus.className = `alert alert-${tone} border small mt-3 mb-0`;
+    elements.generationStatus.textContent = message;
+    persistBuilderWorkspaceState();
+  }
+
+  function formatEventTime(date = new Date()) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function extractStructuredTextCandidate(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    const fenced = raw.match(/^```(?:json)?\s*\n([\s\S]*?)\n```$/i);
+    if (fenced && fenced[1]) {
+      return String(fenced[1]).trim();
+    }
+    return raw;
+  }
+
+  function parseStructuredText(text) {
+    const candidate = extractStructuredTextCandidate(text);
+    if (!candidate) return null;
+    try {
+      return JSON.parse(candidate);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function formatStructuredText(text) {
+    const parsed = parseStructuredText(text);
+    if (parsed == null) return String(text || '');
+    try {
+      return JSON.stringify(parsed, null, 2);
+    } catch (e) {
+      return String(text || '');
+    }
+  }
+
+  function summarizeStructuredText(text) {
+    const parsed = parseStructuredText(text);
+    if (!parsed || typeof parsed !== 'object') {
+      return 'Showing raw response.';
+    }
+    const source = parsed && parsed.scaffold_request && typeof parsed.scaffold_request === 'object'
+      ? parsed.scaffold_request
+      : parsed;
+    const parts = [];
+    const pluginId = String(source.plugin_id || '').trim();
+    const name = String(source.name || '').trim();
+    const folder = String(source.folder_name || '').trim();
+    if (pluginId) parts.push(`plugin_id=${pluginId}`);
+    if (name) parts.push(`name=${name}`);
+    if (folder) parts.push(`folder=${folder}`);
+    if (parsed && parsed.files && typeof parsed.files === 'object' && !Array.isArray(parsed.files)) {
+      parts.push(`${Object.keys(parsed.files).length} file${Object.keys(parsed.files).length === 1 ? '' : 's'}`);
+    }
+    const keys = Object.keys(parsed || {});
+    if (keys.length) {
+      parts.push(`keys: ${keys.slice(0, 8).join(', ')}${keys.length > 8 ? ', ...' : ''}`);
+    }
+    return parts.length ? `Parsed JSON summary: ${parts.join(' | ')}` : 'Parsed JSON response.';
+  }
+
+  function renderTranscriptEvents() {
+    const events = Array.isArray(state.transcriptEvents) ? state.transcriptEvents : [];
+    if (!events.length) {
+      elements.streamEvents.innerHTML = '<li class="text-muted">No activity yet.</li>';
+      return;
+    }
+    elements.streamEvents.innerHTML = events.map((entry) => {
+      const time = escapeHtml(String(entry.time || ''));
+      const text = escapeHtml(String(entry.text || ''));
+      return `<li><span class="gb-stream-event-time">${time}</span><div style="white-space: pre-wrap;">${text}</div></li>`;
+    }).join('');
+  }
+
+  function appendTranscriptEvent(text) {
+    state.transcriptEvents.push({ time: formatEventTime(), text: String(text || '') });
+    renderTranscriptEvents();
+    persistBuilderWorkspaceState();
+  }
+
+  function createGenerateRequestId() {
+    return `gb-stream-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  async function consumeNdjsonStream(response, onEvent) {
+    if (!response.body || typeof response.body.getReader !== 'function') {
+      throw new Error('Streaming response body is unavailable in this browser.');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line) {
+          let parsed = null;
+          try { parsed = JSON.parse(line); } catch (e) { parsed = null; }
+          if (parsed && typeof parsed === 'object') {
+            onEvent(parsed);
+          }
+        }
+        newlineIndex = buffer.indexOf('\n');
+      }
+    }
+    buffer += decoder.decode();
+    const tail = buffer.trim();
+    if (tail) {
+      let parsed = null;
+      try { parsed = JSON.parse(tail); } catch (e) { parsed = null; }
+      if (parsed && typeof parsed === 'object') {
+        onEvent(parsed);
+      }
+    }
+  }
+
+  function applyGeneratedScaffoldResult(result, mode, payload) {
+    state.scaffoldRequest = result.scaffold_request || null;
+    state.scaffoldFiles = result.files || {};
+    state.manifestYaml = String(result.manifest_yaml || '');
+    state.assistantText = String(result.assistant_text || state.assistantText || '');
+    state.activeFilePath = '';
+    if (elements.manifestYaml) {
+      elements.manifestYaml.textContent = state.manifestYaml || 'No manifest generated yet.';
+    }
+    if (elements.assistantText) {
+      elements.assistantText.textContent = state.assistantText ? formatStructuredText(state.assistantText) : 'No model response captured yet.';
+    }
+    renderSummary();
+    renderFiles();
+    updateActionButtons();
+    recordIteration({
+      mode,
+      prompt: payload.prompt,
+      plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
+      status: 'scaffold updated',
+    });
+    appendTranscriptEvent(`Normalized scaffold received for ${(state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator'}.`);
+    appendTranscriptEvent(`Generated ${Object.keys(state.scaffoldFiles || {}).length} scaffold files.`);
+    setTestStatus('Ready to run a CORE VM scaffold test.', 'secondary');
+    elements.testStdout.textContent = 'No output yet.';
+    elements.testStderr.textContent = 'No output yet.';
+    renderTestFiles([]);
+    state.lastTestResult = null;
+    builderTestState.latestOutputsData = null;
+    renderLatestTestSnapshot();
+    queuePromptIntentPreview();
+    const successDetail = `${mode === 'refine' ? 'Refined' : 'Generated'} ${Object.keys(state.scaffoldFiles || {}).length} scaffold files for ${String((state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator')}.`;
+    setGenerationStatus(successDetail, 'success');
+    finishStreamModal({ ok: true, detail: successDetail, output: state.assistantText || 'No model response captured yet.' });
+    showBuildTabPath(elements.buildTabOutputBtn, elements.resultsFilesTabBtn);
+    persistBuilderWorkspaceState();
+  }
+
+  function setStreamState(status, detail, badgeClass = 'text-bg-primary', badgeText = 'Running') {
+    elements.streamStatus.textContent = status;
+    elements.streamDetail.textContent = detail;
+    elements.streamBadge.className = `badge ${badgeClass}`;
+    elements.streamBadge.textContent = badgeText;
+    persistBuilderWorkspaceState();
+  }
+
+  function setStreamOutput(text, hint = '') {
+    elements.streamOutputHint.textContent = hint;
+    elements.streamOutput.textContent = formatStructuredText(text || '');
+    if (elements.streamParsedSummary) {
+      elements.streamParsedSummary.textContent = summarizeStructuredText(text || '');
+    }
+    persistBuilderWorkspaceState();
+  }
+
+  function setGenerateOverlay(visible, title = 'Generating scaffold…', detail = 'The prompt response tab is locked until this run completes or is cancelled.') {
+    if (elements.generateOverlay) {
+      elements.generateOverlay.classList.toggle('is-visible', !!visible);
+      elements.generateOverlay.setAttribute('aria-hidden', visible ? 'false' : 'true');
+    }
+    if (elements.generateOverlayTitle) {
+      elements.generateOverlayTitle.textContent = title;
+    }
+    if (elements.generateOverlayDetail) {
+      elements.generateOverlayDetail.textContent = detail;
+    }
+    if (elements.generateCancelBtn) {
+      elements.generateCancelBtn.disabled = !visible;
+    }
+  }
+
+  function setGenerateBusy(isBusy) {
+    state.generateInFlight = !!isBusy;
+    if (elements.testBtn) elements.testBtn.disabled = !!isBusy || !state.scaffoldRequest;
+    if (elements.installBtn) elements.installBtn.disabled = !!isBusy || !state.scaffoldRequest || !hasSuccessfulBuilderTest();
+    if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = !!isBusy;
+    if (elements.streamRetryBtn) elements.streamRetryBtn.disabled = !!isBusy;
+    if (elements.streamCloseBtn) elements.streamCloseBtn.disabled = !!isBusy;
+    if (elements.streamHeaderCloseBtn) elements.streamHeaderCloseBtn.disabled = !!isBusy;
+    if (elements.downloadComposeBtn) {
+      elements.downloadComposeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/docker-compose.yml'));
+    }
+    if (elements.downloadReadmeBtn) {
+      elements.downloadReadmeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
+    }
+    if (!isBusy) {
+      setGenerateOverlay(false);
+      state.generateCancelRequested = false;
+      state.generateAbortController = null;
+      state.generateRequestId = '';
+    }
+    persistBuilderWorkspaceState();
+  }
+
+  function openStreamModal(mode, payload) {
+    state.lastGenerateMode = mode;
+    state.transcriptEvents = [];
+    state.assistantText = '';
+    state.generateRequestId = String(payload.request_id || '').trim();
+    elements.streamMeta.textContent = `${mode === 'refine' ? 'Refine' : 'Create'} request • ${String(payload.provider || '').trim() || 'provider'} • ${String(payload.model || '').trim() || 'model'}`;
+    setStreamState(
+      mode === 'refine' ? 'Refining scaffold…' : 'Generating scaffold…',
+      'Submitting the prompt to the selected model and waiting for a normalized scaffold response.',
+      'text-bg-primary',
+      'Running'
+    );
+    setStreamOutput('', mode === 'refine' ? 'Latest raw model response for the refine step.' : 'Latest raw model response for the create step.');
+    appendTranscriptEvent(`${mode === 'refine' ? 'Refine' : 'Create'} request queued.`);
+    appendTranscriptEvent(`Provider: ${String(payload.provider || '').trim() || '(none)'} | Model: ${String(payload.model || '').trim() || '(none)'}`);
+    showBuildTabPath(elements.buildTabOutputBtn, elements.promptResponseModelTabBtn);
+  }
+
+  function finishStreamModal({ ok, detail, output }) {
+    if (typeof output === 'string') {
+      setStreamOutput(output, elements.streamOutputHint.textContent || 'Latest raw model response.');
+    }
+    if (ok) {
+      setStreamState('Scaffold updated', detail, 'text-bg-success', 'Complete');
+      appendTranscriptEvent(detail);
+    } else {
+      setStreamState('Generation failed', detail, 'text-bg-danger', 'Failed');
+      appendTranscriptEvent(`Error: ${detail}`);
+    }
+    setGenerateBusy(false);
+    updateActionButtons();
+  }
+
+  function buildTranscriptText() {
+    const lines = [
+      String(elements.streamMeta.textContent || '').trim(),
+      `${String(elements.streamStatus.textContent || '').trim()} :: ${String(elements.streamDetail.textContent || '').trim()}`.trim(),
+      '',
+      'Activity:',
+    ];
+    (state.transcriptEvents || []).forEach((entry) => {
+      lines.push(`[${String(entry.time || '').trim()}] ${String(entry.text || '')}`);
+    });
+    lines.push('', 'Model Output:', String(elements.streamOutput.textContent || ''));
+    return lines.join('\n');
+  }
+
+  async function copyTranscript() {
+    const text = buildTranscriptText();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      appendTranscriptEvent('Transcript copied to clipboard.');
+      return;
+    }
+    throw new Error('Clipboard API is unavailable in this browser.');
+  }
+
+  function downloadTranscript() {
+    const blob = new Blob([buildTranscriptText()], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `generator_builder_${state.lastGenerateMode || 'create'}_transcript.txt`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    appendTranscriptEvent('Transcript downloaded.');
+  }
+
+  function updateActionButtons() {
+    const hasScaffold = !!state.scaffoldRequest;
+    const promptReady = isPromptUnlocked();
+    if (elements.promptRefineBtn) elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
+    if (elements.testBtn) elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
+    if (elements.installBtn) elements.installBtn.disabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
+    if (elements.promptSubmitBtn) elements.promptSubmitBtn.disabled = state.generateInFlight || !promptReady;
+    if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = state.generateInFlight || !promptReady;
+    if (elements.downloadComposeBtn) {
+      elements.downloadComposeBtn.disabled = state.generateInFlight || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/docker-compose.yml'));
+    }
+    if (elements.downloadReadmeBtn) {
+      elements.downloadReadmeBtn.disabled = state.generateInFlight || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
+    }
+    if (elements.fetchModelsBtn) elements.fetchModelsBtn.disabled = state.generateInFlight;
+    if (elements.buildTabTestBtn) {
+      const testRunLocked = state.generateInFlight || !hasScaffold || !builderTestState.hasRunHistory;
+      elements.buildTabTestBtn.disabled = testRunLocked;
+      elements.buildTabTestBtn.setAttribute('aria-disabled', testRunLocked ? 'true' : 'false');
+    }
+    updatePromptLockState();
+    persistBuilderWorkspaceState();
+  }
+
+  async function fetchModelsOnly() {
+    setValidationStatus('Fetching models from the selected provider...', 'secondary');
+    const payload = await validateProvider();
+    const count = Array.isArray(payload.models) ? payload.models.length : 0;
+    setValidationStatus(`Validated provider and loaded ${count} model${count === 1 ? '' : 's'}.`, 'success');
+    updateActionButtons();
+    return payload;
+  }
+
+  async function validateProvider() {
+    setValidationStatus('Checking provider connectivity and loading available models...', 'secondary');
+    state.promptUnlocked = false;
+    const resp = await fetch('/api/ai/provider/validate', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(buildValidationPayload()),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    state.validation = payload;
+    state.models = Array.isArray(payload.models) ? payload.models.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+    renderModelList();
+    if (!resp.ok || payload.success === false) {
+      throw new Error((payload && (payload.error || payload.message)) || `Validation failed (HTTP ${resp.status})`);
+    }
+    if (!String(elements.model.value || '').trim() && state.models.length) {
+      elements.model.value = state.models[0];
+    }
+    persistCurrentProviderModelPrefs();
+    state.promptUnlocked = true;
+    const message = String(payload.message || '').trim() || `Reached ${String(payload.provider || elements.provider.value || 'provider')} successfully.`;
+    setValidationStatus(message, 'success');
+    updatePromptLockState();
+    updateActionButtons();
+    return payload;
+  }
+
+  function buildGeneratePayload() {
+    const payload = {
+      plugin_type: String(elements.pluginType.value || 'flag-generator').trim(),
+      source_id_hint: String(elements.sourceIdHint.value || '').trim(),
+      name_hint: String(elements.nameHint.value || '').trim(),
+      prompt: String(elements.prompt.value || '').trim(),
+      provider: String(elements.provider.value || 'ollama').trim(),
+      base_url: String(elements.baseUrl.value || '').trim(),
+      api_key: String(elements.apiKey.value || '').trim(),
+      model: String(elements.model.value || '').trim(),
+      enforce_ssl: !!elements.enforceSsl.checked,
+    };
+    const intentOverrides = buildIntentOverridePayload();
+    if (intentOverrides) {
+      payload.intent_overrides = intentOverrides;
+    }
+    return payload;
+  }
+
+  function buildIntentOverridePayload() {
+    const payload = {};
+    const runtimeInputs = String(elements.intentRuntimeInputs && elements.intentRuntimeInputs.value || '').trim();
+    const requires = String(elements.intentRequires && elements.intentRequires.value || '').trim();
+    const produces = String(elements.intentProduces && elements.intentProduces.value || '').trim();
+    const injectFiles = String(elements.intentInjectFiles && elements.intentInjectFiles.value || '').trim();
+    const injectDestination = String(elements.intentInjectDestination && elements.intentInjectDestination.value || '').trim();
+    const hintTemplates = String(elements.intentHintTemplates && elements.intentHintTemplates.value || '').trim();
+    const readmeNotes = String(elements.intentReadmeNotes && elements.intentReadmeNotes.value || '').trim();
+    if (runtimeInputs) payload.runtime_inputs = runtimeInputs;
+    if (requires) payload.requires = requires;
+    if (produces) payload.produces = produces;
+    if (injectFiles) payload.inject_files = injectFiles;
+    if (injectDestination) payload.inject_destination = injectDestination;
+    if (hintTemplates) payload.hint_templates = hintTemplates;
+    if (readmeNotes) payload.readme_mentions = readmeNotes;
+    return Object.keys(payload).length ? payload : null;
+  }
+
+  function fillIntentOverrideInputs(values, { refresh = false } = {}) {
+    const source = values && typeof values === 'object' ? values : {};
+    if (elements.intentRuntimeInputs) elements.intentRuntimeInputs.value = String(source.runtime_inputs || '');
+    if (elements.intentRequires) elements.intentRequires.value = String(source.requires || '');
+    if (elements.intentProduces) elements.intentProduces.value = String(source.produces || '');
+    if (elements.intentInjectFiles) elements.intentInjectFiles.value = String(source.inject_files || '');
+    if (elements.intentInjectDestination) elements.intentInjectDestination.value = String(source.inject_destination || '');
+    if (elements.intentHintTemplates) elements.intentHintTemplates.value = String(source.hint_templates || '');
+    if (elements.intentReadmeNotes) elements.intentReadmeNotes.value = String(source.readme_mentions || '');
+    if (refresh) {
+      queuePromptIntentPreview();
+    }
+    persistBuilderWorkspaceState();
+  }
+
+  function clearIntentOverrides({ refresh = true } = {}) {
+    fillIntentOverrideInputs({}, { refresh });
+  }
+
+  function applySuggestedIntentOverrides() {
+    const editable = state.promptIntentPreview && typeof state.promptIntentPreview.editable === 'object'
+      ? state.promptIntentPreview.editable
+      : null;
+    if (!editable) return;
+    fillIntentOverrideInputs(editable, { refresh: true });
+  }
+
+  function applySuggestedIntentOverrideField(key) {
+    const editable = state.promptIntentPreview && typeof state.promptIntentPreview.editable === 'object'
+      ? state.promptIntentPreview.editable
+      : null;
+    if (!editable || !Object.prototype.hasOwnProperty.call(editable, key)) return;
+    const fieldMap = {
+      runtime_inputs: elements.intentRuntimeInputs,
+      requires: elements.intentRequires,
+      produces: elements.intentProduces,
+      inject_files: elements.intentInjectFiles,
+      inject_destination: elements.intentInjectDestination,
+      hint_templates: elements.intentHintTemplates,
+      readme_mentions: elements.intentReadmeNotes,
+    };
+    const field = fieldMap[key];
+    if (!field) return;
+    field.value = String(editable[key] || '');
+    updateIntentOverrideSummary();
+    queuePromptIntentPreview();
+  }
+
+  function countIntentOverrides() {
+    const payload = buildIntentOverridePayload();
+    return payload ? Object.keys(payload).length : 0;
+  }
+
+  function updateIntentOverrideSummary() {
+    if (!elements.intentOverridesSummary) return;
+    const count = countIntentOverrides();
+    const open = !!(elements.intentOverridesPanel && elements.intentOverridesPanel.open);
+    if (!count) {
+      elements.intentOverridesSummary.textContent = open
+        ? 'No manual overrides set.'
+        : 'Collapsed. Open to add manual overrides.';
+      return;
+    }
+    elements.intentOverridesSummary.textContent = open
+      ? `${count} manual override${count === 1 ? '' : 's'} active.`
+      : `${count} manual override${count === 1 ? '' : 's'} active. Open to edit.`;
+  }
+
+  function renderSummary() {
+    const req = state.scaffoldRequest;
+    if (!req) {
+      elements.summaryGrid.innerHTML = '<div class="gb-summary-item"><small>Status</small><strong>Awaiting generation</strong></div>';
+      return;
+    }
+    const runtimeInputs = Array.isArray(req.runtime_inputs) ? req.runtime_inputs.map((item) => String(item.name || '').trim()).filter(Boolean) : [];
+    const requiredArtifacts = Array.isArray(req.requires)
+      ? req.requires.filter((item) => item && item.optional !== true).map((item) => String(item.artifact || '').trim()).filter(Boolean)
+      : [];
+    const optionalArtifacts = Array.isArray(req.requires)
+      ? req.requires.filter((item) => item && item.optional === true).map((item) => String(item.artifact || '').trim()).filter(Boolean)
+      : [];
+    const produces = Array.isArray(req.produces) ? req.produces : [];
+    const items = [
+      ['Kind', req.plugin_type || ''],
+      ['Plugin ID', req.plugin_id || ''],
+      ['Folder', req.folder_name || ''],
+      ['Runtime inputs', runtimeInputs.join(', ') || '(none)'],
+      ['Required artifacts', requiredArtifacts.join(', ') || '(none)'],
+      ['Optional artifacts', optionalArtifacts.join(', ') || '(none)'],
+      ['Produces', produces.join(', ') || '(none)'],
+      ['Hint templates', Array.isArray(req.hint_templates) ? String(req.hint_templates.length) : '0'],
+    ];
+    elements.summaryGrid.innerHTML = items.map(([label, value]) => (
+      `<div class="gb-summary-item"><small>${label}</small><strong>${value || '(none)'}</strong></div>`
+    )).join('');
+  }
+
+  function renderFiles() {
+    const entries = Object.entries(state.scaffoldFiles || {}).sort((a, b) => a[0].localeCompare(b[0]));
+    elements.filesCount.textContent = `${entries.length} file${entries.length === 1 ? '' : 's'}`;
+    if (!entries.length) {
+      elements.fileList.innerHTML = '<div class="list-group-item text-muted">Generate a scaffold to preview files.</div>';
+      elements.fileContent.textContent = 'No file selected.';
+      return;
+    }
+    if (!state.activeFilePath || !state.scaffoldFiles[state.activeFilePath]) {
+      state.activeFilePath = entries[0][0];
+    }
+    elements.fileList.innerHTML = entries.map(([path]) => {
+      const active = path === state.activeFilePath ? ' active' : '';
+      return `<button type="button" class="list-group-item list-group-item-action${active}" data-gb-file-path="${path.replace(/"/g, '&quot;')}">${path}</button>`;
+    }).join('');
+    elements.fileContent.textContent = String(state.scaffoldFiles[state.activeFilePath] || '');
+    Array.from(elements.fileList.querySelectorAll('[data-gb-file-path]')).forEach((button) => {
+      button.addEventListener('click', () => {
+        state.activeFilePath = button.getAttribute('data-gb-file-path') || '';
+        renderFiles();
+      });
+    });
+  }
+
+  function setPromptIntentPreview(status, tone, sections) {
+    const overrideCount = countIntentOverrides();
+    if (elements.promptIntentBadge) {
+      elements.promptIntentBadge.className = `badge text-bg-${tone || 'secondary'}`;
+      elements.promptIntentBadge.textContent = overrideCount ? `${status || 'Idle'} + ${overrideCount} override${overrideCount === 1 ? '' : 's'}` : (status || 'Idle');
+    }
+    if (elements.promptIntentStatus) {
+      elements.promptIntentStatus.textContent = status === 'Empty'
+        ? 'Add more detail to the prompt to preview explicit requirements and inferred defaults.'
+        : overrideCount
+          ? 'This preview shows Builder overrides first, then user-specified requirements, then inferred defaults that still fill gaps.'
+          : 'This preview shows user-specified requirements first, then inferred defaults that fill gaps.';
+    }
+    const body = elements.promptIntentBody;
+    if (!body) return;
+    const items = Array.isArray(sections) ? sections : [];
+    if (!items.length) {
+      body.innerHTML = '<div class="small text-muted">No prompt-intent signals detected yet.</div>';
+      updateIntentOverrideSummary();
+      return;
+    }
+    body.innerHTML = items.map((section) => {
+      const sectionItems = Array.isArray(section && section.items) ? section.items : [];
+      const title = escapeHtml(String((section && section.title) || 'Preview'));
+      const toneClass = escapeHtml(String((section && section.tone) || 'secondary'));
+      const list = sectionItems.length
+        ? `<ul class="small mb-0 ps-3">${sectionItems.map((item) => `<li>${escapeHtml(String(item || ''))}</li>`).join('')}</ul>`
+        : '<div class="small text-muted">No items</div>';
+      return `<div class="border rounded-3 p-2"><div class="fw-semibold text-${toneClass} mb-1">${title}</div>${list}</div>`;
+    }).join('');
+    updateIntentOverrideSummary();
+  }
+
+  async function refreshPromptIntentPreview() {
+    const prompt = String(elements.prompt.value || '').trim();
+    const pluginType = String(elements.pluginType.value || 'flag-generator').trim() || 'flag-generator';
+    if (!prompt) {
+      state.promptIntentPreview = null;
+      setPromptIntentPreview('Empty', 'secondary', []);
+      return;
+    }
+    setPromptIntentPreview('Analyzing', 'info', []);
+    const payload = await fetchJson('/api/generators/prompt_intent_preview', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        prompt,
+        plugin_type: pluginType,
+        intent_overrides: buildIntentOverridePayload(),
+      }),
+    });
+    if (!payload || payload.ok === false) {
+      state.promptIntentPreview = null;
+      setPromptIntentPreview('Error', 'danger', []);
+      if (elements.promptIntentStatus) {
+        elements.promptIntentStatus.textContent = String((payload && payload.error) || 'Failed to preview prompt intent.');
+      }
+      return;
+    }
+    state.promptIntentPreview = payload;
+    const sections = Array.isArray(payload.sections) ? payload.sections : [];
+    setPromptIntentPreview(sections.length ? 'Ready' : 'Idle', sections.length ? 'success' : 'secondary', sections);
+  }
+
+  function queuePromptIntentPreview() {
+    if (state.promptIntentPreviewTimer) {
+      try { clearTimeout(state.promptIntentPreviewTimer); } catch (e) {}
+    }
+    state.promptIntentPreviewTimer = window.setTimeout(() => {
+      state.promptIntentPreviewTimer = null;
+      refreshPromptIntentPreview();
+    }, 180);
+  }
+
+  function renderLatestTestSnapshot() {
+    const container = elements.latestTestSnapshot;
+    if (!container) return;
+    const data = builderTestState.latestOutputsData;
+    const runId = builderTestState.runId;
+    const base = builderTestState.testBase || '/api/generators/builder_test';
+    const scaffold = Array.isArray(data && data.scaffold) ? data.scaffold : [];
+    const misc = Array.isArray(data && data.misc) ? data.misc : [];
+    const failureSummary = String((data && data.failure_summary) || '').trim();
+    if (!runId || (!scaffold.length && !misc.length)) {
+      container.classList.add('d-none');
+      container.innerHTML = '';
+      return;
+    }
+    const links = [];
+    scaffold.forEach((file) => {
+      const relPath = String(file.path || '');
+      links.push(`<a class="btn btn-sm btn-outline-secondary" href="${escapeHtml(`${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}`)}">${escapeHtml(relPath.replace(/^scaffold\//, ''))}</a>`);
+    });
+    misc.filter((file) => String(file.path || '') === 'run.log').forEach((file) => {
+      const relPath = String(file.path || '');
+      links.push(`<a class="btn btn-sm btn-outline-dark" href="${escapeHtml(`${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(relPath)}`)}">Download run.log</a>`);
+    });
+    const summaryHtml = failureSummary
+      ? `<div class="small text-danger mb-2" style="white-space: pre-wrap;">${escapeHtml(failureSummary)}</div>`
+      : '<div class="small text-muted mb-2">Saved scaffold and logs from the latest Builder test run.</div>';
+    container.innerHTML = `
+      <div class="d-flex align-items-start justify-content-between gap-3 flex-wrap mb-2">
+        <div>
+          <div class="fw-semibold">Latest Test Snapshot</div>
+          <div class="small text-muted">Saved from run ${escapeHtml(String(runId))}</div>
+        </div>
+        <button type="button" class="btn btn-sm btn-outline-secondary" id="gbLatestTestSnapshotOpenBtn">Open Test Result</button>
+      </div>
+      ${summaryHtml}
+      <div class="d-flex gap-2 flex-wrap">${links.join('')}</div>
+    `;
+    container.classList.remove('d-none');
+    const openBtn = document.getElementById('gbLatestTestSnapshotOpenBtn');
+    if (openBtn) {
+      openBtn.addEventListener('click', () => {
+        showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
+      });
+    }
+  }
+
+  async function generateScaffold(mode = 'create') {
+    const payload = buildGeneratePayload();
+    if (!payload.prompt) {
+      throw new Error('Prompt is required.');
+    }
+    if (!payload.model) {
+      throw new Error('Model is required. Validate the provider or enter a model manually.');
+    }
+    if (mode === 'refine' && !state.scaffoldRequest) {
+      throw new Error('Create a scaffold before refining it.');
+    }
+    if (mode === 'refine') {
+      payload.current_scaffold_request = state.scaffoldRequest;
+      payload.current_files = state.scaffoldFiles;
+      payload.last_test_result = state.lastTestResult;
+    }
+    payload.request_id = createGenerateRequestId();
+    state.generateCancelRequested = false;
+    state.generateAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    setGenerateBusy(true);
+    openStreamModal(mode, payload);
+    setGenerateOverlay(
+      true,
+      mode === 'refine' ? 'Refining scaffold…' : 'Generating scaffold…',
+      'The prompt response workspace is temporarily locked while the current run is in progress. You can cancel at any time.'
+    );
+    setGenerationStatus(mode === 'refine' ? 'Refining current scaffold via AI...' : 'Generating scaffold via AI...', 'info');
+    appendTranscriptEvent('Request submitted to /api/generators/ai_scaffold_stream.');
+    try {
+      const resp = await fetch('/api/generators/ai_scaffold_stream', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        signal: state.generateAbortController ? state.generateAbortController.signal : undefined,
         body: JSON.stringify(payload),
       });
-      if(!res.ok){
-        const data = await res.json().catch(()=>null);
-        throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
+      if (!resp.ok) {
+        const result = await resp.json().catch(() => ({}));
+        throw new Error((result && (result.error || result.message)) || `Generation failed (HTTP ${resp.status})`);
       }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      const disp = res.headers.get('Content-Disposition') || '';
-      const m = disp.match(/filename="?([^";]+)"?/i);
-      a.download = (m && m[1]) ? m[1] : 'generator_scaffold.zip';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      let finalResult = null;
+      let streamError = '';
+      await consumeNdjsonStream(resp, (event) => {
+        const type = String((event && event.type) || '');
+        if (type === 'status') {
+          const message = String((event && event.message) || 'Working...');
+          setStreamState(message, 'Waiting for the next update.', 'text-bg-primary', 'Running');
+          appendTranscriptEvent(message);
+          return;
+        }
+        if (type === 'llm_prompt') {
+          appendTranscriptEvent(`LLM prompt:\n${String((event && event.text) || '')}`);
+          return;
+        }
+        if (type === 'llm_thinking') {
+          appendTranscriptEvent(`Thinking:\n${String((event && event.text) || '')}`);
+          return;
+        }
+        if (type === 'llm_delta') {
+          const delta = String((event && event.text) || '');
+          if (delta) {
+            state.assistantText = `${state.assistantText || ''}${delta}`;
+            setStreamOutput(state.assistantText, mode === 'refine' ? 'Streaming raw model response for the refine step.' : 'Streaming raw model response for the create step.');
+          }
+          return;
+        }
+        if (type === 'error') {
+          streamError = String((event && event.error) || 'Generation failed.');
+          appendTranscriptEvent(`Error: ${streamError}`);
+          return;
+        }
+        if (type === 'result') {
+          finalResult = event && typeof event.data === 'object' ? event.data : null;
+        }
+      });
+      if (streamError) {
+        throw new Error(streamError);
+      }
+      if (!finalResult || finalResult.ok === false) {
+        throw new Error((finalResult && (finalResult.error || finalResult.message)) || 'Generation stream ended before returning a scaffold result.');
+      }
+      applyGeneratedScaffoldResult(finalResult, mode, payload);
+    } catch (err) {
+      const aborted = !!(state.generateCancelRequested || (err && err.name === 'AbortError'));
+      const message = aborted ? 'Generation cancelled.' : String((err && err.message) || err || 'Generation failed.');
+      setGenerationStatus(message, 'danger');
+      finishStreamModal({ ok: false, detail: message, output: state.assistantText || '' });
+      if (!aborted) {
+        throw err;
+      }
+    } finally {
+      state.generateAbortController = null;
+      state.generateCancelRequested = false;
+    }
+  }
 
-      // Refresh derived metadata view (catalog JSON + scaffold paths)
-      const data = await postJson('/api/generators/scaffold_meta', payload);
-      renderResult(data);
-    } catch (e){
-      alert('Failed: ' + (e && e.message ? e.message : e));
+  async function runBuilderTest() {
+    if (!state.scaffoldRequest) {
+      throw new Error('Generate a scaffold first.');
+    }
+    setTestStatus('Running generated scaffold on the saved CORE VM test target...', 'info');
+    const resp = await fetch('/api/generators/builder_test', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        scaffold_request: state.scaffoldRequest,
+      }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    state.lastTestResult = payload;
+    elements.testStdout.textContent = String(payload.stdout || '');
+    elements.testStderr.textContent = String(payload.stderr || '');
+    renderTestFiles(payload.files || []);
+    if (!resp.ok || payload.ok === false) {
+      recordIteration({
+        mode: 'test',
+        prompt: String(elements.prompt.value || '').trim(),
+        plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
+        status: `failed rc=${payload.returncode == null ? 'n/a' : payload.returncode}`,
+      });
+      throw new Error((payload && (payload.error || payload.message)) || `Builder test failed (HTTP ${resp.status})`);
+    }
+    recordIteration({
+      mode: 'test',
+      prompt: String(elements.prompt.value || '').trim(),
+      plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
+      status: `passed rc=${payload.returncode}`,
+    });
+    setTestStatus(`Test completed successfully (rc=${payload.returncode}).`, 'success');
+    showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
+  }
+
+  async function installGenerated() {
+    if (!state.scaffoldRequest) {
+      throw new Error('Generate a scaffold first.');
+    }
+    setGenerationStatus('Installing current scaffold into the generator catalog...', 'info');
+    const resp = await fetch('/api/generators/install_generated', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        scaffold_request: state.scaffoldRequest,
+        pack_label: String((state.scaffoldRequest && state.scaffoldRequest.name) || (state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'generated-builder-pack'),
+      }),
+    });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || payload.ok === false) {
+      throw new Error((payload && (payload.error || payload.message)) || `Install failed (HTTP ${resp.status})`);
+    }
+    recordIteration({
+      mode: 'install',
+      prompt: String(elements.prompt.value || '').trim(),
+      plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
+      status: 'added to catalog',
+    });
+    setGenerationStatus(String(payload.message || 'Generator added to catalog.'), 'success');
+  }
+
+  function loadExamplePrompt() {
+    const kind = String(elements.pluginType.value || 'flag-generator').trim();
+    clearIntentOverrides({ refresh: false });
+    if (kind === 'flag-node-generator') {
+      elements.sourceIdHint.value = elements.sourceIdHint.value || 'py_web_token_gate';
+      elements.nameHint.value = elements.nameHint.value || 'Token-Gated Web Flag Node';
+      elements.prompt.value = [
+        'Build a flag-node-generator that creates a small Python web service in Docker.',
+        'Runtime inputs: seed (required), node_name (required), flag_prefix (optional).',
+        'Outputs must include Flag(flag_id) and File(path)=docker-compose.yml.',
+        'The compose should run a single HTTP service that checks a static bearer token before revealing a flag page.',
+        'Do not use ${...} in docker-compose.yml. Use explicit working_dir or absolute paths.',
+        'Add a hint template that points the participant toward the token-based web endpoint.',
+        'README should include local scripts/run_flag_generator.py usage.',
+      ].join('\n');
+      queuePromptIntentPreview();
+      return;
+    }
+    elements.sourceIdHint.value = elements.sourceIdHint.value || 'ssh_creds_drop';
+    elements.nameHint.value = elements.nameHint.value || 'SSH Credentials Drop';
+    elements.prompt.value = [
+      'Build a flag-generator that derives deterministic SSH credentials and a hint from seed and secret.',
+      'Runtime inputs: seed (required), secret (required, sensitive), flag_prefix (optional).',
+      'Artifact requirements: require Knowledge(ip). Optionally accept Knowledge(hostname).',
+      'Artifact outputs: Flag(flag_id), Credential(user), Credential(user,password), File(path).',
+      'Write a creds file under /outputs/artifacts/ and expose it through File(path).',
+      'Include inject_files with File(path) and a hint template that references the credential outputs.',
+      'README should mention determinism and local runner testing.',
+    ].join('\n');
+    queuePromptIntentPreview();
+  }
+
+  elements.provider.addEventListener('change', () => {
+    persistSelectedProvider(elements.provider.value || '');
+    state.models = [];
+    elements.model.value = '';
+    elements.baseUrl.value = '';
+    applyProviderDefaults();
+    invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
+  elements.baseUrl.addEventListener('input', () => {
+    persistCurrentProviderModelPrefs();
+    invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
+  elements.apiKey.addEventListener('input', () => {
+    invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
+  elements.enforceSsl.addEventListener('change', () => {
+    invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
+  elements.model.addEventListener('input', () => {
+    persistCurrentProviderModelPrefs();
+    invalidateModelStep('Model selection changed. Validate again to unlock prompting.');
+    persistBuilderWorkspaceState();
+  });
+  elements.refreshProvidersBtn.addEventListener('click', async () => {
+    await refreshProviders(true);
+    setValidationStatus('Provider catalog refreshed.', 'secondary');
+  });
+  elements.fetchModelsBtn.addEventListener('click', async () => {
+    try {
+      await fetchModelsOnly();
+    } catch (err) {
+      state.validation = null;
+      state.promptUnlocked = false;
+      updateActionButtons();
+      setValidationStatus(String((err && err.message) || err || 'Model fetch failed.'), 'danger');
+    }
+  });
+  elements.validateBtn.addEventListener('click', async () => {
+    try {
+      await validateProvider();
+      showBuildTab(elements.buildTabPromptBtn);
+    } catch (err) {
+      state.validation = null;
+      state.promptUnlocked = false;
+      updateActionButtons();
+      setValidationStatus(String((err && err.message) || err || 'Validation failed.'), 'danger');
+    }
+  });
+  elements.promptSubmitBtn.addEventListener('click', async () => {
+    try {
+      await generateScaffold('create');
+    } catch (err) {
+      setGenerationStatus(String((err && err.message) || err || 'Generation failed.'), 'danger');
+    }
+  });
+  elements.promptRefineBtn.addEventListener('click', async () => {
+    try {
+      await generateScaffold('refine');
+    } catch (err) {
+      setGenerationStatus(String((err && err.message) || err || 'Refinement failed.'), 'danger');
+    }
+  });
+  elements.testBtn.addEventListener('click', async () => {
+    try {
+      if (!state.scaffoldRequest) {
+        setTestStatus('Generate a scaffold first.', 'secondary');
+        return;
+      }
+      const creds = await promptBuilderTestCreds();
+      if (!creds) return;
+      builderTestState.testCoreCfg = creds;
+      builderTestState.hasRunHistory = true;
+      updateActionButtons();
+      openBuilderTestModal(state.scaffoldRequest, '/api/generators/builder_test');
+      await runCurrentBuilderTest();
+    } catch (err) {
+      setTestStatus(String((err && err.message) || err || 'Builder test failed.'), 'danger');
+    }
+  });
+  if (elements.installBtn) {
+    elements.installBtn.addEventListener('click', async () => {
+      try {
+        await installGenerated();
+      } catch (err) {
+        setGenerationStatus(String((err && err.message) || err || 'Install failed.'), 'danger');
+      }
+    });
+  }
+  elements.prompt.addEventListener('input', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  elements.sourceIdHint.addEventListener('input', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  elements.nameHint.addEventListener('input', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  elements.pluginType.addEventListener('change', () => {
+    queuePromptIntentPreview();
+    persistBuilderWorkspaceState();
+  });
+  [
+    elements.intentRuntimeInputs,
+    elements.intentRequires,
+    elements.intentProduces,
+    elements.intentInjectFiles,
+    elements.intentInjectDestination,
+    elements.intentHintTemplates,
+    elements.intentReadmeNotes,
+  ].forEach((field) => {
+    if (!field) return;
+    field.addEventListener('input', () => {
+      updateIntentOverrideSummary();
+      queuePromptIntentPreview();
+      persistBuilderWorkspaceState();
+    });
+  });
+  if (elements.intentOverridesPanel) {
+    elements.intentOverridesPanel.addEventListener('toggle', updateIntentOverrideSummary);
+  }
+  Array.from(document.querySelectorAll('[data-gb-intent-fill]')).forEach((button) => {
+    button.addEventListener('click', () => {
+      applySuggestedIntentOverrideField(button.getAttribute('data-gb-intent-fill') || '');
+    });
+  });
+  if (elements.intentApplySuggestedBtn) {
+    elements.intentApplySuggestedBtn.addEventListener('click', applySuggestedIntentOverrides);
+  }
+  if (elements.intentClearBtn) {
+    elements.intentClearBtn.addEventListener('click', () => clearIntentOverrides({ refresh: true }));
+  }
+  if (elements.clearStateBtn) {
+    elements.clearStateBtn.addEventListener('click', () => clearBuilderWorkspace({ includePrefs: true, confirmReset: true }));
+  }
+  if (elements.downloadComposeBtn) {
+    elements.downloadComposeBtn.addEventListener('click', () => {
+      try {
+        downloadGeneratedFile('/docker-compose.yml');
+      } catch (err) {
+        setGenerationStatus(String((err && err.message) || err || 'Download failed.'), 'danger');
+      }
+    });
+  }
+  if (elements.downloadReadmeBtn) {
+    elements.downloadReadmeBtn.addEventListener('click', () => {
+      try {
+        downloadGeneratedFile('/README.md');
+      } catch (err) {
+        setGenerationStatus(String((err && err.message) || err || 'Download failed.'), 'danger');
+      }
+    });
+  }
+  elements.promptExampleBtn.addEventListener('click', loadExamplePrompt);
+  elements.streamCopyBtn.addEventListener('click', async () => {
+    try {
+      await copyTranscript();
+    } catch (err) {
+      appendTranscriptEvent(String((err && err.message) || err || 'Copy failed.'));
+    }
+  });
+  elements.streamDownloadBtn.addEventListener('click', () => {
+    try {
+      downloadTranscript();
+    } catch (err) {
+      appendTranscriptEvent(String((err && err.message) || err || 'Download failed.'));
+    }
+  });
+  elements.streamRetryBtn.addEventListener('click', async () => {
+    try {
+      await generateScaffold(state.lastGenerateMode || 'create');
+    } catch (err) {
+      setGenerationStatus(String((err && err.message) || err || 'Retry failed.'), 'danger');
+    }
+  });
+  if (elements.generateCancelBtn) {
+    elements.generateCancelBtn.addEventListener('click', () => {
+      if (!state.generateInFlight || !state.generateAbortController) return;
+      state.generateCancelRequested = true;
+      setGenerateOverlay(true, 'Cancelling generation…', 'Waiting for the current request to stop cleanly.');
+      appendTranscriptEvent('Cancellation requested by user.');
+      if (state.generateRequestId) {
+        fetch('/api/generators/ai_scaffold_stream/cancel', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ request_id: state.generateRequestId }),
+        }).catch(() => null);
+      }
+      try {
+        state.generateAbortController.abort();
+      } catch (e) {}
+    });
+  }
+  elements.streamHeaderCloseBtn.addEventListener('click', () => showBuildTab(elements.buildTabPromptBtn));
+  elements.streamCloseBtn.addEventListener('click', () => showBuildTab(elements.buildTabPromptBtn));
+  elements.pluginType.addEventListener('change', () => {
+    if (!String(elements.prompt.value || '').trim()) {
+      loadExamplePrompt();
     }
   });
 
+  if (elements.testBackToBuildBtn) {
+    elements.testBackToBuildBtn.addEventListener('click', () => showBuildTab(elements.buildTabPromptBtn));
+  }
+
+  (function attachBuilderCleanupModalHandlers() {
+    const modalEl = document.getElementById('gbGenTestCleanupModal');
+    if (!modalEl) return;
+    const closeBtn = document.getElementById('gbGenTestCleanupCloseBtn');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        try { setBuilderCleanupLogLine('[ui][cleanup] user clicked Close'); } catch (e) {}
+      });
+    }
+    modalEl.addEventListener('hidden.bs.modal', () => {
+      try { clearBuilderCleanupLog(); } catch (e) {}
+    });
+  })();
+
+  renderProviderOptions();
+  updatePromptLockState();
+  renderSummary();
+  renderFiles();
+  renderIterations();
+  updateActionButtons();
+  setPromptIntentPreview('Idle', 'secondary', []);
+  updateIntentOverrideSummary();
+  if (!restoreBuilderWorkspaceState(loadBuilderWorkspaceState())) {
+    loadExamplePrompt();
+  }
+  refreshProviders(false);
 })();
 </script>
 {% endblock %}

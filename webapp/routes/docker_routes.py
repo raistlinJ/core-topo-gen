@@ -7,6 +7,8 @@ from typing import Any, Callable
 
 from flask import jsonify, request
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -26,6 +28,9 @@ def register(
 
     Extracted from `webapp.app_backend`.
     """
+
+    if not begin_route_registration(app, "docker_routes"):
+        return
 
     log = logger or getattr(app, "logger", None)
 
@@ -245,3 +250,5 @@ def register(
             return jsonify(payload)
         except Exception as e:
             return jsonify({'ok': False, 'error': str(e)}), 500
+
+    mark_routes_registered(app, "docker_routes")

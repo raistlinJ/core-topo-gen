@@ -1,7 +1,4 @@
-import os
-
 from webapp import app_backend
-from webapp.app_backend import app
 
 
 class _ImmediateThread:
@@ -42,9 +39,7 @@ def test_vuln_catalog_stop_cleanup_removes_local_run_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(app_backend, '_load_vuln_catalogs_state', lambda: {'catalogs': []})
     monkeypatch.setattr(app_backend, '_write_vuln_catalogs_state', lambda _state: None)
 
-    with app.app_context():
-        response = app_backend._stop_vuln_test_meta(meta, user_ok=True)
-        data = response.get_json() or {}
+    data = app_backend._stop_vuln_test_meta(meta, user_ok=True)
 
     assert data.get('ok') is True
     assert meta.get('cleanup_started') is True
@@ -80,9 +75,7 @@ def test_vuln_catalog_stop_cleanup_can_preserve_local_run_dir_when_disabled(tmp_
     monkeypatch.setattr(app_backend, '_load_vuln_catalogs_state', lambda: {'catalogs': []})
     monkeypatch.setattr(app_backend, '_write_vuln_catalogs_state', lambda _state: None)
 
-    with app.app_context():
-        response = app_backend._stop_vuln_test_meta(meta, user_ok=False)
-        data = response.get_json() or {}
+    data = app_backend._stop_vuln_test_meta(meta, user_ok=False)
 
     assert data.get('ok') is True
     assert meta.get('cleanup_started') is True

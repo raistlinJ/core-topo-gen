@@ -40,3 +40,30 @@ def test_session_add_node_falls_back_when_start_not_supported():
     assert s.calls
     _node_id, kw = s.calls[0]
     assert 'start' not in kw
+
+
+def test_session_add_node_preserves_extra_kwargs_when_start_not_supported():
+    s = SessionNoStart()
+    options = SimpleNamespace(compose='/tmp/vulns/docker-compose-n3.yml', compose_name='n3')
+
+    n = _session_add_node(
+        s,
+        3,
+        node_type="DOCKER",
+        name="n3",
+        start=False,
+        extra_kwargs={
+            'compose': '/tmp/vulns/docker-compose-n3.yml',
+            'compose_name': 'n3',
+            'options': options,
+            'image': '',
+        },
+    )
+
+    assert n.id == 3
+    assert s.calls
+    _node_id, kw = s.calls[0]
+    assert 'start' not in kw
+    assert kw.get('compose') == '/tmp/vulns/docker-compose-n3.yml'
+    assert kw.get('compose_name') == 'n3'
+    assert kw.get('options') is options

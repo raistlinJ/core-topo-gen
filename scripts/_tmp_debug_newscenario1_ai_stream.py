@@ -19,7 +19,7 @@ def main() -> int:
     payload = {
         'request_id': 'debug-newscenario1-stream',
         'provider': ai_state.get('provider') or 'ollama',
-        'bridge_mode': ai_state.get('bridge_mode') or 'ollmcp',
+        'bridge_mode': ai_state.get('bridge_mode') or 'mcp-python-sdk',
         'base_url': ai_state.get('base_url') or 'http://127.0.0.1:11434',
         'model': ai_state.get('model') or '',
         'mcp_server_path': ai_state.get('mcp_server_path') or 'MCP/server.py',

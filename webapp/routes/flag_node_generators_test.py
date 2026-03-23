@@ -12,6 +12,8 @@ from typing import Any, Callable, Optional
 from flask import jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
+
 
 def register(
     app,
@@ -34,16 +36,23 @@ def register(
     resolve_python_executable: Callable[[], str],
     get_repo_root: Callable[[], str],
     local_timestamp_safe: Callable[[], str],
+    coerce_bool: Callable[[Any], bool],
+    cleanup_remote_test_runtime: Callable[[dict[str, Any]], None],
+    flagnodegen_run_ephemeral_execute: Callable[[str], None],
 ) -> None:
     """Register Flag Node Generators test routes.
 
     Extracted from `webapp.app_backend` to reduce file size while keeping behavior identical.
     """
 
+    if not begin_route_registration(app, 'flag_node_generators_test_routes'):
+        return
+
     def _run_view():
         """Start a node-generator test run."""
         t0 = time.time()
         generator_id = (request.form.get('generator_id') or '').strip()
+        execute_like_real = coerce_bool(request.form.get('execute_like_real') or '1')
         try:
             app.logger.info("[flagnodegen_test] POST /flag_node_generators_test/run generator_id=%s", generator_id)
         except Exception:
@@ -132,6 +141,9 @@ def register(
             except Exception as exc:
                 return jsonify({'ok': False, 'error': str(exc)}), 409
 
+        if execute_like_real and not isinstance(core_cfg, dict):
+            return jsonify({'ok': False, 'error': 'CORE VM SSH config required for execute-like-real test mode.'}), 400
+
         if core_cfg:
             try:
                 with open(log_path, 'a', encoding='utf-8') as log_f:
@@ -169,9 +181,12 @@ def register(
                 'log_path': log_path,
                 'done': False,
                 'returncode': None,
+                'status': 'generator_running',
                 'run_dir': run_dir,
                 'kind': 'flag_node_generator_test',
                 'generator_id': generator_id,
+                'generator_name': str((gen or {}).get('name') or generator_id),
+                'execute_like_real': bool(execute_like_real),
                 'remote': True,
                 'core_cfg': core_cfg,
                 'remote_run_dir': remote_meta.get('remote_run_dir'),
@@ -200,11 +215,9 @@ def register(
                                 break
                             time.sleep(0.5)
                 finally:
-                    meta['done'] = True
-                    meta['returncode'] = rc
                     try:
                         with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
-                            write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                            write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
                     except Exception:
                         pass
                     try:
@@ -235,6 +248,23 @@ def register(
                             handle.close()
                     except Exception:
                         pass
+                    if rc == 0 and bool(meta.get('execute_like_real')) and (not meta.get('cleanup_requested')):
+                        try:
+                            flagnodegen_run_ephemeral_execute(run_id_local)
+                            return
+                        except Exception as exc:
+                            meta['done'] = True
+                            meta['returncode'] = 1
+                            meta['status'] = 'failed'
+                            meta['error'] = f'ephemeral execute failed: {exc}'
+                    meta['done'] = True
+                    meta['returncode'] = rc
+                    meta['status'] = 'completed' if rc == 0 else 'failed'
+                    try:
+                        with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                            write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                    except Exception:
+                        pass
 
             threading.Thread(
                 target=_finalize_remote_flagnodegen,
@@ -252,7 +282,7 @@ def register(
                 )
             except Exception:
                 pass
-            return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+            return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads, 'execute_like_real': bool(execute_like_real)})
 
         repo_root = get_repo_root()
         runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
@@ -306,9 +336,13 @@ def register(
             'log_path': log_path,
             'done': False,
             'returncode': None,
+            'status': 'generator_running',
             'run_dir': run_dir,
             'kind': 'flag_node_generator_test',
             'generator_id': generator_id,
+            'generator_name': str((gen or {}).get('name') or generator_id),
+            'execute_like_real': bool(execute_like_real),
+            'core_cfg': core_cfg,
         }
 
         def _finalize(run_id_local: str, log_handle_local: Any):
@@ -320,8 +354,23 @@ def register(
                 if not p:
                     return
                 rc = p.wait()
+                try:
+                    with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                        write_sse_marker(log_f, 'phase', {'phase': 'generator_done', 'returncode': rc})
+                except Exception:
+                    pass
+                if rc == 0 and bool(meta.get('execute_like_real')):
+                    try:
+                        flagnodegen_run_ephemeral_execute(run_id_local)
+                        return
+                    except Exception as exc:
+                        meta['done'] = True
+                        meta['returncode'] = 1
+                        meta['status'] = 'failed'
+                        meta['error'] = f'ephemeral execute failed: {exc}'
                 meta['done'] = True
                 meta['returncode'] = rc
+                meta['status'] = 'completed' if rc == 0 else 'failed'
                 try:
                     with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
                         write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
@@ -350,7 +399,7 @@ def register(
             )
         except Exception:
             pass
-        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+        return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads, 'execute_like_real': bool(execute_like_real)})
 
     def _outputs_view(run_id: str):
         meta = runs.get(run_id)
@@ -438,6 +487,10 @@ def register(
         try:
             if isinstance(meta, dict):
                 meta['cleanup_requested'] = True
+                try:
+                    cleanup_remote_test_runtime(meta)
+                except Exception:
+                    pass
                 if meta.get('remote'):
                     try:
                         channel = meta.get('ssh_channel')
@@ -513,3 +566,4 @@ def register(
         view_func=_cleanup_view,
         methods=['POST'],
     )
+    mark_routes_registered(app, 'flag_node_generators_test_routes')

@@ -8,9 +8,11 @@ Use this page to navigate the main project documentation.
 - [Screenshots](screenshots.md)
 
 ## Core workflows
+- [AI Generator Workflow](AI_GENERATOR_WORKFLOW.md)
 - [Full Preview Workflow](FULL_PREVIEW_WORKFLOW.md)
 - [Feature Deep Dive](FEATURE_DEEP_DIVE.md)
 - AI Generator state flow and persistence are documented in [Feature Deep Dive](FEATURE_DEEP_DIVE.md#ai-generator-workflow).
+- Recent AI generator compiler, validation, retry, and preview-sync improvements are summarized in [AI Generator Workflow](AI_GENERATOR_WORKFLOW.md).
 
 ## Reference
 - [Architecture Overview](ARCHITECTURE_OVERVIEW.md)

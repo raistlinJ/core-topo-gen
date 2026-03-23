@@ -104,6 +104,77 @@ def test_save_xml_api_repairs_router_rows_misplaced_in_node_information(tmp_path
     assert routing_items[0].get('v_count') == 3
 
 
+def test_save_xml_api_concretizes_routing_random_edge_modes(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        'seed': 11,
+        'scenarios': [
+            {
+                'name': 'RoutingRandomSave',
+                'base': {'filepath': ''},
+                'sections': {
+                    'Node Information': {'density': 0, 'items': []},
+                    'Routing': {
+                        'density': 0.5,
+                        'items': [
+                            {
+                                'selected': 'Random',
+                                'factor': 1.0,
+                                'v_metric': 'Count',
+                                'v_count': 2,
+                                'r2r_mode': 'Random',
+                                'r2s_mode': 'Random',
+                            }
+                        ],
+                    },
+                    'Services': {'density': 0.0, 'items': []},
+                    'Traffic': {'density': 0.0, 'items': []},
+                    'Vulnerabilities': {'density': 0.0, 'items': [], 'flag_type': 'text'},
+                    'Segmentation': {'density': 0.0, 'items': []},
+                },
+                'notes': '',
+            }
+        ],
+    }
+
+    resp = client.post('/save_xml_api', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json() or {}
+    assert data.get('ok') is True
+
+    parsed = backend._parse_scenarios_xml(data.get('result_path'))
+    scenarios = parsed.get('scenarios') or []
+    routing_items = (((scenarios[0] if scenarios else {}).get('sections') or {}).get('Routing') or {}).get('items') or []
+
+    assert routing_items
+    routing_item = routing_items[0]
+    assert routing_item.get('selected') in {'RIP', 'RIPNG', 'BGP', 'OSPFv2', 'OSPFv3'}
+    assert routing_item.get('r2r_mode') in {'Min', 'Uniform', 'Exact', 'NonUniform'}
+    assert routing_item.get('r2s_mode') in {'Min', 'Uniform', 'Exact', 'NonUniform'}
+    assert routing_item.get('r2r_mode') != 'Random'
+    assert routing_item.get('r2s_mode') != 'Random'
+
+    if routing_item.get('r2r_mode') == 'Exact':
+        assert int(routing_item.get('r2r_edges') or 0) > 0
+    else:
+        assert routing_item.get('r2r_edges') in (None, '', 0)
+
+    if routing_item.get('r2s_mode') == 'Exact':
+        assert int(routing_item.get('r2s_edges') or 0) > 0
+    if routing_item.get('r2s_mode') == 'NonUniform':
+        assert int(routing_item.get('r2s_hosts_min') or 0) > 0
+        assert int(routing_item.get('r2s_hosts_max') or 0) >= int(routing_item.get('r2s_hosts_min') or 0)
+
+
 def test_save_xml_api_accepts_empty_scenarios_and_persists_snapshot(tmp_path, monkeypatch):
     client = app.test_client()
     _login(client)
@@ -153,6 +224,53 @@ def test_editor_snapshot_api_accepts_empty_scenario_list(tmp_path, monkeypatch):
     snapshot = backend._load_editor_state_snapshot({'username': 'coreadmin', 'role': 'admin'})
     assert snapshot is not None
     assert snapshot.get('scenarios') == []
+
+
+def test_editor_snapshot_api_persists_user_ui_prefs(tmp_path, monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    from webapp import app_backend as backend
+
+    monkeypatch.setattr(backend, '_outputs_dir', lambda: str(outdir))
+
+    payload = {
+        'scenarios': [],
+        'active_index': 0,
+        'ui_prefs': {
+            'section_collapse_state': {'Topology': True},
+            'proxmox_defaults': {
+                'url': 'https://proxmox.example.local',
+                'port': 8006,
+                'username': 'root@pam',
+                'verify_ssl': False,
+            },
+            'execute_confirm_prefs': {'updateRemoteRepo': True},
+            'last_preview_seed': '12345',
+            'last_selected_scenario': 'Scenario A',
+            'selected_scenarios': ['scenario-1', 'scenario-2'],
+            'vuln_picker_filter': 'auth',
+            'graph_labels_state': 'on',
+        },
+    }
+
+    resp = client.post(
+        '/api/editor_snapshot',
+        data=json.dumps(payload),
+        content_type='application/json',
+    )
+    assert resp.status_code == 200
+    assert resp.get_json() == {'success': True}
+
+    snapshot = backend._load_editor_state_snapshot({'username': 'coreadmin', 'role': 'admin'})
+    assert snapshot is not None
+    assert snapshot.get('ui_prefs', {}).get('section_collapse_state') == {'Topology': True}
+    assert snapshot.get('ui_prefs', {}).get('proxmox_defaults', {}).get('url') == 'https://proxmox.example.local'
+    assert snapshot.get('ui_prefs', {}).get('execute_confirm_prefs', {}).get('updateRemoteRepo') is True
+    assert snapshot.get('ui_prefs', {}).get('graph_labels_state') == 'on'
 
 
 def test_index_preserves_empty_snapshot_on_reload(tmp_path, monkeypatch):

@@ -1,6 +1,12 @@
 from pathlib import Path
+import json
 
 from webapp import app_backend
+
+
+def _login(client):
+    resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert resp.status_code in (302, 303)
 
 
 def test_attach_base_upload_sets_display_name():
@@ -64,3 +70,74 @@ def test_base_upload_state_roundtrip(tmp_path, monkeypatch):
 
     app_backend._clear_base_upload_state()
     assert not state_path.exists(), "state file should be cleared after removal"
+
+
+def test_remove_base_clears_editor_snapshot_base_upload(tmp_path, monkeypatch):
+    client = app_backend.app.test_client()
+    _login(client)
+
+    base_xml = tmp_path / "base.xml"
+    base_xml.write_text("<xml />")
+
+    outdir = tmp_path / 'outputs'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(app_backend, '_outputs_dir', lambda: str(outdir))
+    monkeypatch.setattr(app_backend, '_validate_core_xml', lambda path: (True, []))
+
+    user = {'username': 'coreadmin', 'role': 'admin'}
+    app_backend._save_base_upload_state({
+        'path': str(base_xml),
+        'display_name': 'base.xml',
+        'valid': True,
+    })
+    app_backend._persist_editor_state_snapshot({
+        'scenarios': [
+            {
+                'name': 'Scenario 1',
+                'base': {
+                    'filepath': str(base_xml),
+                    'display_name': 'base.xml',
+                },
+                'sections': {},
+                'notes': '',
+            }
+        ],
+        'base_upload': {
+            'path': str(base_xml),
+            'display_name': 'base.xml',
+            'valid': True,
+        },
+        'active_index': 0,
+    }, user=user)
+
+    resp = client.post(
+        '/remove_base',
+        data={
+            'scenarios_json': json.dumps({
+                'scenarios': [
+                    {
+                        'name': 'Scenario 1',
+                        'base': {
+                            'filepath': str(base_xml),
+                            'display_name': 'base.xml',
+                        },
+                        'sections': {},
+                        'notes': '',
+                    }
+                ]
+            })
+        },
+    )
+
+    assert resp.status_code == 200
+
+    snapshot = app_backend._load_editor_state_snapshot(user)
+    assert snapshot is not None
+    assert 'base_upload' not in snapshot
+    scenarios = snapshot.get('scenarios') or []
+    assert len(scenarios) == 1
+    base_section = (scenarios[0].get('base') or {})
+    assert base_section.get('filepath') == ''
+    assert base_section.get('display_name') == ''
+    assert not Path(app_backend._base_upload_state_path()).exists()

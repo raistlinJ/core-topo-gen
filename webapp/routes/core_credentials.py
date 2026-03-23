@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from flask import jsonify, request
+from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
 def register(
@@ -20,6 +21,9 @@ def register(
 
     Extracted from `webapp.app_backend` to reduce file size.
     """
+
+    if not begin_route_registration(app, 'core_credentials_routes'):
+        return
 
     def _require_admin():
         current = current_user_getter()
@@ -130,3 +134,4 @@ def register(
         view_func=_get_view,
         methods=['POST'],
     )
+    mark_routes_registered(app, 'core_credentials_routes')

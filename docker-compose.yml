@@ -17,10 +17,9 @@ services:
       - ${CORETG_DNS_1:-1.1.1.1}
       - ${CORETG_DNS_2:-8.8.8.8}
     volumes:
-      # Persist state/artifacts on the host.
-      - ./outputs:/app/outputs
-      - ./reports:/app/reports
-      - ./uploads:/app/uploads
+      # Mount the repo so checked-out code and template changes are visible
+      # without rebuilding the image on every compose restart.
+      - .:/app
     network_mode: host
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/healthz', timeout=3)"]
