@@ -699,28 +699,28 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
     for service, count in service_counts.items():
         coverage[f'Services:{service}'] = {
             'exact_items': count,
-            'reason': f'user requested exactly {count} {service} service row{'s' if count != 1 else ''}',
+            'reason': f"user requested exactly {count} {service} service row{'s' if count != 1 else ''}",
         }
 
     traffic_protocol_counts = _extract_traffic_protocol_count_intent(user_prompt)
     for protocol, count in traffic_protocol_counts.items():
         coverage[f'Traffic:{protocol}'] = {
             'exact_items': count,
-            'reason': f'user requested exactly {count} {protocol} traffic row{'s' if count != 1 else ''}',
+            'reason': f"user requested exactly {count} {protocol} traffic row{'s' if count != 1 else ''}",
         }
 
     traffic_pattern_counts = _extract_traffic_pattern_count_intent(user_prompt)
     for pattern_name, count in traffic_pattern_counts.items():
         coverage[f'Traffic Pattern:{pattern_name}'] = {
             'exact_items': count,
-            'reason': f'user requested exactly {count} {pattern_name} traffic row{'s' if count != 1 else ''}',
+            'reason': f"user requested exactly {count} {pattern_name} traffic row{'s' if count != 1 else ''}",
         }
 
     segmentation_control_counts = _extract_segmentation_control_count_intent(user_prompt)
     for control, count in segmentation_control_counts.items():
         coverage[f'Segmentation:{control}'] = {
             'exact_items': count,
-            'reason': f'user requested exactly {count} {control} segmentation row{'s' if count != 1 else ''}',
+            'reason': f"user requested exactly {count} {control} segmentation row{'s' if count != 1 else ''}",
         }
 
     vuln_count = _extract_vulnerability_target_count(user_prompt)
@@ -736,7 +736,7 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
     if traffic_count is not None:
         coverage['Traffic'] = {
             'min_items': traffic_count,
-            'reason': f'user requested at least {traffic_count} traffic row{'s' if traffic_count != 1 else ''}',
+            'reason': f"user requested at least {traffic_count} traffic row{'s' if traffic_count != 1 else ''}",
         }
         traffic_values: list[dict[str, Any]] = []
         selected_values = [
@@ -766,7 +766,7 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
     if service_count is not None:
         coverage['Services'] = {
             'min_items': service_count,
-            'reason': f'user requested at least {service_count} service row{'s' if service_count != 1 else ''}',
+            'reason': f"user requested at least {service_count} service row{'s' if service_count != 1 else ''}",
         }
     service_values = [
         canonical
@@ -794,7 +794,7 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
     if segmentation_count is not None:
         coverage['Segmentation'] = {
             'min_items': segmentation_count,
-            'reason': f'user requested at least {segmentation_count} segmentation row{'s' if segmentation_count != 1 else ''}',
+            'reason': f"user requested at least {segmentation_count} segmentation row{'s' if segmentation_count != 1 else ''}",
         }
     segmentation_values = [
         canonical
@@ -841,7 +841,7 @@ def _extract_prompt_coverage_intent(user_prompt: str) -> dict[str, dict[str, Any
         docker_count = _match_count(r'\b(\d+)\s+' + qualifier_words + r'docker\s+(?:hosts?|nodes?|containers?)\b')
         coverage['Docker'] = {
             'min_items': docker_count or 1,
-            'reason': f'user requested at least {docker_count or 1} docker host row{'s' if (docker_count or 1) != 1 else ''}',
+            'reason': f"user requested at least {docker_count or 1} docker host row{'s' if (docker_count or 1) != 1 else ''}",
         }
 
     return coverage
