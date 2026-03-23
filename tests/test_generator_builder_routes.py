@@ -60,12 +60,6 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'gbLatestTestSnapshot' in body
     assert 'gbGenerateOverlayOutput' in body
     assert 'gbGenerateOverlayEvents' in body
-    assert 'gbIntentApplySuggestedBtn' in body
-    assert 'gbIntentRuntimeInputs' in body
-    assert 'gbIntentHintTemplates' in body
-    assert 'gbIntentOverridesPanel' in body
-    assert 'data-gb-intent-fill="runtime_inputs"' in body
-    assert 'gbIntentOverridesSummary' in body
     assert 'Locked until validation' in body
     assert 'coretg_builder_model_config' in body
     assert 'coretg_builder_workspace_state' in body

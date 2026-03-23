@@ -657,6 +657,7 @@
                         return;
                     }
                     if (type === 'llm_thinking') {
+                        streamApi.setStatus('Model is thinking...', 'Waiting for the next streamed reasoning update.', 'primary');
                         streamApi.appendEvent('Thinking', (event.text || '').toString(), 'default', {
                             mergeKey: 'llm-thinking',
                             appendBody: true,
@@ -668,6 +669,7 @@
                     }
                     if (type === 'tool_call') {
                         const toolName = (event.tool_name || 'tool').toString();
+                        streamApi.setStatus('Calling tool...', `${toolName} was requested by the model.`, 'primary');
                         streamApi.appendEvent('Tool requested', toolName);
                         return;
                     }
@@ -675,6 +677,11 @@
                         const toolName = (event.tool_name || 'tool').toString();
                         const stage = (event.stage || 'update').toString();
                         const message = (event.message || '').toString();
+                        streamApi.setStatus(
+                            stage === 'start' ? 'Running tool...' : 'Tool update received',
+                            toolName,
+                            'primary'
+                        );
                         streamApi.appendEvent(stage === 'start' ? 'Tool running' : 'Tool result', `${toolName}\n${message}`);
                         return;
                     }

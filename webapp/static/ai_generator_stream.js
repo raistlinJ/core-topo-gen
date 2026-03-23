@@ -101,17 +101,31 @@
         toggle.checked = !!streamState.autoFollowEvents;
     }
 
-    function scrollActivityToBottom() {
+    function scheduleActivityAutoFollow() {
         if (!streamState.autoFollowEvents) return;
-        const eventsEl = document.getElementById('aiGeneratorStreamEvents');
-        if (eventsEl) {
+        const run = () => {
+            const eventsEl = document.getElementById('aiGeneratorStreamEvents');
+            if (!eventsEl) return;
             eventsEl.scrollTop = eventsEl.scrollHeight;
             eventsEl.querySelectorAll('.ai-generator-stream-event-live-tail, .ai-generator-stream-event-toggle-body').forEach((el) => {
                 try {
                     el.scrollTop = el.scrollHeight;
                 } catch (e) { }
             });
+        };
+        try {
+            window.requestAnimationFrame(() => {
+                run();
+                window.setTimeout(run, 0);
+            });
+        } catch (e) {
+            run();
         }
+    }
+
+    function scrollActivityToBottom() {
+        if (!streamState.autoFollowEvents) return;
+        scheduleActivityAutoFollow();
     }
 
     function bindPayloadToggle(detailsEl, summaryEl) {
@@ -181,6 +195,9 @@
                 event.preventDefault();
                 event.stopPropagation();
             }
+        });
+        modalEl.addEventListener('shown.bs.modal', () => {
+            scrollActivityToBottom();
         });
         const autoFollowInput = document.getElementById('aiGeneratorStreamAutoFollowInput');
         if (autoFollowInput) {
@@ -439,6 +456,7 @@
         appendEvent('Starting', 'Opening generation stream.');
         updateButtons();
         try { streamState.modal?.show(); } catch (e) { }
+        scrollActivityToBottom();
     }
 
     function finishModal(success, detailText = '') {

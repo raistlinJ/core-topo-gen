@@ -189,7 +189,9 @@ def test_ai_generator_stream_defaults_activity_auto_follow_on() -> None:
     expected_snippets = [
         'autoFollowEvents: true,',
         'function syncAutoFollowToggle() {',
+        'function scheduleActivityAutoFollow() {',
         'function scrollActivityToBottom() {',
+        "modalEl.addEventListener('shown.bs.modal', () => {",
         "const autoFollowInput = document.getElementById('aiGeneratorStreamAutoFollowInput');",
         'if (streamState.autoFollowEvents) {',
     ]
