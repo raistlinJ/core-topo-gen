@@ -6885,6 +6885,17 @@
                     }
                     return;
                 }
+                if (action === 'ai-generator') {
+                    const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
+                    const url = '/' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                    try {
+                        if (typeof window.coretgAllowUnsavedNavOnce === 'function') {
+                            window.coretgAllowUnsavedNavOnce();
+                        }
+                    } catch (e) { }
+                    window.location.href = url;
+                    return;
+                }
                 document.getElementById('scenariosPreviewTabLink')?.click();
             } catch (e) { }
         });

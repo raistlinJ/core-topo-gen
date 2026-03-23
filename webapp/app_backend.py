@@ -38189,6 +38189,16 @@ except Exception:
     except Exception:
         pass
 
+try:
+    from webapp.routes import ai_provider as _ai_provider_routes
+
+    _ai_provider_routes.register(
+        app,
+        logger=app.logger,
+    )
+except Exception:
+    pass
+
 
 def purge_history_for_scenario():
     try:
