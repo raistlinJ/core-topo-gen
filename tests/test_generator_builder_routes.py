@@ -71,6 +71,9 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Locked until validation' in body
     assert 'coretg_builder_model_config' in body
     assert 'coretg_builder_workspace_state' in body
+    assert 'gbInstallSuccessAlert' in body
+    assert 'gbOutputInstallBtn' in body
+    assert 'gbTestInstallBtn' in body
     assert '<div class="gb-inline-snapshot d-none" id="gbLatestTestSnapshot"></div>' not in body
     assert 'After Scaffold' not in body
     assert 'Compatibility Checklist' not in body
@@ -91,11 +94,13 @@ def test_generator_builder_template_aggregates_thinking_and_scrolls_latest_activ
         "transcriptThinkingText: ''",
         "function upsertTranscriptEvent(key, text) {",
         "upsertTranscriptEvent('thinking', `Thinking:\\n${state.transcriptThinkingText}`);",
-        "lastItem.scrollIntoView({ block: 'end' });",
+        "target.scrollTop = target.scrollHeight;",
+        "const shouldRevealResults = isNavTabActive(elements.buildTabTestBtn) && isNavTabActive(elements.testProgressTabBtn);",
     ]
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, 'Missing Builder thinking aggregation / auto-follow snippets: ' + '; '.join(missing)
+    assert "scrollIntoView({ block: 'end' });" not in text
 
 
 def test_generator_artifacts_index_merges_sources_reserved_and_custom(monkeypatch):
@@ -1027,10 +1032,16 @@ def test_generator_install_generated_wraps_scaffold_as_pack(monkeypatch):
 
     assert resp.status_code == 200
     payload = resp.get_json() or {}
-    assert payload == {
-        'ok': True,
-        'message': 'Installed 1 generator(s) from Demo Pack',
-        'pack_label': 'Demo Pack',
+    assert payload.get('ok') is True
+    assert payload.get('message') == 'Installed 1 generator(s) from Demo Pack'
+    assert payload.get('pack_label') == 'Demo Pack'
+    assert payload.get('renamed') is False
+    assert payload.get('rename_note') == ''
+    assert payload.get('installed_as') == {
+        'plugin_type': 'flag-generator',
+        'plugin_id': 'demo',
+        'name': 'Demo Pack',
+        'folder_name': 'py_demo',
     }
     assert installed['names'] == [
         'flag_generators/py_demo/README.md',
@@ -1039,3 +1050,98 @@ def test_generator_install_generated_wraps_scaffold_as_pack(monkeypatch):
         'flag_generators/py_demo/manifest.yaml',
     ]
     assert 'id: demo' in installed['manifest']
+
+
+def test_generator_install_generated_renames_duplicate_id(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+    monkeypatch.setattr(backend, '_flag_generators_from_enabled_sources', lambda: ([{'id': 'demo', 'name': 'Demo Pack'}], []))
+
+    installed = {}
+
+    def _fake_install(*, zip_path, pack_label, pack_origin):
+        assert pack_label == 'Demo Pack 2'
+        assert pack_origin == 'generator_builder'
+        with zipfile.ZipFile(zip_path, 'r') as archive:
+            installed['names'] = sorted(archive.namelist())
+            installed['manifest'] = archive.read('flag_generators/py_demo_2/manifest.yaml').decode('utf-8')
+        return True, 'Installed 1 generator(s) from Demo Pack 2'
+
+    monkeypatch.setattr(backend, '_install_generator_pack_or_bundle', _fake_install)
+
+    resp = client.post('/api/generators/install_generated', json={
+        'pack_label': 'Demo Pack',
+        'scaffold_request': {
+            'plugin_type': 'flag-generator',
+            'plugin_id': 'demo',
+            'folder_name': 'py_demo',
+            'name': 'Demo Pack',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)'],
+            'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+            'generator_py_text': 'print("demo")\n',
+            'readme_text': '# Demo\n',
+        },
+    })
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('ok') is True
+    assert payload.get('renamed') is True
+    assert payload.get('pack_label') == 'Demo Pack 2'
+    assert payload.get('rename_note') == 'Duplicate generator id "demo" detected. Installed as "demo_2".'
+    assert payload.get('installed_as') == {
+        'plugin_type': 'flag-generator',
+        'plugin_id': 'demo_2',
+        'name': 'Demo Pack 2',
+        'folder_name': 'py_demo_2',
+    }
+    assert installed['names'] == [
+        'flag_generators/py_demo_2/README.md',
+        'flag_generators/py_demo_2/docker-compose.yml',
+        'flag_generators/py_demo_2/generator.py',
+        'flag_generators/py_demo_2/manifest.yaml',
+    ]
+    assert 'id: demo_2' in installed['manifest']
+
+
+def test_generator_install_generated_detects_duplicates_in_configured_install_root(tmp_path, monkeypatch):
+    install_root = tmp_path / 'installed_generators'
+    monkeypatch.setenv('CORETG_INSTALLED_GENERATORS_DIR', str(install_root))
+
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    payload = {
+        'pack_label': 'Live Smoke Demo',
+        'scaffold_request': {
+            'plugin_type': 'flag-generator',
+            'plugin_id': 'live_smoke_demo',
+            'folder_name': 'py_live_smoke_demo',
+            'name': 'Live Smoke Demo',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)'],
+            'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+            'generator_py_text': 'print("demo")\n',
+            'readme_text': '# Demo\n',
+        },
+    }
+
+    first = client.post('/api/generators/install_generated', json=payload)
+    assert first.status_code == 200
+    first_payload = first.get_json() or {}
+    assert first_payload.get('renamed') is False
+    assert (first_payload.get('installed_as') or {}).get('plugin_id') == 'live_smoke_demo'
+
+    second = client.post('/api/generators/install_generated', json=payload)
+    assert second.status_code == 200
+    second_payload = second.get_json() or {}
+    assert second_payload.get('renamed') is True
+    assert second_payload.get('rename_note') == 'Duplicate generator id "live_smoke_demo" detected. Installed as "live_smoke_demo_2".'
+    assert (second_payload.get('installed_as') or {}).get('plugin_id') == 'live_smoke_demo_2'

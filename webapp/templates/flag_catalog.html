@@ -29,14 +29,19 @@
                 </div>
               </form>
 
-              <form class="row g-2 mt-2 align-items-center" action="{{ url_for('generator_packs_import_url') }}" method="post">
+              <form id="packImportUrlForm" class="row g-2 mt-2 align-items-center" action="{{ url_for('generator_packs_import_url') }}" method="post">
                 <div class="col-md-6">
-                  <input class="form-control" type="url" name="zip_url" placeholder="https://example.com/generator-pack.zip" required>
+                  <input id="packImportUrlInput" class="form-control" type="url" name="zip_url" placeholder="https://example.com/generator-pack.zip" required>
                 </div>
                 <div class="col-auto">
                   <button class="btn btn-outline-primary" type="submit">Import from URL</button>
                 </div>
               </form>
+              <div class="alert alert-success alert-dismissible fade d-none mt-3 mb-0" id="packInstallSuccessAlert" role="alert">
+                <div class="fw-semibold" id="packInstallSuccessText">Generator pack added to catalog.</div>
+                <div class="small mb-0" id="packInstallSuccessMeta"></div>
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+              </div>
             </div>
           </div>
 
@@ -406,7 +411,7 @@
   <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">Uploading Generator Pack…</h5>
+        <h5 class="modal-title" id="packUploadProgressTitle">Uploading Generator Pack…</h5>
       </div>
       <div class="modal-body">
         <div class="small text-muted mb-2" id="packUploadProgressText">Preparing upload…</div>
@@ -2380,6 +2385,10 @@
 
   async function refreshFlagBatchStatus(runId) {
     const targetRunId = String(runId || flagBatchState.activeRunId || '').trim();
+    if (!targetRunId) {
+      renderFlagBatchStatus(null);
+      return;
+    }
     const url = targetRunId
       ? `/flag_catalog_items/batch/status?run_id=${encodeURIComponent(targetRunId)}`
       : '/flag_catalog_items/batch/status';
@@ -2745,16 +2754,22 @@
 
   (function attachGeneratorPackUploadProgress() {
     const form = document.getElementById('packUploadForm');
+    const importForm = document.getElementById('packImportUrlForm');
     const fileInput = document.getElementById('packZipInput');
+    const importUrlInput = document.getElementById('packImportUrlInput');
     const modalEl = document.getElementById('packUploadProgressModal');
+    const titleEl = document.getElementById('packUploadProgressTitle');
     const barEl = document.getElementById('packUploadProgressBar');
     const textEl = document.getElementById('packUploadProgressText');
     const bytesEl = document.getElementById('packUploadProgressBytes');
     const cancelBtn = document.getElementById('packUploadCancelBtn');
     const resultEl = document.getElementById('packUploadResult');
     const closeBtn = document.getElementById('packUploadCloseBtn');
+    const successAlertEl = document.getElementById('packInstallSuccessAlert');
+    const successTextEl = document.getElementById('packInstallSuccessText');
+    const successMetaEl = document.getElementById('packInstallSuccessMeta');
 
-    if (!form || !fileInput || !modalEl || !barEl || !textEl || !bytesEl || !cancelBtn || !resultEl || !closeBtn) return;
+    if (!form || !fileInput || !importForm || !importUrlInput || !modalEl || !barEl || !textEl || !bytesEl || !cancelBtn || !resultEl || !closeBtn) return;
 
     function fmtBytes(n) {
       const num = Number(n) || 0;
@@ -2812,6 +2827,35 @@
       resultEl.style.display = '';
     }
 
+    function showCatalogSuccess(payload) {
+      const confirmationText = String((payload && payload.confirmation_text) || '').trim() || 'Generator pack added to catalog.';
+      const installedAs = payload && typeof payload.installed_as === 'object' ? payload.installed_as : {};
+      const grouped = Array.isArray(installedAs && installedAs.grouped) ? installedAs.grouped : [];
+      const detailLines = [];
+      const confirmationDetail = String((payload && payload.confirmation_detail) || '').trim();
+      if (confirmationDetail) detailLines.push(confirmationDetail);
+      grouped.forEach((group) => {
+        const kind = String(group && group.kind || '').trim();
+        const ids = Array.isArray(group && group.ids) ? group.ids.map((id) => String(id || '').trim()).filter(Boolean) : [];
+        if (kind && ids.length) detailLines.push(`${kind}: ${ids.join(', ')}`);
+      });
+      if (successTextEl) successTextEl.textContent = confirmationText;
+      if (successMetaEl) successMetaEl.textContent = detailLines.join(' ');
+      if (successAlertEl) {
+        successAlertEl.classList.remove('d-none');
+        successAlertEl.classList.add('show');
+      }
+      if (typeof window.showToast === 'function') {
+        window.showToast(confirmationText, { force: true, title: 'Generator Packs', autohide: true, delay: 3500 });
+      }
+      return { confirmationText, detailText: detailLines.join('\n') };
+    }
+
+    function resultTextFromPayload(payload) {
+      const shown = showCatalogSuccess(payload);
+      return [shown.confirmationText, shown.detailText].filter(Boolean).join('\n\n');
+    }
+
     function enterTerminalState() {
       try { cancelBtn.disabled = true; } catch (e) {}
       try { cancelBtn.style.display = 'none'; } catch (e) {}
@@ -2826,6 +2870,7 @@
         ev.preventDefault();
 
         const modal = bootstrap.Modal.getOrCreateInstance(modalEl, { backdrop: 'static', keyboard: false });
+        if (titleEl) titleEl.textContent = 'Uploading Generator Pack…';
         textEl.textContent = `Uploading ${file.name}…`;
         showResult('');
         setBarStyle('working');
@@ -2881,7 +2926,7 @@
               }
               setBarStyle('success');
               textEl.textContent = 'Installed.';
-              showResult((payload && (payload.message || payload.detail)) ? (payload.message || payload.detail) : 'Upload succeeded.');
+              showResult(resultTextFromPayload(payload || {}));
               enterTerminalState();
               // Reload the catalog to show the updated pack table.
               window.setTimeout(() => {
@@ -2933,6 +2978,78 @@
         xhr.send(data);
       } catch (e) {
         // Fall back to normal form submit
+      }
+    });
+
+    importForm.addEventListener('submit', async (ev) => {
+      try {
+        const zipUrl = String(importUrlInput.value || '').trim();
+        if (!zipUrl) return;
+
+        ev.preventDefault();
+
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl, { backdrop: 'static', keyboard: false });
+        const controller = new AbortController();
+        let finished = false;
+        if (titleEl) titleEl.textContent = 'Importing Generator Pack…';
+        textEl.textContent = 'Downloading ZIP and validating generator pack…';
+        showResult('');
+        setBarStyle('working');
+        setProgress(15, 0, 0);
+        cancelBtn.disabled = false;
+        cancelBtn.style.display = '';
+        closeBtn.style.display = 'none';
+        modal.show();
+
+        const onCancel = () => {
+          if (finished) return;
+          try { controller.abort(); } catch (e) {}
+          textEl.textContent = 'Import cancelled.';
+          setBarStyle('cancel');
+          showResult('Request aborted by user.');
+          enterTerminalState();
+        };
+        cancelBtn.addEventListener('click', onCancel, { once: true });
+
+        const resp = await fetch(importForm.action, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
+          },
+          body: new URLSearchParams(new FormData(importForm)),
+          signal: controller.signal,
+        });
+        finished = true;
+        const payload = await resp.json().catch(() => ({}));
+        setProgress(100, 1, 1);
+        if (!resp.ok || payload.ok === false) {
+          setBarStyle('error');
+          textEl.textContent = `Import failed (HTTP ${resp.status || 'error'}).`;
+          showResult(String((payload && (payload.error || payload.message)) || 'URL import failed.'));
+          enterTerminalState();
+          return;
+        }
+        setBarStyle('success');
+        textEl.textContent = 'Installed.';
+        showResult(resultTextFromPayload(payload || {}));
+        enterTerminalState();
+        window.setTimeout(() => {
+          if (typeof window.CORETG_NAVIGATE_PAGE_DETAILS === 'function') {
+            window.CORETG_NAVIGATE_PAGE_DETAILS('{{ url_for('flag_catalog_page') }}');
+          } else {
+            window.location.href = '{{ url_for('flag_catalog_page') }}';
+          }
+        }, 1200);
+      } catch (e) {
+        if (e && e.name === 'AbortError') {
+          return;
+        }
+        textEl.textContent = 'Import failed (network error).';
+        setBarStyle('error');
+        showResult(String((e && e.message) || e || 'URL import failed.'));
+        enterTerminalState();
       }
     });
   })();

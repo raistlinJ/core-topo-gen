@@ -1568,6 +1568,7 @@ def register(
     require_builder_or_admin: Callable[[], None],
     runs: dict[str, dict[str, Any]],
     outputs_dir: Callable[[], str],
+    installed_generators_root: Callable[[], str],
     flag_generators_from_enabled_sources: Callable[[], tuple[list[dict], list[dict]]],
     flag_node_generators_from_enabled_sources: Callable[[], tuple[list[dict], list[dict]]],
     reserved_artifacts: dict[str, dict[str, Any]],
@@ -1592,6 +1593,83 @@ def register(
     _BUILD_GENERATOR_SCAFFOLD = build_generator_scaffold
     if not begin_route_registration(app, 'generator_builder_routes'):
         return
+
+    def _builder_existing_generator_views(plugin_type: str) -> list[dict[str, Any]]:
+        loader = flag_node_generators_from_enabled_sources if str(plugin_type or '').strip() == 'flag-node-generator' else flag_generators_from_enabled_sources
+        try:
+            generators, _errors = loader()
+        except Exception:
+            return []
+        return [generator for generator in (generators or []) if isinstance(generator, dict)]
+
+    def _builder_existing_generator_ids(plugin_type: str) -> set[str]:
+        existing: set[str] = set()
+        kind_dir = 'flag_node_generators' if str(plugin_type or '').strip() == 'flag-node-generator' else 'flag_generators'
+        try:
+            installed_root = os.path.join(installed_generators_root(), kind_dir)
+            for dirpath, _dirnames, filenames in os.walk(installed_root):
+                if '.coretg_pack.json' not in filenames:
+                    continue
+                marker_path = os.path.join(dirpath, '.coretg_pack.json')
+                try:
+                    with open(marker_path, 'r', encoding='utf-8') as handle:
+                        marker = json.load(handle)
+                    if isinstance(marker, dict):
+                        source_id = str(marker.get('source_generator_id') or '').strip()
+                        normalized_id = sanitize_id(source_id) or _derive_plugin_id(source_id, fallback='')
+                        if source_id:
+                            existing.add(source_id)
+                        if normalized_id:
+                            existing.add(normalized_id)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        for generator in _builder_existing_generator_views(plugin_type):
+            raw_id = str(generator.get('id') or '').strip()
+            normalized_id = sanitize_id(raw_id) or _derive_plugin_id(raw_id, fallback='')
+            if raw_id:
+                existing.add(raw_id)
+            if normalized_id:
+                existing.add(normalized_id)
+        return existing
+
+    def _builder_existing_generator_names(plugin_type: str) -> set[str]:
+        existing: set[str] = set()
+        for generator in _builder_existing_generator_views(plugin_type):
+            name = str(generator.get('name') or '').strip().lower()
+            if name:
+                existing.add(name)
+        return existing
+
+    def _next_unique_builder_id(requested_id: str, *, plugin_type: str) -> tuple[str, bool]:
+        candidate = sanitize_id(requested_id) or _derive_plugin_id(requested_id, fallback='generated_generator')
+        existing = _builder_existing_generator_ids(plugin_type)
+        if candidate not in existing:
+            return candidate, False
+        match = re.match(r'^(.*?)(?:[_-](\d+))?$', candidate)
+        root = (match.group(1) if match and match.group(1) else candidate).strip('_-') or candidate
+        suffix = int(match.group(2)) + 1 if match and match.group(2) else 2
+        while candidate in existing:
+            candidate = f'{root}_{suffix}'
+            suffix += 1
+        return candidate, True
+
+    def _next_unique_builder_name(requested_name: str, *, plugin_type: str) -> str:
+        base_name = str(requested_name or '').strip()
+        if not base_name:
+            return base_name
+        existing = _builder_existing_generator_names(plugin_type)
+        if base_name.lower() not in existing:
+            return base_name
+        match = re.match(r'^(.*?)(?:\s+(\d+))?$', base_name)
+        root = (match.group(1) if match and match.group(1) else base_name).strip() or base_name
+        suffix = int(match.group(2)) + 1 if match and match.group(2) else 2
+        candidate = base_name
+        while candidate.lower() in existing:
+            candidate = f'{root} {suffix}'
+            suffix += 1
+        return candidate
 
     @app.route('/generator_builder')
     def generator_builder_page():
@@ -2254,9 +2332,25 @@ def register(
         if not scaffold_payload:
             return jsonify({'ok': False, 'error': 'scaffold_request is required.'}), 400
         try:
-            scaffold_files, _manifest_yaml, _folder_path = build_generator_scaffold(scaffold_payload)
+            normalized_payload = dict(scaffold_payload)
+            plugin_type = str(normalized_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+            requested_plugin_id = sanitize_id(normalized_payload.get('plugin_id')) or _derive_plugin_id(normalized_payload.get('plugin_id') or normalized_payload.get('name') or '')
+            requested_name = str(normalized_payload.get('name') or requested_plugin_id).strip() or requested_plugin_id
+            final_plugin_id, renamed = _next_unique_builder_id(requested_plugin_id, plugin_type=plugin_type)
+            final_name = requested_name
+            if renamed:
+                final_name = _next_unique_builder_name(requested_name, plugin_type=plugin_type) or final_plugin_id
+                normalized_payload['folder_name'] = secure_filename(f'py_{final_plugin_id}') or f'py_{final_plugin_id}'
+            else:
+                normalized_payload['folder_name'] = str(normalized_payload.get('folder_name') or '').strip() or (secure_filename(f'py_{final_plugin_id}') or f'py_{final_plugin_id}')
+            normalized_payload['plugin_id'] = final_plugin_id
+            normalized_payload['name'] = final_name
+            scaffold_files, _manifest_yaml, _folder_path = build_generator_scaffold(normalized_payload)
             zip_bytes = _build_scaffold_zip_bytes(scaffold_files, zipfile_module=zipfile_module, io_module=io_module)
-            pack_label = str(payload.get('pack_label') or scaffold_payload.get('name') or scaffold_payload.get('plugin_id') or 'generated-builder-pack').strip()
+            requested_pack_label = str(payload.get('pack_label') or scaffold_payload.get('name') or scaffold_payload.get('plugin_id') or 'generated-builder-pack').strip()
+            pack_label = requested_pack_label or final_name or final_plugin_id or 'generated-builder-pack'
+            if renamed and pack_label in {requested_name, requested_plugin_id}:
+                pack_label = final_name or final_plugin_id or pack_label
             fd, tmp_path = tempfile.mkstemp(prefix='coretg_builder_pack_', suffix='.zip')
             os.close(fd)
             try:
@@ -2272,7 +2366,22 @@ def register(
             return jsonify({'ok': False, 'error': str(exc)}), 400
         if not ok:
             return jsonify({'ok': False, 'error': note}), 400
-        return jsonify({'ok': True, 'message': note, 'pack_label': pack_label})
+        rename_note = ''
+        if renamed:
+            rename_note = f'Duplicate generator id "{requested_plugin_id}" detected. Installed as "{final_plugin_id}".'
+        return jsonify({
+            'ok': True,
+            'message': note,
+            'pack_label': pack_label,
+            'renamed': renamed,
+            'rename_note': rename_note,
+            'installed_as': {
+                'plugin_type': plugin_type,
+                'plugin_id': final_plugin_id,
+                'name': final_name,
+                'folder_name': str(normalized_payload.get('folder_name') or ''),
+            },
+        })
 
     @app.route('/api/generators/scaffold_zip', methods=['POST'])
     def api_generators_scaffold_zip():

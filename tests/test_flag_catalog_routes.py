@@ -1,8 +1,12 @@
 from webapp import app_backend as backend
+from pathlib import Path
 
 
 app = backend.app
 app.config.setdefault('TESTING', True)
+
+
+FLAG_CATALOG_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / 'webapp' / 'templates' / 'flag_catalog.html'
 
 
 def _login(client):
@@ -39,6 +43,16 @@ def test_flag_catalog_page_groups_installed_ids_by_kind(monkeypatch):
     assert 'flag-generator' in page
     assert 'flag-node-generator' in page
     assert 'Batch Test' in page
+    assert 'packInstallSuccessAlert' in page
+    assert 'packImportUrlForm' in page
+    assert 'packUploadProgressTitle' in page
+
+
+def test_flag_catalog_batch_status_skips_fetch_without_active_run() -> None:
+    text = FLAG_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert "if (!targetRunId) {" in text
+    assert "renderFlagBatchStatus(null);" in text
+    assert "return;" in text
 
 
 def test_data_sources_page_is_still_renderable(monkeypatch):

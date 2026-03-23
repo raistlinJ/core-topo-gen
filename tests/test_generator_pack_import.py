@@ -82,6 +82,116 @@ services:
     assert (install_root / "flag_generators").exists()
 
 
+def test_generator_pack_zip_upload_xhr_returns_confirmation_payload(tmp_path, monkeypatch):
+    install_root = tmp_path / "installed_generators"
+    monkeypatch.setenv("CORETG_INSTALLED_GENERATORS_DIR", str(install_root))
+
+    gen_id = "pack_test_upload_xhr"
+    manifest = f"""manifest_version: 1
+id: {gen_id}
+kind: flag-generator
+name: \"Pack Test: Upload XHR\"
+runtime:
+  type: docker-compose
+  compose_file: docker-compose.yml
+  service: generator
+inputs: []
+artifacts:
+  requires: []
+  produces:
+        - File(path)
+injects: []
+"""
+    compose = """version: '3.8'
+services:
+  generator:
+    image: python:3.11-slim
+    command: [\"python\", \"-c\", \"print('ok')\"]
+"""
+    zip_bytes = _make_zip(
+        {
+            f"flag_generators/{gen_id}/manifest.yaml": manifest,
+            f"flag_generators/{gen_id}/docker-compose.yml": compose,
+            f"flag_generators/{gen_id}/generator.py": "print('hi')\n",
+        }
+    )
+
+    client = app.test_client()
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (200, 302)
+
+    resp = client.post(
+        "/generator_packs/upload",
+        data={"zip_file": (io.BytesIO(zip_bytes), "pack-xhr.zip")},
+        content_type="multipart/form-data",
+        headers={"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get("ok") is True
+    assert payload.get("confirmation_text") == f"Added to catalog as {gen_id}."
+    assert payload.get("installed_as", {}).get("pack_label") == "pack-xhr"
+    assert payload.get("installed_as", {}).get("grouped") == [
+        {"kind": "flag-generator", "count": 1, "ids": [gen_id]}
+    ]
+
+
+def test_generator_pack_import_url_xhr_returns_confirmation_payload(tmp_path, monkeypatch):
+    install_root = tmp_path / "installed_generators"
+    monkeypatch.setenv("CORETG_INSTALLED_GENERATORS_DIR", str(install_root))
+
+    gen_id = "pack_test_import_url_xhr"
+    manifest = f"""manifest_version: 1
+id: {gen_id}
+kind: flag-generator
+name: \"Pack Test: Import URL XHR\"
+runtime:
+  type: docker-compose
+  compose_file: docker-compose.yml
+  service: generator
+inputs: []
+artifacts:
+  requires: []
+  produces:
+        - File(path)
+injects: []
+"""
+    compose = """version: '3.8'
+services:
+  generator:
+    image: python:3.11-slim
+    command: [\"python\", \"-c\", \"print('ok')\"]
+"""
+    zip_bytes = _make_zip(
+        {
+            f"flag_generators/{gen_id}/manifest.yaml": manifest,
+            f"flag_generators/{gen_id}/docker-compose.yml": compose,
+            f"flag_generators/{gen_id}/generator.py": "print('hi')\n",
+        }
+    )
+    monkeypatch.setattr(app_backend, "_download_zip_from_url", lambda url: zip_bytes)
+
+    client = app.test_client()
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (200, 302)
+
+    resp = client.post(
+        "/generator_packs/import_url",
+        data={"zip_url": "https://example.com/packs/demo.zip"},
+        headers={"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get("ok") is True
+    assert payload.get("confirmation_text") == f"Added to catalog as {gen_id}."
+    assert payload.get("installed_as", {}).get("origin") == "url"
+    assert payload.get("installed_as", {}).get("grouped") == [
+        {"kind": "flag-generator", "count": 1, "ids": [gen_id]}
+    ]
+
+
 def test_generator_pack_uninstall_removes_generators(tmp_path, monkeypatch):
     install_root = tmp_path / "installed_generators"
     monkeypatch.setenv("CORETG_INSTALLED_GENERATORS_DIR", str(install_root))

@@ -477,10 +477,15 @@
                 </li>
               </ul>
               <span id="gbInstallBtnHint" title="Install unlocks after a successful Builder test returns rc=0.">
-                <button class="btn btn-outline-success btn-sm" type="button" id="gbInstallBtn" disabled aria-describedby="gbInstallBtnHint">
+                <button class="btn btn-outline-success btn-sm" type="button" id="gbInstallBtn" data-gb-install-btn disabled aria-describedby="gbInstallBtnHint">
                   <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
                 </button>
               </span>
+            </div>
+            <div class="alert alert-success alert-dismissible fade d-none mb-3" id="gbInstallSuccessAlert" role="alert">
+              <div class="fw-semibold" id="gbInstallSuccessText">Generator added to catalog.</div>
+              <div class="small mb-0" id="gbInstallSuccessMeta"></div>
+              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
             </div>
             <div class="tab-content">
               <div class="tab-pane fade show active" id="gbBuildTabModel" role="tabpanel">
@@ -680,11 +685,16 @@
                   </div>
                 </div>
                 <div class="gb-files-footer-anchor mt-3">
-                  <div class="small text-muted">Run the current scaffold locally from the same spot no matter which Prompt Response subtab you are viewing.</div>
+                  <div class="small text-muted">Run the current scaffold locally or install it into the catalog from the same spot no matter which Prompt Response subtab you are viewing.</div>
                   <div class="d-flex gap-2 flex-wrap">
                     <button class="btn btn-outline-dark btn-sm" type="button" id="gbTestBtn" disabled>
                       <i class="bi bi-beaker me-1"></i>Test
                     </button>
+                    <span id="gbOutputInstallBtnHint" data-gb-install-hint title="Install unlocks after a successful Builder test returns rc=0.">
+                      <button class="btn btn-outline-success btn-sm" type="button" id="gbOutputInstallBtn" data-gb-install-btn disabled aria-describedby="gbOutputInstallBtnHint">
+                        <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                      </button>
+                    </span>
                   </div>
                 </div>
               </div>
@@ -748,6 +758,16 @@
                       <div class="list-group-item text-muted">No test artifacts yet.</div>
                     </div>
                     <div class="small text-muted mt-3 pt-3 border-top">Install unlocks after the latest Builder test completes successfully.</div>
+                  </div>
+                </div>
+                <div class="gb-files-footer-anchor mt-3">
+                  <div class="small text-muted">Install the current scaffold from the test workspace once the latest Builder test succeeds.</div>
+                  <div class="d-flex gap-2 flex-wrap">
+                    <span id="gbTestInstallBtnHint" data-gb-install-hint title="Install unlocks after a successful Builder test returns rc=0.">
+                      <button class="btn btn-outline-success btn-sm" type="button" id="gbTestInstallBtn" data-gb-install-btn disabled aria-describedby="gbTestInstallBtnHint">
+                        <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                      </button>
+                    </span>
                   </div>
                 </div>
               </div>
@@ -969,6 +989,9 @@
     fileList: document.getElementById('gbFileList'),
     fileContent: document.getElementById('gbFileContent'),
     filesCount: document.getElementById('gbFilesCount'),
+    installSuccessAlert: document.getElementById('gbInstallSuccessAlert'),
+    installSuccessText: document.getElementById('gbInstallSuccessText'),
+    installSuccessMeta: document.getElementById('gbInstallSuccessMeta'),
     installBtnHint: document.getElementById('gbInstallBtnHint'),
     intentOverridesPanel: document.getElementById('gbIntentOverridesPanel'),
     intentOverridesSummary: document.getElementById('gbIntentOverridesSummary'),
@@ -990,6 +1013,8 @@
     promptRefineBtn: document.getElementById('gbPromptRefineBtn'),
     testBtn: document.getElementById('gbTestBtn'),
     installBtn: document.getElementById('gbInstallBtn'),
+    installButtons: Array.from(document.querySelectorAll('[data-gb-install-btn]')),
+    installBtnHints: Array.from(document.querySelectorAll('[data-gb-install-hint]')),
     downloadComposeBtn: document.getElementById('gbDownloadComposeBtn'),
     downloadReadmeBtn: document.getElementById('gbDownloadReadmeBtn'),
     promptExampleBtn: document.getElementById('gbPromptExampleBtn'),
@@ -1543,7 +1568,10 @@
     const returncode = data && Object.prototype.hasOwnProperty.call(data, 'returncode') ? data.returncode : null;
     if (data && data.done) {
       setTestStatus(returncode === 0 ? `Test completed successfully (rc=${returncode}).` : `Test finished with rc=${returncode == null ? 'n/a' : returncode}.`, returncode === 0 ? 'success' : 'danger');
-      showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
+      const shouldRevealResults = isNavTabActive(elements.buildTabTestBtn) && isNavTabActive(elements.testProgressTabBtn);
+      if (shouldRevealResults) {
+        showBuildTabPath(elements.buildTabTestBtn, elements.resultsTestTabBtn);
+      }
     }
     updateActionButtons();
     persistBuilderWorkspaceState();
@@ -2025,14 +2053,6 @@
   function scrollActivityTargetToBottom(target) {
     if (!target || !state.autoFollowEvents) return;
     target.scrollTop = target.scrollHeight;
-    const lastItem = target.lastElementChild;
-    if (lastItem && typeof lastItem.scrollIntoView === 'function') {
-      try {
-        lastItem.scrollIntoView({ block: 'end' });
-      } catch (e) {
-        lastItem.scrollIntoView(false);
-      }
-    }
   }
 
   function scheduleActivityAutoFollow() {
@@ -2460,6 +2480,10 @@
     bootstrap.Tab.getOrCreateInstance(buttonEl).show();
   }
 
+  function isNavTabActive(buttonEl) {
+    return !!(buttonEl && buttonEl.classList && buttonEl.classList.contains('active'));
+  }
+
   function showBuildTabPath(parentButtonEl, childButtonEl) {
     showBuildTab(parentButtonEl);
     if (!childButtonEl) return;
@@ -2759,7 +2783,9 @@
   function setGenerateBusy(isBusy) {
     state.generateInFlight = !!isBusy;
     if (elements.testBtn) elements.testBtn.disabled = !!isBusy || !state.scaffoldRequest;
-    if (elements.installBtn) elements.installBtn.disabled = !!isBusy || !state.scaffoldRequest || !hasSuccessfulBuilderTest();
+    (elements.installButtons || []).forEach((button) => {
+      button.disabled = !!isBusy || !state.scaffoldRequest || !hasSuccessfulBuilderTest();
+    });
     if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = !!isBusy;
     if (elements.streamRetryBtn) elements.streamRetryBtn.disabled = !!isBusy;
     if (elements.streamCloseBtn) elements.streamCloseBtn.disabled = !!isBusy;
@@ -2856,13 +2882,14 @@
       : (hasSuccessfulBuilderTest()
         ? 'Install this scaffold into the catalog.'
         : 'Install unlocks after the latest Builder test returns rc=0.');
-    if (elements.installBtnHint) {
-      elements.installBtnHint.setAttribute('title', hint);
-    }
-    if (elements.installBtn) {
-      elements.installBtn.setAttribute('title', isDisabled ? hint : 'Install this scaffold into the catalog.');
-      elements.installBtn.setAttribute('aria-label', isDisabled ? hint : 'Install to Catalog');
-    }
+    if (elements.installBtnHint) elements.installBtnHint.setAttribute('title', hint);
+    (elements.installBtnHints || []).forEach((hintEl) => {
+      hintEl.setAttribute('title', hint);
+    });
+    (elements.installButtons || []).forEach((button) => {
+      button.setAttribute('title', isDisabled ? hint : 'Install this scaffold into the catalog.');
+      button.setAttribute('aria-label', isDisabled ? hint : 'Install to Catalog');
+    });
   }
 
   function updateActionButtons() {
@@ -2870,10 +2897,11 @@
     const promptReady = isPromptUnlocked();
     if (elements.promptRefineBtn) elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
     if (elements.testBtn) elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
-    if (elements.installBtn) {
-      elements.installBtn.disabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
-      updateInstallButtonHint(elements.installBtn.disabled, hasScaffold);
-    }
+    const installDisabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
+    (elements.installButtons || []).forEach((button) => {
+      button.disabled = installDisabled;
+    });
+    updateInstallButtonHint(installDisabled, hasScaffold);
     if (elements.promptSubmitBtn) elements.promptSubmitBtn.disabled = state.generateInFlight || !promptReady;
     if (elements.promptExampleBtn) elements.promptExampleBtn.disabled = state.generateInFlight || !promptReady;
     if (elements.downloadComposeBtn) {
@@ -3337,13 +3365,30 @@
     if (!resp.ok || payload.ok === false) {
       throw new Error((payload && (payload.error || payload.message)) || `Install failed (HTTP ${resp.status})`);
     }
+    const installedAs = payload && typeof payload.installed_as === 'object' ? payload.installed_as : {};
+    const installedName = String((installedAs && installedAs.name) || '').trim();
+    const installedId = String((installedAs && installedAs.plugin_id) || '').trim();
+    const successLabel = installedName || installedId || String((payload && payload.pack_label) || 'the generator').trim() || 'the generator';
     recordIteration({
       mode: 'install',
       prompt: String(elements.prompt.value || '').trim(),
       plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
-      status: 'added to catalog',
+      status: `added to catalog as ${installedId || successLabel}`,
     });
-    setGenerationStatus(String(payload.message || 'Generator added to catalog.'), 'success');
+    const renameNote = String((payload && payload.rename_note) || '').trim();
+    const confirmationText = installedId && installedName
+      ? `Added to catalog as ${installedName} (${installedId}).`
+      : `Added to catalog as ${successLabel}.`;
+    if (elements.installSuccessText) elements.installSuccessText.textContent = confirmationText;
+    if (elements.installSuccessMeta) elements.installSuccessMeta.textContent = renameNote || String((payload && payload.message) || 'Generator added to catalog.');
+    if (elements.installSuccessAlert) {
+      elements.installSuccessAlert.classList.remove('d-none');
+      elements.installSuccessAlert.classList.add('show');
+    }
+    if (typeof window.showToast === 'function') {
+      window.showToast(confirmationText, { force: true, title: 'Generator Builder', autohide: true, delay: 3500 });
+    }
+    setGenerationStatus([confirmationText, renameNote || String(payload.message || '')].filter(Boolean).join(' '), 'success');
   }
 
   function loadExamplePrompt() {
@@ -3532,15 +3577,15 @@
       setTestStatus(String((err && err.message) || err || 'Builder test failed.'), 'danger');
     }
   });
-  if (elements.installBtn) {
-    elements.installBtn.addEventListener('click', async () => {
+  (elements.installButtons || []).forEach((button) => {
+    button.addEventListener('click', async () => {
       try {
         await installGenerated();
       } catch (err) {
         setGenerationStatus(String((err && err.message) || err || 'Install failed.'), 'danger');
       }
     });
-  }
+  });
   elements.prompt.addEventListener('input', () => {
     queuePromptIntentPreview();
     persistBuilderWorkspaceState();

@@ -34813,6 +34813,7 @@ try:
         require_builder_or_admin=lambda: _require_builder_or_admin(),
         runs=RUNS,
         outputs_dir=lambda: _outputs_dir(),
+        installed_generators_root=lambda: _installed_generators_root(),
         flag_generators_from_enabled_sources=lambda: _flag_generators_from_enabled_sources(),
         flag_node_generators_from_enabled_sources=lambda: _flag_node_generators_from_enabled_sources(),
         reserved_artifacts=_RESERVED_ARTIFACTS,

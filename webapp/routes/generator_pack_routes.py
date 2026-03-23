@@ -32,6 +32,87 @@ def register(
     if not begin_route_registration(app, 'generator_pack_routes'):
         return
 
+    def _latest_pack_success_payload(note: str) -> dict[str, Any]:
+        warnings: list[dict[str, Any]] = []
+        installed_generators: list[dict[str, Any]] = []
+        grouped: list[dict[str, Any]] = []
+        pack_id = ''
+        pack_label = ''
+        pack_origin = ''
+        try:
+            state = load_installed_generator_packs_state()
+            packs = state.get('packs') if isinstance(state, dict) else None
+            if isinstance(packs, list) and packs:
+                last = packs[-1] if isinstance(packs[-1], dict) else {}
+                pack_id = str(last.get('id') or '').strip()
+                pack_label = str(last.get('label') or '').strip()
+                pack_origin = str(last.get('origin') or '').strip()
+                ww = last.get('warnings') if isinstance(last, dict) else None
+                if isinstance(ww, list):
+                    warnings = [item for item in ww if isinstance(item, dict)]
+                raw_installed = last.get('installed') if isinstance(last, dict) else None
+                if isinstance(raw_installed, list):
+                    for item in raw_installed:
+                        if not isinstance(item, dict):
+                            continue
+                        record = dict(item)
+                        try:
+                            marker_path = os_module.path.join(str(record.get('path') or '').strip(), '.coretg_pack.json')
+                            if marker_path and os_module.path.exists(marker_path) and os_module.path.isfile(marker_path):
+                                import json
+
+                                with open(marker_path, 'r', encoding='utf-8') as handle:
+                                    marker = json.load(handle)
+                                if isinstance(marker, dict):
+                                    source_id = str(marker.get('source_generator_id') or '').strip()
+                                    if source_id:
+                                        record['source_id'] = source_id
+                        except Exception:
+                            pass
+                        installed_generators.append(record)
+        except Exception:
+            warnings = []
+            installed_generators = []
+
+        grouped_map: dict[str, list[str]] = {}
+        for item in installed_generators:
+            kind = str(item.get('kind') or '').strip() or 'generator'
+            gid = str(item.get('source_id') or item.get('id') or '').strip()
+            if not gid:
+                continue
+            grouped_map.setdefault(kind, []).append(gid)
+        grouped = [
+            {'kind': kind, 'count': len(ids), 'ids': ids}
+            for kind, ids in grouped_map.items()
+        ]
+        installed_ids = [
+            str(item.get('source_id') or item.get('id') or '').strip()
+            for item in installed_generators
+            if str(item.get('source_id') or item.get('id') or '').strip()
+        ]
+        if len(installed_ids) == 1:
+            confirmation_text = f'Added to catalog as {installed_ids[0]}.'
+        elif installed_ids:
+            confirmation_text = f'Added to catalog as {", ".join(installed_ids)}.'
+        elif pack_label:
+            confirmation_text = f'Added generator pack {pack_label} to the catalog.'
+        else:
+            confirmation_text = 'Generator pack added to catalog.'
+        return {
+            'ok': True,
+            'message': note,
+            'warnings': warnings,
+            'confirmation_text': confirmation_text,
+            'confirmation_detail': note,
+            'installed_as': {
+                'pack_id': pack_id,
+                'pack_label': pack_label,
+                'origin': pack_origin,
+                'generators': installed_generators,
+                'grouped': grouped,
+            },
+        }
+
     @app.route('/generator_packs/upload', methods=['POST'])
     def generator_packs_upload():
         is_xhr = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
@@ -56,20 +137,13 @@ def register(
             ok, note = install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=label, pack_origin='upload')
             if is_xhr:
                 if ok:
-                    warnings: list[dict[str, Any]] = []
-                    try:
-                        state = load_installed_generator_packs_state()
-                        packs = state.get('packs') if isinstance(state, dict) else None
-                        if isinstance(packs, list) and packs:
-                            last = packs[-1] if isinstance(packs[-1], dict) else {}
-                            ww = last.get('warnings') if isinstance(last, dict) else None
-                            if isinstance(ww, list):
-                                warnings = ww
-                    except Exception:
-                        warnings = []
-                    return jsonify({'ok': True, 'message': note, 'warnings': warnings}), 200
+                    return jsonify(_latest_pack_success_payload(note)), 200
                 return jsonify({'ok': False, 'error': f'Pack install failed: {note}'}), 400
-            flash(note if ok else f'Pack install failed: {note}')
+            if ok:
+                payload = _latest_pack_success_payload(note)
+                flash(f"{payload.get('confirmation_text') or note} {payload.get('confirmation_detail') or ''}".strip())
+            else:
+                flash(f'Pack install failed: {note}')
         finally:
             try:
                 os_module.remove(tmp_path)
@@ -79,8 +153,11 @@ def register(
 
     @app.route('/generator_packs/import_url', methods=['POST'])
     def generator_packs_import_url():
+        is_xhr = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
         url = str(request.form.get('zip_url') or '').strip()
         if not url:
+            if is_xhr:
+                return jsonify({'ok': False, 'error': 'Missing URL.'}), 400
             flash('Missing URL.')
             return redirect(url_for('flag_catalog_page'))
         try:
@@ -91,13 +168,23 @@ def register(
                 with open(tmp_path, 'wb') as fh:
                     fh.write(data)
                 ok, note = install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=url, pack_origin='url')
-                flash(note if ok else f'Pack install failed: {note}')
+                if is_xhr:
+                    if ok:
+                        return jsonify(_latest_pack_success_payload(note)), 200
+                    return jsonify({'ok': False, 'error': f'Pack install failed: {note}'}), 400
+                if ok:
+                    payload = _latest_pack_success_payload(note)
+                    flash(f"{payload.get('confirmation_text') or note} {payload.get('confirmation_detail') or ''}".strip())
+                else:
+                    flash(f'Pack install failed: {note}')
             finally:
                 try:
                     os_module.remove(tmp_path)
                 except Exception:
                     pass
         except Exception as exc:
+            if is_xhr:
+                return jsonify({'ok': False, 'error': f'URL import failed: {exc}'}), 400
             flash(f'URL import failed: {exc}')
         return redirect(url_for('flag_catalog_page'))
 
