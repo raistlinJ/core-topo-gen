@@ -76,6 +76,12 @@ def test_generator_catalog_tabs_use_bootstrap_tab_triggers() -> None:
     assert 'href="#flagBatch"' in text
 
 
+def test_flag_catalog_template_redacts_sensitive_test_log_lines() -> None:
+    text = FLAG_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'function _redactSensitiveTestLine(line, extraTokens = [])' in text
+    assert '_redactSensitiveTestLine(line)' in text
+
+
 def test_flag_generators_data_includes_duplicate_installed_pack_entries(tmp_path, monkeypatch):
     install_root = tmp_path / 'installed_generators'
     duplicate_a = install_root / 'flag_generators' / 'p_pack_a__5'

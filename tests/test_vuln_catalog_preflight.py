@@ -1,3 +1,5 @@
+import io
+
 from webapp import app_backend as backend
 
 
@@ -82,6 +84,24 @@ def test_redact_sensitive_text_ignores_short_or_empty_tokens():
     raw = "abc xyz"
     out = backend._redact_sensitive_text(raw, redact_tokens=["", "ab", None])
     assert out == raw
+
+
+def test_write_sse_marker_redacts_sensitive_payload_fields():
+    handle = io.StringIO()
+
+    backend._write_sse_marker(
+        handle,
+        'phase',
+        {
+            'phase': 'error',
+            'core': {'ssh_username': 'core', 'ssh_password': 'top-secret'},
+            'message': 'core ssh_password=top-secret',
+        },
+    )
+
+    out = handle.getvalue()
+    assert 'top-secret' not in out
+    assert '[REDACTED]' in out
 
 
 def test_core_vm_render_compose_template_success(monkeypatch):

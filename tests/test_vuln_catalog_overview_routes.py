@@ -7,6 +7,9 @@ app = backend.app
 app.config.setdefault('TESTING', True)
 
 
+VULN_CATALOG_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / 'webapp' / 'templates' / 'vuln_catalog.html'
+
+
 def _login(client):
     resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
     assert resp.status_code in (200, 302)
@@ -69,3 +72,9 @@ def test_vuln_catalog_items_data_returns_active_items(monkeypatch, tmp_path):
     assert payload['items'][0]['id'] == 7
     assert payload['items'][0]['name'] == 'vulhub/sample'
     assert payload['items'][0]['readme_url'].endswith('/vuln_catalog_packs/readme/cat-1/vulhub/sample/README.md')
+
+
+def test_vuln_catalog_template_redacts_sensitive_test_log_lines() -> None:
+    text = VULN_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'function _redactSensitiveVulnLogLine(line, extraTokens = [])' in text
+    assert 'const text = _redactSensitiveVulnLogLine(line);' in text

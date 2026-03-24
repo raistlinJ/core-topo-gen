@@ -88,14 +88,30 @@ ALLOWED_EXTENSIONS = {'xml'}
 
 _SSE_MARKER_PREFIX = '__SSE_EVENT__'
 
+_SENSITIVE_ASSIGNMENT_PATTERNS = [
+    re.compile(
+        r"((?:\"(?:ssh_)?password\"|'(?:ssh_)?password'|(?:ssh_)?password)\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^,\s}\]]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"((?:\"(?:token|secret|api[_-]?key)\"|'(?:token|secret|api[_-]?key)'|(?:token|secret|api[_-]?key))\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^,\s}\]]+)",
+        re.IGNORECASE,
+    ),
+]
+_SENSITIVE_FIELD_RE = re.compile(
+    r"(?:^|[_-])(?:ssh_)?password(?:$|[_-])|(?:^|[_-])(?:token|secret|api[_-]?key)(?:$|[_-])",
+    re.IGNORECASE,
+)
 
-def _write_sse_marker(log_handle, event: str, payload) -> None:
+
+def _write_sse_marker(log_handle, event: str, payload, *, redact_tokens: Optional[list[str]] = None) -> None:
     """Write a marker line into the run log that /stream/<run_id> can translate into a typed SSE event."""
     if log_handle is None:
         return
     try:
         safe_event = re.sub(r'[^a-zA-Z0-9_\-]+', '', str(event or 'phase')) or 'phase'
-        data = json.dumps(payload or {}, ensure_ascii=False, separators=(',', ':'))
+        safe_payload = _redact_sensitive_payload(payload or {}, redact_tokens=redact_tokens)
+        data = json.dumps(safe_payload, ensure_ascii=False, separators=(',', ':'))
         log_handle.write(f"{_SSE_MARKER_PREFIX} {safe_event} {data}\n")
     except Exception:
         return
@@ -973,6 +989,11 @@ def _redact_sensitive_text(text: str, redact_tokens: Optional[list[str]] = None)
         return text
     if not out:
         return out
+    for pattern in _SENSITIVE_ASSIGNMENT_PATTERNS:
+        try:
+            out = pattern.sub(r'\1[REDACTED]', out)
+        except Exception:
+            continue
     tokens = []
     for tok in (redact_tokens or []):
         try:
@@ -990,6 +1011,30 @@ def _redact_sensitive_text(text: str, redact_tokens: Optional[list[str]] = None)
         except Exception:
             continue
     return out
+
+
+def _redact_sensitive_payload(payload: Any, redact_tokens: Optional[list[str]] = None) -> Any:
+    if isinstance(payload, dict):
+        redacted: dict[Any, Any] = {}
+        for key, value in payload.items():
+            key_text = str(key or '')
+            if _SENSITIVE_FIELD_RE.search(key_text):
+                if isinstance(value, str) and not value:
+                    redacted[key] = ''
+                elif value in (None, [], {}, ()):
+                    redacted[key] = value
+                else:
+                    redacted[key] = '[REDACTED]'
+                continue
+            redacted[key] = _redact_sensitive_payload(value, redact_tokens=redact_tokens)
+        return redacted
+    if isinstance(payload, list):
+        return [_redact_sensitive_payload(item, redact_tokens=redact_tokens) for item in payload]
+    if isinstance(payload, tuple):
+        return tuple(_redact_sensitive_payload(item, redact_tokens=redact_tokens) for item in payload)
+    if isinstance(payload, str):
+        return _redact_sensitive_text(payload, redact_tokens=redact_tokens)
+    return payload
 
 
 def _relay_remote_channel_to_log(channel: Any, log_handle: Any, *, redact_tokens: Optional[list[str]] = None) -> None:

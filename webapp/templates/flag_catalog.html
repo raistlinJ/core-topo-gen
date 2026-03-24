@@ -497,6 +497,30 @@
   let pendingCleanupRunId = null;
   let pendingCleanupTestBase = null;
 
+  function _redactSensitiveTestLine(line, extraTokens = []) {
+    let text = String(line || '');
+    const patterns = [
+      /((?:"(?:ssh_)?password"|'(?:ssh_)?password'|(?:ssh_)?password)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^,\s}\]]+)/gi,
+      /((?:"(?:token|secret|api[_-]?key)"|'(?:token|secret|api[_-]?key)'|(?:token|secret|api[_-]?key))\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^,\s}\]]+)/gi,
+    ];
+    patterns.forEach((pattern) => {
+      text = text.replace(pattern, '$1[REDACTED]');
+    });
+    const tokens = [];
+    try {
+      const pw = String(genTestState?.testCoreCfg?.ssh_password || '');
+      if (pw.length >= 3) tokens.push(pw);
+    } catch (e) {}
+    (Array.isArray(extraTokens) ? extraTokens : []).forEach((token) => {
+      const value = String(token || '');
+      if (value.length >= 3) tokens.push(value);
+    });
+    for (const token of Array.from(new Set(tokens))) {
+      text = text.split(token).join('[REDACTED]');
+    }
+    return text;
+  }
+
   function normalizeForSort(v) {
     try {
       const s = String(v ?? '');
@@ -700,7 +724,7 @@
   function setCleanupLogLine(line) {
     const el = document.getElementById('genTestCleanupLog');
     if (!el) return;
-    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.textContent = (el.textContent || '') + _redactSensitiveTestLine(line) + '\n';
     el.scrollTop = el.scrollHeight;
   }
 
@@ -1371,7 +1395,7 @@
 
   function setTestLogLine(line) {
     const el = document.getElementById('genTestLog');
-    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.textContent = (el.textContent || '') + _redactSensitiveTestLine(line) + '\n';
     el.scrollTop = el.scrollHeight;
   }
 

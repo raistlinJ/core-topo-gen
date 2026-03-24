@@ -531,6 +531,30 @@
   const _logScheduled = new Set();
   const _MAX_LOG_CHARS = 200000;
 
+  function _redactSensitiveVulnLogLine(line, extraTokens = []) {
+    let text = String(line || '');
+    const patterns = [
+      /((?:"(?:ssh_)?password"|'(?:ssh_)?password'|(?:ssh_)?password)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^,\s}\]]+)/gi,
+      /((?:"(?:token|secret|api[_-]?key)"|'(?:token|secret|api[_-]?key)'|(?:token|secret|api[_-]?key))\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^,\s}\]]+)/gi,
+    ];
+    patterns.forEach((pattern) => {
+      text = text.replace(pattern, '$1[REDACTED]');
+    });
+    const tokens = [];
+    try {
+      const pw = String(_vulnCatalogState?.testCoreCfg?.ssh_password || '');
+      if (pw.length >= 3) tokens.push(pw);
+    } catch (e) {}
+    (Array.isArray(extraTokens) ? extraTokens : []).forEach((token) => {
+      const value = String(token || '');
+      if (value.length >= 3) tokens.push(value);
+    });
+    for (const token of Array.from(new Set(tokens))) {
+      text = text.split(token).join('[REDACTED]');
+    }
+    return text;
+  }
+
   function _flushLog(id) {
     const el = _qs(id);
     if (!el) return;
@@ -549,7 +573,7 @@
   function _appendLog(id, line) {
     const el = _qs(id);
     if (!el) return;
-    const text = String(line || '');
+    const text = _redactSensitiveVulnLogLine(line);
     const buf = _logBuffers.get(id) || [];
     buf.push(text);
     _logBuffers.set(id, buf);
@@ -1447,7 +1471,7 @@
       if (closeBtn) closeBtn.style.display = '';
       try {
         const res = _qs('vulnTestResult');
-        if (res) res.innerHTML = `<span class="badge text-bg-danger">ERROR</span> <span class="text-danger">${escapeHtml(String(e))}</span>`;
+        if (res) res.innerHTML = `<span class="badge text-bg-danger">ERROR</span> <span class="text-danger">${escapeHtml(_redactSensitiveVulnLogLine(String(e)))}</span>`;
       } catch (e2) {}
     } finally {
       try {
