@@ -9,6 +9,7 @@ app.config.setdefault('TESTING', True)
 
 
 FLAG_CATALOG_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / 'webapp' / 'templates' / 'flag_catalog.html'
+GENERATOR_CATALOG_TABS_TEMPLATE_PATH = Path(__file__).resolve().parent.parent / 'webapp' / 'templates' / 'partials' / 'generator_catalog_tabs.html'
 
 
 def _login(client):
@@ -62,6 +63,17 @@ def test_flag_catalog_template_handles_duplicate_conflict_rows() -> None:
     assert 'submitPackUninstall(packId, packLabel)' in text
     assert 'Duplicate ID' in text
     assert 'Uninstall Pack' in text
+
+
+def test_generator_catalog_tabs_use_bootstrap_tab_triggers() -> None:
+    text = GENERATOR_CATALOG_TABS_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'id="flagGeneratorsTab"' in text
+    assert 'data-bs-toggle="tab"' in text
+    assert 'href="#flagGenerators"' in text
+    assert 'aria-controls="flagGenerators"' in text
+    assert 'href="#flagGenSources"' in text
+    assert 'href="#flagNodeGenerators"' in text
+    assert 'href="#flagBatch"' in text
 
 
 def test_flag_generators_data_includes_duplicate_installed_pack_entries(tmp_path, monkeypatch):

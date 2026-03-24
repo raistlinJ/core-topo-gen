@@ -2,22 +2,38 @@
   <li class="nav-item" role="presentation">
     <a class="nav-link {% if active_generator_catalog_tab == 'packs' %}active{% endif %}"
        id="flagGenSourcesTab"
-       href="{{ url_for('flag_catalog_page') }}#flagGenSources">Generator Packs</a>
+       data-bs-toggle="tab"
+       href="#flagGenSources"
+       role="tab"
+       aria-controls="flagGenSources"
+       aria-selected="{{ 'true' if active_generator_catalog_tab == 'packs' else 'false' }}">Generator Packs</a>
   </li>
   <li class="nav-item" role="presentation">
     <a class="nav-link {% if active_generator_catalog_tab == 'flag-generators' %}active{% endif %}"
        id="flagGeneratorsTab"
-       href="{{ url_for('flag_catalog_page') }}#flagGenerators">Flag-Generators</a>
+       data-bs-toggle="tab"
+       href="#flagGenerators"
+       role="tab"
+       aria-controls="flagGenerators"
+       aria-selected="{{ 'true' if active_generator_catalog_tab == 'flag-generators' else 'false' }}">Flag-Generators</a>
   </li>
   <li class="nav-item" role="presentation">
     <a class="nav-link {% if active_generator_catalog_tab == 'flag-node-generators' %}active{% endif %}"
        id="flagNodeGeneratorsTab"
-       href="{{ url_for('flag_catalog_page') }}#flagNodeGenerators">Flag-Node-Generators</a>
+       data-bs-toggle="tab"
+       href="#flagNodeGenerators"
+       role="tab"
+       aria-controls="flagNodeGenerators"
+       aria-selected="{{ 'true' if active_generator_catalog_tab == 'flag-node-generators' else 'false' }}">Flag-Node-Generators</a>
   </li>
   <li class="nav-item" role="presentation">
     <a class="nav-link {% if active_generator_catalog_tab == 'batch-test' %}active{% endif %}"
        id="flagBatchTab"
-       href="{{ url_for('flag_catalog_page') }}#flagBatch">Batch Test</a>
+       data-bs-toggle="tab"
+       href="#flagBatch"
+       role="tab"
+       aria-controls="flagBatch"
+       aria-selected="{{ 'true' if active_generator_catalog_tab == 'batch-test' else 'false' }}">Batch Test</a>
   </li>
   <li class="nav-item" role="presentation">
     <a class="nav-link {% if active_generator_catalog_tab == 'generator-builder' %}active{% endif %}"
