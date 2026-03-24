@@ -222,6 +222,7 @@ def register(app, *, backend_module: Any) -> None:
         scenario_name_hint = request.form.get('scenario') or request.form.get('scenario_name') or None
         docker_cleanup_before_run = backend._coerce_bool(request.form.get('docker_cleanup_before_run'))
         docker_remove_all_containers = backend._coerce_bool(request.form.get('docker_remove_all_containers')) or backend._coerce_bool(request.form.get('docker_nuke_all'))
+        adv_deep_cleanup_after_run = backend._coerce_bool(request.form.get('adv_deep_cleanup_after_run'))
         if backend._webui_running_in_docker() and (docker_cleanup_before_run or docker_remove_all_containers):
             docker_cleanup_before_run = False
             docker_remove_all_containers = False
@@ -366,6 +367,8 @@ def register(app, *, backend_module: Any) -> None:
         )
         try:
             core_cfg = backend._require_core_ssh_credentials(core_cfg)
+            if not adv_deep_cleanup_after_run:
+                adv_deep_cleanup_after_run = backend._coerce_bool(core_cfg.get('adv_deep_postrun_cleanup'))
         except backend._SSHTunnelError as exc:
             flash(str(exc))
             return redirect(url_for('index'))
@@ -691,6 +694,18 @@ def register(app, *, backend_module: Any) -> None:
                 )
             except Exception:
                 pass
+            try:
+                if adv_deep_cleanup_after_run:
+                    backend._run_postrun_remote_maintenance({
+                        'core_cfg': core_cfg,
+                        'log_path': log_path,
+                        'adv_deep_cleanup_after_run': True,
+                    })
+            except Exception as exc:
+                try:
+                    app.logger.warning('[sync] Post-run deep cleanup skipped/failed: %s', exc)
+                except Exception:
+                    pass
             payload = payload_for_core or {}
             if not payload:
                 try:
@@ -778,6 +793,7 @@ def register(app, *, backend_module: Any) -> None:
         update_remote_repo = True
         adv_fix_docker_daemon = False
         adv_run_core_cleanup = False
+        adv_deep_cleanup_after_run = False
         adv_check_core_version = False
         adv_restart_core_daemon = False
         adv_start_core_daemon = False
@@ -824,6 +840,7 @@ def register(app, *, backend_module: Any) -> None:
                 scenario_core_override = None
             adv_fix_docker_daemon = backend._coerce_bool(request.form.get('adv_fix_docker_daemon'))
             adv_run_core_cleanup = backend._coerce_bool(request.form.get('adv_run_core_cleanup'))
+            adv_deep_cleanup_after_run = backend._coerce_bool(request.form.get('adv_deep_cleanup_after_run'))
             adv_check_core_version = False
             adv_restart_core_daemon = backend._coerce_bool(request.form.get('adv_restart_core_daemon'))
             adv_start_core_daemon = backend._coerce_bool(request.form.get('adv_start_core_daemon'))
@@ -864,6 +881,7 @@ def register(app, *, backend_module: Any) -> None:
                         scenario_index_hint = None
                 adv_fix_docker_daemon = backend._coerce_bool(json_body.get('adv_fix_docker_daemon'))
                 adv_run_core_cleanup = backend._coerce_bool(json_body.get('adv_run_core_cleanup'))
+                adv_deep_cleanup_after_run = backend._coerce_bool(json_body.get('adv_deep_cleanup_after_run'))
                 adv_check_core_version = False
                 adv_restart_core_daemon = backend._coerce_bool(json_body.get('adv_restart_core_daemon'))
                 adv_start_core_daemon = backend._coerce_bool(json_body.get('adv_start_core_daemon'))
@@ -1260,6 +1278,7 @@ def register(app, *, backend_module: Any) -> None:
             'update_remote_repo': True,
             'adv_fix_docker_daemon': adv_fix_docker_daemon,
             'adv_run_core_cleanup': adv_run_core_cleanup,
+            'adv_deep_cleanup_after_run': adv_deep_cleanup_after_run,
             'adv_check_core_version': adv_check_core_version,
             'adv_restart_core_daemon': adv_restart_core_daemon,
             'adv_start_core_daemon': adv_start_core_daemon,

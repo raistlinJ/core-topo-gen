@@ -40,6 +40,39 @@ def test_cleanup_remote_test_runtime_removes_container_images(monkeypatch, tmp_p
     assert any(cmd.startswith("docker inspect -f '{{.Image}}' docker-5") for cmd in calls)
     assert any(cmd == 'docker rm -f docker-5 >/dev/null 2>&1 || true' for cmd in calls)
     assert any(cmd == 'docker rmi -f sha256:testimage >/dev/null 2>&1 || true' for cmd in calls)
+    assert any(cmd == 'docker container prune -f' for cmd in calls)
+    assert any(cmd == 'docker image prune -f' for cmd in calls)
+    assert any(cmd == 'docker network prune -f' for cmd in calls)
+    assert any(cmd == 'docker system prune -af --volumes' for cmd in calls)
+    assert any("grep '_wrapper'" in cmd for cmd in calls)
+    log_text = log_path.read_text(encoding='utf-8')
+    assert 'deep cleanup start: docker system prune -af --volumes' in log_text
+    assert 'deep cleanup complete: docker system prune -af --volumes rc=0' in log_text
+
+
+def test_cleanup_remote_workspace_runs_shared_remote_cleanup(monkeypatch):
+    removed = []
+    cleanup_calls = []
+
+    class _DummyClient:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(backend, '_open_ssh_client', lambda *_a, **_k: _DummyClient())
+    monkeypatch.setattr(backend, '_remote_remove_path', lambda _client, path: removed.append(path))
+    monkeypatch.setattr(backend, '_run_postrun_remote_maintenance', lambda meta, _client=None: cleanup_calls.append(dict(meta)))
+
+    meta = {
+        'remote': True,
+        'remote_run_dir': '/tmp/coretg/run-123',
+        'core_cfg': {'ssh_host': 'core-vm', 'ssh_username': 'core', 'ssh_password': 'secret'},
+    }
+
+    backend._cleanup_remote_workspace(meta)
+
+    assert removed == ['/tmp/coretg/run-123']
+    assert len(cleanup_calls) == 1
+    assert meta.get('remote_workspace_cleaned') is True
 
 
 def test_remote_docker_remove_all_containers_script_removes_images():

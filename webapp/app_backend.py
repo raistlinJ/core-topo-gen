@@ -1211,6 +1211,7 @@ def _cleanup_remote_test_runtime(meta: dict[str, Any]) -> None:
     """Best-effort cleanup of remote docker resources created by test runs."""
     if not isinstance(meta, dict):
         return
+    meta.setdefault('deep_cleanup_after_run', True)
     core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
     if not isinstance(core_cfg, dict):
         return
@@ -1218,12 +1219,7 @@ def _cleanup_remote_test_runtime(meta: dict[str, Any]) -> None:
     log_path = str(meta.get('log_path') or '').strip()
 
     def _log(msg: str) -> None:
-        try:
-            if log_path:
-                with open(log_path, 'a', encoding='utf-8') as log_f:
-                    log_f.write(f"[cleanup] {msg}\n")
-        except Exception:
-            pass
+        _postrun_remote_log(log_path, msg)
 
     client = None
     try:
@@ -1360,6 +1356,8 @@ def _cleanup_remote_test_runtime(meta: dict[str, Any]) -> None:
                 f"core-daemon restart after session delete rc={rc} "
                 f"out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}"
             )
+
+        _run_postrun_remote_maintenance(meta, client)
     except Exception as exc:
         _log(f"remote runtime cleanup failed: {exc}")
     finally:
@@ -4974,6 +4972,10 @@ def _cleanup_remote_workspace(meta: Dict[str, Any]) -> None:
         _remote_remove_path(client, run_dir)
     except Exception:
         pass
+    try:
+        _run_postrun_remote_maintenance(meta, client)
+    except Exception:
+        pass
     finally:
         try:
             client.close()
@@ -5273,6 +5275,11 @@ def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[s
 
 def _require_core_ssh_credentials(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg = _normalize_core_config(core_cfg, include_password=True)
+    if isinstance(core_cfg, dict):
+        for key, value in core_cfg.items():
+            if key in cfg or key == 'ssh':
+                continue
+            cfg[key] = value
     ssh_host = str(cfg.get('ssh_host') or cfg.get('host') or '').strip()
     if not ssh_host:
         raise RuntimeError('SSH host is required for CORE VM connection.')
@@ -5294,6 +5301,129 @@ def _remote_core_target_host(core_cfg: Dict[str, Any], *, default: str = 'localh
     if target_host == ssh_host:
         return '127.0.0.1'
     return target_host
+
+
+def _postrun_remote_log(log_path: str, msg: str) -> None:
+    try:
+        if log_path:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[cleanup] {msg}\n")
+    except Exception:
+        pass
+
+
+def _deep_postrun_cleanup_requested(meta: Any) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    try:
+        kind_text = str(meta.get('kind') or '').strip().lower()
+    except Exception:
+        kind_text = ''
+    if kind_text.endswith('test') or '_test' in kind_text or kind_text == 'vuln_test':
+        return True
+    for key in ('deep_cleanup_after_run', 'adv_deep_cleanup_after_run', 'adv_deep_postrun_cleanup'):
+        try:
+            if key in meta and _coerce_bool(meta.get(key)):
+                return True
+        except Exception:
+            continue
+    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+    if isinstance(core_cfg, dict):
+        for key in ('deep_cleanup_after_run', 'adv_deep_cleanup_after_run', 'adv_deep_postrun_cleanup'):
+            try:
+                if key in core_cfg and _coerce_bool(core_cfg.get(key)):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _run_postrun_remote_maintenance(meta: Dict[str, Any], client: Any | None = None) -> None:
+    if not isinstance(meta, dict):
+        return
+    if meta.get('postrun_maintenance_done'):
+        return
+    core_cfg = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+    if not isinstance(core_cfg, dict):
+        return
+
+    log_path = str(meta.get('log_path') or '').strip()
+    deep_cleanup = _deep_postrun_cleanup_requested(meta)
+    own_client = False
+    if client is None:
+        try:
+            client = _open_ssh_client(core_cfg)
+            own_client = True
+        except Exception as exc:
+            _postrun_remote_log(log_path, f'postrun maintenance skipped: {exc}')
+            return
+
+    try:
+        pw = str(core_cfg.get('ssh_password') or '')
+    except Exception:
+        pw = ''
+
+    maintenance_steps = [
+        ('docker container prune', 'docker container prune -f', True, 120.0),
+        ('docker image prune', 'docker image prune -f', True, 120.0),
+        ('docker network prune', 'docker network prune -f', True, 120.0),
+        (
+            'docker remove wrapper images',
+            "docker images --format '{{.Repository}}:{{.Tag}}' | grep '_wrapper' | xargs -r docker rmi -f >/dev/null 2>&1 || true",
+            True,
+            180.0,
+        ),
+    ]
+    if deep_cleanup:
+        maintenance_steps.append(
+            ('docker system prune --all --volumes', 'docker system prune -af --volumes', True, 900.0)
+        )
+
+    for label, command, needs_sudo, timeout in maintenance_steps:
+        try:
+            if command == 'docker system prune -af --volumes':
+                _postrun_remote_log(log_path, 'deep cleanup start: docker system prune -af --volumes')
+            if needs_sudo:
+                rc, out, err = _exec_ssh_sudo_command(client, command, password=pw, timeout=timeout)
+            else:
+                rc, out, err = _exec_ssh_command(client, command, timeout=timeout, check=False)
+            _postrun_remote_log(
+                log_path,
+                f"{label} rc={rc} out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}",
+            )
+            if command == 'docker system prune -af --volumes':
+                _postrun_remote_log(log_path, f'deep cleanup complete: docker system prune -af --volumes rc={rc}')
+        except Exception as exc:
+            if command == 'docker system prune -af --volumes':
+                _postrun_remote_log(log_path, f'deep cleanup failed: docker system prune -af --volumes error={exc}')
+            _postrun_remote_log(log_path, f'{label} failed: {exc}')
+
+    remote_repo_dir = str(meta.get('remote_repo_dir') or '').strip()
+    if deep_cleanup and remote_repo_dir:
+        prune_script = _remote_path_join(remote_repo_dir, 'scripts', 'prune_vuln_catalog_packs.sh')
+        prune_cmd = (
+            f"if [ -f {shlex.quote(prune_script)} ]; then "
+            f"cd {shlex.quote(remote_repo_dir)} && bash scripts/prune_vuln_catalog_packs.sh --yes; "
+            "else echo 'missing prune_vuln_catalog_packs.sh'; fi"
+        )
+        try:
+            rc, out, err = _exec_ssh_command(client, prune_cmd, timeout=300.0, check=False)
+            _postrun_remote_log(
+                log_path,
+                f"prune inactive vuln catalog packs rc={rc} out={_summarize_for_log((out or '').strip())} err={_summarize_for_log((err or '').strip())}",
+            )
+        except Exception as exc:
+            _postrun_remote_log(log_path, f'prune inactive vuln catalog packs failed: {exc}')
+
+    try:
+        meta['postrun_maintenance_done'] = True
+    except Exception:
+        pass
+    if own_client:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -> Dict[str, Any] | None:
@@ -31925,6 +32055,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
     update_remote_repo = True
     adv_fix_docker_daemon = job_spec.get('adv_fix_docker_daemon')
     adv_run_core_cleanup = job_spec.get('adv_run_core_cleanup')
+    adv_deep_cleanup_after_run = job_spec.get('adv_deep_cleanup_after_run')
     adv_check_core_version = False
     adv_restart_core_daemon = job_spec.get('adv_restart_core_daemon')
     adv_start_core_daemon = job_spec.get('adv_start_core_daemon')
@@ -32131,6 +32262,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         meta = RUNS.get(run_id_local)
         if isinstance(meta, dict):
             meta['core_cfg'] = dict(core_cfg) if isinstance(core_cfg, dict) else core_cfg
+            meta['adv_deep_cleanup_after_run'] = bool(_coerce_bool(adv_deep_cleanup_after_run))
             try:
                 meta['remote'] = bool(_coerce_bool(core_cfg.get('ssh_enabled')))
             except Exception:
@@ -32373,6 +32505,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
             meta['scenario_name'] = resolved_scenario_name
             meta['scenario_names'] = list(scen_names or []) if isinstance(scen_names, list) else []
             meta['core_cfg'] = core_cfg
+            meta['adv_deep_cleanup_after_run'] = bool(_coerce_bool(adv_deep_cleanup_after_run))
             if isinstance(scenario_core_public, dict):
                 meta['scenario_core'] = scenario_core_public
     except Exception:
@@ -38009,6 +38142,7 @@ def _flaggen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: str) -
         'update_remote_repo': True,
         'adv_fix_docker_daemon': False,
         'adv_run_core_cleanup': False,
+        'adv_deep_cleanup_after_run': bool(_coerce_bool(core_cfg.get('adv_deep_postrun_cleanup'))),
         'adv_check_core_version': False,
         'adv_restart_core_daemon': False,
         'adv_start_core_daemon': False,
@@ -38168,6 +38302,7 @@ def _flagnodegen_build_ephemeral_execute_job(meta: dict[str, Any], *, run_id: st
         'update_remote_repo': True,
         'adv_fix_docker_daemon': False,
         'adv_run_core_cleanup': False,
+        'adv_deep_cleanup_after_run': bool(_coerce_bool(core_cfg.get('adv_deep_postrun_cleanup'))),
         'adv_check_core_version': False,
         'adv_restart_core_daemon': False,
         'adv_start_core_daemon': False,
@@ -38307,6 +38442,7 @@ def _vuln_test_build_ephemeral_execute_job(
         'update_remote_repo': True,
         'adv_fix_docker_daemon': False,
         'adv_run_core_cleanup': False,
+        'adv_deep_cleanup_after_run': bool(_coerce_bool(core_cfg.get('adv_deep_postrun_cleanup'))),
         'adv_check_core_version': False,
         'adv_restart_core_daemon': False,
         'adv_start_core_daemon': False,

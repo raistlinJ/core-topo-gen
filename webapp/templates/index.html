@@ -1294,6 +1294,11 @@
                             <input class="form-check-input" type="checkbox" id="executeAdvRunCoreCleanup" checked>
                             <label class="form-check-label" for="executeAdvRunCoreCleanup">Run core-cleanup</label>
                         </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvDeepCleanupAfterRun">
+                            <label class="form-check-label" for="executeAdvDeepCleanupAfterRun">Deep post-run cleanup</label>
+                            <div class="form-text">Runs <code>docker system prune -af --volumes</code> on the CORE VM after the run. This is the most aggressive reclaim option.</div>
+                        </div>
                         {% if not webui_running_in_docker %}
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvDockerCleanupBeforeRun"
@@ -18594,6 +18599,7 @@
     let executeAdvancedWrap = null;
     let executeAdvFixDockerDaemon = null;
     let executeAdvRunCoreCleanup = null;
+    let executeAdvDeepCleanupAfterRun = null;
     let executeAdvRestartCoreDaemon = null;
     let executeAdvStartCoreDaemon = null;
     let executeAdvAutoKillSessions = null;
@@ -18678,6 +18684,7 @@
         const advanced = {
             fixDockerDaemon: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvFixDockerDaemon && executeAdvFixDockerDaemon.checked),
             runCoreCleanup: remoteExecution && !!(executeAdvRunCoreCleanup && executeAdvRunCoreCleanup.checked),
+            deepCleanupAfterRun: remoteExecution && !!(executeAdvDeepCleanupAfterRun && executeAdvDeepCleanupAfterRun.checked),
             dockerCleanupBeforeRun: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvDockerCleanupBeforeRun && executeAdvDockerCleanupBeforeRun.checked),
             dockerNukeAll: remoteExecution && !WEBUI_RUNNING_IN_DOCKER && !!(executeAdvDockerNukeAll && executeAdvDockerNukeAll.checked),
             restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
@@ -19036,6 +19043,9 @@
         if (!executeAdvRunCoreCleanup) {
             executeAdvRunCoreCleanup = document.getElementById('executeAdvRunCoreCleanup');
         }
+        if (!executeAdvDeepCleanupAfterRun) {
+            executeAdvDeepCleanupAfterRun = document.getElementById('executeAdvDeepCleanupAfterRun');
+        }
         if (!executeAdvDockerCleanupBeforeRun) {
             executeAdvDockerCleanupBeforeRun = document.getElementById('executeAdvDockerCleanupBeforeRun');
         }
@@ -19081,6 +19091,7 @@
                         executeConfirmPushUpdateToggle,
                         executeAdvFixDockerDaemon,
                         executeAdvRunCoreCleanup,
+                        executeAdvDeepCleanupAfterRun,
                         executeAdvDockerCleanupBeforeRun,
                         executeAdvDockerNukeAll,
                         executeAdvRestartCoreDaemon,
@@ -20107,6 +20118,7 @@
             const enabled = [];
             if (adv.fixDockerDaemon) enabled.push('fix docker daemon');
             if (adv.runCoreCleanup) enabled.push('run core cleanup');
+            if (adv.deepCleanupAfterRun) enabled.push('deep post-run cleanup');
             if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
             if (adv.startCoreDaemon) enabled.push('start core-daemon if inactive');
             if (adv.autoKillSessions) enabled.push('auto-kill sessions');
@@ -22102,6 +22114,7 @@
             const adv = options && typeof options.advanced === 'object' ? options.advanced : null;
             if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');
             if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');
+            if (adv && adv.deepCleanupAfterRun) form.append('adv_deep_cleanup_after_run', '1');
             if (adv && adv.dockerCleanupBeforeRun) form.append('docker_cleanup_before_run', '1');
             if (adv && adv.dockerNukeAll) form.append('docker_remove_all_containers', '1');
             if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
@@ -24527,6 +24540,7 @@
                             const adv = formOptions && typeof formOptions.advanced === 'object' ? formOptions.advanced : null;
                             if (adv && adv.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
                             if (adv && adv.runCoreCleanup) payload.adv_run_core_cleanup = true;
+                            if (adv && adv.deepCleanupAfterRun) payload.adv_deep_cleanup_after_run = true;
                             if (adv && adv.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                             if (adv && adv.startCoreDaemon) payload.adv_start_core_daemon = true;
                             if (adv && adv.autoKillSessions) payload.adv_auto_kill_sessions = true;
@@ -24980,6 +24994,7 @@
                     if (advancedSelections && typeof advancedSelections === 'object') {
                         if (advancedSelections.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
                         if (advancedSelections.runCoreCleanup) payload.adv_run_core_cleanup = true;
+                        if (advancedSelections.deepCleanupAfterRun) payload.adv_deep_cleanup_after_run = true;
                         if (advancedSelections.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                         if (advancedSelections.startCoreDaemon) payload.adv_start_core_daemon = true;
                         if (advancedSelections.autoKillSessions) payload.adv_auto_kill_sessions = true;

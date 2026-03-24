@@ -10,6 +10,7 @@ def test_build_run_form_data_includes_advanced_flags() -> None:
     expected_lines = [
         "if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');",
         "if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');",
+        "if (adv && adv.deepCleanupAfterRun) form.append('adv_deep_cleanup_after_run', '1');",
         "if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');",
         "if (adv && adv.startCoreDaemon) form.append('adv_start_core_daemon', '1');",
         "if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');",
