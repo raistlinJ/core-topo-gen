@@ -245,6 +245,134 @@ def _generate_builder_ollama_streaming_response(
     return assistant_text
 
 
+def _generate_builder_openai_compatible_response(
+    ai_provider_routes: Any,
+    *,
+    prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    verify_ssl: bool,
+    timeout_seconds: float,
+    emit: Callable[..., None] | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
+) -> str:
+    if cancellation_check and cancellation_check():
+        raise ai_provider_routes.ProviderAdapterError('Generation cancelled by user.', status_code=499)
+
+    prompt_chars = len(prompt)
+    prompt_lines = len(prompt.splitlines())
+    request_started_at = time.monotonic()
+    response_opened_at: float | None = None
+
+    heartbeat_done = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
+    if emit is not None:
+        emit('status', message=f'Builder diagnostics: prompt_chars={prompt_chars}, prompt_lines={prompt_lines}, timeout={timeout_seconds:.0f}s.')
+        emit('status', message='Contacting OpenAI-compatible endpoint (initial)...')
+
+        def _heartbeat() -> None:
+            interval = max(float(_BUILDER_PROVIDER_HEARTBEAT_SECONDS), 0.01)
+            while not heartbeat_done.wait(interval):
+                if cancellation_check and cancellation_check():
+                    return
+                elapsed = time.monotonic() - request_started_at
+                emit('status', message=f'Still waiting on OpenAI-compatible endpoint (initial)... elapsed={elapsed:.1f}s')
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+    def _on_response_open(_response_obj: Any) -> None:
+        nonlocal response_opened_at
+        response_opened_at = time.monotonic()
+        if emit is not None:
+            emit('status', message=f'OpenAI-compatible endpoint accepted the request after {response_opened_at - request_started_at:.1f}s; reading body...')
+
+    try:
+        raw_response = ai_provider_routes._run_with_wall_clock_timeout(
+            lambda: ai_provider_routes._post_json(
+                ai_provider_routes._openai_compatible_chat_completions_url(base_url),
+                {
+                    'model': model,
+                    'messages': [
+                        {
+                            'role': 'user',
+                            'content': prompt,
+                        },
+                    ],
+                    'temperature': 0.1,
+                    'response_format': {'type': 'json_object'},
+                    'stream': False,
+                },
+                timeout=timeout_seconds,
+                headers=ai_provider_routes._openai_compatible_request_headers(api_key),
+                verify_ssl=verify_ssl,
+                on_open=_on_response_open,
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+    except HTTPError as exc:
+        detail = ''
+        try:
+            detail = exc.read().decode('utf-8').strip()
+        except Exception:
+            detail = ''
+        message = f'OpenAI-compatible endpoint returned HTTP {exc.code}.'
+        if detail:
+            message = f'{message} {detail[:240]}'
+        raise ai_provider_routes.ProviderAdapterError(
+            message,
+            status_code=502,
+            details={
+                'stage': 'builder_openai_initial',
+                'prompt_chars': prompt_chars,
+                'prompt_lines': prompt_lines,
+                'timeout_seconds': float(timeout_seconds),
+                'elapsed_seconds': round(time.monotonic() - request_started_at, 3),
+                'response_opened': response_opened_at is not None,
+            },
+        ) from exc
+    except URLError as exc:
+        reason = getattr(exc, 'reason', exc)
+        raise ai_provider_routes.ProviderAdapterError(
+            f'Could not reach OpenAI-compatible endpoint at {base_url}: {reason}',
+            status_code=502,
+            details={
+                'stage': 'builder_openai_initial',
+                'prompt_chars': prompt_chars,
+                'prompt_lines': prompt_lines,
+                'timeout_seconds': float(timeout_seconds),
+                'elapsed_seconds': round(time.monotonic() - request_started_at, 3),
+                'response_opened': response_opened_at is not None,
+            },
+        ) from exc
+    finally:
+        heartbeat_done.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=0.2)
+
+    if emit is not None:
+        emit('status', message=f'OpenAI-compatible endpoint responded (initial) in {time.monotonic() - request_started_at:.1f}s.')
+
+    assistant_text = str(ai_provider_routes._extract_openai_compatible_message_text(raw_response) or '').strip()
+    if not assistant_text:
+        raise ai_provider_routes.ProviderAdapterError(
+            'OpenAI-compatible endpoint returned an empty response.',
+            status_code=502,
+            details={
+                'stage': 'builder_openai_initial',
+                'prompt_chars': prompt_chars,
+                'prompt_lines': prompt_lines,
+                'timeout_seconds': float(timeout_seconds),
+                'elapsed_seconds': round(time.monotonic() - request_started_at, 3),
+                'response_opened': response_opened_at is not None,
+            },
+        )
+    if emit is not None:
+        emit('llm_delta', text=assistant_text)
+    return assistant_text
+
+
 def _build_builder_ai_scaffold_result(
     payload: dict[str, Any],
     *,
@@ -255,8 +383,16 @@ def _build_builder_ai_scaffold_result(
 ) -> dict[str, Any]:
     if _BUILD_GENERATOR_SCAFFOLD is None:
         raise RuntimeError('build_generator_scaffold is not configured')
-    messages = _build_generator_builder_ai_messages(payload)
     provider = str(payload.get('provider') or 'ollama').strip().lower() or 'ollama'
+    prompt_payload = dict(payload)
+    prompt_payload['compact_grounding'] = provider in {'litellm', 'openai'}
+    prompt_payload['ultra_compact_prompt'] = bool(
+        provider in {'litellm', 'openai'}
+        and not isinstance(payload.get('current_scaffold_request'), dict)
+        and not isinstance(payload.get('current_files'), dict)
+        and not isinstance(payload.get('last_test_result'), dict)
+    )
+    messages = _build_generator_builder_ai_messages(prompt_payload)
     adapter = ai_provider_routes._get_provider_adapter(provider)
     model = str(payload.get('model') or '').strip()
     if not model:
@@ -279,6 +415,10 @@ def _build_builder_ai_scaffold_result(
     direct_prompt = _build_direct_generation_prompt(messages)
     if emit is not None:
         emit('status', message='Preparing Builder prompt...')
+        if prompt_payload.get('ultra_compact_prompt'):
+            emit('status', message='Using ultra-compact Builder prompt for OpenAI-compatible create request.')
+        if prompt_payload.get('compact_grounding'):
+            emit('status', message='Using compact Builder grounding for OpenAI-compatible request.')
         if provider != 'ollama':
             emit('llm_prompt', text=direct_prompt)
         emit('status', message=f'Contacting {provider}...')
@@ -305,53 +445,17 @@ def _build_builder_ai_scaffold_result(
             timeout_seconds=timeout_seconds,
         )
     else:
-        client = ai_provider_routes._RepoMcpBridgeClient(
+        assistant_text = _generate_builder_openai_compatible_response(
+            ai_provider_routes,
+            prompt=direct_prompt,
             model=model,
-            host=base_url,
-            provider=provider,
+            base_url=base_url,
             api_key=str(payload.get('api_key') or '').strip(),
             verify_ssl=enforce_ssl,
+            timeout_seconds=timeout_seconds,
+            emit=emit,
+            cancellation_check=cancellation_check,
         )
-        client.timeout_seconds = timeout_seconds
-        uses_openai_chat = bool(client._uses_openai_chat_completions())
-        heartbeat_done = threading.Event()
-        heartbeat_thread: threading.Thread | None = None
-        if emit is not None:
-            if uses_openai_chat:
-                emit('status', message='Contacting OpenAI-compatible endpoint (initial)...')
-            else:
-                emit('status', message=f'Contacting {provider}...')
-
-            def _heartbeat() -> None:
-                interval = max(float(_BUILDER_PROVIDER_HEARTBEAT_SECONDS), 0.01)
-                while not heartbeat_done.wait(interval):
-                    if cancellation_check and cancellation_check():
-                        return
-                    if uses_openai_chat:
-                        emit('status', message='Still waiting on OpenAI-compatible endpoint (initial)...')
-                    else:
-                        emit('status', message=f'Still waiting on {provider}...')
-
-            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-            heartbeat_thread.start()
-        try:
-            raw_response = client._post_chat(messages=messages)
-        finally:
-            heartbeat_done.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join(timeout=0.2)
-        if emit is not None:
-            if uses_openai_chat:
-                emit('status', message='OpenAI-compatible endpoint responded (initial).')
-            else:
-                emit('status', message=f'{provider} responded.')
-        if uses_openai_chat:
-            assistant_message = ai_provider_routes._extract_openai_chat_message(raw_response)
-        else:
-            assistant_message = ai_provider_routes._extract_ollama_chat_message(raw_response)
-        assistant_text = str(assistant_message.get('content') or '').strip()
-        if emit is not None and assistant_text:
-            emit('llm_delta', text=assistant_text)
 
     if cancellation_check and cancellation_check():
         raise ai_provider_routes.ProviderAdapterError('Generation cancelled by user.', status_code=499)
@@ -440,7 +544,45 @@ def _render_grounding_excerpt(title: str, rel_path: str, heading: str) -> list[s
     ]
 
 
-def _build_generator_grounding_lines(plugin_type: str) -> list[str]:
+def _render_grounding_excerpt_head(title: str, rel_path: str, heading: str, *, max_lines: int = 40, max_chars: int = 1800) -> list[str]:
+    text = _extract_markdown_section(rel_path, heading)
+    if not text:
+        return []
+    lines = text.splitlines()
+    excerpt = '\n'.join(lines[:max_lines]).strip()
+    if max_chars > 0 and len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip()
+    if len(lines) > max_lines or len(text) > len(excerpt):
+        excerpt = f'{excerpt}\n... [truncated]'.strip()
+    return [
+        f'{title} ({rel_path} :: {heading}):',
+        '```text',
+        excerpt,
+        '```',
+        '',
+    ]
+
+
+def _render_grounding_head(title: str, rel_path: str, *, max_lines: int = 80, max_chars: int = 4000) -> list[str]:
+    text = _read_grounding_file(rel_path)
+    if not text:
+        return []
+    lines = text.splitlines()
+    excerpt = '\n'.join(lines[:max_lines]).strip()
+    if max_chars > 0 and len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip()
+    if len(lines) > max_lines or len(text) > len(excerpt):
+        excerpt = f'{excerpt}\n... [truncated]'.strip()
+    return [
+        f'{title} ({rel_path}):',
+        '```text',
+        excerpt,
+        '```',
+        '',
+    ]
+
+
+def _build_generator_grounding_lines(plugin_type: str, *, compact: bool = False, ultra_compact: bool = False) -> list[str]:
     if plugin_type == 'flag-node-generator':
         template_base = 'generator_templates/flag-node-generator-python-compose'
         sample_base = 'flag_node_generators/py_sample_nfs_sensitive_file'
@@ -456,6 +598,28 @@ def _build_generator_grounding_lines(plugin_type: str) -> list[str]:
         '- Keep the implementation deterministic for the same inputs.',
         '',
     ]
+    if ultra_compact:
+        lines.extend([
+            'Ultra-compact grounding mode is active for this request: return only the requested JSON object and keep the scaffold minimal, deterministic, and valid.',
+            '',
+        ])
+        return lines
+    if compact:
+        lines.extend(_render_grounding_excerpt_head(
+            'Reference docs excerpt: AI scaffolding quickstart',
+            'docs/GENERATOR_AUTHORING.md',
+            '## 0) AI scaffolding quickstart',
+            max_lines=24,
+            max_chars=1400,
+        ))
+        lines.extend(_render_grounding_head('Reference sample excerpt: manifest.yaml', f'{sample_base}/manifest.yaml', max_lines=40, max_chars=1500))
+        if plugin_type == 'flag-node-generator':
+            lines.extend(_render_grounding_head('Reference template excerpt: docker-compose.yml', f'{template_base}/docker-compose.yml', max_lines=20, max_chars=900))
+        lines.extend([
+            'Compact grounding mode is active for this request: use the excerpts above as shape guidance and avoid depending on omitted sample details.',
+            '',
+        ])
+        return lines
     lines.extend(_render_grounding_excerpt(
         'Reference docs excerpt: AI scaffolding quickstart',
         'docs/GENERATOR_AUTHORING.md',
@@ -1195,6 +1359,8 @@ def _build_prompt_intent_guidance(prompt: str, plugin_type: str, overrides_paylo
 
 def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
     plugin_type = str(payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
+    compact_grounding = bool(payload.get('compact_grounding'))
+    ultra_compact_prompt = bool(payload.get('ultra_compact_prompt'))
     source_id_hint = str(payload.get('source_id_hint') or '').strip()
     name_hint = str(payload.get('name_hint') or '').strip()
     prompt = str(payload.get('prompt') or '').strip()
@@ -1225,6 +1391,23 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
             '- If inject_files includes File(path), the File(path) output must exist on disk before exit or the test will fail validation.',
         ])
 
+    if ultra_compact_prompt:
+        kind_requirements = [
+            '- Read /inputs/config.json and write /outputs/outputs.json.',
+            '- outputs.json must include generator_id and Flag(flag_id).',
+            '- Keep outputs deterministic and ensure all declared outputs exist.',
+        ]
+        if plugin_type == 'flag-node-generator':
+            kind_requirements.extend([
+                '- Also write /outputs/docker-compose.yml and expose File(path): docker-compose.yml.',
+                '- Do not emit ${...} placeholders in docker-compose.yml.',
+            ])
+        else:
+            kind_requirements.extend([
+                '- Write file outputs under /outputs or /outputs/artifacts and reference them from outputs.json.',
+                '- If inject_files includes File(path), that file must be created before exit.',
+            ])
+
     schema_lines = [
         '{',
         '  "plugin_id": "source_identifier",',
@@ -1243,6 +1426,14 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
         '  "generator_py_text": "full generator.py text"',
         '}',
     ]
+    if ultra_compact_prompt:
+        schema_lines = [
+            '{"plugin_id":"source_identifier","folder_name":"py_source_identifier","name":"Human-readable name","description":"One sentence summary","requires":[{"artifact":"Knowledge(ip)","optional":false}],"optional_requires":[],"produces":["Flag(flag_id)"],"runtime_inputs":[],"hint_templates":[],"inject_files":[],"env":{},"readme_text":"full README.md text","generator_py_text":"full generator.py text","compose_text":"full docker-compose.yml text if needed"}',
+        ]
+    elif compact_grounding:
+        schema_lines = [
+            '{"plugin_id":"source_identifier","folder_name":"py_source_identifier","name":"Human-readable name","description":"One sentence summary","requires":[{"artifact":"Knowledge(ip)","optional":false}],"optional_requires":["Knowledge(hostname)"],"produces":["Flag(flag_id)"],"runtime_inputs":[{"name":"seed","type":"string","required":true}],"hint_templates":["Next: use {{OUTPUT.Flag(flag_id)}}"],"inject_files":["File(path)"],"env":{"EXAMPLE":"value"},"readme_text":"full README.md text","generator_py_text":"full generator.py text","compose_text":"full docker-compose.yml text"}',
+        ]
 
     current_scaffold = payload.get('current_scaffold_request') if isinstance(payload.get('current_scaffold_request'), dict) else None
     current_files = payload.get('current_files') if isinstance(payload.get('current_files'), dict) else None
@@ -1252,6 +1443,7 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
     context_lines = [
         f'Mode: {mode}',
         f'Target kind: {plugin_type}',
+        f'Grounding mode: {"ultra-compact" if ultra_compact_prompt else ("compact" if compact_grounding else "full")}',
         f'Source id hint: {source_id_hint or "(derive one)"}',
         f'Name hint: {name_hint or "(derive one)"}',
         '',
@@ -1272,8 +1464,35 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
         *schema_lines,
         '',
     ]
-    context_lines.extend(_build_prompt_intent_guidance(prompt, plugin_type, payload.get('intent_overrides')))
-    context_lines.extend(_build_generator_grounding_lines(plugin_type))
+    if ultra_compact_prompt:
+        minimal_requirements = [
+            '- Reply with exactly one JSON object and no prose.',
+            '- Include plugin_id, name, description, readme_text, and generator_py_text.',
+            '- Keep produces aligned with outputs.json and include Flag(flag_id).',
+            '- Include compose_text only if it is actually required.',
+        ]
+        if plugin_type == 'flag-node-generator':
+            minimal_requirements.append('- For node generators, include a working docker-compose.yml in compose_text.')
+        else:
+            minimal_requirements.append('- For file outputs, write them under /outputs or /outputs/artifacts and reference them from outputs.json.')
+        context_lines = [
+            f'Mode: {mode}',
+            f'Target kind: {plugin_type}',
+            'Grounding mode: ultra-compact',
+            '',
+            'Requirements:',
+            *minimal_requirements,
+            '',
+            'JSON schema shape:',
+            *schema_lines,
+            '',
+            'User request:',
+            prompt or 'Build a deterministic generator scaffold.',
+            '',
+        ]
+    else:
+        context_lines.extend(_build_prompt_intent_guidance(prompt, plugin_type, payload.get('intent_overrides')))
+    context_lines.extend(_build_generator_grounding_lines(plugin_type, compact=compact_grounding, ultra_compact=ultra_compact_prompt))
     if current_scaffold:
         context_lines.extend([
             'Current scaffold request (treat this as the existing generator state and preserve compatible parts unless the user asked to change them):',

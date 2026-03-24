@@ -113,6 +113,19 @@ def test_ai_generator_workflow_blocks_bridge_generation_without_enabled_tools() 
     assert not missing, "Missing AI Generator workflow safeguards for zero enabled MCP tools: " + "; ".join(missing)
 
 
+def test_ai_generator_workflow_uses_stored_key_unless_replacement_is_dirty() -> None:
+    text = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_workflow.js").read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "function resolveAiGeneratorApiKey(aiState) {",
+        "return aiState.api_key_dirty === true ? raw : '';",
+        "api_key: resolveAiGeneratorApiKey(aiState),",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator workflow stored-key resolution snippets: " + "; ".join(missing)
+
+
 def test_ai_generator_workflow_classifies_validated_vulnerability_shortages_as_warnings() -> None:
     text = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_workflow.js").read_text(encoding="utf-8", errors="ignore")
 
@@ -160,12 +173,28 @@ def test_ai_generator_panel_uses_url_field_for_provider_base_url_and_disables_pa
     assert not missing, "Missing AI Generator URL/API-key field hardening snippets: " + "; ".join(missing)
 
 
+def test_ai_generator_panel_ignores_stale_api_key_overrides_when_stored_key_exists() -> None:
+    text = AI_PANEL_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        "function resolveAiGeneratorApiKey(aiState) {",
+        "return aiState.api_key_dirty === true ? raw : '';",
+        "api_key: status.has_api_key && aiState.api_key_dirty !== true ? '' : resolveAiGeneratorApiKey(aiState)",
+        "api_key_dirty: true,",
+        "api_key_dirty: false,",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator stored-key protection snippets: " + "; ".join(missing)
+
+
 def test_index_ai_generator_state_strips_api_key_from_persisted_storage() -> None:
     text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
 
     expected_snippets = [
         "const AI_PROVIDER_SECRET_CACHE = window.CORETG_AI_PROVIDER_SECRET_CACHE || {};",
         "sanitized.api_key = '';",
+        "sanitized.api_key_dirty = false;",
         "has_stored_api_key: false,",
         "api_key_status_loaded: false,",
         "localMap[key] = sanitizedState;",
@@ -180,8 +209,11 @@ def test_index_bootstrap_tracks_ai_generator_warning_state() -> None:
 
     expected_snippets = [
         "skip_bridge: false,",
+        "api_key_dirty: false,",
         "merged.skip_bridge = merged.skip_bridge === true;",
+        "merged.api_key_dirty = merged.api_key_dirty === true;",
         "next.skip_bridge = next.skip_bridge === true;",
+        "next.api_key_dirty = next.api_key_dirty === true;",
         "last_generation_error: '',",
         "last_generation_warning: '',",
     ]

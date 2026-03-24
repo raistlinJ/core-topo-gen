@@ -478,7 +478,7 @@
               </ul>
               <span id="gbInstallBtnHint" title="Install unlocks after a successful Builder test returns rc=0.">
                 <button class="btn btn-outline-success btn-sm" type="button" id="gbInstallBtn" data-gb-install-btn disabled aria-describedby="gbInstallBtnHint">
-                  <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
+                  <i class="bi bi-box-arrow-in-down me-1"></i>Install
                 </button>
               </span>
             </div>
@@ -760,16 +760,6 @@
                     <div class="small text-muted mt-3 pt-3 border-top">Install unlocks after the latest Builder test completes successfully.</div>
                   </div>
                 </div>
-                <div class="gb-files-footer-anchor mt-3">
-                  <div class="small text-muted">Install the current scaffold from the test workspace once the latest Builder test succeeds.</div>
-                  <div class="d-flex gap-2 flex-wrap">
-                    <span id="gbTestInstallBtnHint" data-gb-install-hint title="Install unlocks after a successful Builder test returns rc=0.">
-                      <button class="btn btn-outline-success btn-sm" type="button" id="gbTestInstallBtn" data-gb-install-btn disabled aria-describedby="gbTestInstallBtnHint">
-                        <i class="bi bi-box-arrow-in-down me-1"></i>Install to Catalog
-                      </button>
-                    </span>
-                  </div>
-                </div>
               </div>
             </div>
           </div>
@@ -873,6 +863,7 @@
     validation: null,
     autoFollowEvents: true,
     hasStoredApiKey: false,
+    apiKeyDirty: false,
     apiKeySecretId: '',
     apiKeyStoredAt: '',
     apiKeyStatusLoaded: false,
@@ -1210,6 +1201,7 @@
     state.validation = null;
     state.autoFollowEvents = true;
     state.hasStoredApiKey = false;
+    state.apiKeyDirty = false;
     state.apiKeySecretId = '';
     state.apiKeyStoredAt = '';
     state.apiKeyStatusLoaded = false;
@@ -2182,6 +2174,9 @@
       const payload = await fetchStoredApiKeyStatus(provider);
       if (state.apiKeyStatusProvider !== provider) return;
       state.hasStoredApiKey = !!payload.has_api_key;
+      if (state.hasStoredApiKey && !state.apiKeyDirty && elements.apiKey) {
+        elements.apiKey.value = '';
+      }
       state.apiKeySecretId = String(payload.identifier || '');
       state.apiKeyStoredAt = String(payload.stored_at || '');
       state.apiKeyStatusLoaded = true;
@@ -2409,6 +2404,18 @@
     refreshStoredApiKeyStatus(false);
   }
 
+  function resolveBuilderApiKeyForPayload() {
+    const provider = String(elements.provider && elements.provider.value || '').trim().toLowerCase();
+    const raw = String(elements.apiKey && elements.apiKey.value || '').trim();
+    if (!providerSupportsStoredApiKey(provider)) {
+      return raw;
+    }
+    if (!state.hasStoredApiKey) {
+      return raw;
+    }
+    return state.apiKeyDirty ? raw : '';
+  }
+
   async function refreshProviders(force = false) {
     try {
       const resp = await fetch('/api/ai/providers', {
@@ -2458,7 +2465,7 @@
     return {
       provider: String(elements.provider.value || 'ollama').trim(),
       base_url: String(elements.baseUrl.value || '').trim(),
-      api_key: String(elements.apiKey.value || '').trim(),
+      api_key: resolveBuilderApiKeyForPayload(),
       model: String(elements.model.value || '').trim(),
       enforce_ssl: !!elements.enforceSsl.checked,
       skip_bridge: true,
@@ -2968,7 +2975,7 @@
       prompt: String(elements.prompt.value || '').trim(),
       provider: String(elements.provider.value || 'ollama').trim(),
       base_url: String(elements.baseUrl.value || '').trim(),
-      api_key: String(elements.apiKey.value || '').trim(),
+      api_key: resolveBuilderApiKeyForPayload(),
       model: String(elements.model.value || '').trim(),
       enforce_ssl: !!elements.enforceSsl.checked,
     };
@@ -3429,6 +3436,7 @@
     elements.model.value = '';
     elements.baseUrl.value = '';
     elements.apiKey.value = '';
+    state.apiKeyDirty = false;
     state.apiKeyStatusLoaded = false;
     state.apiKeyStatusLoading = false;
     state.apiKeyStatusProvider = String(elements.provider.value || '').trim().toLowerCase();
@@ -3443,12 +3451,18 @@
     persistBuilderWorkspaceState();
   });
   elements.apiKey.addEventListener('input', () => {
+    state.apiKeyDirty = true;
     invalidateModelStep();
     persistBuilderWorkspaceState();
   });
   elements.enforceSsl.addEventListener('change', () => {
     persistCurrentProviderModelPrefs();
     invalidateModelStep();
+    persistBuilderWorkspaceState();
+  });
+  elements.model.addEventListener('change', () => {
+    persistCurrentProviderModelPrefs();
+    invalidateModelStep('Model selection changed. Validate again to unlock prompting.');
     persistBuilderWorkspaceState();
   });
   elements.model.addEventListener('input', () => {
@@ -3507,6 +3521,7 @@
         const stored = await saveStoredApiKey(provider, nextValue);
         elements.apiKey.value = '';
         state.hasStoredApiKey = true;
+        state.apiKeyDirty = false;
         state.apiKeySecretId = String(stored.identifier || '');
         state.apiKeyStoredAt = String(stored.stored_at || '');
         state.apiKeyStatusLoaded = true;
@@ -3532,7 +3547,9 @@
       renderStoredApiKeyControls();
       try {
         await clearStoredApiKey(provider);
+        elements.apiKey.value = '';
         state.hasStoredApiKey = false;
+        state.apiKeyDirty = false;
         state.apiKeySecretId = '';
         state.apiKeyStoredAt = '';
         state.apiKeyStatusLoaded = true;

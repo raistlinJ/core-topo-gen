@@ -103,6 +103,35 @@ def test_generator_builder_template_aggregates_thinking_and_scrolls_latest_activ
     assert "scrollIntoView({ block: 'end' });" not in text
 
 
+def test_generator_builder_template_ignores_stale_api_key_overrides_when_stored_key_exists() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'apiKeyDirty: false,',
+        'function resolveBuilderApiKeyForPayload() {',
+        "return state.apiKeyDirty ? raw : '';",
+        'api_key: resolveBuilderApiKeyForPayload(),',
+        'state.apiKeyDirty = true;',
+        'state.apiKeyDirty = false;',
+        'if (state.hasStoredApiKey && !state.apiKeyDirty && elements.apiKey) {',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder stored-key protection snippets: ' + '; '.join(missing)
+
+
+def test_generator_builder_template_invalidates_validation_on_model_change_event() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "elements.model.addEventListener('change', () => {",
+        "invalidateModelStep('Model selection changed. Validate again to unlock prompting.');",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder model change invalidation snippets: ' + '; '.join(missing)
+
+
 def test_generator_artifacts_index_merges_sources_reserved_and_custom(monkeypatch):
     client = app.test_client()
     _login(client)
@@ -233,6 +262,38 @@ def test_generator_prompt_intent_preview_applies_manual_overrides(monkeypatch):
     assert payload.get('merged', {}).get('produces') == ['Flag(flag_id)', 'Credential(user)']
     assert payload.get('editable', {}).get('runtime_inputs') == 'seed (required)\nnode_name (required)'
     assert payload.get('notes', {}).get('readme_mentions') == ['custom docs', 'test parity']
+
+
+def test_build_generator_builder_ai_messages_compact_grounding_uses_excerpts():
+    full_messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a deterministic demo generator.',
+    })
+    compact_messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a deterministic demo generator.',
+        'compact_grounding': True,
+    })
+    ultra_compact_messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a deterministic demo generator.',
+        'compact_grounding': True,
+        'ultra_compact_prompt': True,
+    })
+
+    full_text = full_messages[1]['content']
+    compact_text = compact_messages[1]['content']
+    ultra_compact_text = ultra_compact_messages[1]['content']
+
+    assert 'Grounding mode: full' in full_text
+    assert 'Grounding mode: compact' in compact_text
+    assert 'Grounding mode: ultra-compact' in ultra_compact_text
+    assert 'Compact grounding mode is active for this request' in compact_text
+    assert 'Ultra-compact grounding mode is active for this request' in ultra_compact_text
+    assert 'Reference sample excerpt: manifest.yaml' in compact_text
+    assert 'Reference template: generator.py' in full_text
+    assert len(compact_text) < len(full_text)
+    assert len(ultra_compact_text) < len(compact_text)
 
 
 def test_generator_scaffold_zip_streams_archive(monkeypatch):
@@ -411,24 +472,20 @@ def test_generator_ai_scaffold_stream_emits_openai_compatible_progress_statuses(
     class _DummyAdapter:
         capability = type('Capability', (), {'default_base_url': 'https://litellm.example.com/v1'})()
 
-    class _DummyClient:
-        def __init__(self, **kwargs):
-            assert kwargs['provider'] == 'litellm'
-            assert kwargs['api_key'] == 'stored-builder-key'
-
-        def _post_chat(self, *, messages):
-            assert messages[0]['role'] == 'system'
-            time.sleep(0.03)
-            return {'choices': [{'message': {'content': json.dumps({'plugin_id': 'builder_progress_demo'})}}]}
-
-        def _uses_openai_chat_completions(self):
-            return True
-
     monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
     monkeypatch.setattr(ai_provider_routes, '_resolve_payload_with_stored_api_key', lambda payload: {**payload, 'api_key': 'stored-builder-key'})
     monkeypatch.setattr(ai_provider_routes, '_normalize_openai_compatible_base_url', lambda value, *, enforce_ssl: 'https://litellm.example.com/v1')
-    monkeypatch.setattr(ai_provider_routes, '_RepoMcpBridgeClient', lambda **kwargs: _DummyClient(**kwargs))
-    monkeypatch.setattr(ai_provider_routes, '_extract_openai_chat_message', lambda payload: (payload.get('choices') or [{}])[0].get('message') or {})
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True, on_open=None):
+        assert url == 'https://litellm.example.com/v1/chat/completions'
+        assert payload['messages'][0]['role'] == 'user'
+        assert payload['response_format'] == {'type': 'json_object'}
+        assert headers == {'Authorization': 'Bearer stored-builder-key'}
+        if callable(on_open):
+            on_open(object())
+        time.sleep(0.03)
+        return {'choices': [{'message': {'content': json.dumps({'plugin_id': 'builder_progress_demo'})}}]}
+
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
     monkeypatch.setattr(generator_builder_routes, '_BUILDER_PROVIDER_HEARTBEAT_SECONDS', 0.01)
 
     resp = client.post('/api/generators/ai_scaffold_stream', json={
@@ -445,10 +502,14 @@ def test_generator_ai_scaffold_stream_emits_openai_compatible_progress_statuses(
     events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
     statuses = [event.get('message') for event in events if event.get('type') == 'status']
     assert 'Preparing Builder prompt...' in statuses
+    assert 'Using ultra-compact Builder prompt for OpenAI-compatible create request.' in statuses
+    assert 'Using compact Builder grounding for OpenAI-compatible request.' in statuses
     assert 'Contacting litellm...' in statuses
+    assert any(str(message).startswith('Builder diagnostics: prompt_chars=') for message in statuses)
     assert 'Contacting OpenAI-compatible endpoint (initial)...' in statuses
-    assert 'Still waiting on OpenAI-compatible endpoint (initial)...' in statuses
-    assert 'OpenAI-compatible endpoint responded (initial).' in statuses
+    assert any(str(message).startswith('Still waiting on OpenAI-compatible endpoint (initial)... elapsed=') for message in statuses)
+    assert any(str(message).startswith('OpenAI-compatible endpoint accepted the request after ') for message in statuses)
+    assert any(str(message).startswith('OpenAI-compatible endpoint responded (initial) in ') for message in statuses)
     event_types = [event.get('type') for event in events]
     assert 'llm_prompt' in event_types
     assert 'llm_delta' in event_types
@@ -466,25 +527,20 @@ def test_generator_ai_scaffold_openai_compatible_uses_api_key_and_ssl(monkeypatc
 
     captured: dict[str, object] = {}
 
-    class _DummyClient:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-        def _post_chat(self, *, messages):
-            assert messages[0]['role'] == 'system'
-            return {'choices': [{'message': {'content': json.dumps({'plugin_id': 'api_key_tls_demo'})}}]}
-
-        def _uses_openai_chat_completions(self):
-            return True
-
     monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
     monkeypatch.setattr(
         ai_provider_routes,
         '_normalize_openai_compatible_base_url',
         lambda value, *, enforce_ssl: 'http://litellm.local/v1' if not enforce_ssl else 'https://litellm.example.com/v1',
     )
-    monkeypatch.setattr(ai_provider_routes, '_RepoMcpBridgeClient', lambda **kwargs: _DummyClient(**kwargs))
-    monkeypatch.setattr(ai_provider_routes, '_extract_openai_chat_message', lambda payload: (payload.get('choices') or [{}])[0].get('message') or {})
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True, on_open=None):
+        captured['url'] = url
+        captured['headers'] = headers
+        captured['verify_ssl'] = verify_ssl
+        captured['payload'] = payload
+        return {'choices': [{'message': {'content': json.dumps({'plugin_id': 'api_key_tls_demo'})}}]}
+
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
 
     resp = client.post('/api/generators/ai_scaffold', json={
         'plugin_type': 'flag-generator',
@@ -499,10 +555,10 @@ def test_generator_ai_scaffold_openai_compatible_uses_api_key_and_ssl(monkeypatc
     assert resp.status_code == 200
     payload = resp.get_json() or {}
     assert payload.get('ok') is True
-    assert captured['provider'] == 'litellm'
-    assert captured['host'] == 'http://litellm.local/v1'
-    assert captured['api_key'] == 'builder-secret-key'
+    assert captured['url'] == 'http://litellm.local/v1/chat/completions'
+    assert captured['headers'] == {'Authorization': 'Bearer builder-secret-key'}
     assert captured['verify_ssl'] is False
+    assert captured['payload']['response_format'] == {'type': 'json_object'}
 
 
 def test_generator_ai_scaffold_openai_compatible_rejects_http_when_ssl_required(monkeypatch):

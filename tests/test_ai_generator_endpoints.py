@@ -169,6 +169,35 @@ def test_ai_provider_validate_uses_stored_secure_api_key_when_request_omits_it(t
         assert data['success'] is True
 
 
+def test_ai_provider_validate_sends_connection_close_header(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    from webapp.routes import ai_provider
+
+    def fake_urlopen(request_obj, timeout=0, context=None):
+        assert request_obj.headers.get('Connection') == 'close'
+        return _FakeResponse({'data': [{'id': 'gpt-4o-mini'}]})
+
+    monkeypatch.setattr(ai_provider, 'urlopen', fake_urlopen)
+
+    resp = client.post(
+        '/api/ai/provider/validate',
+        json={
+            'provider': 'litellm',
+            'base_url': 'https://litellm.example/v1',
+            'api_key': 'test-litellm-key',
+            'enforce_ssl': True,
+            'model': 'gpt-4o-mini',
+            'skip_bridge': True,
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('success') is True
+
+
 def test_ai_provider_validate_uses_first_discovered_openai_compatible_model_for_bridge_discovery(monkeypatch):
     client = app.test_client()
     _login(client)

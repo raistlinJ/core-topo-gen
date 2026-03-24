@@ -163,6 +163,18 @@
             return data;
         }
 
+        function resolveAiGeneratorApiKey(aiState) {
+            const provider = String((aiState && aiState.provider) || '').trim().toLowerCase();
+            const raw = String((aiState && aiState.api_key) || '').trim();
+            if (provider !== 'litellm') {
+                return raw;
+            }
+            if (!aiState || aiState.has_stored_api_key !== true) {
+                return raw;
+            }
+            return aiState.api_key_dirty === true ? raw : '';
+        }
+
         function renderAiGeneratorPanel() {
             const root = document.getElementById('aiGeneratorRoot');
             if (!root) return;
@@ -232,6 +244,7 @@
                 });
                 fetchStoredApiKeyStatus(provider).then((status) => {
                     deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        api_key: status.has_api_key && aiState.api_key_dirty !== true ? '' : resolveAiGeneratorApiKey(aiState),
                         has_stored_api_key: !!status.has_api_key,
                         api_key_secret_id: status.identifier || null,
                         api_key_stored_at: status.stored_at || null,
@@ -560,6 +573,8 @@
                         provider: nextProvider,
                         base_url: shouldResetBaseUrl ? nextMeta.defaultBaseUrl : currentBaseUrl,
                         enforce_ssl: nextProvider === 'litellm' ? true : aiState.enforce_ssl,
+                        api_key: '',
+                        api_key_dirty: false,
                         api_key_status_loaded: false,
                         api_key_status_loading: false,
                         api_key_status_provider: nextProvider,
@@ -578,7 +593,11 @@
             }
             if (apiKeyInput) {
                 apiKeyInput.addEventListener('input', () => {
-                    deps.persistAiGeneratorStateForScenario(scenario, idx, { api_key: apiKeyInput.value, validation: resetValidation() });
+                    deps.persistAiGeneratorStateForScenario(scenario, idx, {
+                        api_key: apiKeyInput.value,
+                        api_key_dirty: true,
+                        validation: resetValidation(),
+                    });
                 });
                 apiKeyInput.addEventListener('change', async () => {
                     const nextValue = String(apiKeyInput.value || '').trim();
@@ -587,6 +606,7 @@
                         const stored = await saveStoredApiKey(provider, nextValue);
                         deps.persistAiGeneratorStateForScenario(scenario, idx, {
                             api_key: '',
+                            api_key_dirty: false,
                             has_stored_api_key: true,
                             api_key_secret_id: stored.identifier || null,
                             api_key_stored_at: stored.stored_at || null,
@@ -618,6 +638,7 @@
                         const stored = await saveStoredApiKey(provider, nextValue);
                         deps.persistAiGeneratorStateForScenario(scenario, idx, {
                             api_key: '',
+                            api_key_dirty: false,
                             has_stored_api_key: true,
                             api_key_secret_id: stored.identifier || null,
                             api_key_stored_at: stored.stored_at || null,
@@ -647,6 +668,7 @@
                         await clearStoredApiKey(provider);
                         deps.persistAiGeneratorStateForScenario(scenario, idx, {
                             api_key: '',
+                            api_key_dirty: false,
                             has_stored_api_key: false,
                             api_key_secret_id: null,
                             api_key_stored_at: null,

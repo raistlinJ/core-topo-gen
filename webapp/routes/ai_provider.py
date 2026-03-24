@@ -2098,7 +2098,10 @@ def _normalize_base_url(raw_value: Any) -> str:
 
 
 def _build_request_headers(*, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
-    headers = {'Accept': 'application/json'}
+    headers = {
+        'Accept': 'application/json',
+        'Connection': 'close',
+    }
     if isinstance(extra_headers, dict):
         for key, value in extra_headers.items():
             key_text = str(key or '').strip()
@@ -2133,6 +2136,7 @@ def _post_json(
     timeout: float,
     headers: dict[str, str] | None = None,
     verify_ssl: bool = True,
+    on_open: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     body = json.dumps(payload).encode('utf-8')
     request_obj = Request(
@@ -2142,7 +2146,7 @@ def _post_json(
         method='POST',
     )
     raw = _run_with_wall_clock_timeout(
-        lambda: _read_response_text(request_obj, timeout=timeout, verify_ssl=verify_ssl),
+        lambda: _read_response_text(request_obj, timeout=timeout, verify_ssl=verify_ssl, on_open=on_open),
         timeout_seconds=timeout,
     )
     data = json.loads(raw)
@@ -2160,8 +2164,10 @@ def _urlopen_kwargs_for_request(request_obj: Request, *, verify_ssl: bool) -> di
     return {'context': ssl._create_unverified_context()}
 
 
-def _read_response_text(request_obj: Request, *, timeout: float, verify_ssl: bool = True) -> str:
+def _read_response_text(request_obj: Request, *, timeout: float, verify_ssl: bool = True, on_open: Callable[[Any], None] | None = None) -> str:
     with urlopen(request_obj, timeout=timeout, **_urlopen_kwargs_for_request(request_obj, verify_ssl=verify_ssl)) as response:
+        if callable(on_open):
+            on_open(response)
         return response.read().decode('utf-8')
 
 

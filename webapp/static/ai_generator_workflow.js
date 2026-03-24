@@ -24,6 +24,18 @@
             return text;
         }
 
+        function resolveAiGeneratorApiKey(aiState) {
+            const provider = String((aiState && aiState.provider) || '').trim().toLowerCase();
+            const raw = String((aiState && aiState.api_key) || '').trim();
+            if (provider !== 'litellm') {
+                return raw;
+            }
+            if (!aiState || aiState.has_stored_api_key !== true) {
+                return raw;
+            }
+            return aiState.api_key_dirty === true ? raw : '';
+        }
+
         function extractCountIntent(promptValue) {
             const text = String(promptValue || '').toLowerCase();
             const totalNodesMatch = text.match(/\b(?:topology|scenario)\s+with\s+(\d+)\s+nodes?\b|\b(\d+)\s+total\s+nodes?\b|\b(\d+)\s+nodes?\b/);
@@ -302,7 +314,7 @@
                     body: JSON.stringify({
                         provider: aiState.provider,
                         base_url: aiState.base_url,
-                        api_key: aiState.api_key || '',
+                        api_key: resolveAiGeneratorApiKey(aiState),
                         enforce_ssl: aiState.enforce_ssl === false ? false : true,
                         model: aiState.model,
                         ...deps.buildAiGeneratorBridgePayload(aiState),
@@ -427,7 +439,7 @@
                     body: JSON.stringify({
                         provider: aiState.provider,
                         base_url: aiState.base_url,
-                        api_key: aiState.api_key || '',
+                        api_key: resolveAiGeneratorApiKey(aiState),
                         enforce_ssl: aiState.enforce_ssl === false ? false : true,
                         model: '',
                         bridge_mode: normalizeBridgeMode(aiState.bridge_mode || 'mcp-python-sdk'),
@@ -605,7 +617,7 @@
                     request_id: streamApi.createRequestId(),
                     provider: aiState.provider,
                     base_url: aiState.base_url,
-                    api_key: aiState.api_key || '',
+                    api_key: resolveAiGeneratorApiKey(aiState),
                     enforce_ssl: aiState.enforce_ssl === false ? false : true,
                     model: aiState.model,
                     skip_bridge: aiState.skip_bridge === true,

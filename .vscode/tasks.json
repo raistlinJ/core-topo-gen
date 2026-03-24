@@ -308,6 +308,21 @@
 				"listed_vulnerability_requests or compiles_listed_vulnerability_requests_as_multiple_targets or mcp_bridge_generate_refreshes_preview_from_final_scenario or canonicalizes_specific_vuln_name_from_matching_path"
 			],
 			"isBackground": false
+		},
+		{
+			"label": "Live Builder Probe User Endpoint",
+			"type": "shell",
+			"command": "./.venv312/bin/python",
+			"args": [
+				"scripts/_tmp_live_builder_probe.py",
+				"--provider-base",
+				"https://acostanet.ddns.net:64644",
+				"--api-key",
+				"sk-tGTH7LjOjFUUBpIPu662bQ",
+				"--model",
+				"qwen3.5:35b"
+			],
+			"isBackground": false
 		}
 	]
 }
