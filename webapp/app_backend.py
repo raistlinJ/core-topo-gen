@@ -5110,9 +5110,7 @@ def _grpc_save_current_session_xml_with_config(
     try:
         ssh_user = (ssh_cfg.get('ssh_username') or '').strip() or '<unknown>'
         ssh_host = str(ssh_cfg.get('ssh_host') or ssh_cfg.get('host') or 'localhost').strip() or 'localhost'
-        remote_target_host = str(ssh_cfg.get('host') or CORE_HOST or 'localhost').strip() or 'localhost'
-        if remote_target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
-            remote_target_host = '127.0.0.1'
+        remote_target_host = _remote_core_target_host(ssh_cfg)
         remote_target_port = int(ssh_cfg.get('port') or CORE_PORT)
         address = f'{remote_target_host}:{remote_target_port}'
         remote_filename = (
@@ -5287,6 +5285,17 @@ def _require_core_ssh_credentials(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _remote_core_target_host(core_cfg: Dict[str, Any], *, default: str = 'localhost') -> str:
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    ssh_host = str(cfg.get('ssh_host') or cfg.get('host') or default).strip() or default
+    target_host = str(cfg.get('host') or default).strip() or default
+    if target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
+        return '127.0.0.1'
+    if target_host == ssh_host:
+        return '127.0.0.1'
+    return target_host
+
+
 def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -> Dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -5436,6 +5445,33 @@ def _merge_core_configs(*configs: Any, include_password: bool = True) -> Dict[st
     if extras:
         merged.update(extras)
     return merged
+
+
+def _prefer_explicit_or_ssh_core_host(core_cfg: Dict[str, Any], *raw_configs: Any) -> Dict[str, Any]:
+    if not isinstance(core_cfg, dict):
+        return core_cfg
+
+    preferred_ssh_host = ''
+    for raw in reversed(raw_configs):
+        if not isinstance(raw, dict) or not raw:
+            continue
+        explicit_host = str(raw.get('grpc_host') or raw.get('host') or '').strip()
+        explicit_secret_id = str(raw.get('core_secret_id') or raw.get('secret_id') or '').strip()
+        if explicit_host or explicit_secret_id:
+            return core_cfg
+        ssh_host = str(raw.get('ssh_host') or '').strip()
+        if ssh_host and not preferred_ssh_host:
+            preferred_ssh_host = ssh_host
+
+    if not preferred_ssh_host:
+        preferred_ssh_host = str(core_cfg.get('ssh_host') or '').strip()
+    if not preferred_ssh_host:
+        return core_cfg
+
+    adjusted = dict(core_cfg)
+    adjusted['host'] = preferred_ssh_host
+    adjusted['grpc_host'] = preferred_ssh_host
+    return adjusted
 
 
 def _core_backend_defaults(*, include_password: bool = True) -> Dict[str, Any]:
@@ -7459,16 +7495,11 @@ def _list_active_core_sessions_via_remote_python(
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
     ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
-    target_host = str(cfg.get('host') or 'localhost').strip() or 'localhost'
+    target_host = _remote_core_target_host(cfg)
     try:
         target_port = int(cfg.get('port') or CORE_PORT)
     except Exception:
         target_port = CORE_PORT
-
-    # This remote script executes on ssh_host, so translate docker-only hostnames
-    # to a loopback address that is correct from the SSH host's perspective.
-    if target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
-        target_host = '127.0.0.1'
     if meta is not None:
         meta['grpc_command'] = (
             f"remote ssh {ssh_user}@{ssh_host} -> CoreGrpcClient.get_sessions {target_host}:{target_port}"
@@ -7531,7 +7562,7 @@ def _exec_ssh_python_probe(client: Any, command: str, *, timeout: float) -> Tupl
 def _ensure_core_daemon_listening(core_cfg: Dict[str, Any], *, timeout: float = 5.0) -> None:
     cfg = _require_core_ssh_credentials(core_cfg)
     _ensure_paramiko_available()
-    daemon_host = str(cfg.get('host') or CORE_HOST or 'localhost').strip() or 'localhost'
+    daemon_host = _remote_core_target_host(cfg)
     if daemon_host in {'0.0.0.0', '::', '::0', '[::]'}:
         daemon_host = '127.0.0.1'
     daemon_port = int(cfg.get('port') or CORE_PORT)
@@ -32038,6 +32069,13 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
         scenario_core_override if isinstance(scenario_core_override, dict) else None,
         include_password=True,
     )
+    core_cfg = _prefer_explicit_or_ssh_core_host(
+        core_cfg,
+        global_core_saved,
+        scenario_core_saved,
+        core_override if isinstance(core_override, dict) else None,
+        scenario_core_override if isinstance(scenario_core_override, dict) else None,
+    )
     # Flag Sequencing (flow.html) invokes via JSON without sending core config.
     try:
         request_provided_core = bool(
@@ -32074,6 +32112,13 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                 core_cfg = _merge_core_configs(core_cfg, selected_cfg, include_password=True)
     except Exception:
         pass
+    core_cfg = _prefer_explicit_or_ssh_core_host(
+        core_cfg,
+        global_core_saved,
+        scenario_core_saved,
+        core_override if isinstance(core_override, dict) else None,
+        scenario_core_override if isinstance(scenario_core_override, dict) else None,
+    )
     try:
         core_cfg = _require_core_ssh_credentials(core_cfg)
     except _SSHTunnelError as exc:
@@ -32207,7 +32252,7 @@ def _run_cli_background_task(run_id: str, job_spec: dict[str, Any]) -> None:
                 pass
     # Note: for local execution, repo sync is not applicable.
 
-    core_host = core_cfg.get('host', '127.0.0.1')
+    core_host = _remote_core_target_host(core_cfg, default='127.0.0.1')
     try:
         core_port = int(core_cfg.get('port', 50051))
     except Exception:
@@ -37171,6 +37216,7 @@ def _parse_flag_test_core_cfg_from_form(form: Any) -> Dict[str, Any] | None:
     if not isinstance(payload, dict):
         raise RuntimeError('Invalid core payload: expected object')
     core_cfg = _merge_core_configs(payload, include_password=True)
+    core_cfg = _prefer_explicit_or_ssh_core_host(core_cfg, payload)
     if not core_cfg.get('host'):
         core_cfg['host'] = core_cfg.get('ssh_host') or '127.0.0.1'
     if not core_cfg.get('port'):

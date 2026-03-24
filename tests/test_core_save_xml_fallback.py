@@ -5,6 +5,32 @@ import contextlib
 from webapp import app_backend as backend
 
 
+def test_remote_core_target_host_rewrites_same_machine_public_host_to_loopback():
+    assert backend._remote_core_target_host(
+        {
+            'host': '129.108.4.37',
+            'port': 50051,
+            'ssh_host': '129.108.4.37',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+            'ssh_password': 'pw',
+        }
+    ) == '127.0.0.1'
+
+
+def test_remote_core_target_host_preserves_distinct_grpc_host():
+    assert backend._remote_core_target_host(
+        {
+            'host': '10.10.10.20',
+            'port': 50051,
+            'ssh_host': '129.108.4.37',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+            'ssh_password': 'pw',
+        }
+    ) == '10.10.10.20'
+
+
 def test_grpc_save_current_session_xml_falls_back_to_remote_python(tmp_path, monkeypatch):
     @contextlib.contextmanager
     def _broken_core_connection(_cfg):

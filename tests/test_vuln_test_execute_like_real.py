@@ -296,3 +296,70 @@ def test_vuln_catalog_batch_prefers_ssh_host_when_core_host_not_explicit(monkeyp
     assert seen['port'] == 50051
     assert seen['core_cfg']['host'] == 'arlsouth1.utep.edu'
     assert seen['core_cfg']['grpc_host'] == 'arlsouth1.utep.edu'
+
+
+def test_run_cli_background_task_prefers_ssh_host_when_override_has_no_explicit_core_host(monkeypatch, tmp_path):
+    xml_path = tmp_path / 'scenario.xml'
+    xml_path.write_text('<Scenarios><Scenario name="Scenario A"><ScenarioEditor/></Scenario></Scenarios>', encoding='utf-8')
+
+    monkeypatch.setattr(app_backend, '_read_flow_state_from_xml_path', lambda path, scenario=None: {})
+    monkeypatch.setattr(app_backend, '_update_flow_state_in_xml', lambda path, scenario, flow_state: None)
+    monkeypatch.setattr(
+        app_backend,
+        '_parse_scenarios_xml',
+        lambda path: {'scenarios': [{'name': 'Scenario A'}], 'core': {}},
+    )
+    monkeypatch.setattr(app_backend, '_load_run_history', lambda: [])
+    monkeypatch.setattr(app_backend, '_normalize_scenario_label', lambda value: str(value or '').strip().lower())
+    monkeypatch.setattr(app_backend, '_select_core_config_for_page', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        app_backend,
+        '_merge_core_configs',
+        lambda *args, **kwargs: {
+            'host': 'host.docker.internal',
+            'grpc_host': 'host.docker.internal',
+            'port': 50051,
+            'grpc_port': 50051,
+            'ssh_enabled': True,
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+            'ssh_password': 'pw',
+        },
+    )
+
+    observed = {}
+
+    def _capture_core_cfg(cfg):
+        observed['host'] = cfg.get('host')
+        observed['grpc_host'] = cfg.get('grpc_host')
+        observed['ssh_host'] = cfg.get('ssh_host')
+        raise app_backend._SSHTunnelError('stop after capture')
+
+    monkeypatch.setattr(app_backend, '_require_core_ssh_credentials', _capture_core_cfg)
+
+    run_id = 'async-host-fallback'
+    app_backend.RUNS[run_id] = {'kind': 'vuln_test', 'log_path': str(tmp_path / 'cli.log')}
+
+    app_backend._run_cli_background_task(
+        run_id,
+        {
+            'xml_path': str(xml_path),
+            'preview_plan_path': str(xml_path),
+            'scenario_name_hint': 'Scenario A',
+            'scenario_index_hint': 0,
+            'core_override': {
+                'ssh_host': 'arlsouth1.utep.edu',
+                'ssh_port': 10000,
+                'ssh_username': 'corevm',
+                'ssh_password': 'pw',
+            },
+            'scenario_core_override': None,
+        },
+    )
+
+    assert observed['host'] == 'arlsouth1.utep.edu'
+    assert observed['grpc_host'] == 'arlsouth1.utep.edu'
+    assert observed['ssh_host'] == 'arlsouth1.utep.edu'
+
+    app_backend.RUNS.pop(run_id, None)

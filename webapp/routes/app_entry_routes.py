@@ -292,6 +292,13 @@ def register(app, *, backend_module: Any) -> None:
             scenario_core_override,
             include_password=True,
         )
+        core_cfg = backend._prefer_explicit_or_ssh_core_host(
+            core_cfg,
+            global_core_saved,
+            scenario_core_saved,
+            core_override,
+            scenario_core_override,
+        )
         try:
             request_provided_core = bool(
                 (isinstance(core_override, dict) and core_override)
@@ -350,6 +357,13 @@ def register(app, *, backend_module: Any) -> None:
                 core_cfg = merged_core_cfg
         except Exception:
             pass
+        core_cfg = backend._prefer_explicit_or_ssh_core_host(
+            core_cfg,
+            global_core_saved,
+            scenario_core_saved,
+            core_override,
+            scenario_core_override,
+        )
         try:
             core_cfg = backend._require_core_ssh_credentials(core_cfg)
         except backend._SSHTunnelError as exc:
