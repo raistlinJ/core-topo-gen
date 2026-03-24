@@ -73,7 +73,6 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'coretg_builder_workspace_state' in body
     assert 'gbInstallSuccessAlert' in body
     assert 'gbOutputInstallBtn' in body
-    assert 'gbTestInstallBtn' in body
     assert '<div class="gb-inline-snapshot d-none" id="gbLatestTestSnapshot"></div>' not in body
     assert 'After Scaffold' not in body
     assert 'Compatibility Checklist' not in body
@@ -130,6 +129,39 @@ def test_generator_builder_template_invalidates_validation_on_model_change_event
 
     missing = [snippet for snippet in expected_snippets if snippet not in text]
     assert not missing, 'Missing Builder model change invalidation snippets: ' + '; '.join(missing)
+
+
+def test_generator_builder_template_shows_install_result_popup_for_success_and_failure() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'function showInstallResultAlert(message, detail = \'\', tone = \'success\') {',
+        'async function showInstallResultPopup({ title, message, detail = \'\', tone = \'success\', installedAs = null } = {}) {',
+        "const resultTone = renameNote ? 'warning' : 'success';",
+        "const resultTitle = renameNote ? 'Installed With New ID' : 'Install Succeeded';",
+        "showInstallResultAlert('Install failed.', message, 'danger');",
+        "title: 'Install Failed',",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder install popup snippets: ' + '; '.join(missing)
+
+
+def test_generator_builder_template_prompts_for_cancel_during_long_waits() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'const GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS = [90000, 180000, 240000, 360000];',
+        'function requestGenerateCancellation(reason = \'Cancellation requested by user.\'',
+        'function scheduleNextGenerateLongWaitPrompt() {',
+        'async function promptForLongRunningGenerationCancel(checkpointMs) {',
+        "cancelLabel: 'Keep Waiting'",
+        'appendTranscriptEvent(`User chose to keep waiting after ${seconds}s.`);',
+        'startGenerateLongWaitPrompts();',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder long-wait cancel prompt snippets: ' + '; '.join(missing)
 
 
 def test_generator_artifacts_index_merges_sources_reserved_and_custom(monkeypatch):
@@ -401,7 +433,7 @@ def test_generator_ai_scaffold_normalizes_model_output(monkeypatch):
     ]
     assert payload['scaffold_request']['runtime_inputs'][1]['sensitive'] is True
     assert captured['url'] == 'http://127.0.0.1:11434/api/generate'
-    assert captured['timeout'] == 240.0
+    assert captured['timeout'] == 480.0
     assert captured['verify_ssl'] is True
     assert captured['payload']['model'] == 'qwen2.5:7b'
     assert captured['payload']['stream'] is False

@@ -1,4 +1,5 @@
 (function (window, document) {
+    const AI_GENERATOR_CANCEL_PROMPT_CHECKPOINTS_MS = [90000, 180000, 240000, 360000];
     const streamState = {
         modal: null,
         outputStarted: false,
@@ -13,6 +14,10 @@
         detail: '',
         outputText: '',
         events: [],
+        startedAt: 0,
+        longWaitPromptTimer: null,
+        longWaitPromptIndex: 0,
+        longWaitPromptActive: false,
     };
     const EVENT_COLLAPSE_THRESHOLD = 900;
     const STREAMING_TAIL_MAX_CHARS = 24000;
@@ -41,6 +46,89 @@
         if (retryBtn) retryBtn.disabled = !!streamState.running || !streamState.canRetry || typeof streamState.retryAction !== 'function';
         if (closeBtn) closeBtn.disabled = !!streamState.running;
         if (headerCloseBtn) headerCloseBtn.disabled = !!streamState.running;
+    }
+
+    function stopLongWaitPrompts() {
+        if (streamState.longWaitPromptTimer) {
+            try { clearTimeout(streamState.longWaitPromptTimer); } catch (e) { }
+            streamState.longWaitPromptTimer = null;
+        }
+        streamState.longWaitPromptIndex = 0;
+        streamState.longWaitPromptActive = false;
+        streamState.startedAt = 0;
+    }
+
+    function scheduleNextLongWaitPrompt() {
+        if (!streamState.running) return;
+        const nextIndex = Number(streamState.longWaitPromptIndex || 0);
+        if (nextIndex >= AI_GENERATOR_CANCEL_PROMPT_CHECKPOINTS_MS.length) return;
+        const checkpointMs = AI_GENERATOR_CANCEL_PROMPT_CHECKPOINTS_MS[nextIndex];
+        const startedAt = Number(streamState.startedAt || Date.now());
+        const elapsedMs = Date.now() - startedAt;
+        const delayMs = Math.max(0, checkpointMs - elapsedMs);
+        if (streamState.longWaitPromptTimer) {
+            try { clearTimeout(streamState.longWaitPromptTimer); } catch (e) { }
+        }
+        streamState.longWaitPromptTimer = window.setTimeout(() => {
+            streamState.longWaitPromptTimer = null;
+            void promptForLongWaitCancel(checkpointMs);
+        }, delayMs);
+    }
+
+    async function promptForLongWaitCancel(checkpointMs) {
+        if (!streamState.running) return;
+        const nextIndex = Number(streamState.longWaitPromptIndex || 0);
+        if (nextIndex >= AI_GENERATOR_CANCEL_PROMPT_CHECKPOINTS_MS.length) return;
+        if (AI_GENERATOR_CANCEL_PROMPT_CHECKPOINTS_MS[nextIndex] !== checkpointMs) {
+            scheduleNextLongWaitPrompt();
+            return;
+        }
+        streamState.longWaitPromptIndex = nextIndex + 1;
+        const seconds = Math.round(Number(checkpointMs || 0) / 1000);
+        appendEvent('Still waiting', `Generation is still running after ${seconds}s.`);
+        if (streamState.longWaitPromptActive) {
+            scheduleNextLongWaitPrompt();
+            return;
+        }
+        streamState.longWaitPromptActive = true;
+        let shouldCancel = false;
+        try {
+            if (typeof window.confirmWithModal === 'function') {
+                shouldCancel = await window.confirmWithModal(
+                    'Still Waiting on Model',
+                    `This AI Generator request has been running for ${seconds} seconds.\n\nIf the model is still processing, you can keep waiting.\n\nWould you like to cancel the current generation?`,
+                    'Cancel Generation',
+                    'danger',
+                    { cancelLabel: 'Keep Waiting' }
+                );
+            } else {
+                shouldCancel = window.confirm(
+                    `This AI Generator request has been running for ${seconds} seconds.\n\nPress OK to cancel generation now.\nPress Cancel to keep waiting.`
+                );
+            }
+        } finally {
+            streamState.longWaitPromptActive = false;
+        }
+        if (!streamState.running) return;
+        if (shouldCancel) {
+            await cancelStream({
+                eventTitle: 'Cancel requested',
+                eventBody: `Cancellation requested after waiting ${seconds}s.`,
+                statusText: 'Cancelling generation...',
+                detailText: 'Stopping the in-flight request after your confirmation.',
+            });
+            return;
+        }
+        appendEvent('Continuing to wait', `User chose to keep waiting after ${seconds}s.`);
+        scheduleNextLongWaitPrompt();
+    }
+
+    function startLongWaitPrompts() {
+        stopLongWaitPrompts();
+        streamState.startedAt = Date.now();
+        streamState.longWaitPromptIndex = 0;
+        streamState.longWaitPromptActive = false;
+        scheduleNextLongWaitPrompt();
     }
 
     function setRetryAction(retryAction) {
@@ -409,10 +497,18 @@
         }
     }
 
-    async function cancelStream() {
+    async function cancelStream(options = {}) {
         if (!streamState.running || !streamState.controller) return;
-        appendEvent('Cancel requested', 'Aborting the active browser request.');
-        setStatus('Cancelling generation...', 'Waiting for the request to stop.', 'danger');
+        stopLongWaitPrompts();
+        appendEvent(
+            (options && options.eventTitle) ? String(options.eventTitle) : 'Cancel requested',
+            (options && options.eventBody) ? String(options.eventBody) : 'Aborting the active browser request.'
+        );
+        setStatus(
+            (options && options.statusText) ? String(options.statusText) : 'Cancelling generation...',
+            (options && options.detailText) ? String(options.detailText) : 'Waiting for the request to stop.',
+            'danger'
+        );
         const requestId = streamState.requestId;
         if (requestId) {
             try {
@@ -432,6 +528,7 @@
 
     function showModal({ scenarioName = '', provider = '', model = '' } = {}) {
         streamState.modal = getModalInstance();
+        stopLongWaitPrompts();
         streamState.outputStarted = false;
         streamState.controller = null;
         streamState.running = false;
@@ -460,6 +557,7 @@
     }
 
     function finishModal(success, detailText = '') {
+        stopLongWaitPrompts();
         streamState.running = false;
         streamState.controller = null;
         streamState.requestId = '';
@@ -522,6 +620,8 @@
         cancelStream,
         retryStream,
         setRetryAction,
+        startLongWaitPrompts,
+        stopLongWaitPrompts,
         showModal,
         finishModal,
         consumeNdjsonStream,

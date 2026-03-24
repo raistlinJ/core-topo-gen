@@ -2025,7 +2025,10 @@ def test_ai_generate_scenario_preview_stream_emits_openai_compatible_progress_st
         },
     }
 
+    captured = {}
+
     def fake_generate_once(self, *, base_url, api_key, model, prompt, timeout_seconds, verify_ssl):
+        captured['timeout_seconds'] = timeout_seconds
         return json.dumps(generated), generated, 'json_object'
 
     monkeypatch.setattr(ai_provider.OpenAiCompatibleProviderAdapter, '_generate_once', fake_generate_once)
@@ -2043,6 +2046,7 @@ def test_ai_generate_scenario_preview_stream_emits_openai_compatible_progress_st
             'bridge_mode': 'mcp-python-sdk',
             'skip_bridge': True,
             'prompt': 'Generate a small offline scenario with two PCs.',
+            'timeout_seconds': 480,
             'scenarios': [scenario],
             'scenario_index': 0,
             'core': {},
@@ -2059,6 +2063,7 @@ def test_ai_generate_scenario_preview_stream_emits_openai_compatible_progress_st
                 events.append(json.loads(line))
 
     status_messages = [str(event.get('message') or '') for event in events if event.get('type') == 'status']
+    assert captured.get('timeout_seconds') == 480.0
     assert any('Contacting OpenAI-compatible endpoint (initial)' in message for message in status_messages)
     assert any('OpenAI-compatible endpoint responded (initial).' in message for message in status_messages)
     result_event = next(event for event in events if event.get('type') == 'result')

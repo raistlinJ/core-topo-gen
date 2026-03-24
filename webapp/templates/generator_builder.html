@@ -856,6 +856,7 @@
   const BUILDER_MODEL_PREFS_KEY = 'coretg_builder_model_config';
   const BUILDER_WORKSPACE_STATE_KEY = 'coretg_builder_workspace_state';
   const BUILDER_TEST_SSH_KEY = 'coretg_builder_test_ssh';
+  const GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS = [90000, 180000, 240000, 360000];
 
   const state = {
     catalog: { ...fallbackCatalog },
@@ -881,6 +882,10 @@
     generateInFlight: false,
     generateAbortController: null,
     generateCancelRequested: false,
+    generateStartedAt: 0,
+    generateLongWaitPromptTimer: null,
+    generateLongWaitPromptIndex: 0,
+    generateLongWaitPromptActive: false,
     lastGenerateMode: 'create',
     transcriptEvents: [],
     transcriptThinkingText: '',
@@ -2539,6 +2544,53 @@
     persistBuilderWorkspaceState();
   }
 
+  function resetInstallResultAlert() {
+    if (!elements.installSuccessAlert) return;
+    elements.installSuccessAlert.className = 'alert alert-success alert-dismissible fade d-none mb-3';
+    elements.installSuccessAlert.classList.remove('show');
+    if (elements.installSuccessText) elements.installSuccessText.textContent = 'Generator added to catalog.';
+    if (elements.installSuccessMeta) elements.installSuccessMeta.textContent = '';
+  }
+
+  function showInstallResultAlert(message, detail = '', tone = 'success') {
+    if (!elements.installSuccessAlert) return;
+    elements.installSuccessAlert.className = `alert alert-${tone} alert-dismissible fade show mb-3`;
+    elements.installSuccessAlert.classList.remove('d-none');
+    if (elements.installSuccessText) elements.installSuccessText.textContent = String(message || 'Generator added to catalog.');
+    if (elements.installSuccessMeta) elements.installSuccessMeta.textContent = String(detail || '');
+  }
+
+  function buildInstallResultPopupHtml(message, detail = '', installedAs = null) {
+    const installed = installedAs && typeof installedAs === 'object' ? installedAs : {};
+    const rows = [];
+    if (installed.name) rows.push(`<div><strong>Name:</strong> ${escapeHtml(String(installed.name || ''))}</div>`);
+    if (installed.plugin_id) rows.push(`<div><strong>ID:</strong> ${escapeHtml(String(installed.plugin_id || ''))}</div>`);
+    if (installed.folder_name) rows.push(`<div><strong>Folder:</strong> ${escapeHtml(String(installed.folder_name || ''))}</div>`);
+    return [
+      `<div class="mb-2">${escapeHtml(String(message || ''))}</div>`,
+      detail ? `<div class="small text-muted mb-2">${escapeHtml(String(detail || ''))}</div>` : '',
+      rows.length ? `<div class="small">${rows.join('')}</div>` : '',
+    ].filter(Boolean).join('');
+  }
+
+  async function showInstallResultPopup({ title, message, detail = '', tone = 'success', installedAs = null } = {}) {
+    const popupTitle = String(title || 'Install Result').trim() || 'Install Result';
+    const popupMessage = String(message || '').trim() || 'Generator Builder finished the install step.';
+    const popupDetail = String(detail || '').trim();
+    const popupTone = String(tone || 'success').trim() || 'success';
+    if (typeof window.alertWithModal === 'function') {
+      await window.alertWithModal(
+        popupTitle,
+        buildInstallResultPopupHtml(popupMessage, popupDetail, installedAs),
+        'Close',
+        popupTone,
+        { allowHtml: true }
+      );
+      return;
+    }
+    window.alert([popupTitle, popupMessage, popupDetail].filter(Boolean).join('\n\n'));
+  }
+
   function formatEventTime(date = new Date()) {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
@@ -2787,6 +2839,111 @@
     }
   }
 
+  function stopGenerateLongWaitPrompts() {
+    if (state.generateLongWaitPromptTimer) {
+      try { clearTimeout(state.generateLongWaitPromptTimer); } catch (e) {}
+      state.generateLongWaitPromptTimer = null;
+    }
+    state.generateLongWaitPromptIndex = 0;
+    state.generateLongWaitPromptActive = false;
+    state.generateStartedAt = 0;
+  }
+
+  function requestGenerateCancellation(reason = 'Cancellation requested by user.', overlayTitle = 'Cancelling generation…', overlayDetail = 'Waiting for the current request to stop cleanly.') {
+    if (!state.generateInFlight || !state.generateAbortController) return false;
+    state.generateCancelRequested = true;
+    stopGenerateLongWaitPrompts();
+    setGenerateOverlay(true, overlayTitle, overlayDetail);
+    appendTranscriptEvent(reason);
+    if (state.generateRequestId) {
+      fetch('/api/generators/ai_scaffold_stream/cancel', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ request_id: state.generateRequestId }),
+      }).catch(() => null);
+    }
+    try {
+      state.generateAbortController.abort();
+    } catch (e) {}
+    return true;
+  }
+
+  function scheduleNextGenerateLongWaitPrompt() {
+    if (!state.generateInFlight || state.generateCancelRequested) return;
+    const nextIndex = Number(state.generateLongWaitPromptIndex || 0);
+    if (nextIndex >= GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS.length) return;
+    const checkpointMs = GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS[nextIndex];
+    const startedAt = Number(state.generateStartedAt || Date.now());
+    const elapsedMs = Date.now() - startedAt;
+    const delayMs = Math.max(0, checkpointMs - elapsedMs);
+    if (state.generateLongWaitPromptTimer) {
+      try { clearTimeout(state.generateLongWaitPromptTimer); } catch (e) {}
+    }
+    state.generateLongWaitPromptTimer = window.setTimeout(() => {
+      state.generateLongWaitPromptTimer = null;
+      promptForLongRunningGenerationCancel(checkpointMs).catch(() => null);
+    }, delayMs);
+  }
+
+  async function promptForLongRunningGenerationCancel(checkpointMs) {
+    if (!state.generateInFlight || state.generateCancelRequested) return;
+    const nextIndex = Number(state.generateLongWaitPromptIndex || 0);
+    if (nextIndex >= GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS.length) return;
+    if (GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS[nextIndex] !== checkpointMs) {
+      scheduleNextGenerateLongWaitPrompt();
+      return;
+    }
+    state.generateLongWaitPromptIndex = nextIndex + 1;
+    const seconds = Math.round(Number(checkpointMs || 0) / 1000);
+    appendTranscriptEvent(`Generation is still running after ${seconds}s.`);
+    if (state.generateLongWaitPromptActive) {
+      scheduleNextGenerateLongWaitPrompt();
+      return;
+    }
+    state.generateLongWaitPromptActive = true;
+    let shouldCancel = false;
+    try {
+      if (typeof window.confirmWithModal === 'function') {
+        shouldCancel = await window.confirmWithModal(
+          'Still Waiting on Model',
+          `This generation request has been running for ${seconds} seconds.\n\nIf the model is still processing, you can keep waiting.\n\nWould you like to cancel the current generation?`,
+          'Cancel Generation',
+          'danger',
+          { cancelLabel: 'Keep Waiting' }
+        );
+      } else {
+        shouldCancel = window.confirm(
+          `This generation request has been running for ${seconds} seconds.\n\nPress OK to cancel generation now.\nPress Cancel to keep waiting.`
+        );
+      }
+    } finally {
+      state.generateLongWaitPromptActive = false;
+    }
+    if (!state.generateInFlight || state.generateCancelRequested) return;
+    if (shouldCancel) {
+      requestGenerateCancellation(
+        `Cancellation requested after waiting ${seconds}s.`,
+        'Cancelling generation…',
+        'Stopping the in-flight model request after your confirmation.'
+      );
+      return;
+    }
+    appendTranscriptEvent(`User chose to keep waiting after ${seconds}s.`);
+    scheduleNextGenerateLongWaitPrompt();
+  }
+
+  function startGenerateLongWaitPrompts() {
+    stopGenerateLongWaitPrompts();
+    state.generateStartedAt = Date.now();
+    state.generateLongWaitPromptIndex = 0;
+    state.generateLongWaitPromptActive = false;
+    scheduleNextGenerateLongWaitPrompt();
+  }
+
   function setGenerateBusy(isBusy) {
     state.generateInFlight = !!isBusy;
     if (elements.testBtn) elements.testBtn.disabled = !!isBusy || !state.scaffoldRequest;
@@ -2804,6 +2961,7 @@
       elements.downloadReadmeBtn.disabled = !!isBusy || !Object.keys(state.scaffoldFiles || {}).some((path) => path.endsWith('/README.md'));
     }
     if (!isBusy) {
+      stopGenerateLongWaitPrompts();
       setGenerateOverlay(false);
       state.generateCancelRequested = false;
       state.generateAbortController = null;
@@ -3224,6 +3382,7 @@
     state.generateCancelRequested = false;
     state.generateAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
     setGenerateBusy(true);
+    startGenerateLongWaitPrompts();
     openStreamModal(mode, payload);
     setGenerateOverlay(
       true,
@@ -3355,6 +3514,7 @@
     if (!state.scaffoldRequest) {
       throw new Error('Generate a scaffold first.');
     }
+    resetInstallResultAlert();
     setGenerationStatus('Installing current scaffold into the generator catalog...', 'info');
     const resp = await fetch('/api/generators/install_generated', {
       method: 'POST',
@@ -3383,19 +3543,24 @@
       status: `added to catalog as ${installedId || successLabel}`,
     });
     const renameNote = String((payload && payload.rename_note) || '').trim();
+    const resultTone = renameNote ? 'warning' : 'success';
+    const resultTitle = renameNote ? 'Installed With New ID' : 'Install Succeeded';
     const confirmationText = installedId && installedName
       ? `Added to catalog as ${installedName} (${installedId}).`
       : `Added to catalog as ${successLabel}.`;
-    if (elements.installSuccessText) elements.installSuccessText.textContent = confirmationText;
-    if (elements.installSuccessMeta) elements.installSuccessMeta.textContent = renameNote || String((payload && payload.message) || 'Generator added to catalog.');
-    if (elements.installSuccessAlert) {
-      elements.installSuccessAlert.classList.remove('d-none');
-      elements.installSuccessAlert.classList.add('show');
-    }
+    const resultDetail = renameNote || String((payload && payload.message) || 'Generator added to catalog.');
+    showInstallResultAlert(confirmationText, resultDetail, resultTone);
     if (typeof window.showToast === 'function') {
       window.showToast(confirmationText, { force: true, title: 'Generator Builder', autohide: true, delay: 3500 });
     }
-    setGenerationStatus([confirmationText, renameNote || String(payload.message || '')].filter(Boolean).join(' '), 'success');
+    setGenerationStatus([confirmationText, resultDetail].filter(Boolean).join(' '), resultTone);
+    await showInstallResultPopup({
+      title: resultTitle,
+      message: confirmationText,
+      detail: resultDetail,
+      tone: resultTone,
+      installedAs,
+    });
   }
 
   function loadExamplePrompt() {
@@ -3599,7 +3764,15 @@
       try {
         await installGenerated();
       } catch (err) {
-        setGenerationStatus(String((err && err.message) || err || 'Install failed.'), 'danger');
+        const message = String((err && err.message) || err || 'Install failed.');
+        showInstallResultAlert('Install failed.', message, 'danger');
+        setGenerationStatus(message, 'danger');
+        await showInstallResultPopup({
+          title: 'Install Failed',
+          message: 'Generator Builder could not install the current scaffold.',
+          detail: message,
+          tone: 'danger',
+        });
       }
     });
   });
@@ -3694,24 +3867,7 @@
   });
   if (elements.generateCancelBtn) {
     elements.generateCancelBtn.addEventListener('click', () => {
-      if (!state.generateInFlight || !state.generateAbortController) return;
-      state.generateCancelRequested = true;
-      setGenerateOverlay(true, 'Cancelling generation…', 'Waiting for the current request to stop cleanly.');
-      appendTranscriptEvent('Cancellation requested by user.');
-      if (state.generateRequestId) {
-        fetch('/api/generators/ai_scaffold_stream/cancel', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ request_id: state.generateRequestId }),
-        }).catch(() => null);
-      }
-      try {
-        state.generateAbortController.abort();
-      } catch (e) {}
+      requestGenerateCancellation();
     });
   }
   elements.streamHeaderCloseBtn.addEventListener('click', () => showBuildTab(elements.buildTabPromptBtn));

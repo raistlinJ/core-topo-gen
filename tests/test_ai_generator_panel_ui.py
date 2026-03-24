@@ -252,6 +252,35 @@ def test_ai_generator_stream_defaults_activity_auto_follow_on() -> None:
     assert not missing, "Missing AI Generator activity auto-follow stream snippets: " + "; ".join(missing)
 
 
+def test_ai_generator_stream_prompts_for_cancel_during_long_waits() -> None:
+    text = AI_STREAM_PATH.read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'const AI_GENERATOR_CANCEL_PROMPT_CHECKPOINTS_MS = [90000, 180000, 240000, 360000];',
+        'function scheduleNextLongWaitPrompt() {',
+        'async function promptForLongWaitCancel(checkpointMs) {',
+        "cancelLabel: 'Keep Waiting'",
+        "Cancellation requested after waiting ${seconds}s.",
+        'function startLongWaitPrompts() {',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator long-wait cancel prompt snippets: " + "; ".join(missing)
+
+
+def test_ai_generator_workflow_requests_extended_timeout_and_starts_long_wait_prompts() -> None:
+    text = (Path(__file__).resolve().parent.parent / "webapp" / "static" / "ai_generator_workflow.js").read_text(encoding="utf-8", errors="ignore")
+
+    expected_snippets = [
+        'timeout_seconds: 480,',
+        "if (typeof streamApi.startLongWaitPrompts === 'function') {",
+        'streamApi.startLongWaitPrompts();',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, "Missing AI Generator workflow long-wait prompt snippets: " + "; ".join(missing)
+
+
 
 def test_index_bootstrap_caches_ai_provider_catalog_for_panel() -> None:
     text = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")

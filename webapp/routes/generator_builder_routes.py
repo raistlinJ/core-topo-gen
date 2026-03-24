@@ -407,9 +407,9 @@ def _build_builder_ai_scaffold_result(
         base_url = ai_provider_routes._normalize_base_url(base_url)
     timeout_seconds = ai_provider_routes._normalize_bridge_timeout_seconds(
         payload.get('timeout_seconds'),
-        default=240.0,
+        default=480.0,
         low=5.0,
-        high=240.0,
+        high=480.0,
     )
 
     direct_prompt = _build_direct_generation_prompt(messages)

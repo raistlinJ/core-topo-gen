@@ -627,6 +627,7 @@
                     core: deps.getCoreConfig(true),
                     scenario_index: idx,
                     seed: scenarioSeed,
+                    timeout_seconds: 480,
                 };
                 streamApi.showModal({
                     scenarioName: scenario.name || `Scenario ${idx + 1}`,
@@ -637,6 +638,9 @@
                 streamApi.state.controller = streamController;
                 streamApi.state.running = true;
                 streamApi.state.requestId = requestBody.request_id;
+                if (typeof streamApi.startLongWaitPrompts === 'function') {
+                    streamApi.startLongWaitPrompts();
+                }
                 streamApi.updateButtons();
                 const resp = await fetch('/api/ai/generate_scenario_preview_stream', {
                     method: 'POST',

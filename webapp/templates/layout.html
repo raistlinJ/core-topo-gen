@@ -348,6 +348,7 @@
                 const previousActive = document.activeElement instanceof HTMLElement ? document.activeElement : null;
                 let result = false;
                 const hideCancel = !!(options && options.hideCancel);
+                const cancelLabel = String((options && options.cancelLabel) || 'Cancel');
 
                 if (titleEl) titleEl.textContent = title;
                 if (bodyEl) {
@@ -361,6 +362,7 @@
                 }
                 try {
                     if (cancelBtn instanceof HTMLElement) {
+                        cancelBtn.textContent = cancelLabel;
                         cancelBtn.style.display = hideCancel ? 'none' : '';
                     }
                     if (closeBtn instanceof HTMLElement) {
@@ -402,6 +404,7 @@
                     modalEl.removeEventListener('hidden.bs.modal', hiddenHandler);
                     try {
                         if (cancelBtn instanceof HTMLElement) {
+                            cancelBtn.textContent = 'Cancel';
                             cancelBtn.style.display = '';
                         }
                         if (closeBtn instanceof HTMLElement) {

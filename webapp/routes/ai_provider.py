@@ -5026,7 +5026,7 @@ def _generate_ollama_streaming_result(
         timeout_seconds = float(timeout_raw) if timeout_raw is not None else 90.0
     except (TypeError, ValueError):
         timeout_seconds = 90.0
-    timeout_seconds = min(max(timeout_seconds, 5.0), 240.0)
+    timeout_seconds = min(max(timeout_seconds, 5.0), 480.0)
 
     def _generate_once_streaming(*, prompt: str) -> tuple[str, dict[str, Any], str]:
         format_mode: dict[str, Any] | str = _scenario_generation_schema()
@@ -5271,7 +5271,7 @@ class OllamaProviderAdapter(ProviderAdapter):
             timeout_seconds = float(timeout_raw) if timeout_raw is not None else 90.0
         except (TypeError, ValueError):
             timeout_seconds = 90.0
-        timeout_seconds = min(max(timeout_seconds, 5.0), 240.0)
+        timeout_seconds = min(max(timeout_seconds, 5.0), 480.0)
 
         prompt = _build_ollama_prompt(current_scenario, user_prompt)
         provider_attempts: list[dict[str, Any]] = []
@@ -5564,7 +5564,7 @@ class OpenAiCompatibleProviderAdapter(ProviderAdapter):
             timeout_seconds = float(timeout_raw) if timeout_raw is not None else 90.0
         except (TypeError, ValueError):
             timeout_seconds = 90.0
-        timeout_seconds = min(max(timeout_seconds, 5.0), 240.0)
+        timeout_seconds = min(max(timeout_seconds, 5.0), 480.0)
 
         api_key = str(payload.get('api_key') or '').strip()
         prompt = _build_ollama_prompt(current_scenario, user_prompt)
