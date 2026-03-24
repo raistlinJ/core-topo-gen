@@ -916,6 +916,30 @@
   let pendingBuilderCleanupRunId = null;
   let pendingBuilderCleanupTestBase = null;
 
+  function redactBuilderSensitiveText(line, extraTokens = []) {
+    let text = String(line || '');
+    const patterns = [
+      /((?:"(?:ssh_)?password"|'(?:ssh_)?password'|(?:ssh_)?password)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^,\s}\]]+)/gi,
+      /((?:"(?:token|secret|api[_-]?key)"|'(?:token|secret|api[_-]?key)'|(?:token|secret|api[_-]?key))\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^,\s}\]]+)/gi,
+    ];
+    patterns.forEach((pattern) => {
+      text = text.replace(pattern, '$1[REDACTED]');
+    });
+    const tokens = [];
+    try {
+      const pw = String(builderTestState?.testCoreCfg?.ssh_password || '');
+      if (pw.length >= 3) tokens.push(pw);
+    } catch (e) {}
+    (Array.isArray(extraTokens) ? extraTokens : []).forEach((token) => {
+      const value = String(token || '');
+      if (value.length >= 3) tokens.push(value);
+    });
+    for (const token of Array.from(new Set(tokens))) {
+      text = text.split(token).join('[REDACTED]');
+    }
+    return text;
+  }
+
   function escapeHtml(text) {
     return String(text || '')
       .replace(/&/g, '&amp;')
@@ -1177,10 +1201,10 @@
       elements.testStatus.textContent = String(saved.testStatusText || (hasSuccessfulBuilderTest() ? 'Restored latest successful Builder test result.' : 'No local test run yet.'));
     }
     if (elements.testStdout) {
-      elements.testStdout.textContent = String(saved.testStdout || 'No output yet.');
+      elements.testStdout.textContent = redactBuilderSensitiveText(String(saved.testStdout || 'No output yet.'));
     }
     if (elements.testStderr) {
-      elements.testStderr.textContent = String(saved.testStderr || 'No output yet.');
+      elements.testStderr.textContent = redactBuilderSensitiveText(String(saved.testStderr || 'No output yet.'));
     }
     const logEl = document.getElementById('gbGenTestLog');
     if (logEl) {
@@ -1321,7 +1345,7 @@
   function setBuilderTestLogLine(line) {
     const el = document.getElementById('gbGenTestLog');
     if (!el) return;
-    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.textContent = (el.textContent || '') + redactBuilderSensitiveText(line) + '\n';
     el.scrollTop = el.scrollHeight;
   }
 
@@ -1453,7 +1477,7 @@
   function setBuilderCleanupLogLine(line) {
     const el = document.getElementById('gbGenTestCleanupLog');
     if (!el) return;
-    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.textContent = (el.textContent || '') + redactBuilderSensitiveText(line) + '\n';
     el.scrollTop = el.scrollHeight;
   }
 
@@ -1558,10 +1582,10 @@
     pushFiles('Scaffold', scaffold, 'scaffold');
     pushFiles('Log', misc, 'logs');
     renderTestFiles(rows.map((row) => ({ path: row.path, size: row.size, desc: row.desc, href: row.href, text: null })));
-    elements.testStdout.textContent = document.getElementById('gbGenTestLog')?.textContent || 'No output yet.';
+    elements.testStdout.textContent = redactBuilderSensitiveText(document.getElementById('gbGenTestLog')?.textContent || 'No output yet.');
     const failureSummary = String((data && data.failure_summary) || '').trim();
     const logTail = String((data && data.log_tail) || '').trim();
-    elements.testStderr.textContent = failureSummary || logTail || 'See the test dialog progress log for the full run transcript.';
+    elements.testStderr.textContent = redactBuilderSensitiveText(failureSummary || logTail || 'See the test dialog progress log for the full run transcript.');
     const returncode = data && Object.prototype.hasOwnProperty.call(data, 'returncode') ? data.returncode : null;
     if (data && data.done) {
       setTestStatus(returncode === 0 ? `Test completed successfully (rc=${returncode}).` : `Test finished with rc=${returncode == null ? 'n/a' : returncode}.`, returncode === 0 ? 'success' : 'danger');
@@ -3488,8 +3512,8 @@
     });
     const payload = await resp.json().catch(() => ({}));
     state.lastTestResult = payload;
-    elements.testStdout.textContent = String(payload.stdout || '');
-    elements.testStderr.textContent = String(payload.stderr || '');
+    elements.testStdout.textContent = redactBuilderSensitiveText(String(payload.stdout || ''));
+    elements.testStderr.textContent = redactBuilderSensitiveText(String(payload.stderr || ''));
     renderTestFiles(payload.files || []);
     if (!resp.ok || payload.ok === false) {
       recordIteration({

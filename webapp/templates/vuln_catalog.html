@@ -1270,6 +1270,11 @@
     _vulnCatalogState.testCoreCfg = creds;
     const payload = _collectVulnBatchFilters();
     _setText('vulnBatchMeta', 'Starting batch run…');
+    const canProceed = await _ensureCoreVmReadyForVulnTest(creds);
+    if (!canProceed) {
+      _setText('vulnBatchMeta', 'Batch run cancelled.');
+      return;
+    }
     const result = await _postJson('/vuln_catalog_items/batch/start', {
       scope: payload.scope,
       query: payload.query,

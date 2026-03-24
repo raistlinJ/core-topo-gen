@@ -82,6 +82,12 @@ def test_flag_catalog_template_redacts_sensitive_test_log_lines() -> None:
     assert '_redactSensitiveTestLine(line)' in text
 
 
+def test_flag_catalog_batch_reuses_core_session_prompt() -> None:
+    text = FLAG_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'const canProceed = await ensureCoreVmReadyForGenTest(creds);' in text
+    assert "if (metaEl) metaEl.textContent = 'Batch run cancelled.';" in text
+
+
 def test_flag_generators_data_includes_duplicate_installed_pack_entries(tmp_path, monkeypatch):
     install_root = tmp_path / 'installed_generators'
     duplicate_a = install_root / 'flag_generators' / 'p_pack_a__5'

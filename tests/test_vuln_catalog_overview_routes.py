@@ -78,3 +78,9 @@ def test_vuln_catalog_template_redacts_sensitive_test_log_lines() -> None:
     text = VULN_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
     assert 'function _redactSensitiveVulnLogLine(line, extraTokens = [])' in text
     assert 'const text = _redactSensitiveVulnLogLine(line);' in text
+
+
+def test_vuln_catalog_batch_reuses_core_session_prompt() -> None:
+    text = VULN_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'const canProceed = await _ensureCoreVmReadyForVulnTest(creds);' in text
+    assert "_setText('vulnBatchMeta', 'Batch run cancelled.');" in text

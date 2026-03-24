@@ -78,12 +78,19 @@ def test_generator_builder_page_renders(monkeypatch):
     assert 'Compatibility Checklist' not in body
     assert 'Test &amp; Iterate' not in body
     assert 'Advanced <span class="gb-optional-badge">Optional</span>' not in body
-    assert 'Test Configuration' not in body
-    assert 'Install & downloads' not in body
-    assert 'Normalized manifest.yaml' not in body
-    assert 'Raw model response' not in body
-    assert 'Prompt Intent Preview' not in body
-    assert 'gbPromptIntentPreview' not in body
+
+
+def test_generator_builder_template_redacts_sensitive_test_output() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'function redactBuilderSensitiveText(line, extraTokens = [])' in text
+    assert "elements.testStdout.textContent = redactBuilderSensitiveText(String(payload.stdout || ''));" in text
+    assert "elements.testStderr.textContent = redactBuilderSensitiveText(String(payload.stderr || ''));" in text
+    assert 'Test Configuration' not in text
+    assert 'Install & downloads' not in text
+    assert 'Normalized manifest.yaml' not in text
+    assert 'Raw model response' not in text
+    assert 'Prompt Intent Preview' not in text
+    assert 'gbPromptIntentPreview' not in text
 
 
 def test_generator_builder_template_aggregates_thinking_and_scrolls_latest_activity() -> None:

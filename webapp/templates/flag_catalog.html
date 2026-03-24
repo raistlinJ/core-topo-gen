@@ -2499,6 +2499,11 @@
     const payload = collectFlagBatchFilters();
     const metaEl = flagBatchEl('flagBatchMeta');
     if (metaEl) metaEl.textContent = 'Starting batch run…';
+    const canProceed = await ensureCoreVmReadyForGenTest(creds);
+    if (!canProceed) {
+      if (metaEl) metaEl.textContent = 'Batch run cancelled.';
+      return;
+    }
     const result = await fetchJson('/flag_catalog_items/batch/start', {
       method: 'POST',
       headers: {
