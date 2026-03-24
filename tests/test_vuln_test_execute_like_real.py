@@ -1,6 +1,7 @@
 import os
 
 from webapp import app_backend
+from webapp.routes import vuln_catalog_batch
 
 
 def test_vuln_test_build_ephemeral_execute_job_builds_xml_and_job_spec(tmp_path, monkeypatch):
@@ -146,3 +147,152 @@ def test_vuln_catalog_test_start_rejects_active_core_sessions(monkeypatch, tmp_p
         'ok': False,
         'error': 'CORE VM has active session(s). Stop running scenario before testing.',
     }
+
+
+def test_vuln_catalog_test_start_uses_ssh_host_when_core_host_not_explicit(monkeypatch, tmp_path):
+    compose_path = tmp_path / 'catalog-compose.yml'
+    compose_path.write_text("version: '3.8'\nservices:\n  app:\n    image: alpine:latest\n", encoding='utf-8')
+
+    monkeypatch.setattr(app_backend, '_load_vuln_catalogs_state', lambda: {'catalogs': []})
+    monkeypatch.setattr(app_backend, '_get_active_vuln_catalog_entry', lambda _state: {'id': 'cat1'})
+    monkeypatch.setattr(app_backend, '_normalize_vuln_catalog_items', lambda _entry: [{'id': 1, 'name': 'Demo Vuln'}])
+    monkeypatch.setattr(app_backend, '_vuln_catalog_item_abs_compose_path', lambda **_kwargs: str(compose_path))
+    monkeypatch.setattr(
+        app_backend,
+        '_merge_core_configs',
+        lambda *_args, **_kwargs: {
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+            'ssh_password': 'p',
+            'host': 'host.docker.internal',
+            'grpc_host': 'host.docker.internal',
+            'port': 50051,
+            'grpc_port': 50051,
+        },
+    )
+    monkeypatch.setattr(app_backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+
+    seen = {}
+
+    def _fake_list_active_core_sessions(host, port, core_cfg, errors=None, meta=None):
+        seen['host'] = host
+        seen['port'] = port
+        seen['core_cfg'] = dict(core_cfg)
+        return []
+
+    monkeypatch.setattr(app_backend, '_list_active_core_sessions', _fake_list_active_core_sessions)
+    monkeypatch.setattr(
+        app_backend,
+        '_vuln_test_build_ephemeral_execute_job',
+        lambda **_kwargs: ({
+            'seed': None,
+            'xml_path': str(tmp_path / 'ephemeral.xml'),
+            'preview_plan_path': str(tmp_path / 'ephemeral.xml'),
+            'core_override': {'ssh_host': 'arlsouth1.utep.edu'},
+            'scenario_name_hint': 'vuln-test',
+            'scenario_for_plan': 'vuln-test',
+        }, None),
+    )
+    monkeypatch.setattr(app_backend, '_run_cli_background_task', lambda *_args, **_kwargs: None)
+
+    class _DummyThread:
+        def __init__(self, target=None, args=(), kwargs=None, name=None, daemon=None):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(app_backend.threading, 'Thread', _DummyThread)
+
+    app_backend.app.config['TESTING'] = True
+    client = app_backend.app.test_client()
+    login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert login_resp.status_code in (200, 302)
+
+    resp = client.post(
+        '/vuln_catalog_items/test/start',
+        json={
+            'item_id': 1,
+            'core': {
+                'ssh_host': 'arlsouth1.utep.edu',
+                'ssh_port': 10000,
+                'ssh_username': 'corevm',
+                'ssh_password': 'p',
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    assert seen['host'] == 'arlsouth1.utep.edu'
+    assert seen['port'] == 50051
+    assert seen['core_cfg']['host'] == 'arlsouth1.utep.edu'
+    assert seen['core_cfg']['grpc_host'] == 'arlsouth1.utep.edu'
+
+    run_id = str((resp.get_json() or {}).get('run_id') or '')
+    if run_id:
+        app_backend.RUNS.pop(run_id, None)
+
+
+def test_vuln_catalog_batch_prefers_ssh_host_when_core_host_not_explicit(monkeypatch, tmp_path):
+    compose_path = tmp_path / 'catalog-compose.yml'
+    compose_path.write_text("version: '3.8'\nservices:\n  app:\n    image: alpine:latest\n", encoding='utf-8')
+
+    monkeypatch.setattr(app_backend, '_vuln_catalog_item_abs_compose_path', lambda **_kwargs: str(compose_path))
+    monkeypatch.setattr(
+        app_backend,
+        '_merge_core_configs',
+        lambda *_args, **_kwargs: {
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+            'ssh_password': 'p',
+            'host': 'host.docker.internal',
+            'grpc_host': 'host.docker.internal',
+            'port': 50051,
+            'grpc_port': 50051,
+        },
+    )
+    monkeypatch.setattr(app_backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+
+    seen = {}
+
+    def _fake_list_active_core_sessions(host, port, core_cfg, errors=None, meta=None):
+        seen['host'] = host
+        seen['port'] = port
+        seen['core_cfg'] = dict(core_cfg)
+        return []
+
+    monkeypatch.setattr(app_backend, '_list_active_core_sessions', _fake_list_active_core_sessions)
+    monkeypatch.setattr(
+        app_backend,
+        '_vuln_test_build_ephemeral_execute_job',
+        lambda **_kwargs: ({
+            'seed': None,
+            'xml_path': str(tmp_path / 'ephemeral.xml'),
+            'preview_plan_path': str(tmp_path / 'ephemeral.xml'),
+            'core_override': {'ssh_host': 'arlsouth1.utep.edu'},
+            'scenario_name_hint': 'vuln-test',
+            'scenario_for_plan': 'vuln-test',
+        }, None),
+    )
+
+    payload, status = vuln_catalog_batch._start_execute_like_real_vuln_test(
+        app_backend,
+        item={'id': 1, 'name': 'Demo Vuln'},
+        catalog_id='cat1',
+        core_payload={
+            'ssh_host': 'arlsouth1.utep.edu',
+            'ssh_port': 10000,
+            'ssh_username': 'corevm',
+            'ssh_password': 'p',
+        },
+    )
+
+    assert status == 200
+    assert payload.get('ok') is True
+    assert seen['host'] == 'arlsouth1.utep.edu'
+    assert seen['port'] == 50051
+    assert seen['core_cfg']['host'] == 'arlsouth1.utep.edu'
+    assert seen['core_cfg']['grpc_host'] == 'arlsouth1.utep.edu'

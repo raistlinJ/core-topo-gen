@@ -10,6 +10,23 @@ from flask import Response, jsonify, request, send_file
 from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
+def _prefer_explicit_or_ssh_core_host(raw_core: Any, core_cfg: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(core_cfg, dict):
+        return core_cfg
+    payload = raw_core if isinstance(raw_core, dict) else {}
+    explicit_host = str(payload.get('grpc_host') or payload.get('host') or '').strip()
+    explicit_secret_id = str(payload.get('core_secret_id') or payload.get('secret_id') or '').strip()
+    if explicit_host or explicit_secret_id:
+        return core_cfg
+    ssh_host = str(payload.get('ssh_host') or core_cfg.get('ssh_host') or '').strip()
+    if not ssh_host:
+        return core_cfg
+    adjusted = dict(core_cfg)
+    adjusted['host'] = ssh_host
+    adjusted['grpc_host'] = ssh_host
+    return adjusted
+
+
 _VALIDATION_CHECKS: tuple[tuple[str, str], ...] = (
     ('missing_nodes', 'missing nodes'),
     ('docker_not_running', 'docker not running'),
@@ -573,6 +590,7 @@ def _start_execute_like_real_vuln_test(backend: Any, *, item: dict[str, Any], ca
 
     try:
         core_cfg = backend._merge_core_configs(core_payload, include_password=True)
+        core_cfg = _prefer_explicit_or_ssh_core_host(core_payload, core_cfg)
         if not core_cfg.get('host'):
             core_cfg['host'] = core_cfg.get('ssh_host') or '127.0.0.1'
         if not core_cfg.get('port'):

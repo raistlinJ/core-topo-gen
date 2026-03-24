@@ -9,6 +9,23 @@ from flask import jsonify, request
 from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
 
+def _prefer_explicit_or_ssh_core_host(raw_core: Any, core_cfg: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(core_cfg, dict):
+        return core_cfg
+    payload = raw_core if isinstance(raw_core, dict) else {}
+    explicit_host = str(payload.get('grpc_host') or payload.get('host') or '').strip()
+    explicit_secret_id = str(payload.get('core_secret_id') or payload.get('secret_id') or '').strip()
+    if explicit_host or explicit_secret_id:
+        return core_cfg
+    ssh_host = str(payload.get('ssh_host') or core_cfg.get('ssh_host') or '').strip()
+    if not ssh_host:
+        return core_cfg
+    adjusted = dict(core_cfg)
+    adjusted['host'] = ssh_host
+    adjusted['grpc_host'] = ssh_host
+    return adjusted
+
+
 def register(app, *, backend_module: Any) -> None:
     if not begin_route_registration(app, 'vuln_catalog_test_start_routes'):
         return
@@ -70,7 +87,9 @@ def register(app, *, backend_module: Any) -> None:
         log_path = backend.os.path.join(run_dir, 'run.log')
 
         try:
-            core_cfg = backend._merge_core_configs(payload.get('core'), include_password=True)
+            raw_core = payload.get('core')
+            core_cfg = backend._merge_core_configs(raw_core, include_password=True)
+            core_cfg = _prefer_explicit_or_ssh_core_host(raw_core, core_cfg)
             if not core_cfg.get('host'):
                 core_cfg['host'] = core_cfg.get('ssh_host') or '127.0.0.1'
             if not core_cfg.get('port'):
