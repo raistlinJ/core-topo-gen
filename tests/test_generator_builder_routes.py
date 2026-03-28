@@ -1213,6 +1213,7 @@ def test_generator_builder_async_test_success_refreshes_install_gating_snippets(
         'function updateLatestBuilderTestResult(data, runId) {',
         'builderTestState.latestOutputsData = data || null;',
         'state.lastTestResult = data || null;',
+        '(this is only a summary - see full output for other errors)',
         'updateActionButtons();',
     ]
 

@@ -1598,7 +1598,10 @@
     elements.testStdout.textContent = redactBuilderSensitiveText(document.getElementById('gbGenTestLog')?.textContent || 'No output yet.');
     const failureSummary = String((data && data.failure_summary) || '').trim();
     const logTail = String((data && data.log_tail) || '').trim();
-    elements.testStderr.textContent = redactBuilderSensitiveText(failureSummary || logTail || 'See the test dialog progress log for the full run transcript.');
+    const stderrDisplay = failureSummary
+      ? `${failureSummary}\n\n(this is only a summary - see full output for other errors)`
+      : (logTail || 'See the test dialog progress log for the full run transcript.');
+    elements.testStderr.textContent = redactBuilderSensitiveText(stderrDisplay);
     const returncode = data && Object.prototype.hasOwnProperty.call(data, 'returncode') ? data.returncode : null;
     if (data && data.done) {
       setTestStatus(returncode === 0 ? `Test completed successfully (rc=${returncode}).` : `Test finished with rc=${returncode == null ? 'n/a' : returncode}.`, returncode === 0 ? 'success' : 'danger');
