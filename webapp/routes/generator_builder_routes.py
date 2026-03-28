@@ -20,7 +20,66 @@ from webapp.routes._registration import begin_route_registration, mark_routes_re
 
 _GROUNDING_CACHE: dict[str, str] = {}
 _BUILD_GENERATOR_SCAFFOLD: Callable[[dict[str, Any]], tuple[dict[str, str], str, str]] | None = None
+_VALIDATE_BUILDER_SCAFFOLD: Callable[[dict[str, str]], list[str]] | None = None
 _BUILDER_PROVIDER_HEARTBEAT_SECONDS = 5.0
+
+
+class BuilderScaffoldValidationError(ValueError):
+    def __init__(self, validation_errors: list[str], *, auto_heal: dict[str, Any] | None = None):
+        errors = [str(item).strip() for item in (validation_errors or []) if str(item).strip()]
+        super().__init__(errors[0] if errors else 'Generated scaffold failed validation.')
+        self.validation_errors = errors
+        self.auto_heal = dict(auto_heal or {}) if isinstance(auto_heal, dict) else {}
+
+
+class BuilderScaffoldGenerationError(ValueError):
+    def __init__(self, scaffold_errors: list[str], *, auto_heal: dict[str, Any] | None = None):
+        errors = [str(item).strip() for item in (scaffold_errors or []) if str(item).strip()]
+        super().__init__(errors[0] if errors else 'Generated scaffold could not be normalized or built.')
+        self.scaffold_errors = errors
+        self.auto_heal = dict(auto_heal or {}) if isinstance(auto_heal, dict) else {}
+
+
+def _normalize_builder_file_text(text: Any) -> str:
+    return str(text or '').replace('\r\n', '\n').replace('\r', '\n')
+
+
+def _first_builder_failure_line(last_test_result: dict[str, Any] | None) -> str:
+    text = _extract_builder_failure_text(last_test_result)
+    for raw_line in text.splitlines():
+        line = str(raw_line or '').strip()
+        if line:
+            return line
+    return ''
+
+
+def _detect_builder_refinement_noop(
+    scaffold_payload: dict[str, Any],
+    scaffold_files: dict[str, str],
+    request_payload: dict[str, Any],
+) -> list[str]:
+    current_scaffold = request_payload.get('current_scaffold_request')
+    current_files = request_payload.get('current_files')
+    if not isinstance(current_scaffold, dict) or not isinstance(current_files, dict):
+        return []
+
+    normalized_current_files = {str(path): _normalize_builder_file_text(text) for path, text in current_files.items()}
+    normalized_next_files = {str(path): _normalize_builder_file_text(text) for path, text in scaffold_files.items()}
+    if normalized_current_files != normalized_next_files:
+        return []
+
+    plugin_id = str(scaffold_payload.get('plugin_id') or current_scaffold.get('plugin_id') or '').strip()
+    detail = f' for {plugin_id}' if plugin_id else ''
+    prior_failure = _first_builder_failure_line(
+        request_payload.get('last_test_result') if isinstance(request_payload.get('last_test_result'), dict) else None
+    )
+    prior_failure_detail = f' Latest failure to address: {prior_failure}' if prior_failure else ''
+    return [
+        'Refinement returned the same scaffold files'
+        f'{detail} without any file changes. '
+        'When refining or auto-healing, modify the relevant scaffold files to address the latest request or failure instead of returning the existing scaffold unchanged.'
+        f'{prior_failure_detail}'
+    ]
 
 
 def _derive_plugin_id(name_hint: str, *, fallback: str = 'generated_generator') -> str:
@@ -373,7 +432,73 @@ def _generate_builder_openai_compatible_response(
     return assistant_text
 
 
-def _build_builder_ai_scaffold_result(
+def _validate_builder_scaffold_files(scaffold_files: dict[str, str]) -> list[str]:
+    if _VALIDATE_BUILDER_SCAFFOLD is None:
+        return []
+    try:
+        errors = _VALIDATE_BUILDER_SCAFFOLD(scaffold_files)
+    except Exception:
+        return []
+    if not isinstance(errors, list):
+        return []
+    return [str(item).strip() for item in errors if str(item).strip()]
+
+
+def _build_builder_auto_heal_prompt(original_prompt: str, validation_errors: list[str]) -> str:
+    bullets = '\n'.join(f'- {str(item).strip()}' for item in (validation_errors or []) if str(item).strip())
+    lines = [
+        'Repair the current generator scaffold without changing its intended behavior more than necessary.',
+        'Fix these scaffold validation errors first:',
+        bullets or '- Generated scaffold failed validation.',
+        'Requirements for the repaired scaffold:',
+        '- Do not return the prior scaffold unchanged; make concrete edits to the relevant scaffold files.',
+        '- Any runtime input that generator.py treats as required in /inputs/config.json must be declared in runtime_inputs so manifest inputs stay in sync.',
+        '- If a required runtime input is sensitive, mark it sensitive in runtime_inputs.',
+        '- Keep outputs.json, produces, inject_files, and actual created files aligned.',
+        '',
+        'Original user request:',
+        str(original_prompt or '').strip() or 'Repair the current scaffold.',
+    ]
+    return '\n'.join(lines).strip()
+
+
+def _build_builder_scaffold_repair_prompt(original_prompt: str, scaffold_errors: list[str]) -> str:
+    bullets = '\n'.join(f'- {str(item).strip()}' for item in (scaffold_errors or []) if str(item).strip())
+    lines = [
+        'Repair the current generator scaffold response so it can be normalized and built into a valid scaffold.',
+        'Fix these scaffold construction errors first:',
+        bullets or '- Generated scaffold could not be normalized or built.',
+        'Requirements for the repaired scaffold:',
+        '- Do not return the prior scaffold unchanged; make concrete edits that resolve the reported issue.',
+        '- Reply with exactly one JSON object matching the Builder scaffold schema.',
+        '- Include complete generator_py_text and keep manifest-facing fields internally consistent.',
+        '- Ensure the response can be normalized into a scaffold and persisted without manual edits.',
+        '',
+        'Original user request:',
+        str(original_prompt or '').strip() or 'Repair the current scaffold.',
+    ]
+    return '\n'.join(lines).strip()
+
+
+def _materialize_builder_scaffold(assistant_text: str, request_payload: dict[str, Any]) -> dict[str, Any]:
+    ai_payload = _extract_json_object(assistant_text)
+    scaffold_payload = _normalize_ai_scaffold_payload(ai_payload, request_payload)
+    if _BUILD_GENERATOR_SCAFFOLD is None:
+        raise RuntimeError('build_generator_scaffold is not configured')
+    scaffold_files, manifest_yaml, folder_path = _BUILD_GENERATOR_SCAFFOLD(scaffold_payload)
+    validation_errors = _validate_builder_scaffold_files(scaffold_files)
+    validation_errors.extend(_detect_builder_refinement_noop(scaffold_payload, scaffold_files, request_payload))
+    return {
+        'ai_payload': ai_payload,
+        'scaffold_payload': scaffold_payload,
+        'scaffold_files': scaffold_files,
+        'manifest_yaml': manifest_yaml,
+        'folder_path': folder_path,
+        'validation_errors': validation_errors,
+    }
+
+
+def _generate_builder_ai_assistant_text(
     payload: dict[str, Any],
     *,
     ai_provider_routes: Any,
@@ -381,8 +506,6 @@ def _build_builder_ai_scaffold_result(
     cancellation_check: Callable[[], bool] | None = None,
     on_response_open: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
-    if _BUILD_GENERATOR_SCAFFOLD is None:
-        raise RuntimeError('build_generator_scaffold is not configured')
     provider = str(payload.get('provider') or 'ollama').strip().lower() or 'ollama'
     prompt_payload = dict(payload)
     prompt_payload['compact_grounding'] = provider in {'litellm', 'openai'}
@@ -459,16 +582,150 @@ def _build_builder_ai_scaffold_result(
 
     if cancellation_check and cancellation_check():
         raise ai_provider_routes.ProviderAdapterError('Generation cancelled by user.', status_code=499)
-    if emit is not None:
-        emit('status', message='Normalizing scaffold...')
-    ai_payload = _extract_json_object(assistant_text)
-    scaffold_payload = _normalize_ai_scaffold_payload(ai_payload, payload)
-    scaffold_files, manifest_yaml, folder_path = _BUILD_GENERATOR_SCAFFOLD(scaffold_payload)
+
     return {
-        'ok': True,
+        'assistant_text': assistant_text,
         'provider': provider,
         'base_url': base_url,
         'model': model,
+    }
+
+
+def _build_builder_ai_scaffold_result(
+    payload: dict[str, Any],
+    *,
+    ai_provider_routes: Any,
+    emit: Callable[..., None] | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
+    on_response_open: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
+    if _BUILD_GENERATOR_SCAFFOLD is None:
+        raise RuntimeError('build_generator_scaffold is not configured')
+
+    def _coerce_scaffold_errors(exc: Exception) -> list[str]:
+        message = str(exc).strip() or exc.__class__.__name__
+        return [message]
+
+    attempt = _generate_builder_ai_assistant_text(
+        payload,
+        ai_provider_routes=ai_provider_routes,
+        emit=emit,
+        cancellation_check=cancellation_check,
+        on_response_open=on_response_open,
+    )
+    auto_heal: dict[str, Any] = {
+        'attempted': False,
+        'healed': False,
+        'initial_scaffold_errors': [],
+        'final_scaffold_errors': [],
+        'initial_validation_errors': [],
+        'final_validation_errors': [],
+        'attempt_count': 1,
+    }
+    if emit is not None:
+        emit('status', message='Normalizing scaffold...')
+    assistant_text = str(attempt.get('assistant_text') or '')
+    try:
+        materialized = _materialize_builder_scaffold(assistant_text, payload)
+    except Exception as exc:
+        scaffold_errors = _coerce_scaffold_errors(exc)
+        auto_heal['attempted'] = True
+        auto_heal['attempt_count'] = 2
+        auto_heal['initial_scaffold_errors'] = list(scaffold_errors)
+        auto_heal['final_scaffold_errors'] = list(scaffold_errors)
+        if emit is not None:
+            emit('status', message='Generated scaffold could not be normalized or built; attempting AI auto-heal...')
+            emit('llm_output_reset', reason='Auto-heal retry started after scaffold construction failed.')
+        repair_payload = dict(payload)
+        repair_payload['prompt'] = _build_builder_scaffold_repair_prompt(str(payload.get('prompt') or ''), scaffold_errors)
+        repair_payload['last_test_result'] = {
+            'ok': False,
+            'returncode': 1,
+            'failure_summary': '\n'.join(scaffold_errors),
+            'stderr': '\n'.join(scaffold_errors),
+            'stdout': '',
+            'log_tail': '',
+            'files': [],
+        }
+        repair_attempt = _generate_builder_ai_assistant_text(
+            repair_payload,
+            ai_provider_routes=ai_provider_routes,
+            emit=emit,
+            cancellation_check=cancellation_check,
+            on_response_open=on_response_open,
+        )
+        if emit is not None:
+            emit('status', message='Normalizing auto-healed scaffold...')
+        assistant_text = str(repair_attempt.get('assistant_text') or '')
+        try:
+            materialized = _materialize_builder_scaffold(assistant_text, repair_payload)
+        except Exception as retry_exc:
+            retry_scaffold_errors = _coerce_scaffold_errors(retry_exc)
+            auto_heal['final_scaffold_errors'] = list(retry_scaffold_errors)
+            raise BuilderScaffoldGenerationError(retry_scaffold_errors, auto_heal=auto_heal)
+
+    ai_payload = materialized['ai_payload']
+    scaffold_payload = materialized['scaffold_payload']
+    scaffold_files = materialized['scaffold_files']
+    manifest_yaml = materialized['manifest_yaml']
+    folder_path = materialized['folder_path']
+    validation_errors = list(materialized['validation_errors'])
+    auto_heal['initial_validation_errors'] = list(validation_errors)
+    auto_heal['final_validation_errors'] = list(validation_errors)
+
+    if validation_errors:
+        auto_heal['attempted'] = True
+        auto_heal['attempt_count'] = 2
+        if emit is not None:
+            emit('status', message='Generated scaffold failed validation; attempting AI auto-heal...')
+            emit('llm_output_reset', reason='Auto-heal retry started after scaffold validation failed.')
+        repair_payload = dict(payload)
+        repair_payload['prompt'] = _build_builder_auto_heal_prompt(str(payload.get('prompt') or ''), validation_errors)
+        repair_payload['current_scaffold_request'] = scaffold_payload
+        repair_payload['current_files'] = scaffold_files
+        repair_payload['last_test_result'] = {
+            'ok': False,
+            'returncode': 1,
+            'failure_summary': '\n'.join(validation_errors),
+            'stderr': '\n'.join(validation_errors),
+            'stdout': '',
+            'log_tail': '',
+            'files': [],
+        }
+        repair_attempt = _generate_builder_ai_assistant_text(
+            repair_payload,
+            ai_provider_routes=ai_provider_routes,
+            emit=emit,
+            cancellation_check=cancellation_check,
+            on_response_open=on_response_open,
+        )
+        if emit is not None:
+            emit('status', message='Normalizing auto-healed scaffold...')
+        assistant_text = str(repair_attempt.get('assistant_text') or '')
+        try:
+            materialized = _materialize_builder_scaffold(assistant_text, repair_payload)
+        except Exception as exc:
+            retry_scaffold_errors = _coerce_scaffold_errors(exc)
+            auto_heal['final_scaffold_errors'] = list(retry_scaffold_errors)
+            raise BuilderScaffoldGenerationError(retry_scaffold_errors, auto_heal=auto_heal)
+        ai_payload = materialized['ai_payload']
+        scaffold_payload = materialized['scaffold_payload']
+        scaffold_files = materialized['scaffold_files']
+        manifest_yaml = materialized['manifest_yaml']
+        folder_path = materialized['folder_path']
+        validation_errors = list(materialized['validation_errors'])
+        auto_heal['final_validation_errors'] = list(validation_errors)
+        auto_heal['healed'] = not validation_errors
+        if validation_errors:
+            raise BuilderScaffoldValidationError(validation_errors, auto_heal=auto_heal)
+    else:
+        auto_heal['healed'] = True
+
+    return {
+        'ok': True,
+        'provider': str(attempt.get('provider') or ''),
+        'base_url': str(attempt.get('base_url') or ''),
+        'model': str(attempt.get('model') or ''),
         'assistant_json': ai_payload,
         'assistant_text': assistant_text,
         'scaffold_request': scaffold_payload,
@@ -476,6 +733,9 @@ def _build_builder_ai_scaffold_result(
         'manifest_yaml': manifest_yaml,
         'scaffold_paths': sorted(scaffold_files.keys()),
         'files': scaffold_files,
+        'scaffold_errors': [],
+        'validation_errors': validation_errors,
+        'auto_heal': auto_heal,
     }
 
 
@@ -667,6 +927,115 @@ def _build_targeted_failure_guidance(last_test_result: dict[str, Any] | None) ->
             '- Create required parent directories before writing generated assets.',
             '',
         ])
+    missing_module = re.search(r"modulenotfounderror:\s+no module named ['\"]([^'\"]+)['\"]", text, re.IGNORECASE)
+    if missing_module:
+        module_name = missing_module.group(1).strip()
+        module_label = module_name or 'the missing dependency'
+        lines.extend([
+            f'Observed failure to fix first: the runtime image is missing the Python dependency {module_label}.',
+            f'- Update compose_text or the Docker image build so {module_label} is installed before generator.py runs.',
+            '- If the missing package is optional, remove the import and implementation path that depends on it instead of leaving a guaranteed runtime crash.',
+            '- Keep generator.py imports aligned with the packages installed inside the container.',
+            '',
+        ])
+    if 'does not declare them under inputs' in lowered or ('generated scaffold is inconsistent' in lowered and '/inputs/config.json' in lowered):
+        lines.extend([
+            'Observed failure to fix first: generator.py requires runtime config keys that manifest inputs do not declare.',
+            '- Every key that generator.py treats as required from /inputs/config.json must appear in runtime_inputs so manifest.yaml inputs stay aligned.',
+            '- If the required key is sensitive, mark it sensitive in runtime_inputs.',
+            '- If the extra key is not truly required, remove the hard failure path from generator.py instead of leaving manifest/code drift.',
+            '',
+        ])
+    return lines
+
+
+def _builder_file_block_language(path: str) -> str:
+    lowered = str(path or '').lower()
+    if lowered.endswith('.py'):
+        return 'python'
+    if lowered.endswith('.md'):
+        return 'markdown'
+    if lowered.endswith('.yaml') or lowered.endswith('.yml'):
+        return 'yaml'
+    if lowered.endswith('.json'):
+        return 'json'
+    return ''
+
+
+def _format_builder_current_files(current_files: dict[str, Any] | None) -> list[str]:
+    if not isinstance(current_files, dict):
+        return []
+    lines: list[str] = []
+    for key in sorted(current_files.keys()):
+        text = str(current_files.get(key) or '')
+        if not (
+            key.endswith('/manifest.yaml')
+            or key.endswith('/generator.py')
+            or key.endswith('/README.md')
+            or key.endswith('/docker-compose.yml')
+        ):
+            continue
+        language = _builder_file_block_language(key)
+        lines.append(f'File: {key}')
+        lines.append(f'```{language}' if language else '```')
+        lines.append(text.rstrip('\n'))
+        lines.append('```')
+        lines.append('')
+    return lines
+
+
+def _extract_builder_original_create_prompt(iteration_history: list[dict[str, Any]] | None) -> str:
+    if not isinstance(iteration_history, list):
+        return ''
+    for entry in iteration_history:
+        if not isinstance(entry, dict):
+            continue
+        mode = str(entry.get('mode') or '').strip().lower()
+        prompt = str(entry.get('prompt') or '').strip()
+        if mode == 'create' and prompt:
+            return prompt
+    return ''
+
+
+def _format_builder_iteration_history(iteration_history: list[dict[str, Any]] | None) -> list[str]:
+    if not isinstance(iteration_history, list):
+        return []
+    lines: list[str] = []
+    for entry in iteration_history[-8:]:
+        if not isinstance(entry, dict):
+            continue
+        mode = str(entry.get('mode') or '').strip().lower()
+        if mode not in {'create', 'refine'}:
+            continue
+        prompt = str(entry.get('prompt') or '').strip()
+        if not prompt:
+            continue
+        status = str(entry.get('status') or '').strip()
+        plugin_id = str(entry.get('plugin_id') or '').strip()
+        detail_parts = []
+        if status:
+            detail_parts.append(f'status={status}')
+        if plugin_id:
+            detail_parts.append(f'plugin_id={plugin_id}')
+        detail = f" ({', '.join(detail_parts)})" if detail_parts else ''
+        lines.append(f'- {mode}{detail}: {prompt}')
+    return lines
+
+
+def _format_builder_scaffold_validation(scaffold_validation: dict[str, Any] | None) -> list[str]:
+    if not isinstance(scaffold_validation, dict):
+        return []
+    if scaffold_validation.get('pending') is True:
+        return ['- Validation is still pending.']
+    lines: list[str] = []
+    errors = scaffold_validation.get('errors') if isinstance(scaffold_validation.get('errors'), list) else []
+    for error in errors[:8]:
+        text = str(error or '').strip()
+        if text:
+            lines.append(f'- {text}')
+    message = str(scaffold_validation.get('message') or '').strip()
+    if message and all(message != line[2:] for line in lines if line.startswith('- ')):
+        lines.append(f'- {message}')
     return lines
 
 
@@ -1366,6 +1735,8 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
     prompt = str(payload.get('prompt') or '').strip()
     if not prompt:
         raise ValueError('prompt is required')
+    prompt_lower = prompt.lower()
+    prompt_mentions_image = any(token in prompt_lower for token in ('stego', 'stegan', 'carrier image', 'png', 'jpeg', 'jpg', 'image flag', 'image artifact'))
 
     kind_requirements = [
         '- For all generators: read /inputs/config.json and write /outputs/outputs.json.',
@@ -1373,6 +1744,8 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
         '- Keep outputs deterministic for the same inputs.',
         '- Use Python standard library only unless the prompt explicitly requires otherwise.',
         '- Return JSON only. Do not wrap in markdown fences.',
+        '- Any /inputs/config.json key that generator.py requires must be declared in runtime_inputs so manifest inputs match the code.',
+        '- If a required runtime input is secret-like (for example secret, token, api_key, password), mark it sensitive in runtime_inputs.',
         '- outputs.json.outputs keys must exactly match produces and must reference artifacts that actually exist by the time the generator exits successfully.',
         '- If you declare inject_files, every inject entry must resolve to a real generated file path, not just an ontology key name.',
     ]
@@ -1390,6 +1763,13 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
             '- If produces includes File(path), write the file under /outputs or /outputs/artifacts and set outputs.json.outputs["File(path)"] to that created path.',
             '- If inject_files includes File(path), the File(path) output must exist on disk before exit or the test will fail validation.',
         ])
+        if prompt_mentions_image:
+            kind_requirements.extend([
+                '- For image or steganography outputs, generate a valid, viewable carrier image file rather than random bytes renamed to .png or .jpg.',
+                '- Prefer Pillow/PIL with an explicit install step in compose_text when you need to create or modify images; do not hand-roll PNG or JPEG bytes unless you fully implement a standards-compliant encoder.',
+                '- Do not append arbitrary payload bytes after image end markers or mutate container bytes outside real pixel data.',
+                '- If you embed a flag in an image, preserve normal renderability of the carrier image and write the artifact under /outputs/artifacts/.',
+            ])
 
     if ultra_compact_prompt:
         kind_requirements = [
@@ -1438,6 +1818,8 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
     current_scaffold = payload.get('current_scaffold_request') if isinstance(payload.get('current_scaffold_request'), dict) else None
     current_files = payload.get('current_files') if isinstance(payload.get('current_files'), dict) else None
     last_test_result = payload.get('last_test_result') if isinstance(payload.get('last_test_result'), dict) else None
+    iteration_history = payload.get('iteration_history') if isinstance(payload.get('iteration_history'), list) else None
+    scaffold_validation = payload.get('scaffold_validation') if isinstance(payload.get('scaffold_validation'), dict) else None
     mode = 'refine' if current_scaffold else 'create'
 
     context_lines = [
@@ -1492,25 +1874,33 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
         ]
     else:
         context_lines.extend(_build_prompt_intent_guidance(prompt, plugin_type, payload.get('intent_overrides')))
-    context_lines.extend(_build_generator_grounding_lines(plugin_type, compact=compact_grounding, ultra_compact=ultra_compact_prompt))
     if current_scaffold:
         context_lines.extend([
+            'Refinement priority:',
+            '- Treat the current scaffold below as the source material to edit, not as a loose example.',
+            '- Preserve plugin_id, folder_name, and working behavior unless the user request or concrete failure requires a change.',
+            '- Fix the latest concrete failure first, then make only the minimum additional edits needed to satisfy the user request.',
+            '- Do not return the current scaffold unchanged; update the relevant files that implement the requested fix.',
+            '',
             'Current scaffold request (treat this as the existing generator state and preserve compatible parts unless the user asked to change them):',
             json.dumps(current_scaffold, indent=2, ensure_ascii=False),
             '',
         ])
-    if current_files:
-        selected_files: dict[str, str] = {}
-        for key in sorted(current_files.keys()):
-            text = str(current_files.get(key) or '')
-            if key.endswith('/manifest.yaml') or key.endswith('/generator.py') or key.endswith('/README.md') or key.endswith('/docker-compose.yml'):
-                selected_files[key] = text
-        if selected_files:
-            context_lines.extend([
-                'Current scaffold files:',
-                json.dumps(selected_files, indent=2, ensure_ascii=False),
-                '',
-            ])
+    original_create_prompt = _extract_builder_original_create_prompt(iteration_history)
+    if original_create_prompt:
+        context_lines.extend([
+            'Original create request:',
+            original_create_prompt,
+            '',
+        ])
+    formatted_iteration_history = _format_builder_iteration_history(iteration_history)
+    if formatted_iteration_history:
+        context_lines.extend([
+            'Recent create/refine history (oldest to newest):',
+            *formatted_iteration_history,
+            '- Preserve earlier intent unless the newest user request or a concrete test/validation failure requires changing it.',
+            '',
+        ])
     if last_test_result:
         test_summary = {
             'ok': bool(last_test_result.get('ok')),
@@ -1528,6 +1918,21 @@ def _build_generator_builder_ai_messages(payload: dict[str, Any]) -> list[dict[s
             '',
         ])
         context_lines.extend(_build_targeted_failure_guidance(last_test_result))
+    formatted_scaffold_validation = _format_builder_scaffold_validation(scaffold_validation)
+    if formatted_scaffold_validation:
+        context_lines.extend([
+            'Current scaffold validation warnings:',
+            *formatted_scaffold_validation,
+            '- Fix these warnings if they are still relevant after applying the latest request.',
+            '',
+        ])
+    formatted_current_files = _format_builder_current_files(current_files)
+    if formatted_current_files:
+        context_lines.extend([
+            'Current scaffold files:',
+            *formatted_current_files,
+        ])
+    context_lines.extend(_build_generator_grounding_lines(plugin_type, compact=compact_grounding, ultra_compact=ultra_compact_prompt))
     context_lines.extend([
         'User request:',
         prompt,
@@ -1794,6 +2199,7 @@ def register(
     load_custom_artifacts: Callable[[], dict[str, dict[str, Any]]],
     upsert_custom_artifact: Callable[..., dict[str, Any]],
     build_generator_scaffold: Callable[[dict[str, Any]], tuple[dict[str, str], str, str]],
+    validate_builder_scaffold: Callable[[dict[str, str]], list[str]],
     install_generator_pack_or_bundle: Callable[..., tuple[bool, str]],
     run_remote_builder_test: Callable[..., dict[str, Any]],
     start_remote_builder_test_process: Callable[..., dict[str, Any]],
@@ -1808,8 +2214,9 @@ def register(
     io_module: Any,
     zipfile_module: Any,
 ) -> None:
-    global _BUILD_GENERATOR_SCAFFOLD
+    global _BUILD_GENERATOR_SCAFFOLD, _VALIDATE_BUILDER_SCAFFOLD
     _BUILD_GENERATOR_SCAFFOLD = build_generator_scaffold
+    _VALIDATE_BUILDER_SCAFFOLD = validate_builder_scaffold
     if not begin_route_registration(app, 'generator_builder_routes'):
         return
 
@@ -1994,11 +2401,16 @@ def register(
             scaffold_files, manifest_yaml, _folder_path = build_generator_scaffold(payload)
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
-        return jsonify({
+        response = {
             'ok': True,
             'manifest_yaml': manifest_yaml,
             'scaffold_paths': sorted(scaffold_files.keys()),
-        })
+        }
+        validation_errors = validate_builder_scaffold(scaffold_files)
+        if validation_errors:
+            response['validation_errors'] = validation_errors
+            response['validation_ok'] = False
+        return jsonify(response)
 
     @app.route('/api/generators/prompt_intent_preview', methods=['POST'])
     def api_generators_prompt_intent_preview():
@@ -2019,6 +2431,20 @@ def register(
             result = _build_builder_ai_scaffold_result(payload, ai_provider_routes=ai_provider_routes)
         except ai_provider_routes.ProviderAdapterError as exc:
             return jsonify({'ok': False, 'error': exc.message, **(exc.details or {})}), exc.status_code
+        except BuilderScaffoldGenerationError as exc:
+            return jsonify({
+                'ok': False,
+                'error': str(exc),
+                'scaffold_errors': exc.scaffold_errors,
+                'auto_heal': exc.auto_heal,
+            }), 422
+        except BuilderScaffoldValidationError as exc:
+            return jsonify({
+                'ok': False,
+                'error': str(exc),
+                'validation_errors': exc.validation_errors,
+                'auto_heal': exc.auto_heal,
+            }), 422
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
 
@@ -2067,6 +2493,10 @@ def register(
                     emit('result', data=result)
                 except ai_provider_routes.ProviderAdapterError as exc:
                     emit('error', error=exc.message, status_code=exc.status_code, details=exc.details or {})
+                except BuilderScaffoldGenerationError as exc:
+                    emit('error', error=str(exc), status_code=422, scaffold_errors=exc.scaffold_errors, auto_heal=exc.auto_heal)
+                except BuilderScaffoldValidationError as exc:
+                    emit('error', error=str(exc), status_code=422, validation_errors=exc.validation_errors, auto_heal=exc.auto_heal)
                 except Exception as exc:  # pragma: no cover
                     emit('error', error=str(exc))
                 finally:
@@ -2117,6 +2547,13 @@ def register(
             scaffold_files, manifest_yaml, folder_path = build_generator_scaffold(scaffold_payload)
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
+        validation_errors = validate_builder_scaffold(scaffold_files)
+        if validation_errors:
+            return jsonify({
+                'ok': False,
+                'error': validation_errors[0],
+                'validation_errors': validation_errors,
+            }), 400
 
         plugin_kind = str(scaffold_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
         plugin_id = sanitize_id(scaffold_payload.get('plugin_id')) or 'generator'
@@ -2162,6 +2599,13 @@ def register(
             scaffold_files, _manifest_yaml, _folder_path = build_generator_scaffold(scaffold_payload)
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
+        validation_errors = validate_builder_scaffold(scaffold_files)
+        if validation_errors:
+            return jsonify({
+                'ok': False,
+                'error': validation_errors[0],
+                'validation_errors': validation_errors,
+            }), 400
 
         plugin_kind = str(scaffold_payload.get('plugin_type') or 'flag-generator').strip() or 'flag-generator'
         plugin_id = sanitize_id(scaffold_payload.get('plugin_id')) or 'generator'
@@ -2565,6 +3009,9 @@ def register(
             normalized_payload['plugin_id'] = final_plugin_id
             normalized_payload['name'] = final_name
             scaffold_files, _manifest_yaml, _folder_path = build_generator_scaffold(normalized_payload)
+            validation_errors = validate_builder_scaffold(scaffold_files)
+            if validation_errors:
+                return jsonify({'ok': False, 'error': validation_errors[0], 'validation_errors': validation_errors}), 400
             zip_bytes = _build_scaffold_zip_bytes(scaffold_files, zipfile_module=zipfile_module, io_module=io_module)
             requested_pack_label = str(payload.get('pack_label') or scaffold_payload.get('name') or scaffold_payload.get('plugin_id') or 'generated-builder-pack').strip()
             pack_label = requested_pack_label or final_name or final_plugin_id or 'generated-builder-pack'
@@ -2611,6 +3058,9 @@ def register(
             plugin_id = sanitize_id(payload.get('plugin_id')) or 'generator'
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
+        validation_errors = validate_builder_scaffold(scaffold_files)
+        if validation_errors:
+            return jsonify({'ok': False, 'error': validation_errors[0], 'validation_errors': validation_errors}), 400
 
         mem = io_module.BytesIO()
         with zipfile_module.ZipFile(mem, 'w', zipfile_module.ZIP_DEFLATED) as zf:

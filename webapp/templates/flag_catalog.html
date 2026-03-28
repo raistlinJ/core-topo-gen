@@ -121,6 +121,15 @@
                 </div>
               </div>
               <div class="small text-muted mt-2" id="genMeta"></div>
+              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
+                <div class="small text-muted" id="genSelectionMeta">0 selected.</div>
+                <div class="btn-group btn-group-sm" role="group" aria-label="Selected generator actions">
+                  <button class="btn btn-outline-warning" type="button" id="genBatchDisableBtn" disabled>Disable</button>
+                  <button class="btn btn-outline-danger" type="button" id="genBatchDeleteBtn" disabled>Delete</button>
+                  <button class="btn btn-outline-success" type="button" id="genBatchOverrideSuccessBtn" disabled>Override Success</button>
+                  <button class="btn btn-outline-secondary" type="button" id="genBatchOverrideFailBtn" disabled>Override Fail</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -130,12 +139,14 @@
                 <table class="table table-sm align-middle" id="genTable">
                   <thead>
                     <tr>
+                      <th style="width: 42px;"><input class="form-check-input" type="checkbox" id="genCheckAll" aria-label="Select all visible generators"></th>
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Type</th>
                       <th>Inputs</th>
                       <th>Outputs</th>
                       <th>Injects</th>
+                      <th style="width: 140px;">Validated</th>
                       <th>From Source</th>
                       <th style="width: 160px;">Actions</th>
                     </tr>
@@ -158,6 +169,15 @@
                 </div>
               </div>
               <div class="small text-muted mt-2" id="nodeGenMeta"></div>
+              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
+                <div class="small text-muted" id="nodeGenSelectionMeta">0 selected.</div>
+                <div class="btn-group btn-group-sm" role="group" aria-label="Selected node-generator actions">
+                  <button class="btn btn-outline-warning" type="button" id="nodeGenBatchDisableBtn" disabled>Disable</button>
+                  <button class="btn btn-outline-danger" type="button" id="nodeGenBatchDeleteBtn" disabled>Delete</button>
+                  <button class="btn btn-outline-success" type="button" id="nodeGenBatchOverrideSuccessBtn" disabled>Override Success</button>
+                  <button class="btn btn-outline-secondary" type="button" id="nodeGenBatchOverrideFailBtn" disabled>Override Fail</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -167,12 +187,14 @@
                 <table class="table table-sm align-middle" id="nodeGenTable">
                   <thead>
                     <tr>
+                      <th style="width: 42px;"><input class="form-check-input" type="checkbox" id="nodeGenCheckAll" aria-label="Select all visible node-generators"></th>
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Type</th>
                       <th>Inputs</th>
                       <th>Outputs</th>
                       <th>Injects</th>
+                      <th style="width: 140px;">Validated</th>
                       <th>From Source</th>
                       <th style="width: 160px;">Actions</th>
                     </tr>
@@ -457,6 +479,7 @@
     filter: '',
     sortKey: 'name',
     sortDir: 'asc',
+    selectedIds: new Set(),
   };
 
   const nodeGenState = {
@@ -465,6 +488,7 @@
     filter: '',
     sortKey: 'name',
     sortDir: 'asc',
+    selectedIds: new Set(),
   };
 
   const genTestState = {
@@ -1153,6 +1177,16 @@
       const isDuplicateConflict = !!(g && typeof g === 'object' && g._duplicate_conflict);
       const packId = String((g && g._pack_id) || '').trim();
       const packLabel = String((g && g._pack_label) || '').trim();
+      const rowSelectable = isInstalled && !isDuplicateConflict;
+      const rowSelected = !!(genState.selectedIds && genState.selectedIds.has(String(g.id || '')));
+      const logLink = g.log_download_url ? `<a class="btn btn-link btn-sm p-0 ms-2 align-baseline" href="${escapeHtml(g.log_download_url)}">Log</a>` : '';
+      const validatedHtml = g.validated_incomplete === true
+        ? `<span class="badge text-bg-secondary">Incomplete</span>${logLink}${g.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(g.validated_at)}</div>` : ''}`
+        : (g.validated_ok === true
+          ? `<span class="badge text-bg-success">Validated</span>${logLink}${g.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(g.validated_at)}</div>` : ''}`
+          : (g.validated_ok === false
+            ? `<span class="badge text-bg-danger">Failed</span>${logLink}${g.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(g.validated_at)}</div>` : ''}`
+            : '<span class="text-muted">—</span>'));
 
       if (isDisabled) {
         tr.classList.add('table-secondary');
@@ -1163,6 +1197,7 @@
 
       const typeLabel = String(g.language || '');
       tr.innerHTML = `
+        <td><input class="form-check-input" type="checkbox" data-role="row-select" data-generator-id="${escapeHtml(g.id || '')}" ${rowSelected ? 'checked' : ''} ${(rowSelectable && !generatorSelectionLocked()) ? '' : 'disabled'} aria-label="Select generator ${escapeHtml(g.name || '')}"></td>
         <td class="text-muted">${idx + 1}</td>
         <td>
           <div>
@@ -1178,6 +1213,7 @@
         <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
         <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
+        <td class="small">${validatedHtml}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
@@ -1190,6 +1226,21 @@
         </td>
       `;
       body.appendChild(tr);
+
+      tr.querySelector('[data-role="row-select"]')?.addEventListener('change', (event) => {
+        const checked = !!(event && event.target && event.target.checked);
+        const gid = String(g.id || '');
+        if (!gid) return;
+        if (checked) genState.selectedIds.add(gid);
+        else genState.selectedIds.delete(gid);
+        updateGeneratorSelectionUi({
+          state: genState,
+          metaId: 'genSelectionMeta',
+          checkAllId: 'genCheckAll',
+          rowSelector: '#genBody',
+          buttonIds: ['genBatchDisableBtn', 'genBatchDeleteBtn', 'genBatchOverrideSuccessBtn', 'genBatchOverrideFailBtn'],
+        });
+      });
 
       const packDeleteBtn = tr.querySelector('.genPackDeleteBtn');
       if (packDeleteBtn && packId) {
@@ -1240,6 +1291,20 @@
           }
         });
       }
+    });
+
+    if (!filtered.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="10" class="text-muted">No generators found.</td>';
+      body.appendChild(tr);
+    }
+
+    updateGeneratorSelectionUi({
+      state: genState,
+      metaId: 'genSelectionMeta',
+      checkAllId: 'genCheckAll',
+      rowSelector: '#genBody',
+      buttonIds: ['genBatchDisableBtn', 'genBatchDeleteBtn', 'genBatchOverrideSuccessBtn', 'genBatchOverrideFailBtn'],
     });
   }
 
@@ -1303,6 +1368,16 @@
       const isDuplicateConflict = !!(g && typeof g === 'object' && g._duplicate_conflict);
       const packId = String((g && g._pack_id) || '').trim();
       const packLabel = String((g && g._pack_label) || '').trim();
+      const rowSelectable = isInstalled && !isDuplicateConflict;
+      const rowSelected = !!(nodeGenState.selectedIds && nodeGenState.selectedIds.has(String(g.id || '')));
+      const logLink = g.log_download_url ? `<a class="btn btn-link btn-sm p-0 ms-2 align-baseline" href="${escapeHtml(g.log_download_url)}">Log</a>` : '';
+      const validatedHtml = g.validated_incomplete === true
+        ? `<span class="badge text-bg-secondary">Incomplete</span>${logLink}${g.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(g.validated_at)}</div>` : ''}`
+        : (g.validated_ok === true
+          ? `<span class="badge text-bg-success">Validated</span>${logLink}${g.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(g.validated_at)}</div>` : ''}`
+          : (g.validated_ok === false
+            ? `<span class="badge text-bg-danger">Failed</span>${logLink}${g.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(g.validated_at)}</div>` : ''}`
+            : '<span class="text-muted">—</span>'));
 
       if (isDisabled) {
         tr.classList.add('table-secondary');
@@ -1313,6 +1388,7 @@
 
       const typeLabel = String(g.language || '');
       tr.innerHTML = `
+        <td><input class="form-check-input" type="checkbox" data-role="row-select" data-generator-id="${escapeHtml(g.id || '')}" ${rowSelected ? 'checked' : ''} ${(rowSelectable && !generatorSelectionLocked()) ? '' : 'disabled'} aria-label="Select node-generator ${escapeHtml(g.name || '')}"></td>
         <td class="text-muted">${idx + 1}</td>
         <td>
           <div>
@@ -1328,6 +1404,7 @@
         <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
         <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
+        <td class="small">${validatedHtml}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
@@ -1340,6 +1417,21 @@
         </td>
       `;
       body.appendChild(tr);
+
+      tr.querySelector('[data-role="row-select"]')?.addEventListener('change', (event) => {
+        const checked = !!(event && event.target && event.target.checked);
+        const gid = String(g.id || '');
+        if (!gid) return;
+        if (checked) nodeGenState.selectedIds.add(gid);
+        else nodeGenState.selectedIds.delete(gid);
+        updateGeneratorSelectionUi({
+          state: nodeGenState,
+          metaId: 'nodeGenSelectionMeta',
+          checkAllId: 'nodeGenCheckAll',
+          rowSelector: '#nodeGenBody',
+          buttonIds: ['nodeGenBatchDisableBtn', 'nodeGenBatchDeleteBtn', 'nodeGenBatchOverrideSuccessBtn', 'nodeGenBatchOverrideFailBtn'],
+        });
+      });
 
       const packDeleteBtn = tr.querySelector('.nodeGenPackDeleteBtn');
       if (packDeleteBtn && packId) {
@@ -1390,6 +1482,20 @@
           }
         });
       }
+    });
+
+    if (!filtered.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="10" class="text-muted">No node-generators found.</td>';
+      body.appendChild(tr);
+    }
+
+    updateGeneratorSelectionUi({
+      state: nodeGenState,
+      metaId: 'nodeGenSelectionMeta',
+      checkAllId: 'nodeGenCheckAll',
+      rowSelector: '#nodeGenBody',
+      buttonIds: ['nodeGenBatchDisableBtn', 'nodeGenBatchDeleteBtn', 'nodeGenBatchOverrideSuccessBtn', 'nodeGenBatchOverrideFailBtn'],
     });
   }
 
@@ -1962,6 +2068,69 @@
     const cur = el.textContent || '';
     const next = cur ? (cur + '\n' + String(line || '')) : String(line || '');
     el.textContent = next;
+  }
+
+  function generatorSelectionLocked() {
+    return !!(genTestState && (genTestState.runActive || genTestState.runId)) || !!(flagBatchState && flagBatchState.activeRunId && !flagBatchState.activeDone);
+  }
+
+  function pruneGeneratorSelection(state) {
+    const validIds = new Set((Array.isArray(state && state.generators) ? state.generators : []).map((item) => String(item && item.id ? item.id : '')).filter(Boolean));
+    Array.from(state && state.selectedIds ? state.selectedIds : []).forEach((value) => {
+      if (!validIds.has(String(value))) state.selectedIds.delete(value);
+    });
+  }
+
+  function updateGeneratorSelectionUi(opts) {
+    const state = opts && opts.state ? opts.state : null;
+    const selectedCount = state && state.selectedIds ? state.selectedIds.size : 0;
+    const locked = generatorSelectionLocked();
+    const metaEl = document.getElementById(opts.metaId);
+    if (metaEl) {
+      metaEl.textContent = locked
+        ? `${selectedCount} selected. Selection actions are locked while a test or batch is active.`
+        : `${selectedCount} selected.`;
+    }
+    (opts.buttonIds || []).forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.disabled = locked || selectedCount === 0;
+    });
+    const checkboxes = Array.from(document.querySelectorAll(`${opts.rowSelector} input[data-role="row-select"]`)).filter((el) => !el.disabled);
+    const allChecked = checkboxes.length > 0 && checkboxes.every((el) => el.checked);
+    const checkAll = document.getElementById(opts.checkAllId);
+    if (checkAll) {
+      checkAll.checked = allChecked;
+      checkAll.indeterminate = !allChecked && checkboxes.some((el) => el.checked);
+      checkAll.disabled = locked || checkboxes.length === 0;
+    }
+  }
+
+  async function applyGeneratorBatchMutation(opts) {
+    const state = opts && opts.state ? opts.state : null;
+    const selectedIds = Array.from(state && state.selectedIds ? state.selectedIds : []);
+    if (!selectedIds.length || generatorSelectionLocked()) return;
+    if (opts.confirmMessage && !window.confirm(opts.confirmMessage)) return;
+    if (opts.logPreId) appendPreLine(opts.logPreId, `[ui] Applying ${opts.action} to ${selectedIds.length} selected ${opts.itemLabel}(s)…`);
+    const resp = await fetchJson(opts.apiPath, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ action: opts.action, generator_ids: selectedIds }),
+    });
+    if (!resp || resp.ok === false) {
+      if (opts.logPreId) appendPreLine(opts.logPreId, `[error] ${(resp && resp.error) ? resp.error : 'Batch action failed.'}`);
+      return;
+    }
+    if (opts.action === 'delete') {
+      selectedIds.forEach((value) => state.selectedIds.delete(value));
+    }
+    if (typeof opts.reloadFn === 'function') {
+      await opts.reloadFn();
+    }
+    if (opts.logPreId) appendPreLine(opts.logPreId, `[ok] ${(resp && resp.message) ? resp.message : 'Batch action applied.'}`);
   }
 
   async function deleteInstalledGenerator(apiPath, generator, opts) {
@@ -2551,6 +2720,7 @@
       return;
     }
     genState.generators = data.generators || [];
+    pruneGeneratorSelection(genState);
     genState.errors = data.errors || [];
     metaEl.textContent = `Loaded ${genState.generators.length} installed generators.`;
     const lines = [];
@@ -2608,6 +2778,11 @@
       try {
         try { setCleanupLogLine(`[ui][cleanup] invoked from genTestModal hidden (runId=${runId})`); } catch (e) {}
         await cleanupRunArtifacts(runId, testBase);
+        if (String(testBase || '').includes('/flag_node_generators_test')) {
+          await loadNodeGenerators();
+        } else {
+          await loadGenerators();
+        }
       } catch (e) {
         // Ignore cleanup errors; UI already closed.
       }
@@ -2624,6 +2799,7 @@
       return;
     }
     nodeGenState.generators = data.generators || [];
+    pruneGeneratorSelection(nodeGenState);
     nodeGenState.errors = data.errors || [];
     metaEl.textContent = `Loaded ${nodeGenState.generators.length} installed node-generators.`;
     const lines = [];
@@ -2639,6 +2815,120 @@
     renderFlagBatchSelectionPreview();
   });
 
+  document.getElementById('genCheckAll')?.addEventListener('change', (e) => {
+    if (generatorSelectionLocked()) return;
+    const checked = !!(e && e.target && e.target.checked);
+    document.querySelectorAll('#genBody input[data-role="row-select"]').forEach((el) => {
+      if (el.disabled) return;
+      el.checked = checked;
+      const gid = String(el.getAttribute('data-generator-id') || '');
+      if (!gid) return;
+      if (checked) genState.selectedIds.add(gid);
+      else genState.selectedIds.delete(gid);
+    });
+    updateGeneratorSelectionUi({
+      state: genState,
+      metaId: 'genSelectionMeta',
+      checkAllId: 'genCheckAll',
+      rowSelector: '#genBody',
+      buttonIds: ['genBatchDisableBtn', 'genBatchDeleteBtn', 'genBatchOverrideSuccessBtn', 'genBatchOverrideFailBtn'],
+    });
+  });
+
+  document.getElementById('nodeGenCheckAll')?.addEventListener('change', (e) => {
+    if (generatorSelectionLocked()) return;
+    const checked = !!(e && e.target && e.target.checked);
+    document.querySelectorAll('#nodeGenBody input[data-role="row-select"]').forEach((el) => {
+      if (el.disabled) return;
+      el.checked = checked;
+      const gid = String(el.getAttribute('data-generator-id') || '');
+      if (!gid) return;
+      if (checked) nodeGenState.selectedIds.add(gid);
+      else nodeGenState.selectedIds.delete(gid);
+    });
+    updateGeneratorSelectionUi({
+      state: nodeGenState,
+      metaId: 'nodeGenSelectionMeta',
+      checkAllId: 'nodeGenCheckAll',
+      rowSelector: '#nodeGenBody',
+      buttonIds: ['nodeGenBatchDisableBtn', 'nodeGenBatchDeleteBtn', 'nodeGenBatchOverrideSuccessBtn', 'nodeGenBatchOverrideFailBtn'],
+    });
+  });
+
+  document.getElementById('genBatchDisableBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: genState,
+    action: 'disable',
+    apiPath: '/api/flag_generators/batch_mutate',
+    logPreId: 'genLog',
+    reloadFn: loadGenerators,
+    itemLabel: 'generator',
+    confirmMessage: `Disable ${genState.selectedIds.size} selected generator(s)?`,
+  }));
+  document.getElementById('genBatchDeleteBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: genState,
+    action: 'delete',
+    apiPath: '/api/flag_generators/batch_mutate',
+    logPreId: 'genLog',
+    reloadFn: loadGenerators,
+    itemLabel: 'generator',
+    confirmMessage: `Delete ${genState.selectedIds.size} selected generator(s)? This removes them from outputs/installed_generators.`,
+  }));
+  document.getElementById('genBatchOverrideSuccessBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: genState,
+    action: 'override_success',
+    apiPath: '/api/flag_generators/batch_mutate',
+    logPreId: 'genLog',
+    reloadFn: loadGenerators,
+    itemLabel: 'generator',
+    confirmMessage: `Override ${genState.selectedIds.size} selected generator(s) as success?`,
+  }));
+  document.getElementById('genBatchOverrideFailBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: genState,
+    action: 'override_fail',
+    apiPath: '/api/flag_generators/batch_mutate',
+    logPreId: 'genLog',
+    reloadFn: loadGenerators,
+    itemLabel: 'generator',
+    confirmMessage: `Override ${genState.selectedIds.size} selected generator(s) as fail?`,
+  }));
+
+  document.getElementById('nodeGenBatchDisableBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: nodeGenState,
+    action: 'disable',
+    apiPath: '/api/flag_node_generators/batch_mutate',
+    logPreId: 'nodeGenLog',
+    reloadFn: loadNodeGenerators,
+    itemLabel: 'node-generator',
+    confirmMessage: `Disable ${nodeGenState.selectedIds.size} selected node-generator(s)?`,
+  }));
+  document.getElementById('nodeGenBatchDeleteBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: nodeGenState,
+    action: 'delete',
+    apiPath: '/api/flag_node_generators/batch_mutate',
+    logPreId: 'nodeGenLog',
+    reloadFn: loadNodeGenerators,
+    itemLabel: 'node-generator',
+    confirmMessage: `Delete ${nodeGenState.selectedIds.size} selected node-generator(s)? This removes them from outputs/installed_generators.`,
+  }));
+  document.getElementById('nodeGenBatchOverrideSuccessBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: nodeGenState,
+    action: 'override_success',
+    apiPath: '/api/flag_node_generators/batch_mutate',
+    logPreId: 'nodeGenLog',
+    reloadFn: loadNodeGenerators,
+    itemLabel: 'node-generator',
+    confirmMessage: `Override ${nodeGenState.selectedIds.size} selected node-generator(s) as success?`,
+  }));
+  document.getElementById('nodeGenBatchOverrideFailBtn')?.addEventListener('click', () => applyGeneratorBatchMutation({
+    state: nodeGenState,
+    action: 'override_fail',
+    apiPath: '/api/flag_node_generators/batch_mutate',
+    logPreId: 'nodeGenLog',
+    reloadFn: loadNodeGenerators,
+    itemLabel: 'node-generator',
+    confirmMessage: `Override ${nodeGenState.selectedIds.size} selected node-generator(s) as fail?`,
+  }));
+
   // Load node-generator list when the tab is shown
   document.getElementById('flagNodeGeneratorsTab').addEventListener('shown.bs.tab', async () => {
     await loadNodeGenerators();
@@ -2646,23 +2936,27 @@
 
   // Enable sorting (click any header) for both generator tables.
   enableTableSorting('genTable', genState, [
+    { key: null, label: '' },
     { key: null, label: '#' },
     { key: 'name', label: 'Name' },
     { key: 'type', label: 'Type' },
     { key: 'inputs', label: 'Inputs' },
     { key: 'outputs', label: 'Outputs' },
     { key: 'injects', label: 'Injects' },
+    { key: null, label: 'Validated' },
     { key: 'source', label: 'From Source' },
     { key: null, label: 'Actions' },
   ], renderGenerators);
 
   enableTableSorting('nodeGenTable', nodeGenState, [
+    { key: null, label: '' },
     { key: null, label: '#' },
     { key: 'name', label: 'Name' },
     { key: 'type', label: 'Type' },
     { key: 'inputs', label: 'Inputs' },
     { key: 'outputs', label: 'Outputs' },
     { key: 'injects', label: 'Injects' },
+    { key: null, label: 'Validated' },
     { key: 'source', label: 'From Source' },
     { key: null, label: 'Actions' },
   ], renderNodeGenerators);

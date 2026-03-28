@@ -39,6 +39,7 @@ def register(
     coerce_bool: Callable[[Any], bool],
     cleanup_remote_test_runtime: Callable[[dict[str, Any]], None],
     flaggen_run_ephemeral_execute: Callable[[str], None],
+    persist_generator_test_result: Callable[..., tuple[bool, str]],
 ) -> None:
     """Register Flag Generators test routes.
 
@@ -47,6 +48,21 @@ def register(
 
     if not begin_route_registration(app, 'flag_generators_test_routes'):
         return
+
+    def _persist_result(meta: dict[str, Any] | None, *, validated_ok: bool | None, validated_incomplete: bool = False) -> None:
+        if not isinstance(meta, dict):
+            return
+        try:
+            persist_generator_test_result(
+                kind='flag-generator',
+                generator_id=str(meta.get('generator_id') or '').strip(),
+                generator_name=str(meta.get('generator_name') or meta.get('generator_id') or '').strip(),
+                validated_ok=validated_ok,
+                validated_incomplete=validated_incomplete,
+                source_log_path=str(meta.get('log_path') or '').strip(),
+            )
+        except Exception:
+            pass
 
     def _cleanup_view(run_id: str):
         """Delete all artifacts for a flag-generator test run.
@@ -138,6 +154,12 @@ def register(
             if isinstance(lp, str) and lp:
                 with open(lp, 'a', encoding='utf-8') as log_f:
                     write_sse_marker(log_f, 'phase', {'phase': 'cleanup_start', 'run_id': run_id})
+        except Exception:
+            pass
+
+        try:
+            if isinstance(meta, dict) and not bool(meta.get('done')):
+                _persist_result(meta, validated_ok=None, validated_incomplete=True)
         except Exception:
             pass
 
@@ -445,13 +467,12 @@ def register(
                             flaggen_run_ephemeral_execute(run_id_local)
                             return
                         except Exception as exc:
-                            meta['done'] = True
-                            meta['returncode'] = 1
-                            meta['status'] = 'failed'
+                            rc = 1
                             meta['error'] = f'ephemeral execute failed: {exc}'
                     meta['done'] = True
                     meta['returncode'] = rc
                     meta['status'] = 'completed' if rc == 0 else 'failed'
+                    _persist_result(meta, validated_ok=(rc == 0), validated_incomplete=False)
                     try:
                         with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
                             write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
@@ -571,13 +592,12 @@ def register(
                         flaggen_run_ephemeral_execute(run_id_local)
                         return
                     except Exception as exc:
-                        meta['done'] = True
-                        meta['returncode'] = 1
-                        meta['status'] = 'failed'
+                        rc = 1
                         meta['error'] = f'ephemeral execute failed: {exc}'
                 meta['done'] = True
                 meta['returncode'] = rc
                 meta['status'] = 'completed' if rc == 0 else 'failed'
+                _persist_result(meta, validated_ok=(rc == 0), validated_incomplete=False)
                 try:
                     with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
                         write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})

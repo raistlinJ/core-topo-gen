@@ -24856,6 +24856,7 @@ try:
         coerce_bool=lambda value: _coerce_bool(value),
         cleanup_remote_test_runtime=lambda meta: _cleanup_remote_test_runtime(meta),
         flagnodegen_run_ephemeral_execute=lambda run_id: _flagnodegen_run_ephemeral_execute(run_id),
+        persist_generator_test_result=lambda **kwargs: _persist_generator_test_result(**kwargs),
     )
 except Exception:
     try:
@@ -24890,6 +24891,7 @@ try:
         coerce_bool=lambda value: _coerce_bool(value),
         cleanup_remote_test_runtime=lambda meta: _cleanup_remote_test_runtime(meta),
         flaggen_run_ephemeral_execute=lambda run_id: _flaggen_run_ephemeral_execute(run_id),
+        persist_generator_test_result=lambda **kwargs: _persist_generator_test_result(**kwargs),
     )
 except Exception:
     try:
@@ -35028,6 +35030,78 @@ if __name__ == '__main__':
     return scaffold_files, manifest_yaml, folder_path
 
 
+def _validate_builder_scaffold_runtime_contract(scaffold_files: dict[str, str]) -> list[str]:
+    manifest_path = ''
+    manifest_text = ''
+    generator_path = ''
+    generator_text = ''
+    for rel_path, content in (scaffold_files or {}).items():
+        path_text = str(rel_path or '').strip()
+        if not path_text:
+            continue
+        if not manifest_path and path_text.endswith(('/manifest.yaml', '/manifest.yml')):
+            manifest_path = path_text
+            manifest_text = str(content or '')
+        elif not generator_path and path_text.endswith('/generator.py'):
+            generator_path = path_text
+            generator_text = str(content or '')
+
+    if not manifest_path or not generator_path:
+        return []
+
+    declared_inputs: set[str] = set()
+    try:
+        import yaml  # type: ignore
+
+        manifest_doc = yaml.safe_load(manifest_text) or {}
+        manifest_inputs = manifest_doc.get('inputs')
+        if isinstance(manifest_inputs, list):
+            for item in manifest_inputs:
+                if not isinstance(item, dict):
+                    continue
+                input_name = str(item.get('name') or '').strip()
+                if input_name:
+                    declared_inputs.add(input_name)
+    except Exception:
+        return []
+
+    required_config_inputs: set[str] = set()
+    missing_config_pattern = re.compile(r"Missing\s+([A-Za-z0-9_.-]+)\s+in\s+/inputs/config\.json", re.IGNORECASE)
+    try:
+        parsed = ast.parse(generator_text)
+    except Exception:
+        parsed = None
+    if parsed is not None:
+        for node in ast.walk(parsed):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != 'SystemExit':
+                continue
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
+                continue
+            match = missing_config_pattern.search(first_arg.value)
+            if match:
+                required_config_inputs.add(match.group(1))
+    for match in missing_config_pattern.finditer(generator_text):
+        required_config_inputs.add(match.group(1))
+
+    errors: list[str] = []
+
+    missing_from_manifest = sorted(required_config_inputs - declared_inputs)
+    if missing_from_manifest:
+        joined = ', '.join(missing_from_manifest)
+        errors.append(
+            'Generated scaffold is inconsistent: '
+            f'{generator_path} requires runtime input(s) {joined} via /inputs/config.json, '
+            f'but {manifest_path} does not declare them under inputs.'
+        )
+
+    return errors
+
+
 try:
     from webapp.routes import generator_builder_routes as _generator_builder_routes
 
@@ -35043,6 +35117,7 @@ try:
         load_custom_artifacts=lambda: _load_custom_artifacts(),
         upsert_custom_artifact=lambda *args, **kwargs: _upsert_custom_artifact(*args, **kwargs),
         build_generator_scaffold=lambda payload: _build_generator_scaffold(payload),
+        validate_builder_scaffold=lambda scaffold_files: _validate_builder_scaffold_runtime_contract(scaffold_files),
         install_generator_pack_or_bundle=lambda *args, **kwargs: _install_generator_pack_or_bundle(*args, **kwargs),
         run_remote_builder_test=lambda *args, **kwargs: _run_remote_builder_scaffold_test(*args, **kwargs),
         start_remote_builder_test_process=lambda **kwargs: _start_remote_builder_scaffold_test_process(**kwargs),
@@ -35428,6 +35503,29 @@ def _save_installed_generator_packs_state(state: dict) -> None:
         pass
 
 
+def _snapshot_test_log_copy(*, source_log_path: str, subdir: str, file_stem: str) -> tuple[str | None, str | None]:
+    src = str(source_log_path or '').strip()
+    if not src or not os.path.isfile(src):
+        return None, None
+
+    safe_stem = re.sub(r'[^A-Za-z0-9_.-]+', '-', str(file_stem or '').strip()).strip('-') or 'test-log'
+    dest_dir = os.path.join(_outputs_dir(), subdir)
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = f'{safe_stem}-{_local_timestamp_safe()}.log'
+    dest_path = os.path.join(dest_dir, filename)
+
+    try:
+        shutil.copy2(src, dest_path)
+    except Exception:
+        try:
+            with open(src, 'r', encoding='utf-8', errors='ignore') as src_handle, open(dest_path, 'w', encoding='utf-8') as dest_handle:
+                dest_handle.write(src_handle.read())
+        except Exception:
+            return None, None
+
+    return dest_path, filename
+
+
 def _normalize_installed_source_path(p: str) -> str:
     return str(p or '').replace('\\', '/').strip().lower()
 
@@ -35490,6 +35588,11 @@ def _build_installed_disable_maps() -> tuple[dict[str, dict[str, Any]], dict[tup
                 'pack_disabled': pack_disabled,
                 'disabled': pack_disabled or item_disabled,
                 'item_disabled': item_disabled,
+                'validated_ok': bool(it.get('validated_ok')) if it.get('validated_ok') is not None else None,
+                'validated_incomplete': bool(it.get('validated_incomplete') is True),
+                'validated_at': str(it.get('validated_at') or '').strip() or None,
+                'last_test_log_path': str(it.get('last_test_log_path') or '').strip() or None,
+                'last_test_log_filename': str(it.get('last_test_log_filename') or '').strip() or None,
             }
 
             # Back-compat: generator packs may use numeric ids in the packs state,
@@ -35529,8 +35632,18 @@ def _annotate_disabled_state(generators: list[dict], *, kind: str) -> list[dict]
             g['_pack_disabled'] = bool(info.get('pack_disabled'))
             g['_disabled'] = bool(info.get('disabled'))
             g['_item_disabled'] = bool(info.get('item_disabled'))
+            g['_validated_ok'] = info.get('validated_ok')
+            g['_validated_incomplete'] = bool(info.get('validated_incomplete') is True)
+            g['_validated_at'] = info.get('validated_at')
+            g['_last_test_log_path'] = info.get('last_test_log_path')
+            g['_last_test_log_filename'] = info.get('last_test_log_filename')
         else:
             g['_disabled'] = False
+            g['_validated_ok'] = None
+            g['_validated_incomplete'] = False
+            g['_validated_at'] = None
+            g['_last_test_log_path'] = None
+            g['_last_test_log_filename'] = None
         out.append(g)
     return out
 
@@ -35542,6 +35655,117 @@ def _is_installed_generator_disabled(*, kind: str, generator_id: str) -> bool:
     _pack_by_id, gen_by_kind_id = _build_installed_disable_maps()
     info = gen_by_kind_id.get((str(kind or '').strip(), gid))
     return bool(info and info.get('disabled') is True)
+
+
+def _installed_generator_state_item_matches(*, item: dict[str, Any], kind: str, generator_id: str) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item_kind = str(item.get('kind') or '').strip().lower().replace('_', '-')
+    target_kind = str(kind or '').strip().lower().replace('_', '-')
+    if item_kind != target_kind:
+        return False
+
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False
+    if str(item.get('id') or '').strip() == gid:
+        return True
+
+    try:
+        pack_path = str(item.get('path') or '').strip()
+        if not pack_path:
+            return False
+        marker_path = os.path.join(pack_path, '.coretg_pack.json')
+        if not os.path.isfile(marker_path):
+            return False
+        with open(marker_path, 'r', encoding='utf-8') as fh:
+            marker = json.load(fh)
+        if not isinstance(marker, dict):
+            return False
+        return str(marker.get('source_generator_id') or '').strip() == gid
+    except Exception:
+        return False
+
+
+def _set_generator_validation_state(
+    *,
+    kind: str,
+    generator_id: str,
+    validated_ok: bool | None,
+    validated_incomplete: bool = False,
+    log_path: str | None = None,
+    log_filename: str | None = None,
+) -> tuple[bool, str]:
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False, 'Missing generator id'
+
+    k = str(kind or '').strip().lower().replace('_', '-')
+    if k not in ('flag-generator', 'flag-node-generator'):
+        return False, f'Invalid kind: {kind}'
+
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+
+    for pack in packs:
+        if not isinstance(pack, dict):
+            continue
+        items = pack.get('installed')
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not _installed_generator_state_item_matches(item=item, kind=k, generator_id=gid):
+                continue
+            if validated_ok is None:
+                item['validated_ok'] = None
+            else:
+                item['validated_ok'] = bool(validated_ok)
+            item['validated_incomplete'] = bool(validated_incomplete)
+            item['validated_at'] = _local_timestamp_display()
+            if isinstance(log_path, str) and log_path.strip():
+                item['last_test_log_path'] = str(log_path).strip()
+            if isinstance(log_filename, str) and log_filename.strip():
+                item['last_test_log_filename'] = str(log_filename).strip()
+            state['packs'] = packs
+            _save_installed_generator_packs_state(state)
+            if validated_ok is None:
+                status_label = 'incomplete'
+            else:
+                status_label = 'success' if bool(validated_ok) else 'fail'
+            return True, f'Updated {k} {gid} as {status_label}'
+
+    return False, 'Installed generator not found'
+
+
+def _persist_generator_test_result(
+    *,
+    kind: str,
+    generator_id: str,
+    generator_name: str,
+    validated_ok: bool | None,
+    validated_incomplete: bool = False,
+    source_log_path: str | None = None,
+) -> tuple[bool, str]:
+    safe_name = re.sub(r'[^A-Za-z0-9_.-]+', '-', str(generator_name or generator_id or '').strip()).strip('-') or str(generator_id or 'generator')
+    subdir = 'catalog-test-logs/flag_node_generators' if str(kind or '').strip().lower().replace('_', '-') == 'flag-node-generator' else 'catalog-test-logs/flag_generators'
+    copied_log_path = None
+    copied_log_name = None
+    if isinstance(source_log_path, str) and source_log_path.strip():
+        copied_log_path, copied_log_name = _snapshot_test_log_copy(
+            source_log_path=source_log_path,
+            subdir=subdir,
+            file_stem=f'{safe_name}-{generator_id}',
+        )
+    return _set_generator_validation_state(
+        kind=kind,
+        generator_id=generator_id,
+        validated_ok=validated_ok,
+        validated_incomplete=validated_incomplete,
+        log_path=copied_log_path,
+        log_filename=copied_log_name,
+    )
 
 
 def _is_safe_remote_zip_url(url: str) -> tuple[bool, str]:
@@ -36464,6 +36688,15 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
         state = _load_vuln_catalogs_state()
         cid = str(meta.get('catalog_id') or '').strip()
         item_id = int(meta.get('item_id') or 0)
+        item_name = str(meta.get('item_name') or meta.get('test_docker_node_name') or f'item-{item_id}').strip()
+        copied_log_path = None
+        copied_log_name = None
+        if isinstance(log_path, str) and log_path.strip():
+            copied_log_path, copied_log_name = _snapshot_test_log_copy(
+                source_log_path=log_path,
+                subdir='catalog-test-logs/vuln_catalog',
+                file_stem=f'{cid}-{item_id}-{item_name}',
+            )
         catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
         for c in catalogs:
             if str(c.get('id') or '').strip() != cid:
@@ -36479,6 +36712,10 @@ def _stop_vuln_test_meta(meta: dict, user_ok: bool | None):
                         it['validated_incomplete'] = False
                         it['validated_ok'] = bool(user_ok)
                     it['validated_at'] = _local_timestamp_display()
+                    if copied_log_path:
+                        it['last_test_log_path'] = copied_log_path
+                    if copied_log_name:
+                        it['last_test_log_filename'] = copied_log_name
                     updated = True
                     break
             if updated:
@@ -37159,11 +37396,7 @@ def _set_generator_disabled_state(*, kind: str, generator_id: str, disabled: boo
         if not isinstance(items, list):
             continue
         for it in items:
-            if not isinstance(it, dict):
-                continue
-            if str(it.get('kind') or '').strip().lower().replace('_', '-') != k:
-                continue
-            if str(it.get('id') or '').strip() != gid:
+            if not _installed_generator_state_item_matches(item=it, kind=k, generator_id=gid):
                 continue
             it['disabled'] = bool(disabled)
             state['packs'] = packs
@@ -37181,6 +37414,7 @@ try:
         require_builder_or_admin=lambda: _require_builder_or_admin(),
         set_pack_disabled_state=lambda **kwargs: _set_pack_disabled_state(**kwargs),
         set_generator_disabled_state=lambda **kwargs: _set_generator_disabled_state(**kwargs),
+        set_generator_validation_state=lambda **kwargs: _set_generator_validation_state(**kwargs),
         delete_installed_generator=lambda **kwargs: _delete_installed_generator(**kwargs),
     )
 except Exception:

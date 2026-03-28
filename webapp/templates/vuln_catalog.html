@@ -127,6 +127,15 @@
                 </div>
               </div>
               <div class="small text-muted mt-2" id="vulnCatalogMeta"></div>
+              <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mt-3">
+                <div class="small text-muted" id="vulnSelectionMeta">0 selected.</div>
+                <div class="btn-group btn-group-sm" role="group" aria-label="Selected vulnerability actions">
+                  <button class="btn btn-outline-warning" type="button" id="vulnBatchDisableSelectedBtn" disabled>Disable</button>
+                  <button class="btn btn-outline-danger" type="button" id="vulnBatchDeleteSelectedBtn" disabled>Delete</button>
+                  <button class="btn btn-outline-success" type="button" id="vulnBatchOverrideSuccessBtn" disabled>Override Success</button>
+                  <button class="btn btn-outline-secondary" type="button" id="vulnBatchOverrideFailBtn" disabled>Override Fail</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -136,6 +145,7 @@
                 <table class="table table-sm align-middle" id="vulnCatalogTable">
                   <thead class="fw-semibold">
                     <tr>
+                      <th style="width: 42px;"><input class="form-check-input" type="checkbox" id="vulnCatalogCheckAll" aria-label="Select all visible vulnerabilities"></th>
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Description</th>
@@ -401,6 +411,7 @@
     active: null,
     items: [],
     selectedItem: null,
+    selectedItemIds: new Set(),
     activeTestRunId: null,
     activeTestItemId: null,
     cleanupItemId: null,
@@ -452,6 +463,63 @@
       return x.idx - y.idx;
     });
     return decorated.map(d => d.item);
+  }
+
+  function _selectedVulnItemIds() {
+    return Array.from(_vulnCatalogState.selectedItemIds || []).map((value) => parseInt(value, 10)).filter((value) => Number.isFinite(value) && value > 0);
+  }
+
+  function _vulnMutationsLocked() {
+    return !!_vulnCatalogState.activeTestRunId || !!_vulnCatalogState.cleanupItemId || (!!_vulnCatalogState.activeBatchRunId && !_vulnCatalogState.activeBatchDone);
+  }
+
+  function _pruneVulnSelection() {
+    const validIds = new Set((Array.isArray(_vulnCatalogState.items) ? _vulnCatalogState.items : []).map((item) => String(item && item.id != null ? item.id : '')));
+    Array.from(_vulnCatalogState.selectedItemIds || []).forEach((value) => {
+      if (!validIds.has(String(value))) {
+        _vulnCatalogState.selectedItemIds.delete(value);
+      }
+    });
+  }
+
+  function _updateVulnSelectionUi() {
+    const selectedCount = (_vulnCatalogState.selectedItemIds && _vulnCatalogState.selectedItemIds.size) || 0;
+    const locked = _vulnMutationsLocked();
+    const metaEl = _qs('vulnSelectionMeta');
+    if (metaEl) {
+      metaEl.textContent = locked
+        ? `${selectedCount} selected. Selection actions are locked while a test or batch is active.`
+        : `${selectedCount} selected.`;
+    }
+    ['vulnBatchDisableSelectedBtn', 'vulnBatchDeleteSelectedBtn', 'vulnBatchOverrideSuccessBtn', 'vulnBatchOverrideFailBtn'].forEach((id) => {
+      const el = _qs(id);
+      if (el) el.disabled = locked || selectedCount === 0;
+    });
+    const checkboxes = Array.from(document.querySelectorAll('#vulnCatalogBody input[data-role="row-select"]')).filter((el) => !el.disabled);
+    const allChecked = checkboxes.length > 0 && checkboxes.every((el) => el.checked);
+    const checkAll = _qs('vulnCatalogCheckAll');
+    if (checkAll) {
+      checkAll.checked = allChecked;
+      checkAll.indeterminate = !allChecked && checkboxes.some((el) => el.checked);
+      checkAll.disabled = locked || checkboxes.length === 0;
+    }
+  }
+
+  async function _applyVulnBatchMutation(action, confirmMessage) {
+    const itemIds = _selectedVulnItemIds();
+    if (!itemIds.length || _vulnMutationsLocked()) return;
+    if (confirmMessage && !window.confirm(confirmMessage)) return;
+    try {
+      _appendLog('vulnCatalogLog', `[ui] Applying ${action} to ${itemIds.length} selected item(s)…`);
+      const result = await _postJson('/vuln_catalog_items/batch_mutate', { action, item_ids: itemIds });
+      _appendLog('vulnCatalogLog', `[ok] ${(result && result.message) ? result.message : 'Batch action applied.'}`);
+      if (action === 'delete') {
+        itemIds.forEach((value) => _vulnCatalogState.selectedItemIds.delete(String(value)));
+      }
+      await loadVulnCatalogItems();
+    } catch (e) {
+      _appendLog('vulnCatalogLog', `[error] ${String(e)}`);
+    }
   }
 
   function updateSortIndicators(tableId, state, columns) {
@@ -752,7 +820,10 @@
       const mutationsLocked = isRunning || isCleaning || batchActive;
       const tr = document.createElement('tr');
       if (it.disabled) tr.classList.add('table-secondary');
+      const isSelected = !!(_vulnCatalogState.selectedItemIds && _vulnCatalogState.selectedItemIds.has(itemId));
+      const logLink = it.log_download_url ? `<a class="btn btn-link btn-sm p-0 ms-2 align-baseline" href="${escapeHtml(it.log_download_url)}">Log</a>` : '';
       tr.innerHTML = `
+        <td><input class="form-check-input" type="checkbox" data-role="row-select" data-item-id="${escapeHtml(itemId)}" ${isSelected ? 'checked' : ''} ${mutationsLocked ? 'disabled' : ''} aria-label="Select vulnerability ${escapeHtml(it.name || '')}"></td>
         <td class="text-muted">${idx + 1}</td>
         <td>
           <div>
@@ -769,11 +840,11 @@
         </td>
         <td class="small">
           ${it.validated_incomplete === true
-            ? `<span class="badge text-bg-secondary">Incomplete</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+            ? `<span class="badge text-bg-secondary">Incomplete</span>${logLink}${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
             : (it.validated_ok === true
-              ? `<span class="badge text-bg-success">Validated</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+              ? `<span class="badge text-bg-success">Validated</span>${logLink}${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
               : (it.validated_ok === false
-                ? `<span class="badge text-bg-danger">Failed</span>${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
+                ? `<span class="badge text-bg-danger">Failed</span>${logLink}${it.validated_at ? `<div class="text-muted" style="font-size:11px;">${escapeHtml(it.validated_at)}</div>` : ''}`
                 : '<span class="text-muted">—</span>'))}
         </td>
         <td class="small">${escapeHtml(it.from_source || '')}</td>
@@ -785,6 +856,13 @@
           </div>
         </td>
       `;
+
+      tr.querySelector('[data-role="row-select"]')?.addEventListener('change', (event) => {
+        const checked = !!(event && event.target && event.target.checked);
+        if (checked) _vulnCatalogState.selectedItemIds.add(itemId);
+        else _vulnCatalogState.selectedItemIds.delete(itemId);
+        _updateVulnSelectionUi();
+      });
 
       tr.querySelector('[data-action="test"]').addEventListener('click', () => openVulnTestModal(it));
       tr.querySelector('[data-action="toggle"]').addEventListener('click', async () => {
@@ -814,9 +892,11 @@
 
     if (!rows.length) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="6" class="text-muted">No vulnerabilities found.</td>`;
+      tr.innerHTML = `<td colspan="7" class="text-muted">No vulnerabilities found.</td>`;
       body.appendChild(tr);
     }
+
+    _updateVulnSelectionUi();
   }
 
   async function loadVulnCatalogItems() {
@@ -833,6 +913,7 @@
     }
     _vulnCatalogState.active = data.active || null;
     _vulnCatalogState.items = Array.isArray(data.items) ? data.items : [];
+    _pruneVulnSelection();
     const src = _vulnCatalogState.active && _vulnCatalogState.active.from_source ? String(_vulnCatalogState.active.from_source) : '';
     const activeLabel = _vulnCatalogState.active && _vulnCatalogState.active.label ? String(_vulnCatalogState.active.label) : 'repo default';
     if (metaEl) metaEl.textContent = `${_vulnCatalogState.items.length} items • Active: ${activeLabel}${src ? ' • From: ' + src : ''}`;
@@ -1783,11 +1864,33 @@
     const batchIncludeDisabled = _qs('vulnBatchIncludeDisabled');
     if (batchIncludeDisabled) batchIncludeDisabled.addEventListener('change', renderVulnBatchSelectionPreview);
 
+    const checkAll = _qs('vulnCatalogCheckAll');
+    if (checkAll) checkAll.addEventListener('change', (event) => {
+      if (_vulnMutationsLocked()) return;
+      const checked = !!(event && event.target && event.target.checked);
+      document.querySelectorAll('#vulnCatalogBody input[data-role="row-select"]').forEach((el) => {
+        if (el.disabled) return;
+        el.checked = checked;
+        const itemId = String(el.getAttribute('data-item-id') || '');
+        if (!itemId) return;
+        if (checked) _vulnCatalogState.selectedItemIds.add(itemId);
+        else _vulnCatalogState.selectedItemIds.delete(itemId);
+      });
+      _updateVulnSelectionUi();
+    });
+
+    _qs('vulnBatchDisableSelectedBtn')?.addEventListener('click', () => _applyVulnBatchMutation('disable', `Disable ${_selectedVulnItemIds().length} selected item(s)?`));
+    _qs('vulnBatchDeleteSelectedBtn')?.addEventListener('click', () => _applyVulnBatchMutation('delete', `Delete ${_selectedVulnItemIds().length} selected item(s)? This cannot be undone.`));
+    _qs('vulnBatchOverrideSuccessBtn')?.addEventListener('click', () => _applyVulnBatchMutation('override_success', `Override ${_selectedVulnItemIds().length} selected item(s) as success?`));
+    _qs('vulnBatchOverrideFailBtn')?.addEventListener('click', () => _applyVulnBatchMutation('override_fail', `Override ${_selectedVulnItemIds().length} selected item(s) as fail?`));
+
     // Mirror Flag-Generators: click header to sort + arrows
     enableTableSorting('vulnCatalogTable', _vulnCatalogState, [
+      { label: '', key: null },
       { label: '#', key: null },
       { label: 'Name', key: 'name' },
       { label: 'Description', key: null },
+      { label: 'Validated', key: null },
       { label: 'From Source', key: 'from_source' },
       { label: 'Actions', key: null },
     ], _renderVulnCatalogTable);

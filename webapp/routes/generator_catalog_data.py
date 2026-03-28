@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Callable
 
-from flask import jsonify
+from flask import jsonify, request, send_file
 
 from webapp.routes._registration import begin_route_registration, mark_routes_registered
 
@@ -22,6 +22,51 @@ def register(
 ) -> None:
     if not begin_route_registration(app, 'generator_catalog_data_routes'):
         return
+
+    def _state_item_matches(item: object, *, kind: str, generator_id: str) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if str(item.get('kind') or '').strip() != kind:
+            return False
+        gid = str(generator_id or '').strip()
+        if not gid:
+            return False
+        if str(item.get('id') or '').strip() == gid:
+            return True
+        try:
+            pack_path = str(item.get('path') or '').strip()
+            if not pack_path:
+                return False
+            marker_path = os.path.join(pack_path, '.coretg_pack.json')
+            if not os.path.isfile(marker_path):
+                return False
+            marker = json.loads(Path(marker_path).read_text(encoding='utf-8', errors='ignore') or '{}')
+            return str(marker.get('source_generator_id') or '').strip() == gid
+        except Exception:
+            return False
+
+    def _attach_test_metadata(generators: list[dict], *, kind: str) -> list[dict]:
+        outputs_root = os.path.abspath(Path(installed_generators_root()).parent)
+        out: list[dict] = []
+        for generator in (generators or []):
+            if not isinstance(generator, dict):
+                continue
+            item = dict(generator)
+            item['validated_ok'] = item.get('_validated_ok')
+            item['validated_incomplete'] = bool(item.get('_validated_incomplete') is True)
+            item['validated_at'] = item.get('_validated_at')
+            log_path = str(item.get('_last_test_log_path') or '').strip()
+            log_download_url = None
+            if log_path:
+                try:
+                    abs_log_path = os.path.abspath(log_path)
+                    if os.path.isfile(abs_log_path) and os.path.commonpath([outputs_root, abs_log_path]) == outputs_root:
+                        log_download_url = f"/api/generator_catalog/test_log?kind={kind}&generator_id={generator.get('id') or ''}"
+                except Exception:
+                    log_download_url = None
+            item['log_download_url'] = log_download_url
+            out.append(item)
+        return out
 
     def _normalize_manifest_io(items, *, fallback_type: str) -> list[dict]:
         normalized: list[dict] = []
@@ -183,6 +228,7 @@ def register(
             generators, errors = flag_generators_from_enabled_sources()
             generators = [g for g in (generators or []) if isinstance(g, dict) and is_installed_generator_view(g)]
             generators = annotate_disabled_state(generators, kind='flag-generator')
+            generators = _attach_test_metadata(generators, kind='flag-generator')
             visible_manifest_paths = {
                 os.path.abspath(str(g.get('_source_path') or '').strip())
                 for g in generators
@@ -200,6 +246,7 @@ def register(
             generators, errors = flag_node_generators_from_enabled_sources()
             generators = [g for g in (generators or []) if isinstance(g, dict) and is_installed_generator_view(g)]
             generators = annotate_disabled_state(generators, kind='flag-node-generator')
+            generators = _attach_test_metadata(generators, kind='flag-node-generator')
             visible_manifest_paths = {
                 os.path.abspath(str(g.get('_source_path') or '').strip())
                 for g in generators
@@ -210,5 +257,43 @@ def register(
             return jsonify({'generators': generators, 'errors': _filter_duplicate_installed_errors(errors, duplicate_manifest_paths)})
         except Exception as exc:
             return jsonify({'generators': [], 'errors': [{'error': str(exc)}]}), 500
+
+    @app.route('/api/generator_catalog/test_log')
+    def generator_catalog_test_log():
+        kind = str(request.args.get('kind') or '').strip()
+        generator_id = str(request.args.get('generator_id') or '').strip()
+        if kind not in {'flag-generator', 'flag-node-generator'}:
+            return jsonify({'ok': False, 'error': 'Invalid kind'}), 400
+        if not generator_id:
+            return jsonify({'ok': False, 'error': 'Missing generator id'}), 400
+
+        outputs_root = os.path.abspath(Path(installed_generators_root()).parent)
+        state = load_installed_generator_packs_state()
+        packs = state.get('packs') if isinstance(state, dict) else None
+        if not isinstance(packs, list):
+            packs = []
+
+        for pack in packs:
+            if not isinstance(pack, dict):
+                continue
+            installed = pack.get('installed') if isinstance(pack.get('installed'), list) else []
+            for item in installed:
+                if not _state_item_matches(item, kind=kind, generator_id=generator_id):
+                    continue
+                log_path = str(item.get('last_test_log_path') or '').strip()
+                if not log_path:
+                    return jsonify({'ok': False, 'error': 'Log not available'}), 404
+                abs_log_path = os.path.abspath(log_path)
+                try:
+                    if os.path.commonpath([outputs_root, abs_log_path]) != outputs_root:
+                        return jsonify({'ok': False, 'error': 'Refusing path'}), 400
+                except Exception:
+                    return jsonify({'ok': False, 'error': 'Refusing path'}), 400
+                if not os.path.isfile(abs_log_path):
+                    return jsonify({'ok': False, 'error': 'Log not available'}), 404
+                download_name = str(item.get('last_test_log_filename') or os.path.basename(abs_log_path) or f'{generator_id}.log').strip()
+                return send_file(abs_log_path, as_attachment=True, download_name=download_name, mimetype='text/plain; charset=utf-8')
+
+        return jsonify({'ok': False, 'error': 'Unknown generator id'}), 404
 
     mark_routes_registered(app, 'generator_catalog_data_routes')

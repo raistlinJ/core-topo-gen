@@ -1734,6 +1734,36 @@ def _iter_bind_sources_from_service(svc: Dict[str, object]) -> List[str]:
 	return results
 
 
+def _copy_path_replace_wrong_type(src_path: str, dst_path: str) -> None:
+	"""Copy src_path to dst_path, replacing stale wrong-type destinations.
+
+	This avoids a common docker bind-mount failure mode where a support file path
+	was left behind as a directory (or vice-versa) from an earlier preparation run.
+	"""
+	src_is_dir = os.path.isdir(src_path)
+	if os.path.lexists(dst_path):
+		try:
+			dst_is_dir = os.path.isdir(dst_path)
+		except Exception:
+			dst_is_dir = False
+		if src_is_dir != dst_is_dir:
+			try:
+				if dst_is_dir and (not os.path.islink(dst_path)):
+					shutil.rmtree(dst_path, ignore_errors=True)
+				else:
+					os.remove(dst_path)
+			except Exception:
+				try:
+					shutil.rmtree(dst_path, ignore_errors=True)
+				except Exception:
+					pass
+	if src_is_dir:
+		shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+	else:
+		os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+		shutil.copy2(src_path, dst_path)
+
+
 def _copy_support_paths_and_absolutize_binds(compose_obj: dict, src_dir: str, base_dir: str) -> dict:
 	"""Copy referenced relative bind sources into base_dir and rewrite to absolute paths.
 
@@ -1761,11 +1791,7 @@ def _copy_support_paths_and_absolutize_binds(compose_obj: dict, src_dir: str, ba
 			src_path = os.path.normpath(os.path.join(src_dir, rel))
 			dst_path = os.path.normpath(os.path.join(base_dir, rel))
 			try:
-				if os.path.isdir(src_path):
-					shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
-				else:
-					os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-					shutil.copy2(src_path, dst_path)
+				_copy_path_replace_wrong_type(src_path, dst_path)
 			except Exception:
 				# Best-effort: continue even if some optional paths fail.
 				pass
@@ -1870,17 +1896,14 @@ def _rewrite_abs_paths_from_dir_to_dir(compose_obj: dict, from_dir: str, to_dir:
 							except Exception:
 								pass
 							try:
-								if os.path.isdir(src_child):
-									shutil.copytree(src_child, dst_child, dirs_exist_ok=True)
-								elif os.path.exists(src_child):
-									os.makedirs(os.path.dirname(dst_child), exist_ok=True)
-									shutil.copy2(src_child, dst_child)
+								if os.path.exists(src_child):
+									_copy_path_replace_wrong_type(src_child, dst_child)
 							except Exception:
 								pass
 					else:
-						shutil.copytree(p_abs, dst, dirs_exist_ok=True)
+						_copy_path_replace_wrong_type(p_abs, dst)
 				elif os.path.exists(p_abs):
-					shutil.copy2(p_abs, dst)
+					_copy_path_replace_wrong_type(p_abs, dst)
 			except Exception:
 				pass
 			return dst

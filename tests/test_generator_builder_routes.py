@@ -246,6 +246,37 @@ def test_generator_scaffold_meta_returns_sorted_paths(monkeypatch):
     }
 
 
+def test_generator_scaffold_meta_surfaces_validation_errors(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+    monkeypatch.setattr(
+        backend,
+        '_build_generator_scaffold',
+        lambda payload: (
+            {
+                'flag_generators/py_demo/manifest.yaml': 'manifest_version: 1\ninputs:\n  - name: seed\n',
+                'flag_generators/py_demo/generator.py': (
+                    'def main():\n'
+                    '    raise SystemExit("Missing secret in /inputs/config.json")\n'
+                ),
+            },
+            'manifest_version: 1\ninputs:\n  - name: seed\n',
+            'flag_generators/py_demo',
+        ),
+    )
+
+    resp = client.post('/api/generators/scaffold_meta', json={'plugin_id': 'demo'})
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload['ok'] is True
+    assert payload['validation_ok'] is False
+    assert payload.get('validation_errors')
+    assert 'secret' in str(payload['validation_errors'][0])
+
+
 def test_generator_prompt_intent_preview_returns_structured_sections(monkeypatch):
     client = app.test_client()
     _login(client)
@@ -358,6 +389,33 @@ def test_generator_scaffold_zip_streams_archive(monkeypatch):
         assert archive.read('demo/manifest.yaml').decode('utf-8') == 'manifest-body'
 
 
+def test_generator_scaffold_zip_rejects_invalid_scaffold(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+    monkeypatch.setattr(
+        backend,
+        '_build_generator_scaffold',
+        lambda payload: (
+            {
+                'flag_generators/py_demo_invalid_zip/manifest.yaml': 'manifest_version: 1\ninputs:\n  - name: seed\n',
+                'flag_generators/py_demo_invalid_zip/generator.py': 'def main():\n    raise SystemExit("Missing secret in /inputs/config.json")\n',
+            },
+            'manifest_version: 1\ninputs:\n  - name: seed\n',
+            'flag_generators/py_demo_invalid_zip',
+        ),
+    )
+
+    resp = client.post('/api/generators/scaffold_zip', json={'plugin_id': 'demo_invalid_zip'})
+
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert payload['ok'] is False
+    assert 'secret' in str(payload.get('error') or '')
+    assert payload.get('validation_errors')
+
+
 def test_build_generator_scaffold_accepts_runtime_inputs_and_generator_override():
     scaffold_files, manifest_yaml, folder_path = backend._build_generator_scaffold({
         'plugin_type': 'flag-node-generator',
@@ -450,6 +508,413 @@ def test_generator_ai_scaffold_normalizes_model_output(monkeypatch):
     assert 'Credential(user,password)' in payload['manifest_yaml']
 
 
+def test_generator_ai_scaffold_auto_heals_runtime_input_mismatch(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'http://127.0.0.1:11434'})()
+
+    invalid_json = {
+        'plugin_id': 'heal_demo',
+        'name': 'Heal Demo',
+        'description': 'Initial invalid scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [
+            {'name': 'seed', 'type': 'string', 'required': True},
+        ],
+        'generator_py_text': (
+            'def main():\n'
+            '    raise SystemExit("Missing secret in /inputs/config.json")\n'
+        ),
+    }
+    healed_json = {
+        'plugin_id': 'heal_demo',
+        'name': 'Heal Demo',
+        'description': 'Healed scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [
+            {'name': 'seed', 'type': 'string', 'required': True},
+            {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+        ],
+        'generator_py_text': (
+            'def main():\n'
+            '    raise SystemExit("Missing secret in /inputs/config.json")\n'
+        ),
+    }
+
+    responses = [invalid_json, healed_json]
+    captured_prompts: list[str] = []
+
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True):
+        captured_prompts.append(str(payload.get('prompt') or ''))
+        current = responses.pop(0)
+        return {'response': '', 'thinking': json.dumps(current)}
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_normalize_base_url', lambda value: str(value))
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
+
+    resp = client.post('/api/generators/ai_scaffold', json={
+        'plugin_type': 'flag-generator',
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'qwen2.5:7b',
+        'prompt': 'Build a deterministic credential generator.',
+    })
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('ok') is True
+    assert payload['auto_heal']['attempted'] is True
+    assert payload['auto_heal']['healed'] is True
+    assert payload['auto_heal']['initial_validation_errors']
+    assert payload['validation_errors'] == []
+    assert payload['scaffold_request']['runtime_inputs'] == [
+        {'name': 'seed', 'type': 'string', 'required': True},
+        {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+    ]
+    assert len(captured_prompts) == 2
+    assert 'Fix these scaffold validation errors first:' in captured_prompts[1]
+    assert 'secret' in captured_prompts[1]
+
+
+def test_generator_ai_scaffold_auto_heals_scaffold_construction_error(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'http://127.0.0.1:11434'})()
+
+    valid_json = {
+        'plugin_id': 'json_heal_demo',
+        'name': 'JSON Heal Demo',
+        'description': 'Recovered scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'print("ok")\n',
+    }
+
+    responses = ['not valid json', json.dumps(valid_json)]
+    captured_prompts: list[str] = []
+
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True):
+        captured_prompts.append(str(payload.get('prompt') or ''))
+        current = responses.pop(0)
+        return {'response': current, 'thinking': ''}
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_normalize_base_url', lambda value: str(value))
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
+
+    resp = client.post('/api/generators/ai_scaffold', json={
+        'plugin_type': 'flag-generator',
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'qwen2.5:7b',
+        'prompt': 'Build a deterministic demo generator.',
+    })
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('ok') is True
+    assert payload['auto_heal']['attempted'] is True
+    assert payload['auto_heal']['healed'] is True
+    assert payload['auto_heal']['initial_scaffold_errors']
+    assert 'valid JSON object' in payload['auto_heal']['initial_scaffold_errors'][0]
+    assert payload['scaffold_request']['plugin_id'] == 'json_heal_demo'
+    assert len(captured_prompts) == 2
+    assert 'Fix these scaffold construction errors first:' in captured_prompts[1]
+
+
+def test_generator_ai_scaffold_auto_heals_noop_refinement(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'http://127.0.0.1:11434'})()
+
+    current_scaffold = {
+        'plugin_type': 'flag-generator',
+        'plugin_id': 'refine_demo',
+        'folder_name': 'py_refine_demo',
+        'name': 'Refine Demo',
+        'description': 'Current scaffold.',
+        'requires': [],
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'print("before")\n',
+    }
+    current_files, _manifest_yaml, _folder_path = backend._build_generator_scaffold(current_scaffold)
+    unchanged_json = {
+        'plugin_id': 'refine_demo',
+        'folder_name': 'py_refine_demo',
+        'name': 'Refine Demo',
+        'description': 'Current scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'print("before")\n',
+    }
+    healed_json = {
+        'plugin_id': 'refine_demo',
+        'folder_name': 'py_refine_demo',
+        'name': 'Refine Demo',
+        'description': 'Refined scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'print("after")\n',
+    }
+
+    responses = [unchanged_json, healed_json]
+    captured_prompts: list[str] = []
+
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True):
+        captured_prompts.append(str(payload.get('prompt') or ''))
+        current = responses.pop(0)
+        return {'response': '', 'thinking': json.dumps(current)}
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_normalize_base_url', lambda value: str(value))
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
+
+    resp = client.post('/api/generators/ai_scaffold', json={
+        'plugin_type': 'flag-generator',
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'qwen2.5:7b',
+        'prompt': 'Refine the generator to fix the last failure and change the generated output.',
+        'current_scaffold_request': current_scaffold,
+        'current_files': current_files,
+        'last_test_result': {
+            'ok': False,
+            'returncode': 1,
+            'failure_summary': 'Generator still behaves the same after refinement.',
+            'stderr': 'Generator still behaves the same after refinement.',
+            'stdout': '',
+            'files': [],
+        },
+    })
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    assert payload.get('ok') is True
+    assert payload['auto_heal']['attempted'] is True
+    assert payload['auto_heal']['healed'] is True
+    assert any('same scaffold files' in str(item).lower() for item in payload['auto_heal']['initial_validation_errors'])
+    assert any('generator still behaves the same after refinement.' in str(item).lower() for item in payload['auto_heal']['initial_validation_errors'])
+    assert len(captured_prompts) == 2
+    assert 'same scaffold files' in captured_prompts[1].lower()
+
+
+def test_build_generator_builder_ai_messages_require_actual_refine_edits():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Refine the current generator.',
+        'current_scaffold_request': {
+            'plugin_id': 'refine_demo',
+            'folder_name': 'py_refine_demo',
+        },
+        'current_files': {
+            'flag_generators/py_refine_demo/generator.py': 'print("before")\n',
+        },
+    })
+
+    text = messages[1]['content']
+    assert 'Do not return the current scaffold unchanged' in text
+
+
+def test_build_generator_builder_ai_messages_include_missing_module_guidance():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Refine the current generator.',
+        'current_scaffold_request': {
+            'plugin_id': 'refine_demo',
+            'folder_name': 'py_refine_demo',
+        },
+        'current_files': {
+            'flag_generators/py_refine_demo/generator.py': 'from PIL import Image\n',
+        },
+        'last_test_result': {
+            'ok': False,
+            'returncode': 1,
+            'failure_summary': "ModuleNotFoundError: No module named 'PIL'",
+            'stderr': '',
+            'stdout': '',
+            'files': [],
+        },
+    })
+
+    text = messages[1]['content']
+    assert 'missing the Python dependency PIL' in text
+    assert 'compose_text or the Docker image build' in text
+
+
+def test_build_generator_builder_ai_messages_include_iteration_history_and_validation() -> None:
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Now update the compose file so dependencies are installed and keep the Batman theme.',
+        'current_scaffold_request': {
+            'plugin_id': 'batman_demo',
+            'folder_name': 'py_batman_demo',
+        },
+        'current_files': {
+            'flag_generators/py_batman_demo/generator.py': 'from PIL import Image\nprint("demo")\n',
+        },
+        'iteration_history': [
+            {
+                'mode': 'create',
+                'prompt': 'Create a Batman-themed stego flag generator.',
+                'plugin_id': 'batman_demo',
+                'status': 'scaffold updated',
+            },
+            {
+                'mode': 'test',
+                'prompt': 'irrelevant test row',
+                'plugin_id': 'batman_demo',
+                'status': 'failed rc=1',
+            },
+            {
+                'mode': 'refine',
+                'prompt': 'Keep the same generator but make the image output deterministic.',
+                'plugin_id': 'batman_demo',
+                'status': 'scaffold updated',
+            },
+        ],
+        'scaffold_validation': {
+            'ok': False,
+            'pending': False,
+            'errors': ['manifest and generator inputs are out of sync'],
+            'message': '',
+            'source': 'generation',
+        },
+    })
+
+    text = messages[1]['content']
+    assert 'Original create request:' in text
+    assert 'Create a Batman-themed stego flag generator.' in text
+    assert 'Recent create/refine history (oldest to newest):' in text
+    assert 'Keep the same generator but make the image output deterministic.' in text
+    assert 'irrelevant test row' not in text
+    assert 'Current scaffold validation warnings:' in text
+    assert 'manifest and generator inputs are out of sync' in text
+
+
+def test_generator_ai_scaffold_stream_openai_compatible_concatenates_fragment_lists(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'https://litellm.example.com/v1'})()
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_resolve_payload_with_stored_api_key', lambda payload: {**payload, 'api_key': 'stored-builder-key'})
+    monkeypatch.setattr(ai_provider_routes, '_normalize_openai_compatible_base_url', lambda value, *, enforce_ssl: 'https://litellm.example.com/v1')
+
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True, on_open=None):
+        if callable(on_open):
+            on_open(object())
+        return {
+            'choices': [
+                {
+                    'message': {
+                        'content': [
+                            {'type': 'text', 'text': '{'},
+                            {'type': 'text', 'text': '"plugin_id": '},
+                            {'type': 'text', 'text': '"nemotron_demo"'},
+                            {'type': 'text', 'text': '}'},
+                        ],
+                    },
+                }
+            ]
+        }
+
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
+
+    resp = client.post('/api/generators/ai_scaffold_stream', json={
+        'request_id': 'builder-openai-fragment-list-test',
+        'plugin_type': 'flag-generator',
+        'provider': 'litellm',
+        'base_url': 'https://litellm.example.com/v1',
+        'model': 'nemotron',
+        'prompt': 'Build a deterministic fragment-list demo generator.',
+    })
+
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
+    llm_deltas = [str(event.get('text') or '') for event in events if event.get('type') == 'llm_delta']
+    assert llm_deltas
+    assert '\n' not in llm_deltas[-1]
+    assert llm_deltas[-1] == '{"plugin_id": "nemotron_demo"}'
+
+
+def test_generator_ai_scaffold_stream_auto_heals_scaffold_build_error(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'http://127.0.0.1:11434'})()
+
+    assistant_json = {
+        'plugin_id': 'stream_build_heal_demo',
+        'name': 'Stream Build Heal Demo',
+        'description': 'Recovered after scaffold build failure.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'print("stream-build")\n',
+    }
+    stream_payloads = [json.dumps(assistant_json), json.dumps(assistant_json)]
+    original_build = generator_builder_routes._BUILD_GENERATOR_SCAFFOLD
+    build_calls = {'count': 0}
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_normalize_base_url', lambda value: str(value))
+
+    def _fake_stream_json_lines(url, payload, *, timeout, headers=None, verify_ssl=True, cancellation_check=None, on_open=None):
+        if callable(on_open):
+            on_open(object())
+        yield {'response': stream_payloads.pop(0)}
+
+    def _build_once_then_succeed(scaffold_payload):
+        build_calls['count'] += 1
+        if build_calls['count'] == 1:
+            raise RuntimeError('synthetic scaffold build failed')
+        return original_build(scaffold_payload)
+
+    monkeypatch.setattr(ai_provider_routes, '_stream_json_lines', _fake_stream_json_lines)
+    monkeypatch.setattr(generator_builder_routes, '_BUILD_GENERATOR_SCAFFOLD', _build_once_then_succeed)
+
+    resp = client.post('/api/generators/ai_scaffold_stream', json={
+        'request_id': 'builder-stream-scaffold-heal-test',
+        'plugin_type': 'flag-generator',
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'qwen2.5:7b',
+        'prompt': 'Build a deterministic stream demo generator.',
+    })
+
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
+    event_types = [event.get('type') for event in events]
+    assert 'llm_output_reset' in event_types
+    status_messages = [str(event.get('message') or '') for event in events if event.get('type') == 'status']
+    assert 'Generated scaffold could not be normalized or built; attempting AI auto-heal...' in status_messages
+    result_event = next(event for event in events if event.get('type') == 'result')
+    assert result_event['data']['auto_heal']['attempted'] is True
+    assert result_event['data']['auto_heal']['healed'] is True
+    assert result_event['data']['auto_heal']['initial_scaffold_errors'] == ['synthetic scaffold build failed']
+    assert result_event['data']['scaffold_request']['plugin_id'] == 'stream_build_heal_demo'
+
+
 def test_generator_ai_scaffold_stream_emits_prompt_delta_and_result(monkeypatch):
     client = app.test_client()
     _login(client)
@@ -500,6 +965,70 @@ def test_generator_ai_scaffold_stream_emits_prompt_delta_and_result(monkeypatch)
     result_event = next(event for event in events if event.get('type') == 'result')
     assert result_event['data']['scaffold_request']['plugin_id'] == 'stream_demo'
     assert 'flag_generators/py_stream_demo/generator.py' in result_event['data']['files']
+
+
+def test_generator_ai_scaffold_stream_auto_heals_runtime_input_mismatch(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'http://127.0.0.1:11434'})()
+
+    invalid_json = {
+        'plugin_id': 'stream_heal_demo',
+        'name': 'Stream Heal Demo',
+        'description': 'Initial invalid scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        'generator_py_text': 'def main():\n    raise SystemExit("Missing secret in /inputs/config.json")\n',
+    }
+    healed_json = {
+        'plugin_id': 'stream_heal_demo',
+        'name': 'Stream Heal Demo',
+        'description': 'Healed scaffold.',
+        'produces': ['Flag(flag_id)'],
+        'runtime_inputs': [
+            {'name': 'seed', 'type': 'string', 'required': True},
+            {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+        ],
+        'generator_py_text': 'def main():\n    raise SystemExit("Missing secret in /inputs/config.json")\n',
+    }
+    stream_payloads = [json.dumps(invalid_json), json.dumps(healed_json)]
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_normalize_base_url', lambda value: str(value))
+
+    def _fake_stream_json_lines(url, payload, *, timeout, headers=None, verify_ssl=True, cancellation_check=None, on_open=None):
+        if callable(on_open):
+            on_open(object())
+        yield {'response': stream_payloads.pop(0)}
+
+    monkeypatch.setattr(ai_provider_routes, '_stream_json_lines', _fake_stream_json_lines)
+
+    resp = client.post('/api/generators/ai_scaffold_stream', json={
+        'request_id': 'builder-stream-heal-test',
+        'plugin_type': 'flag-generator',
+        'provider': 'ollama',
+        'base_url': 'http://127.0.0.1:11434',
+        'model': 'qwen2.5:7b',
+        'prompt': 'Build a deterministic stream demo generator.',
+    })
+
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
+    event_types = [event.get('type') for event in events]
+    assert 'llm_output_reset' in event_types
+    status_messages = [str(event.get('message') or '') for event in events if event.get('type') == 'status']
+    assert 'Generated scaffold failed validation; attempting AI auto-heal...' in status_messages
+    result_event = next(event for event in events if event.get('type') == 'result')
+    assert result_event['data']['auto_heal']['attempted'] is True
+    assert result_event['data']['auto_heal']['healed'] is True
+    assert result_event['data']['scaffold_request']['runtime_inputs'] == [
+        {'name': 'seed', 'type': 'string', 'required': True},
+        {'name': 'secret', 'type': 'string', 'required': True, 'sensitive': True},
+    ]
 
 
 def test_generator_ai_scaffold_stream_emits_openai_compatible_progress_statuses(monkeypatch):
@@ -553,6 +1082,51 @@ def test_generator_ai_scaffold_stream_emits_openai_compatible_progress_statuses(
     assert 'llm_prompt' in event_types
     assert 'llm_delta' in event_types
     assert 'result' in event_types
+
+
+def test_generator_ai_scaffold_stream_openai_compatible_extracts_reasoning_content(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    class _DummyAdapter:
+        capability = type('Capability', (), {'default_base_url': 'https://litellm.example.com/v1'})()
+
+    monkeypatch.setattr(ai_provider_routes, '_get_provider_adapter', lambda provider: _DummyAdapter())
+    monkeypatch.setattr(ai_provider_routes, '_resolve_payload_with_stored_api_key', lambda payload: {**payload, 'api_key': 'stored-builder-key'})
+    monkeypatch.setattr(ai_provider_routes, '_normalize_openai_compatible_base_url', lambda value, *, enforce_ssl: 'https://litellm.example.com/v1')
+
+    def _fake_post_json(url, payload, *, timeout, headers=None, verify_ssl=True, on_open=None):
+        if callable(on_open):
+            on_open(object())
+        return {
+            'choices': [
+                {
+                    'message': {
+                        'content': '',
+                        'reasoning_content': json.dumps({'plugin_id': 'builder_reasoning_demo'}),
+                    },
+                },
+            ],
+        }
+
+    monkeypatch.setattr(ai_provider_routes, '_post_json', _fake_post_json)
+
+    resp = client.post('/api/generators/ai_scaffold_stream', json={
+        'request_id': 'builder-openai-reasoning-content-test',
+        'plugin_type': 'flag-generator',
+        'provider': 'litellm',
+        'base_url': 'https://litellm.example.com/v1',
+        'model': 'gpt-4o-mini',
+        'prompt': 'Build a demo generator.',
+    })
+
+    assert resp.status_code == 200
+    events = [json.loads(line) for line in resp.get_data(as_text=True).splitlines() if line.strip()]
+    assert any(event.get('type') == 'llm_delta' and 'builder_reasoning_demo' in str(event.get('text') or '') for event in events)
+    result_event = next(event for event in events if event.get('type') == 'result')
+    assert result_event['data']['scaffold_request']['plugin_id'] == 'builder_reasoning_demo'
 
 
 def test_generator_ai_scaffold_openai_compatible_uses_api_key_and_ssl(monkeypatch):
@@ -707,6 +1281,132 @@ def test_generator_builder_ai_messages_add_targeted_inject_failure_guidance():
     assert 'Observed failure to fix first: inject_files referenced file paths that were never created.' in user_content
     assert 'If you keep inject_files: ["File(path)"]' in user_content
     assert 'If no injected file is needed, remove inject_files and remove File(path) from produces.' in user_content
+
+
+def test_generator_builder_ai_messages_add_runtime_input_drift_guidance():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Please refine the generator.',
+        'current_scaffold_request': {
+            'plugin_type': 'flag-generator',
+            'plugin_id': 'demo',
+            'folder_name': 'py_demo',
+            'name': 'Demo',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)'],
+            'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        },
+        'last_test_result': {
+            'ok': False,
+            'returncode': 1,
+            'stderr': 'Generated scaffold is inconsistent: generator.py requires runtime input(s) secret via /inputs/config.json, but manifest.yaml does not declare them under inputs.',
+            'failure_summary': 'Generated scaffold is inconsistent: generator.py requires runtime input(s) secret via /inputs/config.json, but manifest.yaml does not declare them under inputs.',
+            'files': [],
+        },
+    })
+
+    user_content = messages[1]['content']
+    assert 'Observed failure to fix first: generator.py requires runtime config keys that manifest inputs do not declare.' in user_content
+    assert 'Every key that generator.py treats as required from /inputs/config.json must appear in runtime_inputs' in user_content
+
+
+def test_generator_builder_ai_messages_add_image_generation_guidance_for_stego_prompts():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Build a deterministic stego generator that creates a PNG image with a hidden flag.',
+    })
+
+    user_content = messages[1]['content']
+    assert 'For image or steganography outputs, generate a valid, viewable carrier image file rather than random bytes renamed to .png or .jpg.' in user_content
+    assert 'Prefer Pillow/PIL with an explicit install step in compose_text when you need to create or modify images' in user_content
+    assert 'Do not append arbitrary payload bytes after image end markers or mutate container bytes outside real pixel data.' in user_content
+
+
+def test_generator_builder_ai_messages_prioritize_refine_context_and_render_file_blocks():
+    messages = generator_builder_routes._build_generator_builder_ai_messages({
+        'plugin_type': 'flag-generator',
+        'prompt': 'Please refine the generator to fix the failing image output.',
+        'current_scaffold_request': {
+            'plugin_id': 'demo',
+            'folder_name': 'py_demo',
+            'name': 'Demo',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)', 'File(path)'],
+            'runtime_inputs': [{'name': 'seed', 'type': 'string', 'required': True}],
+        },
+        'current_files': {
+            'flag_generators/py_demo/generator.py': 'print("demo")\n',
+            'flag_generators/py_demo/manifest.yaml': 'manifest_version: 1\n',
+        },
+        'last_test_result': {
+            'ok': False,
+            'returncode': 1,
+            'failure_summary': 'generated image is corrupt',
+            'stderr': 'generated image is corrupt',
+            'stdout': '',
+            'files': [],
+        },
+    })
+
+    user_content = messages[1]['content']
+    assert 'Refinement priority:' in user_content
+    assert 'Treat the current scaffold below as the source material to edit, not as a loose example.' in user_content
+    assert 'File: flag_generators/py_demo/generator.py' in user_content
+    assert '```python' in user_content
+    assert 'print("demo")' in user_content
+    assert user_content.index('Latest local test result:') < user_content.index('Reference template: generator.py')
+    assert user_content.index('Current scaffold files:') < user_content.index('Reference template: generator.py')
+
+
+def test_generator_builder_template_handles_stream_auto_heal_reset() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "if (type === 'llm_output_reset') {",
+        'assistantAttemptLabel',
+        'state.assistantText = \'\';',
+        'Starting another model attempt after an automatic retry.',
+        'Automatic scaffold repair succeeded after an early validation failure.',
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder auto-heal stream handling snippets: ' + '; '.join(missing)
+
+
+def test_generator_builder_template_surfaces_scaffold_validation_warnings() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        'id="gbScaffoldValidationBanner"',
+        'scaffoldValidation: null,',
+        'function applyScaffoldValidationState(result, options = {}) {',
+        'function renderScaffoldValidation() {',
+        "Validating current scaffold contract...",
+        "Scaffold contract check passed: manifest inputs, generated files, and runtime expectations are aligned.",
+        "Scaffold validation warning",
+        "Scaffold validation', !validation ? 'pending'",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder scaffold validation warning snippets: ' + '; '.join(missing)
+
+
+def test_generator_builder_template_refreshes_validation_for_restored_scaffolds() -> None:
+    text = GENERATOR_BUILDER_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+
+    expected_snippets = [
+        "function refreshScaffoldValidation(options = {}) {",
+        "fetchJson('/api/generators/scaffold_meta'",
+        "applyScaffoldValidationState(result, { source: 'refresh' });",
+        "setTimeout(() => { refreshScaffoldValidation({ quiet: true }); }, 0);",
+        "Resolve scaffold validation warnings before installing this generator.",
+        "Wait for scaffold validation to finish before installing.",
+    ]
+
+    missing = [snippet for snippet in expected_snippets if snippet not in text]
+    assert not missing, 'Missing Builder scaffold validation refresh/gating snippets: ' + '; '.join(missing)
 
 
 def test_generator_builder_ai_messages_add_prompt_derived_ssh_credential_defaults():
@@ -935,6 +1635,56 @@ def test_generator_builder_test_runs_remote_core_vm(monkeypatch):
     assert 'docker-compose.yml' in file_map
 
 
+def test_generator_builder_test_rejects_runtime_input_mismatch(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    def _unexpected_remote_test(**_kwargs):
+        raise AssertionError('remote builder test should not run for an inconsistent scaffold')
+
+    monkeypatch.setattr(backend, '_run_remote_builder_scaffold_test', _unexpected_remote_test)
+
+    resp = client.post('/api/generators/builder_test', json={
+        'scaffold_request': {
+            'plugin_type': 'flag-generator',
+            'plugin_id': 'demo_mismatch',
+            'folder_name': 'py_demo_mismatch',
+            'name': 'Demo Mismatch',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)'],
+            'runtime_inputs': [
+                {'name': 'seed', 'type': 'string', 'required': True},
+            ],
+            'generator_py_text': (
+                'import json\n'
+                'from pathlib import Path\n\n'
+                'def _read_config():\n'
+                '    return json.loads(Path("/inputs/config.json").read_text("utf-8"))\n\n'
+                'def main():\n'
+                '    cfg = _read_config()\n'
+                '    seed = str(cfg.get("seed") or "").strip()\n'
+                '    secret = str(cfg.get("secret") or "").strip()\n'
+                '    if not seed:\n'
+                '        raise SystemExit("Missing seed in /inputs/config.json")\n'
+                '    if not secret:\n'
+                '        raise SystemExit("Missing secret in /inputs/config.json")\n\n'
+                'if __name__ == "__main__":\n'
+                '    main()\n'
+            ),
+        },
+    })
+
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert payload['ok'] is False
+    assert 'Generated scaffold is inconsistent' in str(payload.get('error') or '')
+    assert 'secret' in str(payload.get('error') or '')
+    assert payload.get('validation_errors')
+
+
 def test_generator_builder_test_run_uses_async_catalog_style_flow(monkeypatch, tmp_path):
     client = app.test_client()
     _login(client)
@@ -1017,6 +1767,60 @@ def test_generator_builder_test_run_uses_async_catalog_style_flow(monkeypatch, t
     assert cleanup_resp.status_code == 200
     cleanup_payload = cleanup_resp.get_json() or {}
     assert cleanup_payload['ok'] is True
+
+
+def test_generator_builder_test_run_rejects_runtime_input_mismatch(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+    monkeypatch.setattr(backend, '_parse_flag_test_core_cfg_from_form', lambda form: {'ssh_host': 'core', 'ssh_port': 22, 'ssh_username': 'user', 'ssh_password': 'pw'})
+    monkeypatch.setattr(backend, '_ensure_core_vm_idle_for_test', lambda core_cfg: None)
+
+    def _unexpected_start(**_kwargs):
+        raise AssertionError('async remote builder test should not start for an inconsistent scaffold')
+
+    monkeypatch.setattr(backend, '_start_remote_builder_scaffold_test_process', _unexpected_start)
+
+    resp = client.post('/api/generators/builder_test/run', data={
+        'scaffold_request': json.dumps({
+            'plugin_type': 'flag-generator',
+            'plugin_id': 'demo_async_mismatch',
+            'folder_name': 'py_demo_async_mismatch',
+            'name': 'Demo Async Mismatch',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)'],
+            'runtime_inputs': [
+                {'name': 'seed', 'type': 'string', 'required': True},
+            ],
+            'generator_py_text': (
+                'import json\n'
+                'from pathlib import Path\n\n'
+                'def _read_config():\n'
+                '    return json.loads(Path("/inputs/config.json").read_text("utf-8"))\n\n'
+                'def main():\n'
+                '    cfg = _read_config()\n'
+                '    seed = str(cfg.get("seed") or "").strip()\n'
+                '    secret = str(cfg.get("secret") or "").strip()\n'
+                '    if not seed:\n'
+                '        raise SystemExit("Missing seed in /inputs/config.json")\n'
+                '    if not secret:\n'
+                '        raise SystemExit("Missing secret in /inputs/config.json")\n\n'
+                'if __name__ == "__main__":\n'
+                '    main()\n'
+            ),
+        }),
+        'seed': 'custom-seed',
+        'core': json.dumps({'ssh_host': 'core'}),
+    })
+
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert payload['ok'] is False
+    assert 'Generated scaffold is inconsistent' in str(payload.get('error') or '')
+    assert 'secret' in str(payload.get('error') or '')
+    assert payload.get('validation_errors')
 
 
 def test_generator_builder_test_outputs_include_failure_summary(monkeypatch):
@@ -1145,6 +1949,44 @@ def test_generator_install_generated_wraps_scaffold_as_pack(monkeypatch):
         'flag_generators/py_demo/manifest.yaml',
     ]
     assert 'id: demo' in installed['manifest']
+
+
+def test_generator_install_generated_rejects_invalid_scaffold(monkeypatch):
+    client = app.test_client()
+    _login(client)
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    def _unexpected_install(**_kwargs):
+        raise AssertionError('install should not run for an invalid scaffold')
+
+    monkeypatch.setattr(backend, '_install_generator_pack_or_bundle', _unexpected_install)
+
+    resp = client.post('/api/generators/install_generated', json={
+        'pack_label': 'Demo Pack',
+        'scaffold_request': {
+            'plugin_type': 'flag-generator',
+            'plugin_id': 'demo_invalid_install',
+            'folder_name': 'py_demo_invalid_install',
+            'name': 'Demo Invalid Install',
+            'description': 'demo',
+            'requires': [],
+            'produces': ['Flag(flag_id)'],
+            'runtime_inputs': [
+                {'name': 'seed', 'type': 'string', 'required': True},
+            ],
+            'generator_py_text': (
+                'def main():\n'
+                '    raise SystemExit("Missing secret in /inputs/config.json")\n'
+            ),
+        },
+    })
+
+    assert resp.status_code == 400
+    payload = resp.get_json() or {}
+    assert payload['ok'] is False
+    assert 'secret' in str(payload.get('error') or '')
+    assert payload.get('validation_errors')
 
 
 def test_generator_install_generated_renames_duplicate_id(monkeypatch):

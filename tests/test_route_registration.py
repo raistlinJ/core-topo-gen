@@ -817,6 +817,7 @@ def test_flag_node_generators_test_register_is_idempotent():
         coerce_bool=lambda value: bool(value),
         cleanup_remote_test_runtime=lambda meta: None,
         flagnodegen_run_ephemeral_execute=lambda run_id: None,
+        persist_generator_test_result=lambda **kwargs: (True, 'ok'),
     )
     flag_node_generators_test.register(
         app,
@@ -841,6 +842,7 @@ def test_flag_node_generators_test_register_is_idempotent():
         coerce_bool=lambda value: bool(value),
         cleanup_remote_test_runtime=lambda meta: None,
         flagnodegen_run_ephemeral_execute=lambda run_id: None,
+        persist_generator_test_result=lambda **kwargs: (True, 'ok'),
     )
 
     rules = {rule.rule for rule in app.url_map.iter_rules()}
@@ -876,6 +878,7 @@ def test_flag_generators_test_register_is_idempotent():
         coerce_bool=lambda value: bool(value),
         cleanup_remote_test_runtime=lambda meta: None,
         flaggen_run_ephemeral_execute=lambda run_id: None,
+        persist_generator_test_result=lambda **kwargs: (True, 'ok'),
     )
     flag_generators_test.register(
         app,
@@ -900,6 +903,7 @@ def test_flag_generators_test_register_is_idempotent():
         coerce_bool=lambda value: bool(value),
         cleanup_remote_test_runtime=lambda meta: None,
         flaggen_run_ephemeral_execute=lambda run_id: None,
+        persist_generator_test_result=lambda **kwargs: (True, 'ok'),
     )
 
     rules = {rule.rule for rule in app.url_map.iter_rules()}
@@ -1272,6 +1276,8 @@ def test_generator_catalog_data_register_is_idempotent():
         flag_node_generators_from_enabled_sources=lambda: ([], []),
         is_installed_generator_view=lambda gen: True,
         annotate_disabled_state=lambda generators, kind: generators,
+        load_installed_generator_packs_state=lambda: {'packs': []},
+        installed_generators_root=lambda: '/tmp/outputs/installed_generators',
     )
     generator_catalog_data.register(
         app,
@@ -1279,11 +1285,14 @@ def test_generator_catalog_data_register_is_idempotent():
         flag_node_generators_from_enabled_sources=lambda: ([], []),
         is_installed_generator_view=lambda gen: True,
         annotate_disabled_state=lambda generators, kind: generators,
+        load_installed_generator_packs_state=lambda: {'packs': []},
+        installed_generators_root=lambda: '/tmp/outputs/installed_generators',
     )
 
     rules = {rule.rule for rule in app.url_map.iter_rules()}
     assert '/flag_generators_data' in rules
     assert '/flag_node_generators_data' in rules
+    assert '/api/generator_catalog/test_log' in rules
 
 
 def test_generator_builder_routes_register_is_idempotent():
@@ -1294,6 +1303,7 @@ def test_generator_builder_routes_register_is_idempotent():
         require_builder_or_admin=lambda: None,
         runs={},
         outputs_dir=lambda: '/tmp/outputs',
+        installed_generators_root=lambda: '/tmp/outputs/installed_generators',
         flag_generators_from_enabled_sources=lambda: ([], []),
         flag_node_generators_from_enabled_sources=lambda: ([], []),
         reserved_artifacts={},
@@ -1319,6 +1329,7 @@ def test_generator_builder_routes_register_is_idempotent():
         require_builder_or_admin=lambda: None,
         runs={},
         outputs_dir=lambda: '/tmp/outputs',
+        installed_generators_root=lambda: '/tmp/outputs/installed_generators',
         flag_generators_from_enabled_sources=lambda: ([], []),
         flag_node_generators_from_enabled_sources=lambda: ([], []),
         reserved_artifacts={},
@@ -1455,6 +1466,7 @@ def test_vuln_catalog_overview_register_is_idempotent():
     rules = {rule.rule for rule in app.url_map.iter_rules()}
     assert '/vuln_catalog_page' in rules
     assert '/vuln_catalog_items_data' in rules
+    assert '/vuln_catalog_items/test/log' in rules
 
 
 def test_vuln_catalog_pack_files_register_is_idempotent():
@@ -1528,6 +1540,7 @@ def test_vuln_catalog_mutations_register_is_idempotent():
     assert '/vuln_catalog_packs/delete/<catalog_id>' in rules
     assert '/vuln_catalog_items/set_disabled' in rules
     assert '/vuln_catalog_items/delete' in rules
+    assert '/vuln_catalog_items/batch_mutate' in rules
 
 
 def test_vuln_catalog_pack_ingest_register_is_idempotent():
@@ -1660,6 +1673,7 @@ def test_generator_catalog_mutations_register_is_idempotent():
         require_builder_or_admin=lambda: None,
         set_pack_disabled_state=lambda **kwargs: (True, 'ok'),
         set_generator_disabled_state=lambda **kwargs: (True, 'ok'),
+        set_generator_validation_state=lambda **kwargs: (True, 'ok'),
         delete_installed_generator=lambda **kwargs: (True, 'ok'),
     )
     generator_catalog_mutations.register(
@@ -1667,6 +1681,7 @@ def test_generator_catalog_mutations_register_is_idempotent():
         require_builder_or_admin=lambda: None,
         set_pack_disabled_state=lambda **kwargs: (True, 'ok'),
         set_generator_disabled_state=lambda **kwargs: (True, 'ok'),
+        set_generator_validation_state=lambda **kwargs: (True, 'ok'),
         delete_installed_generator=lambda **kwargs: (True, 'ok'),
     )
 
@@ -1677,6 +1692,8 @@ def test_generator_catalog_mutations_register_is_idempotent():
     assert '/api/generator_packs/set_disabled' in rules
     assert '/api/flag_generators/set_disabled' in rules
     assert '/api/flag_node_generators/set_disabled' in rules
+    assert '/api/flag_generators/batch_mutate' in rules
+    assert '/api/flag_node_generators/batch_mutate' in rules
 
 
 def test_flag_sequencing_progress_register_is_idempotent():

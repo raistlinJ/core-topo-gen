@@ -1,0 +1,57 @@
+services:
+  apisix:
+    image: coretg/scenario-vuln-test-15:iproute2
+    volumes:
+    - /Users/jcacosta/Documents/core-topo-gen/tmp_hitl/apisix-repro/apisix-cve-2020-13945/node-vuln-test-15/config.yml:/usr/local/apisix/conf/config.yaml:ro
+    depends_on:
+    - etcd
+    labels:
+      coretg.flow_artifacts.src: /tmp/vulns/flag_node_generators_runs/flow-zz-gve-copy-474785ea
+      coretg.flow_artifacts.dest: /flow_artifacts
+      coretg.wrapper_build_context: /Users/jcacosta/Documents/core-topo-gen/tmp_hitl/apisix-repro/docker-wrap-scenario-vuln-test-15
+      coretg.wrapper_build_dockerfile: Dockerfile
+      coretg.wrapper_build_network: host
+      coretg.wrapper_base_image: vulhub/apisix:2.11.0
+    pull_policy: never
+    cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    network_mode: none
+    expose:
+    - '9080'
+    - '9091'
+    - '9443'
+  etcd:
+    image: bitnami/etcd:3.4.15
+    environment:
+      ETCD_ENABLE_V2: 'true'
+      ALLOW_NONE_AUTHENTICATION: 'yes'
+      ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    network_mode: none
+    expose:
+    - 2379/tcp
+  vuln-test-15:
+    image: coretg/scenario-vuln-test-15:iproute2
+    volumes:
+    - /Users/jcacosta/Documents/core-topo-gen/tmp_hitl/apisix-repro/apisix-cve-2020-13945/node-vuln-test-15/config.yml:/usr/local/apisix/conf/config.yaml:ro
+    depends_on:
+    - etcd
+    labels:
+      coretg.flow_artifacts.src: /tmp/vulns/flag_node_generators_runs/flow-zz-gve-copy-474785ea
+      coretg.flow_artifacts.dest: /flow_artifacts
+      coretg.wrapper_build_context: /Users/jcacosta/Documents/core-topo-gen/tmp_hitl/apisix-repro/docker-wrap-scenario-vuln-test-15
+      coretg.wrapper_build_dockerfile: Dockerfile
+      coretg.wrapper_build_network: host
+      coretg.wrapper_base_image: vulhub/apisix:2.11.0
+    pull_policy: never
+    cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    network_mode: none
+    expose:
+    - '9080'
+    - '9091'
+    - '9443'
+    container_name: vuln-test-15
+    restart: unless-stopped

@@ -2482,29 +2482,55 @@ def _openai_compatible_chat_completions_url(base_url: str) -> str:
 
 
 def _extract_openai_compatible_message_text(raw_payload: dict[str, Any]) -> str:
+    def _coerce_content_text(value: Any, *, strip_text: bool = True) -> str:
+        if isinstance(value, str):
+            return value.strip() if strip_text else value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                text = _coerce_content_text(item, strip_text=False)
+                if text:
+                    parts.append(text)
+            joined = ''.join(parts)
+            return joined.strip() if strip_text else joined
+        if isinstance(value, dict):
+            item_type = str(value.get('type') or '').strip().lower()
+            if item_type in {'text', 'output_text'}:
+                text_value = value.get('text')
+                if isinstance(text_value, dict):
+                    inner = str(text_value.get('value') or '')
+                    return inner.strip() if strip_text else inner
+                text = str(text_value or '')
+                return text.strip() if strip_text else text
+            for key in ('text', 'value', 'content'):
+                if key in value:
+                    text = _coerce_content_text(value.get(key), strip_text=strip_text)
+                    if text:
+                        return text
+        return str(value or '').strip() if value not in (None, '', [], {}) else ''
+
     choices = raw_payload.get('choices') if isinstance(raw_payload.get('choices'), list) else []
     if not choices:
         return ''
-    message = choices[0].get('message') if isinstance(choices[0], dict) else {}
-    content = message.get('content') if isinstance(message, dict) else ''
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                if item.strip():
-                    parts.append(item.strip())
-                continue
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get('type') or '').strip().lower()
-            if item_type in {'text', 'output_text'}:
-                text = str(item.get('text') or '').strip()
-                if text:
-                    parts.append(text)
-        return '\n'.join(parts).strip()
-    return str(content or '').strip()
+    first_choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = first_choice.get('message') if isinstance(first_choice.get('message'), dict) else {}
+    candidate_values: list[Any] = []
+    if isinstance(message, dict):
+        candidate_values.extend([
+            message.get('content'),
+            message.get('reasoning_content'),
+            message.get('reasoning'),
+            message.get('output_text'),
+        ])
+    candidate_values.extend([
+        first_choice.get('text') if isinstance(first_choice, dict) else '',
+        raw_payload.get('output_text') if isinstance(raw_payload, dict) else '',
+    ])
+    for candidate in candidate_values:
+        text = _coerce_content_text(candidate)
+        if text:
+            return text
+    return ''
 
 
 def _default_section_payload(name: str) -> dict[str, Any]:

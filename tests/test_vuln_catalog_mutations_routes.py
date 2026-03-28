@@ -171,3 +171,39 @@ def test_vuln_catalog_items_set_disabled_returns_404_for_missing_item():
     assert response.status_code == 404
     assert response.get_json() == {'ok': False, 'error': 'Unknown item id'}
     assert writes == []
+
+
+def test_vuln_catalog_items_batch_override_fail_updates_multiple_items():
+    app, state, writes, csv_calls, _ = _build_app(
+        {
+            'active_id': 'pack-1',
+            'catalogs': [
+                {
+                    'id': 'pack-1',
+                    'compose_items': [
+                        {'id': 11, 'disabled': False, 'validated_ok': True},
+                        {'id': 12, 'disabled': False, 'validated_ok': None, 'validated_incomplete': True},
+                        {'id': 13, 'disabled': False, 'validated_ok': True},
+                    ],
+                }
+            ],
+        }
+    )
+    client = app.test_client()
+
+    response = client.post('/vuln_catalog_items/batch_mutate', json={'item_ids': [11, 12], 'action': 'override_fail'})
+
+    assert response.status_code == 200
+    payload = response.get_json() or {}
+    assert payload['ok'] is True
+    assert payload['updated'] == [11, 12]
+    assert payload['message'] == 'Applied override_fail to 2 item(s).'
+    items = state['catalogs'][0]['compose_items']
+    assert items[0]['validated_ok'] is False
+    assert items[0]['validated_incomplete'] is False
+    assert items[0]['validated_at']
+    assert items[1]['validated_ok'] is False
+    assert items[1]['validated_incomplete'] is False
+    assert items[1]['validated_at']
+    assert writes[-1]['catalogs'][0]['compose_items'][0]['validated_ok'] is False
+    assert csv_calls[-1]['catalog_id'] == 'pack-1'

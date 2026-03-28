@@ -604,6 +604,7 @@
                     <button type="button" class="btn btn-outline-secondary btn-sm" id="gbStreamHeaderCloseBtn">Back to Prompt</button>
                   </div>
                 </div>
+                <div class="alert alert-secondary small d-none" id="gbScaffoldValidationBanner">Scaffold validation has not run yet.</div>
                 <ul class="nav nav-pills gb-tab-nav mb-3" role="tablist">
                   <li class="nav-item" role="presentation">
                     <button class="nav-link active" id="gbPromptResponseModelTabBtn" data-bs-toggle="tab" data-bs-target="#gbPromptResponseModelTab" type="button" role="tab" aria-selected="true">Model Output</button>
@@ -856,8 +857,6 @@
   const BUILDER_MODEL_PREFS_KEY = 'coretg_builder_model_config';
   const BUILDER_WORKSPACE_STATE_KEY = 'coretg_builder_workspace_state';
   const BUILDER_TEST_SSH_KEY = 'coretg_builder_test_ssh';
-  const GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS = [90000, 180000, 240000, 360000];
-
   const state = {
     catalog: { ...fallbackCatalog },
     models: [],
@@ -873,10 +872,13 @@
     apiKeyStatusMessage: '',
     promptUnlocked: false,
     scaffoldRequest: null,
+    scaffoldValidation: null,
     scaffoldFiles: {},
     activeFilePath: '',
     manifestYaml: '',
     assistantText: '',
+    assistantAttempt: 1,
+    assistantAttemptLabel: '',
     lastTestResult: null,
     iterations: [],
     generateInFlight: false,
@@ -1006,6 +1008,7 @@
     testFiles: document.getElementById('gbTestFiles'),
     iterationHistory: document.getElementById('gbIterationHistory'),
     summaryGrid: document.getElementById('gbSummaryGrid'),
+    scaffoldValidationBanner: document.getElementById('gbScaffoldValidationBanner'),
     fileList: document.getElementById('gbFileList'),
     fileContent: document.getElementById('gbFileContent'),
     filesCount: document.getElementById('gbFilesCount'),
@@ -1109,6 +1112,7 @@
       prompt: String(elements.prompt && elements.prompt.value || ''),
       intentOverrides: buildIntentOverridePayload() || {},
       scaffoldRequest: state.scaffoldRequest || null,
+      scaffoldValidation: state.scaffoldValidation || null,
       scaffoldFiles: state.scaffoldFiles || {},
       activeFilePath: String(state.activeFilePath || ''),
       manifestYaml: String(state.manifestYaml || ''),
@@ -1161,6 +1165,7 @@
     fillIntentOverrideInputs(saved.intentOverrides || {}, { refresh: false });
     state.promptUnlocked = !!saved.promptUnlocked;
     state.scaffoldRequest = saved.scaffoldRequest || null;
+    state.scaffoldValidation = saved.scaffoldValidation || null;
     state.scaffoldFiles = saved.scaffoldFiles && typeof saved.scaffoldFiles === 'object' ? saved.scaffoldFiles : {};
     state.activeFilePath = String(saved.activeFilePath || '');
     state.manifestYaml = String(saved.manifestYaml || '');
@@ -1211,10 +1216,14 @@
       logEl.textContent = String(saved.builderLog || 'Press Test from Prompt Response to prepare a run.\n');
     }
     syncAutoFollowToggle();
+    renderScaffoldValidation();
     renderSummary();
     renderFiles();
     renderIterations();
     updateActionButtons();
+    if (state.scaffoldRequest) {
+      setTimeout(() => { refreshScaffoldValidation({ quiet: true }); }, 0);
+    }
     return true;
   }
 
@@ -1239,10 +1248,13 @@
     state.apiKeyStatusMessage = '';
     state.promptUnlocked = false;
     state.scaffoldRequest = null;
+    state.scaffoldValidation = null;
     state.scaffoldFiles = {};
     state.activeFilePath = '';
     state.manifestYaml = '';
     state.assistantText = '';
+    state.assistantAttempt = 1;
+    state.assistantAttemptLabel = '';
     state.lastTestResult = null;
     state.iterations = [];
     state.generateInFlight = false;
@@ -1270,6 +1282,7 @@
     if (elements.enforceSsl) elements.enforceSsl.checked = true;
     syncAutoFollowToggle(true);
     renderStoredApiKeyControls();
+    renderScaffoldValidation();
     renderSummary();
     renderFiles();
     renderIterations();
@@ -2649,6 +2662,36 @@
     }
   }
 
+  function appendAssistantAttemptHeader(label) {
+    const normalizedLabel = String(label || '').trim() || `Attempt ${Number(state.assistantAttempt || 1)}`;
+    const header = `=== ${normalizedLabel} ===\n`;
+    const current = String(state.assistantText || '');
+    state.assistantAttemptLabel = normalizedLabel;
+    if (!current) {
+      state.assistantText = header;
+      return;
+    }
+    if (current.includes(header)) {
+      return;
+    }
+    if (!current.endsWith('\n')) {
+      state.assistantText = `${current}\n\n${header}`;
+      return;
+    }
+    if (current.endsWith('\n\n')) {
+      state.assistantText = `${current}${header}`;
+      return;
+    }
+    state.assistantText = `${current}\n${header}`;
+  }
+
+  function appendAssistantDelta(delta) {
+    const text = String(delta || '');
+    if (!text) return;
+    appendAssistantAttemptHeader(state.assistantAttemptLabel || `Attempt ${Number(state.assistantAttempt || 1)}`);
+    state.assistantText = `${state.assistantText || ''}${text}`;
+  }
+
   function summarizeStructuredText(text) {
     const parsed = parseStructuredText(text);
     if (!parsed || typeof parsed !== 'object') {
@@ -2699,6 +2742,15 @@
     state.transcriptEvents.push({ time: formatEventTime(), text: String(text || '') });
     renderTranscriptEvents();
     persistBuilderWorkspaceState();
+  }
+
+  function appendTranscriptEventIfChanged(text) {
+    const nextText = String(text || '');
+    const lastEntry = state.transcriptEvents.length ? state.transcriptEvents[state.transcriptEvents.length - 1] : null;
+    if (lastEntry && String(lastEntry.text || '') === nextText) {
+      return;
+    }
+    appendTranscriptEvent(nextText);
   }
 
   function upsertTranscriptEvent(key, text) {
@@ -2767,13 +2819,11 @@
     state.scaffoldRequest = result.scaffold_request || null;
     state.scaffoldFiles = result.files || {};
     state.manifestYaml = String(result.manifest_yaml || '');
-    state.assistantText = String(result.assistant_text || state.assistantText || '');
+    state.assistantText = String(state.assistantText || result.assistant_text || '');
+    applyScaffoldValidationState(result, { source: 'generation' });
     state.activeFilePath = '';
     if (elements.manifestYaml) {
       elements.manifestYaml.textContent = state.manifestYaml || 'No manifest generated yet.';
-    }
-    if (elements.assistantText) {
-      elements.assistantText.textContent = state.assistantText ? formatStructuredText(state.assistantText) : 'No model response captured yet.';
     }
     renderSummary();
     renderFiles();
@@ -2784,6 +2834,12 @@
       plugin_id: state.scaffoldRequest && state.scaffoldRequest.plugin_id,
       status: 'scaffold updated',
     });
+    const autoHeal = result && typeof result.auto_heal === 'object' ? result.auto_heal : null;
+    if (autoHeal && autoHeal.attempted) {
+      appendTranscriptEvent(autoHeal.healed
+        ? 'Automatic scaffold repair succeeded after an early validation failure.'
+        : 'Automatic scaffold repair was attempted but the scaffold still failed validation.');
+    }
     appendTranscriptEvent(`Normalized scaffold received for ${(state.scaffoldRequest && state.scaffoldRequest.plugin_id) || 'the requested generator'}.`);
     appendTranscriptEvent(`Generated ${Object.keys(state.scaffoldFiles || {}).length} scaffold files.`);
     setTestStatus('Ready to run a CORE VM scaffold test.', 'secondary');
@@ -2896,76 +2952,11 @@
     return true;
   }
 
-  function scheduleNextGenerateLongWaitPrompt() {
-    if (!state.generateInFlight || state.generateCancelRequested) return;
-    const nextIndex = Number(state.generateLongWaitPromptIndex || 0);
-    if (nextIndex >= GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS.length) return;
-    const checkpointMs = GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS[nextIndex];
-    const startedAt = Number(state.generateStartedAt || Date.now());
-    const elapsedMs = Date.now() - startedAt;
-    const delayMs = Math.max(0, checkpointMs - elapsedMs);
-    if (state.generateLongWaitPromptTimer) {
-      try { clearTimeout(state.generateLongWaitPromptTimer); } catch (e) {}
-    }
-    state.generateLongWaitPromptTimer = window.setTimeout(() => {
-      state.generateLongWaitPromptTimer = null;
-      promptForLongRunningGenerationCancel(checkpointMs).catch(() => null);
-    }, delayMs);
-  }
-
-  async function promptForLongRunningGenerationCancel(checkpointMs) {
-    if (!state.generateInFlight || state.generateCancelRequested) return;
-    const nextIndex = Number(state.generateLongWaitPromptIndex || 0);
-    if (nextIndex >= GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS.length) return;
-    if (GENERATE_CANCEL_PROMPT_CHECKPOINTS_MS[nextIndex] !== checkpointMs) {
-      scheduleNextGenerateLongWaitPrompt();
-      return;
-    }
-    state.generateLongWaitPromptIndex = nextIndex + 1;
-    const seconds = Math.round(Number(checkpointMs || 0) / 1000);
-    appendTranscriptEvent(`Generation is still running after ${seconds}s.`);
-    if (state.generateLongWaitPromptActive) {
-      scheduleNextGenerateLongWaitPrompt();
-      return;
-    }
-    state.generateLongWaitPromptActive = true;
-    let shouldCancel = false;
-    try {
-      if (typeof window.confirmWithModal === 'function') {
-        shouldCancel = await window.confirmWithModal(
-          'Still Waiting on Model',
-          `This generation request has been running for ${seconds} seconds.\n\nIf the model is still processing, you can keep waiting.\n\nWould you like to cancel the current generation?`,
-          'Cancel Generation',
-          'danger',
-          { cancelLabel: 'Keep Waiting' }
-        );
-      } else {
-        shouldCancel = window.confirm(
-          `This generation request has been running for ${seconds} seconds.\n\nPress OK to cancel generation now.\nPress Cancel to keep waiting.`
-        );
-      }
-    } finally {
-      state.generateLongWaitPromptActive = false;
-    }
-    if (!state.generateInFlight || state.generateCancelRequested) return;
-    if (shouldCancel) {
-      requestGenerateCancellation(
-        `Cancellation requested after waiting ${seconds}s.`,
-        'Cancelling generation…',
-        'Stopping the in-flight model request after your confirmation.'
-      );
-      return;
-    }
-    appendTranscriptEvent(`User chose to keep waiting after ${seconds}s.`);
-    scheduleNextGenerateLongWaitPrompt();
-  }
-
   function startGenerateLongWaitPrompts() {
     stopGenerateLongWaitPrompts();
     state.generateStartedAt = Date.now();
     state.generateLongWaitPromptIndex = 0;
     state.generateLongWaitPromptActive = false;
-    scheduleNextGenerateLongWaitPrompt();
   }
 
   function setGenerateBusy(isBusy) {
@@ -2999,6 +2990,8 @@
     state.transcriptEvents = [];
     state.transcriptThinkingText = '';
     state.assistantText = '';
+    state.assistantAttempt = 1;
+    state.assistantAttemptLabel = '';
     state.generateRequestId = String(payload.request_id || '').trim();
     elements.streamMeta.textContent = `${mode === 'refine' ? 'Refine' : 'Create'} request • ${String(payload.provider || '').trim() || 'provider'} • ${String(payload.model || '').trim() || 'model'}`;
     setStreamState(
@@ -3022,7 +3015,7 @@
       appendTranscriptEvent(detail);
     } else {
       setStreamState('Generation failed', detail, 'text-bg-danger', 'Failed');
-      appendTranscriptEvent(`Error: ${detail}`);
+      appendTranscriptEventIfChanged(`Error: ${detail}`);
     }
     setGenerateBusy(false);
     updateActionButtons();
@@ -3066,11 +3059,18 @@
   }
 
   function updateInstallButtonHint(isDisabled, hasScaffold) {
+    const validation = state.scaffoldValidation;
+    const hasValidationIssue = !!(validation && !validation.pending && validation.ok === false);
+    const validationPending = !!(validation && validation.pending);
     const hint = !hasScaffold
       ? 'Generate a scaffold before installing it into the catalog.'
-      : (hasSuccessfulBuilderTest()
-        ? 'Install this scaffold into the catalog.'
-        : 'Install unlocks after the latest Builder test returns rc=0.');
+      : (validationPending
+        ? 'Wait for scaffold validation to finish before installing.'
+        : (hasValidationIssue
+          ? 'Resolve scaffold validation warnings before installing this generator.'
+          : (hasSuccessfulBuilderTest()
+            ? 'Install this scaffold into the catalog.'
+            : 'Install unlocks after the latest Builder test returns rc=0.')));
     if (elements.installBtnHint) elements.installBtnHint.setAttribute('title', hint);
     (elements.installBtnHints || []).forEach((hintEl) => {
       hintEl.setAttribute('title', hint);
@@ -3084,9 +3084,11 @@
   function updateActionButtons() {
     const hasScaffold = !!state.scaffoldRequest;
     const promptReady = isPromptUnlocked();
+    const validation = state.scaffoldValidation;
+    const installBlockedByValidation = !!(validation && (validation.pending || validation.ok === false));
     if (elements.promptRefineBtn) elements.promptRefineBtn.disabled = state.generateInFlight || !promptReady || !hasScaffold;
     if (elements.testBtn) elements.testBtn.disabled = state.generateInFlight || !hasScaffold;
-    const installDisabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest();
+    const installDisabled = state.generateInFlight || !hasScaffold || !hasSuccessfulBuilderTest() || installBlockedByValidation;
     (elements.installButtons || []).forEach((button) => {
       button.disabled = installDisabled;
     });
@@ -3166,6 +3168,23 @@
       payload.intent_overrides = intentOverrides;
     }
     return payload;
+  }
+
+  function buildRefineIterationHistoryPayload() {
+    const items = Array.isArray(state.iterations) ? state.iterations : [];
+    return items
+      .filter((entry) => {
+        const mode = String((entry && entry.mode) || '').trim().toLowerCase();
+        return mode === 'create' || mode === 'refine';
+      })
+      .slice(-8)
+      .map((entry) => ({
+        mode: String((entry && entry.mode) || '').trim(),
+        prompt: String((entry && entry.prompt) || '').trim(),
+        plugin_id: String((entry && entry.plugin_id) || '').trim(),
+        status: String((entry && entry.status) || '').trim(),
+      }))
+      .filter((entry) => entry.prompt);
   }
 
   function buildIntentOverridePayload() {
@@ -3255,12 +3274,105 @@
       : `${count} manual override${count === 1 ? '' : 's'} active. Open to edit.`;
   }
 
+  function applyScaffoldValidationState(result, options = {}) {
+    const payload = result && typeof result === 'object' ? result : {};
+    const errors = Array.isArray(payload.validation_errors)
+      ? payload.validation_errors.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const pending = options && options.pending === true;
+    const source = String((options && options.source) || payload.source || '').trim();
+    const message = String(payload.error || '').trim();
+    if (!state.scaffoldRequest) {
+      state.scaffoldValidation = null;
+    } else {
+      state.scaffoldValidation = {
+        pending,
+        ok: !pending && !errors.length && payload.validation_ok !== false && !message,
+        errors,
+        message,
+        source,
+      };
+    }
+    renderScaffoldValidation();
+    renderSummary();
+    persistBuilderWorkspaceState();
+  }
+
+  function renderScaffoldValidation() {
+    const banner = elements.scaffoldValidationBanner;
+    if (!banner) return;
+    const validation = state.scaffoldValidation;
+    if (!state.scaffoldRequest) {
+      banner.className = 'alert alert-secondary small d-none';
+      banner.textContent = 'Scaffold validation has not run yet.';
+      return;
+    }
+    if (!validation || validation.pending) {
+      banner.className = 'alert alert-secondary small';
+      banner.textContent = 'Validating current scaffold contract...';
+      return;
+    }
+    if (validation.ok) {
+      banner.className = 'alert alert-success small';
+      banner.textContent = 'Scaffold contract check passed: manifest inputs, generated files, and runtime expectations are aligned.';
+      return;
+    }
+    const errors = Array.isArray(validation.errors) ? validation.errors : [];
+    const headline = errors.length
+      ? `Scaffold validation warning${errors.length === 1 ? '' : 's'}: ${errors[0]}`
+      : (validation.message || 'Scaffold validation warning.');
+    banner.className = 'alert alert-warning small';
+    banner.textContent = headline;
+  }
+
+  async function refreshScaffoldValidation(options = {}) {
+    const quiet = !!(options && options.quiet);
+    if (!state.scaffoldRequest) {
+      state.scaffoldValidation = null;
+      renderScaffoldValidation();
+      renderSummary();
+      persistBuilderWorkspaceState();
+      return null;
+    }
+    applyScaffoldValidationState({ validation_errors: [] }, { pending: true, source: 'refresh' });
+    const payload = state.scaffoldRequest;
+    const result = await fetchJson('/api/generators/scaffold_meta', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!result || result.ok === false) {
+      applyScaffoldValidationState({
+        validation_ok: false,
+        validation_errors: [],
+        error: String((result && result.error) || 'Unable to validate current scaffold.'),
+      }, { source: 'refresh' });
+      if (!quiet) {
+        appendTranscriptEvent(`Scaffold validation refresh failed: ${String((result && result.error) || 'Unknown error.')}`);
+      }
+      return result;
+    }
+    applyScaffoldValidationState(result, { source: 'refresh' });
+    if (!quiet) {
+      const errors = Array.isArray(result.validation_errors) ? result.validation_errors : [];
+      appendTranscriptEvent(errors.length
+        ? `Scaffold validation reported ${errors.length} warning${errors.length === 1 ? '' : 's'}.`
+        : 'Scaffold validation check passed.');
+    }
+    return result;
+  }
+
   function renderSummary() {
     const req = state.scaffoldRequest;
     if (!req) {
       elements.summaryGrid.innerHTML = '<div class="gb-summary-item"><small>Status</small><strong>Awaiting generation</strong></div>';
       return;
     }
+    const validation = state.scaffoldValidation;
     const runtimeInputs = Array.isArray(req.runtime_inputs) ? req.runtime_inputs.map((item) => String(item.name || '').trim()).filter(Boolean) : [];
     const requiredArtifacts = Array.isArray(req.requires)
       ? req.requires.filter((item) => item && item.optional !== true).map((item) => String(item.artifact || '').trim()).filter(Boolean)
@@ -3273,6 +3385,7 @@
       ['Kind', req.plugin_type || ''],
       ['Plugin ID', req.plugin_id || ''],
       ['Folder', req.folder_name || ''],
+      ['Scaffold validation', !validation ? 'pending' : (validation.pending ? 'running' : (validation.ok ? 'passed' : `${Array.isArray(validation.errors) ? validation.errors.length : 0} warning${Array.isArray(validation.errors) && validation.errors.length === 1 ? '' : 's'}`))],
       ['Runtime inputs', runtimeInputs.join(', ') || '(none)'],
       ['Required artifacts', requiredArtifacts.join(', ') || '(none)'],
       ['Optional artifacts', optionalArtifacts.join(', ') || '(none)'],
@@ -3401,12 +3514,15 @@
       payload.current_scaffold_request = state.scaffoldRequest;
       payload.current_files = state.scaffoldFiles;
       payload.last_test_result = state.lastTestResult;
+      payload.iteration_history = buildRefineIterationHistoryPayload();
+      if (state.scaffoldValidation) {
+        payload.scaffold_validation = state.scaffoldValidation;
+      }
     }
     payload.request_id = createGenerateRequestId();
     state.generateCancelRequested = false;
     state.generateAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
     setGenerateBusy(true);
-    startGenerateLongWaitPrompts();
     openStreamModal(mode, payload);
     setGenerateOverlay(
       true,
@@ -3457,9 +3573,17 @@
           const delta = String((event && event.text) || '');
           if (delta) {
             state.transcriptThinkingText = '';
-            state.assistantText = `${state.assistantText || ''}${delta}`;
+            appendAssistantDelta(delta);
             setStreamOutput(state.assistantText, mode === 'refine' ? 'Streaming raw model response for the refine step.' : 'Streaming raw model response for the create step.');
           }
+          return;
+        }
+        if (type === 'llm_output_reset') {
+          state.transcriptThinkingText = '';
+          state.assistantAttempt = Number(state.assistantAttempt || 1) + 1;
+          appendAssistantAttemptHeader(`Attempt ${state.assistantAttempt} (Auto-heal retry)`);
+          setStreamOutput(state.assistantText, mode === 'refine' ? 'Showing raw model responses for each refine attempt.' : 'Showing raw model responses for each create attempt.');
+          appendTranscriptEvent(String((event && event.reason) || 'Starting another model attempt after an automatic retry.'));
           return;
         }
         if (type === 'error') {
@@ -3931,6 +4055,8 @@
   updateIntentOverrideSummary();
   if (!restoreBuilderWorkspaceState(loadBuilderWorkspaceState())) {
     loadExamplePrompt();
+  } else if (state.scaffoldRequest) {
+    setTimeout(() => { refreshScaffoldValidation({ quiet: true }); }, 0);
   }
   refreshProviders(false);
 })();

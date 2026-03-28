@@ -85,3 +85,61 @@ def test_api_flag_node_generators_set_disabled_maps_kind(monkeypatch):
     assert resp.status_code == 200
     assert resp.get_json() == {'ok': True, 'message': 'updated'}
     assert captured == {'kind': 'flag-node-generator', 'generator_id': 'node-g-1', 'disabled': True}
+
+
+def test_api_flag_generators_batch_override_success_maps_validation_state(monkeypatch):
+    client = app.test_client()
+    _login(client)
+    captured = []
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    def fake_set_generator_validation_state(*, kind, generator_id, validated_ok, validated_incomplete):
+        captured.append({
+            'kind': kind,
+            'generator_id': generator_id,
+            'validated_ok': validated_ok,
+            'validated_incomplete': validated_incomplete,
+        })
+        return True, 'updated'
+
+    monkeypatch.setattr(backend, '_set_generator_validation_state', fake_set_generator_validation_state)
+
+    resp = client.post('/api/flag_generators/batch_mutate', json={'generator_ids': ['g-1', 'g-2'], 'action': 'override_success'})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        'ok': True,
+        'updated': ['g-1', 'g-2'],
+        'errors': [],
+        'message': 'Applied override_success to 2 item(s).',
+    }
+    assert captured == [
+        {'kind': 'flag-generator', 'generator_id': 'g-1', 'validated_ok': True, 'validated_incomplete': False},
+        {'kind': 'flag-generator', 'generator_id': 'g-2', 'validated_ok': True, 'validated_incomplete': False},
+    ]
+
+
+def test_api_flag_node_generators_batch_disable_maps_kind(monkeypatch):
+    client = app.test_client()
+    _login(client)
+    captured = []
+
+    monkeypatch.setattr(backend, '_require_builder_or_admin', lambda: None)
+
+    def fake_set_generator_disabled_state(*, kind, generator_id, disabled):
+        captured.append({'kind': kind, 'generator_id': generator_id, 'disabled': disabled})
+        return True, 'updated'
+
+    monkeypatch.setattr(backend, '_set_generator_disabled_state', fake_set_generator_disabled_state)
+
+    resp = client.post('/api/flag_node_generators/batch_mutate', json={'generator_ids': ['node-g-1'], 'action': 'disable'})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        'ok': True,
+        'updated': ['node-g-1'],
+        'errors': [],
+        'message': 'Applied disable to 1 item(s).',
+    }
+    assert captured == [{'kind': 'flag-node-generator', 'generator_id': 'node-g-1', 'disabled': True}]

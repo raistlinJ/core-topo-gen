@@ -88,6 +88,15 @@ def test_flag_catalog_batch_reuses_core_session_prompt() -> None:
     assert "if (metaEl) metaEl.textContent = 'Batch run cancelled.';" in text
 
 
+def test_flag_catalog_template_exposes_selection_and_log_controls() -> None:
+    text = FLAG_CATALOG_TEMPLATE_PATH.read_text(encoding='utf-8', errors='ignore')
+    assert 'id="genCheckAll"' in text
+    assert 'id="nodeGenCheckAll"' in text
+    assert 'id="genBatchOverrideSuccessBtn"' in text
+    assert 'id="nodeGenBatchOverrideFailBtn"' in text
+    assert 'href="${escapeHtml(g.log_download_url)}"' in text
+
+
 def test_flag_generators_data_includes_duplicate_installed_pack_entries(tmp_path, monkeypatch):
     install_root = tmp_path / 'installed_generators'
     duplicate_a = install_root / 'flag_generators' / 'p_pack_a__5'
@@ -160,6 +169,80 @@ injects: []
     assert {g.get('id') for g in generators if isinstance(g, dict)} == {'mario_http_drop'}
     assert {g.get('_pack_id') for g in generators if isinstance(g, dict)} == {'pack-a', 'pack-b'}
     assert all(g.get('_duplicate_conflict') is True for g in generators if isinstance(g, dict))
+
+
+def test_flag_generators_data_exposes_persisted_log_metadata(monkeypatch, tmp_path):
+    outputs_dir = tmp_path / 'outputs'
+    installed_dir = outputs_dir / 'installed_generators'
+    installed_dir.mkdir(parents=True)
+    log_dir = outputs_dir / 'test-logs'
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / 'generator.log'
+    log_path.write_text('generator log\n', encoding='utf-8')
+
+    monkeypatch.setenv('CORETG_INSTALLED_GENERATORS_DIR', str(installed_dir))
+    monkeypatch.setattr(backend, '_flag_generators_from_enabled_sources', lambda: ([{
+        'id': 'demo-gen',
+        'name': 'Demo Generator',
+        '_source_path': str(tmp_path / 'manifest.yaml'),
+    }], []))
+    monkeypatch.setattr(backend, '_is_installed_generator_view', lambda gen: True)
+    monkeypatch.setattr(backend, '_annotate_disabled_state', lambda generators, kind: [{
+        **generators[0],
+        '_validated_ok': True,
+        '_validated_incomplete': False,
+        '_validated_at': 'now',
+        '_last_test_log_path': str(log_path),
+        '_last_test_log_filename': 'generator.log',
+    }])
+    monkeypatch.setattr(backend, '_load_installed_generator_packs_state', lambda: {'packs': []})
+
+    client = app.test_client()
+    _login(client)
+    resp = client.get('/flag_generators_data')
+
+    assert resp.status_code == 200
+    payload = resp.get_json() or {}
+    generator = payload['generators'][0]
+    assert generator['validated_ok'] is True
+    assert generator['validated_incomplete'] is False
+    assert generator['validated_at'] == 'now'
+    assert generator['log_download_url'] == '/api/generator_catalog/test_log?kind=flag-generator&generator_id=demo-gen'
+
+
+def test_generator_catalog_test_log_download_returns_copied_log(monkeypatch, tmp_path):
+    outputs_dir = tmp_path / 'outputs'
+    installed_dir = outputs_dir / 'installed_generators'
+    installed_dir.mkdir(parents=True)
+    log_dir = outputs_dir / 'test-logs'
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / 'generator.log'
+    log_path.write_text('generator log\n', encoding='utf-8')
+
+    monkeypatch.setenv('CORETG_INSTALLED_GENERATORS_DIR', str(installed_dir))
+    monkeypatch.setattr(backend, '_load_installed_generator_packs_state', lambda: {
+        'packs': [
+            {
+                'id': 'pack-1',
+                'installed': [
+                    {
+                        'kind': 'flag-generator',
+                        'id': 'demo-gen',
+                        'last_test_log_path': str(log_path),
+                        'last_test_log_filename': 'generator.log',
+                    }
+                ],
+            }
+        ]
+    })
+
+    client = app.test_client()
+    _login(client)
+    resp = client.get('/api/generator_catalog/test_log?kind=flag-generator&generator_id=demo-gen')
+
+    assert resp.status_code == 200
+    assert resp.headers['Content-Disposition'].startswith('attachment;')
+    assert resp.data.decode('utf-8') == 'generator log\n'
 
 
 def test_data_sources_page_is_still_renderable(monkeypatch):

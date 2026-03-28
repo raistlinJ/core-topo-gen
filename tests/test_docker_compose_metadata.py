@@ -384,6 +384,50 @@ def test_prepare_compose_local_template_dot_bind_isolation(tmp_path):
     assert vol0.split(":", 1)[0].startswith(str(out_base)), vol0
 
 
+def test_prepare_compose_replaces_stale_directory_at_file_bind_paths(tmp_path):
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return
+
+    src_dir = tmp_path / "apisix-src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "config.yml").write_text("node_listen: 9080\n", encoding="utf-8")
+    compose_src = src_dir / "docker-compose.yml"
+    compose_src.write_text(
+        (
+            "services:\n"
+            "  apisix:\n"
+            "    image: vulhub/apisix:2.11.0\n"
+            "    volumes:\n"
+            "      - ./config.yml:/usr/local/apisix/conf/config.yaml:ro\n"
+        ),
+        encoding="utf-8",
+    )
+
+    out_base = tmp_path / "out"
+    base_dir = out_base / "apisix-cve-2020-13945"
+    node_dir = base_dir / "node-docker-1"
+    (base_dir / "config.yml").mkdir(parents=True, exist_ok=True)
+    (node_dir / "config.yml").mkdir(parents=True, exist_ok=True)
+
+    record = {"Type": "docker-compose", "Name": "apisix/CVE-2020-13945", "Path": str(compose_src)}
+    created = prepare_compose_for_assignments({"docker-1": record}, out_base=str(out_base))
+
+    out_path = out_base / "docker-compose-docker-1.yml"
+    assert str(out_path) in created
+    assert (base_dir / "config.yml").is_file()
+    assert (node_dir / "config.yml").is_file()
+
+    obj = yaml.safe_load(out_path.read_text("utf-8", errors="ignore"))
+    svc = (obj.get("services") or {}).get("docker-1") or (obj.get("services") or {}).get("apisix")
+    assert isinstance(svc, dict)
+    vols = svc.get("volumes") or []
+    assert isinstance(vols, list)
+    vol0 = str(vols[0])
+    assert vol0.split(":", 1)[0] == str(node_dir / "config.yml")
+
+
 def test_prepare_compose_prefers_local_path_over_cached(tmp_path):
     # Two different local compose sources but same Name (so same safe base_dir).
     src1 = tmp_path / "run1"
